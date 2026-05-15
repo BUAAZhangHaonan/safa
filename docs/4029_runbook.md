@@ -12,6 +12,9 @@ Environment rules:
 export CUDA_VISIBLE_DEVICES=0
 export OMP_NUM_THREADS=8
 export MKL_NUM_THREADS=8
+export PYTHON_BIN=/home/hdd3/zhanghaonan/anaconda3/bin/python
+export HTTP_PROXY=http://<proxy-host>:<proxy-port>
+export HTTPS_PROXY=http://<proxy-host>:<proxy-port>
 ```
 
 Use only GPUs `0,1,2,3`. Start with GPU `0`. Do not fall back to CPU.
@@ -20,10 +23,10 @@ Use only GPUs `0,1,2,3`. Start with GPU `0`. Do not fall back to CPU.
 
 ```bash
 cd /home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -U pip
-pip install -e ".[test,privacy]"
+$PYTHON_BIN -m pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cu128
+$PYTHON_BIN -m pip install --no-cache-dir -e ".[test]"
+$PYTHON_BIN -m pip install --no-cache-dir insightface onnxruntime-gpu
+$PYTHON_BIN -m pip install --no-cache-dir --force-reinstall "numpy==1.26.4"
 ```
 
 If ImageNet, InsightFace, FaceNet, or AdaFace weights cannot be downloaded, stop and provide local checkpoint paths. Do not replace them with random weights.

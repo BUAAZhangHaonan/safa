@@ -19,9 +19,17 @@ Status: implementation prepared locally; remote login works through remote acces
 - `python -m compileall -q src tests` passed.
 - Torch-dependent tests are present but were skipped locally because this Windows environment does not have `torch` and `torchvision` installed.
 
+## Remote Environment Validation
+
+- Repository cloned on 4029 at `/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization`.
+- Proxy `http://<proxy-host>:<proxy-port>` reaches PyPI from 4029.
+- Anaconda Python at `/home/hdd3/zhanghaonan/anaconda3/bin/python` has torch `2.11.0+cu128`, torchvision `0.26.0+cu128`, CUDA visible on GPU 0, insightface, and onnxruntime installed.
+- Remote `PYTHONPATH=src CUDA_VISIBLE_DEVICES=0 /home/hdd3/zhanghaonan/anaconda3/bin/python -m unittest discover tests` passed all 18 tests.
+- `insightface` required pinning `numpy==1.26.4` to match the existing `scikit-image` ABI; `cv2` import was verified after the pin.
+
 ## Remote Execution Blockers
 
-- OpenSSH batch login to `4029` still fails without remote access setup or SSH key.
+- OpenSSH batch login to `4029` still fails without remote access setup or SSH key. Paramiko remote access setup was used for setup.
 - AffectNet root exists at `/home/hdd3/zhanghaonan/AffectNet`; full label/layout validation is pending.
 - External recognizer assets for FaceNet and AdaFace must be placed at the configured paths or the evaluation must stop.
 
