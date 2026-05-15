@@ -39,7 +39,7 @@ def build_affectnet_index(
         raise FileNotFoundError(f"AffectNet root does not exist or is not a directory: {root}")
     csv_files = [root / name for name in CSV_CANDIDATES if (root / name).is_file()]
     if csv_files:
-        records = _records_from_csvs(root, csv_files, default_split, dataset_version, label_policy, csv_image_prefix)
+        records = _records_from_csvs(root, csv_files, default_split, dataset_version, label_policy, csv_image_prefix, only_split)
     else:
         records = _records_from_folders(root, default_split, dataset_version)
     if only_split is not None:
@@ -60,11 +60,14 @@ def _records_from_csvs(
     dataset_version: str,
     label_policy: str,
     csv_image_prefix: str | None,
+    only_split: str | None,
 ) -> list[IndexRecord]:
     records: list[IndexRecord] = []
     errors: list[str] = []
     for csv_path in csv_files:
         split_from_name = _split_from_csv_name(csv_path.name, default_split)
+        if only_split is not None and split_from_name != only_split:
+            continue
         with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
             reader = csv.DictReader(handle)
             if reader.fieldnames is None:
