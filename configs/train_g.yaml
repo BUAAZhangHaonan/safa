@@ -15,5 +15,4 @@ out_dir: artifacts/checkpoints/g
 loss_weights:
   cycle: 1.0
   semantic_ce: 0.25
-  image_l1: 0.05
-
+  image_tv: 0.001

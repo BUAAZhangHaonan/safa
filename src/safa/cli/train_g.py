@@ -1,0 +1,41 @@
+from __future__ import annotations
+
+import argparse
+
+from safa.training.g_loop import train_g_from_config
+from safa.utils.config import load_yaml, require_keys
+
+
+REQUIRED_KEYS = (
+    "seed",
+    "device",
+    "num_workers",
+    "batch_size",
+    "epochs",
+    "learning_rate",
+    "weight_decay",
+    "image_size",
+    "embedding_dim",
+    "train_index",
+    "train_features",
+    "e0_checkpoint",
+    "out_dir",
+    "loss_weights",
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train z-only generator G.")
+    parser.add_argument("--config", required=True)
+    return parser.parse_args()
+
+
+def main() -> None:
+    config = load_yaml(parse_args().config)
+    require_keys(config, REQUIRED_KEYS)
+    print(train_g_from_config(config))
+
+
+if __name__ == "__main__":
+    main()
+
