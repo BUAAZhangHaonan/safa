@@ -44,6 +44,7 @@ scripts/run_train_e0_tmux.sh
 
 ```bash
 scripts/run_cache_e0.sh
+scripts/run_cache_e0_val.sh
 ```
 
 Use a validation cache config before evaluation:

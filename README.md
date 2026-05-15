@@ -24,10 +24,10 @@ The first validation is intentionally small. It checks whether the full chain ru
 python -m safa.cli.build_index --root /home/hdd3/zhanghaonan/AffectNet --out data/index/train.jsonl
 python -m safa.cli.train_e0 --config configs/train_e0.yaml
 python -m safa.cli.cache_e0 --config configs/cache_e0.yaml
+python -m safa.cli.cache_e0 --config configs/cache_e0_val.yaml
 python -m safa.cli.train_g --config configs/train_g.yaml
 python -m safa.cli.eval --config configs/eval.yaml
 python -m safa.cli.smoke --config configs/smoke.yaml
 ```
 
 Long runs should be launched through the scripts in `scripts/`, which start `tmux` sessions and set `CUDA_VISIBLE_DEVICES`.
-
