@@ -70,6 +70,27 @@ class AffectNetIndexTests(unittest.TestCase):
             self.assertEqual(len(records), 8)
             self.assertEqual({record.label for record in records}, set(range(8)))
 
+    def test_affectnet8_policy_filters_official_non_eight_class_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_root = root / "Manually_Annotated_Images"
+            image_root.mkdir()
+            rows = []
+            for label in range(11):
+                path = image_root / f"{label}.jpg"
+                Image.new("RGB", (8, 8)).save(path)
+                rows.append(f"{label}.jpg,{label}\n")
+            (root / "training.csv").write_text("subDirectory_filePath,expression\n" + "".join(rows), encoding="utf-8")
+            records = build_affectnet_index(
+                root,
+                default_split="train",
+                dataset_version="unit",
+                label_policy="affectnet8",
+                csv_image_prefix="Manually_Annotated_Images",
+            )
+            self.assertEqual(len(records), 8)
+            self.assertEqual({record.label for record in records}, set(range(8)))
+
     def test_missing_label_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -81,4 +102,3 @@ class AffectNetIndexTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

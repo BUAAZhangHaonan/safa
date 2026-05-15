@@ -31,6 +31,8 @@ def main() -> None:
         default_split="smoke",
         dataset_version="affectnet-smoke",
         limit=int(config["limit"]),
+        label_policy="affectnet8",
+        csv_image_prefix="Manually_Annotated_Images",
     )
     write_index(records, index_path)
     feature_dir = work_dir / "features"
@@ -77,4 +79,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

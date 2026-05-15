@@ -31,12 +31,14 @@ def build_affectnet_index(
     default_split: str,
     dataset_version: str,
     limit: int | None = None,
+    label_policy: str = "strict_0_7",
+    csv_image_prefix: str | None = "Manually_Annotated_Images",
 ) -> list[IndexRecord]:
     if not root.is_dir():
         raise FileNotFoundError(f"AffectNet root does not exist or is not a directory: {root}")
     csv_files = [root / name for name in CSV_CANDIDATES if (root / name).is_file()]
     if csv_files:
-        records = _records_from_csvs(root, csv_files, default_split, dataset_version)
+        records = _records_from_csvs(root, csv_files, default_split, dataset_version, label_policy, csv_image_prefix)
     else:
         records = _records_from_folders(root, default_split, dataset_version)
     records = sorted(records, key=lambda item: item.sample_id)
@@ -53,6 +55,8 @@ def _records_from_csvs(
     csv_files: list[Path],
     default_split: str,
     dataset_version: str,
+    label_policy: str,
+    csv_image_prefix: str | None,
 ) -> list[IndexRecord]:
     records: list[IndexRecord] = []
     errors: list[str] = []
@@ -73,11 +77,11 @@ def _records_from_csvs(
             for row_no, row in enumerate(reader, start=2):
                 try:
                     rel_path = str(row[path_field]).strip()
-                    label = _parse_label(row[label_field])
+                    label = _parse_label(row[label_field], label_policy=label_policy)
+                    if label is None:
+                        continue
                     split = str(row[split_field]).strip() if split_field else split_from_name
-                    image_path = Path(rel_path)
-                    if not image_path.is_absolute():
-                        image_path = root / image_path
+                    image_path = _resolve_csv_image_path(root, rel_path, csv_image_prefix)
                     sample_id = _sample_id(split, image_path, root)
                     records.append(
                         IndexRecord.from_mapping(
@@ -153,14 +157,27 @@ def _first_present(fields: list[str], candidates: tuple[str, ...], required: boo
     return None
 
 
-def _parse_label(raw: object) -> int:
+def _parse_label(raw: object, label_policy: str = "strict_0_7") -> int | None:
     text = str(raw).strip()
     if text.lower() in CLASS_NAME_TO_LABEL:
         return CLASS_NAME_TO_LABEL[text.lower()]
     label = int(float(text))
     if label not in VALID_LABELS:
+        if label_policy == "affectnet8" and label in {8, 9, 10}:
+            return None
         raise ValueError(f"Invalid 8-class AffectNet label: {raw}")
     return label
+
+
+def _resolve_csv_image_path(root: Path, rel_path: str, csv_image_prefix: str | None) -> Path:
+    image_path = Path(rel_path)
+    if image_path.is_absolute():
+        return image_path
+    direct = root / image_path
+    if direct.is_file() or csv_image_prefix is None:
+        return direct
+    prefixed = root / csv_image_prefix / image_path
+    return prefixed
 
 
 def _split_from_csv_name(name: str, default_split: str) -> str:
@@ -190,4 +207,3 @@ def _validate_collection(records: list[IndexRecord]) -> None:
     duplicate_count = len(records) - len({record.sample_id for record in records})
     if duplicate_count:
         raise ValueError(f"Duplicate sample_id values found: {duplicate_count}")
-
