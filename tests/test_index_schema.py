@@ -91,6 +91,33 @@ class AffectNetIndexTests(unittest.TestCase):
             self.assertEqual(len(records), 8)
             self.assertEqual({record.label for record in records}, set(range(8)))
 
+    def test_only_split_filters_csv_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_root = root / "Manually_Annotated_Images"
+            image_root.mkdir()
+            for label in range(8):
+                Image.new("RGB", (8, 8)).save(image_root / f"train_{label}.jpg")
+                Image.new("RGB", (8, 8)).save(image_root / f"val_{label}.jpg")
+            (root / "training.csv").write_text(
+                "subDirectory_filePath,expression\n" + "".join(f"train_{label}.jpg,{label}\n" for label in range(8)),
+                encoding="utf-8",
+            )
+            (root / "validation.csv").write_text(
+                "subDirectory_filePath,expression\n" + "".join(f"val_{label}.jpg,{label}\n" for label in range(8)),
+                encoding="utf-8",
+            )
+            records = build_affectnet_index(
+                root,
+                default_split="train",
+                dataset_version="unit",
+                label_policy="affectnet8",
+                csv_image_prefix="Manually_Annotated_Images",
+                only_split="val",
+            )
+            self.assertEqual(len(records), 8)
+            self.assertEqual({record.split for record in records}, {"val"})
+
     def test_missing_label_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -17,6 +17,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--label-policy", choices=("strict_0_7", "affectnet8"), default="strict_0_7")
     parser.add_argument("--csv-image-prefix", default="Manually_Annotated_Images")
+    parser.add_argument("--only-split", default=None)
     return parser.parse_args()
 
 
@@ -29,6 +30,7 @@ def main() -> None:
         limit=args.limit,
         label_policy=args.label_policy,
         csv_image_prefix=args.csv_image_prefix,
+        only_split=args.only_split,
     )
     write_index(records, args.out)
     split_counts = Counter(record.split for record in records)

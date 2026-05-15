@@ -33,6 +33,7 @@ def build_affectnet_index(
     limit: int | None = None,
     label_policy: str = "strict_0_7",
     csv_image_prefix: str | None = "Manually_Annotated_Images",
+    only_split: str | None = None,
 ) -> list[IndexRecord]:
     if not root.is_dir():
         raise FileNotFoundError(f"AffectNet root does not exist or is not a directory: {root}")
@@ -41,6 +42,8 @@ def build_affectnet_index(
         records = _records_from_csvs(root, csv_files, default_split, dataset_version, label_policy, csv_image_prefix)
     else:
         records = _records_from_folders(root, default_split, dataset_version)
+    if only_split is not None:
+        records = [record for record in records if record.split == only_split]
     records = sorted(records, key=lambda item: item.sample_id)
     if limit is not None:
         if limit <= 0:

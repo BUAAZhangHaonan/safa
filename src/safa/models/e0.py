@@ -85,7 +85,12 @@ def load_e0_checkpoint(path: str | Path, device: str | None = None):
     cfg = checkpoint.get("model_config")
     if not isinstance(cfg, dict):
         raise ValueError(f"E0 checkpoint missing model_config: {checkpoint_path}")
-    model = build_e0(E0Config(**cfg), allow_random_init=True)
+    load_config = E0Config(
+        num_classes=int(cfg["num_classes"]),
+        embedding_dim=int(cfg["embedding_dim"]),
+        imagenet_weights="",
+    )
+    model = build_e0(load_config, allow_random_init=True)
     model.load_state_dict(checkpoint["model_state_dict"])
     return model, checkpoint
 
@@ -100,4 +105,3 @@ def checkpoint_payload(model, config: E0Config, metrics: dict[str, Any]) -> dict
         },
         "metrics": metrics,
     }
-

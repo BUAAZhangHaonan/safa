@@ -34,8 +34,8 @@ If ImageNet, InsightFace, FaceNet, or AdaFace weights cannot be downloaded, stop
 ## Milestone Commands
 
 ```bash
-$PYTHON_BIN -m safa.cli.build_index --root /home/hdd3/zhanghaonan/AffectNet --out data/index/train.jsonl --split train --label-policy affectnet8 --csv-image-prefix Manually_Annotated_Images
-$PYTHON_BIN -m safa.cli.build_index --root /home/hdd3/zhanghaonan/AffectNet --out data/index/val.jsonl --split val --label-policy affectnet8 --csv-image-prefix Manually_Annotated_Images
+$PYTHON_BIN -m safa.cli.build_index --root /home/hdd3/zhanghaonan/AffectNet --out data/index/train.jsonl --split train --only-split train --label-policy affectnet8 --csv-image-prefix Manually_Annotated_Images
+$PYTHON_BIN -m safa.cli.build_index --root /home/hdd3/zhanghaonan/AffectNet --out data/index/val.jsonl --split val --only-split val --label-policy affectnet8 --csv-image-prefix Manually_Annotated_Images
 ```
 
 ```bash
