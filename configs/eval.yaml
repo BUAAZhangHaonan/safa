@@ -1,0 +1,33 @@
+seed: 1337
+device: cuda:0
+num_workers: 2
+batch_size: 16
+image_size: 224
+index: data/index/val.jsonl
+features: artifacts/e0_features/val
+e0_checkpoint: artifacts/checkpoints/e0/best.pt
+g_checkpoint: artifacts/checkpoints/g/best.pt
+out_json: artifacts/eval/g_val.json
+sample_dir: artifacts/eval/samples
+privacy:
+  enabled: true
+  recognizers:
+    - name: arcface
+      type: insightface
+      model_name: buffalo_l
+    - name: facenet
+      type: torchscript
+      checkpoint: artifacts/privacy/facenet.pt
+      embedding_dim: 512
+    - name: adaface
+      type: torchscript
+      checkpoint: artifacts/privacy/adaface.pt
+      embedding_dim: 512
+anti_steg:
+  enabled: true
+  jpeg_quality: 75
+  blur_radius: 1.5
+  downsample_scale: 0.5
+  crop_fraction: 0.9
+  noise_std: 0.01
+

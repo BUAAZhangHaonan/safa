@@ -1,0 +1,15 @@
+seed: 1337
+device: cuda:0
+num_workers: 4
+batch_size: 64
+epochs: 2
+learning_rate: 0.0001
+weight_decay: 0.0001
+num_classes: 8
+embedding_dim: 512
+image_size: 224
+imagenet_weights: IMAGENET1K_V2
+train_index: data/index/train.jsonl
+val_index: data/index/val.jsonl
+out_dir: artifacts/checkpoints/e0
+

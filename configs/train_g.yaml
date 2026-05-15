@@ -1,0 +1,19 @@
+seed: 1337
+device: cuda:0
+num_workers: 4
+batch_size: 32
+epochs: 1
+learning_rate: 0.0002
+weight_decay: 0.0
+image_size: 224
+embedding_dim: 512
+train_index: data/index/train.jsonl
+val_index: data/index/val.jsonl
+train_features: artifacts/e0_features/train
+e0_checkpoint: artifacts/checkpoints/e0/best.pt
+out_dir: artifacts/checkpoints/g
+loss_weights:
+  cycle: 1.0
+  semantic_ce: 0.25
+  image_l1: 0.05
+

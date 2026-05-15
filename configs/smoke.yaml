@@ -1,0 +1,11 @@
+seed: 1337
+device: cuda:0
+num_workers: 0
+batch_size: 4
+image_size: 224
+limit: 32
+root: /home/hdd3/zhanghaonan/AffectNet
+work_dir: artifacts/smoke
+e0_checkpoint: artifacts/checkpoints/e0/best.pt
+privacy_enabled: false
+
