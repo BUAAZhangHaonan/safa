@@ -15,7 +15,7 @@ REQUIRED_FIELDS = {
     "dataset_root",
     "dataset_version",
 }
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
 
 @dataclass(frozen=True)
@@ -91,4 +91,3 @@ def write_index(records: Iterable[IndexRecord], path: Path) -> None:
     with path.open("w", encoding="utf-8", newline="\n") as handle:
         for record in materialized:
             handle.write(record.to_json() + "\n")
-
