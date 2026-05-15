@@ -6,6 +6,7 @@ import json
 from safa.data.feature_dataset import FeatureAlignedAffectNet
 from safa.models.e0 import assert_e0_frozen, freeze_e0, load_e0_checkpoint
 from safa.models.generator import ZOnlyGenerator
+from safa.training.audit import audit_no_identity_supervision
 from safa.training.losses import cosine_cycle_loss, normalize_for_e0, total_variation_loss
 from safa.training.transforms import generator_image_transform
 from safa.utils.device import assert_finite_tensor, require_cuda_device
@@ -19,6 +20,7 @@ def train_g_from_config(config: dict) -> dict:
     from tqdm import tqdm
 
     set_seed(int(config["seed"]))
+    audit_no_identity_supervision(config)
     device = require_cuda_device(str(config["device"]))
     out_dir = Path(config["out_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -104,4 +106,3 @@ def _save_generator(path: Path, generator, config: dict, metrics: dict) -> None:
 def _write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False), encoding="utf-8")
-
