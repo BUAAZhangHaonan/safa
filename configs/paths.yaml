@@ -1,5 +1,4 @@
-project_root: /home/zhanghaonan/projects/samplewise-affective-face-anonymization
+project_root: /home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization
 affectnet_root: /home/hdd3/zhanghaonan/AffectNet
 index_dir: data/index
 artifact_dir: artifacts
-

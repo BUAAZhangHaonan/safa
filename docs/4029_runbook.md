@@ -3,7 +3,7 @@
 Repository path:
 
 ```bash
-/home/zhanghaonan/projects/samplewise-affective-face-anonymization
+/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization
 ```
 
 Environment rules:
@@ -19,7 +19,7 @@ Use only GPUs `0,1,2,3`. Start with GPU `0`. Do not fall back to CPU.
 ## Setup
 
 ```bash
-cd /home/zhanghaonan/projects/samplewise-affective-face-anonymization
+cd /home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -U pip
@@ -62,4 +62,3 @@ scripts/run_eval.sh
 - `artifacts/smoke/smoke_result.json` exists after smoke.
 - `artifacts/eval/g_val.json` exists after evaluation.
 - Privacy recognizers are not imported or used by training commands.
-
