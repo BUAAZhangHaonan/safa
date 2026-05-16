@@ -77,11 +77,17 @@ def export_adaface(output_path: Path, repo_id: str) -> None:
         from huggingface_hub import snapshot_download
     except ImportError as exc:
         raise RuntimeError("transformers and huggingface_hub are required to export AdaFace") from exc
+    import os
     import sys
 
     snapshot_path = Path(snapshot_download(repo_id=repo_id))
     sys.path.insert(0, str(snapshot_path))
-    model = AutoModel.from_pretrained(str(snapshot_path), trust_remote_code=True).eval()
+    cwd = Path.cwd()
+    try:
+        os.chdir(snapshot_path)
+        model = AutoModel.from_pretrained(str(snapshot_path), trust_remote_code=True).eval()
+    finally:
+        os.chdir(cwd)
     _EmbeddingWrapper(model).export(output_path, input_size=112)
 
 
