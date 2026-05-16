@@ -74,9 +74,14 @@ def export_facenet(output_path: Path) -> None:
 def export_adaface(output_path: Path, repo_id: str) -> None:
     try:
         from transformers import AutoModel
+        from huggingface_hub import snapshot_download
     except ImportError as exc:
-        raise RuntimeError("transformers is required to export AdaFace") from exc
-    model = AutoModel.from_pretrained(repo_id, trust_remote_code=True).eval()
+        raise RuntimeError("transformers and huggingface_hub are required to export AdaFace") from exc
+    import sys
+
+    snapshot_path = Path(snapshot_download(repo_id=repo_id))
+    sys.path.insert(0, str(snapshot_path))
+    model = AutoModel.from_pretrained(str(snapshot_path), trust_remote_code=True).eval()
     _EmbeddingWrapper(model).export(output_path, input_size=112)
 
 
