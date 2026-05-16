@@ -20,10 +20,12 @@ privacy:
       type: torchscript
       checkpoint: artifacts/privacy/facenet.pt
       embedding_dim: 512
+      input_size: 160
     - name: adaface
       type: torchscript
       checkpoint: artifacts/privacy/adaface.pt
       embedding_dim: 512
+      input_size: 112
 anti_steg:
   enabled: true
   jpeg_quality: 75

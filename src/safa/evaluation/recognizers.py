@@ -6,7 +6,7 @@ from safa.utils.hashing import sha256_file
 
 
 class TorchScriptRecognizer:
-    def __init__(self, name: str, checkpoint: str | Path, device: str, embedding_dim: int = 512):
+    def __init__(self, name: str, checkpoint: str | Path, device: str, embedding_dim: int = 512, input_size: int = 112):
         import torch
 
         self.name = name
@@ -16,11 +16,14 @@ class TorchScriptRecognizer:
             raise FileNotFoundError(f"Recognizer checkpoint missing for {name}: {checkpoint_path}")
         self.model = torch.jit.load(str(checkpoint_path), map_location=self.device).eval()
         self.embedding_dim = int(embedding_dim)
+        self.input_size = int(input_size)
+        if self.input_size <= 0:
+            raise ValueError(f"Recognizer {name} input_size must be positive, got {input_size}")
 
     def embed(self, images):
         import torch.nn.functional as F
 
-        resized = F.interpolate(images, size=(112, 112), mode="bilinear", align_corners=False)
+        resized = F.interpolate(images, size=(self.input_size, self.input_size), mode="bilinear", align_corners=False)
         normalized = (resized - 0.5) / 0.5
         output = self.model(normalized.to(self.device))
         if output.ndim != 2 or output.shape[1] != self.embedding_dim:
@@ -70,6 +73,7 @@ def build_recognizers(configs: list[dict], device: str):
                     checkpoint=config["checkpoint"],
                     device=device,
                     embedding_dim=int(config.get("embedding_dim", 512)),
+                    input_size=int(config.get("input_size", 112)),
                 )
             )
         else:
@@ -94,6 +98,7 @@ def describe_recognizer_assets(configs: list[dict]) -> list[dict]:
                     "checkpoint": str(checkpoint),
                     "checkpoint_sha256": sha256_file(checkpoint),
                     "embedding_dim": int(config.get("embedding_dim", 512)),
+                    "input_size": int(config.get("input_size", 112)),
                 }
             )
         else:
