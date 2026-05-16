@@ -8,7 +8,8 @@ export HTTPS_PROXY="${HTTPS_PROXY:-http://<proxy-host>:<proxy-port>}"
 PYTHON_BIN="${PYTHON_BIN:-/home/hdd3/zhanghaonan/anaconda3/bin/python}"
 MAX_RAM_FRACTION="${MAX_RAM_FRACTION:-0.90}"
 mkdir -p artifacts/logs
-tmux new-session -d -s smoke_safa "$PYTHON_BIN scripts/guarded_run.py --max-ram-fraction $MAX_RAM_FRACTION -- $PYTHON_BIN -m safa.cli.smoke --config configs/smoke.yaml 2>&1 | tee artifacts/logs/smoke.log"
+RUN_ENV="CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES OMP_NUM_THREADS=$OMP_NUM_THREADS MKL_NUM_THREADS=$MKL_NUM_THREADS HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY"
+tmux new-session -d -s smoke_safa "$RUN_ENV $PYTHON_BIN scripts/guarded_run.py --max-ram-fraction $MAX_RAM_FRACTION -- $PYTHON_BIN -m safa.cli.smoke --config configs/smoke.yaml 2>&1 | tee artifacts/logs/smoke.log"
 echo "Started tmux session smoke_safa. Log: artifacts/logs/smoke.log"
 if [[ "${ATTACH:-0}" == "1" ]]; then
   tmux attach -t smoke_safa
