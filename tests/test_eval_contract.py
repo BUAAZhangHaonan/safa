@@ -6,6 +6,7 @@ import unittest
 
 from safa.evaluation.metrics import flatten_finite_numbers, summarize
 from safa.evaluation import perturbations
+from safa.evaluation.runner import deterministic_impostor_indices
 
 
 class EvalContractTests(unittest.TestCase):
@@ -29,7 +30,13 @@ class EvalContractTests(unittest.TestCase):
             params = set(inspect.signature(getattr(perturbations, name)).parameters)
             self.assertFalse(forbidden.intersection(params), name)
 
+    def test_impostor_indices_are_dataset_level_derangement(self) -> None:
+        indices = deterministic_impostor_indices(5)
+        self.assertEqual(indices, [2, 3, 4, 0, 1])
+        self.assertTrue(all(index != impostor for index, impostor in enumerate(indices)))
+        with self.assertRaises(ValueError):
+            deterministic_impostor_indices(1)
+
 
 if __name__ == "__main__":
     unittest.main()
-

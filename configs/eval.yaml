@@ -8,6 +8,7 @@ features: artifacts/e0_features/val
 e0_checkpoint: artifacts/checkpoints/e0/best.pt
 g_checkpoint: artifacts/checkpoints/g/best.pt
 out_json: artifacts/eval/g_val.json
+per_sample_jsonl: artifacts/eval/per_sample.jsonl
 sample_dir: artifacts/eval/samples
 privacy:
   enabled: true
@@ -30,4 +31,3 @@ anti_steg:
   downsample_scale: 0.5
   crop_fraction: 0.9
   noise_std: 0.01
-

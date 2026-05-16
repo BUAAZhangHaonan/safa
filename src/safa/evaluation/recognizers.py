@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from safa.utils.hashing import sha256_file
+
 
 class TorchScriptRecognizer:
     def __init__(self, name: str, checkpoint: str | Path, device: str, embedding_dim: int = 512):
@@ -74,3 +76,26 @@ def build_recognizers(configs: list[dict], device: str):
             raise ValueError(f"Unknown recognizer type: {kind}")
     return recognizers
 
+
+def describe_recognizer_assets(configs: list[dict]) -> list[dict]:
+    assets = []
+    for config in configs:
+        kind = config["type"]
+        if kind == "insightface":
+            assets.append({"name": config["name"], "type": kind, "model_name": config["model_name"]})
+        elif kind == "torchscript":
+            checkpoint = Path(config["checkpoint"])
+            if not checkpoint.is_file():
+                raise FileNotFoundError(f"Recognizer checkpoint missing for {config['name']}: {checkpoint}")
+            assets.append(
+                {
+                    "name": config["name"],
+                    "type": kind,
+                    "checkpoint": str(checkpoint),
+                    "checkpoint_sha256": sha256_file(checkpoint),
+                    "embedding_dim": int(config.get("embedding_dim", 512)),
+                }
+            )
+        else:
+            raise ValueError(f"Unknown recognizer type: {kind}")
+    return assets

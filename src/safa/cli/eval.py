@@ -17,6 +17,7 @@ REQUIRED_KEYS = (
     "e0_checkpoint",
     "g_checkpoint",
     "out_json",
+    "per_sample_jsonl",
     "sample_dir",
 )
 
@@ -36,4 +37,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
