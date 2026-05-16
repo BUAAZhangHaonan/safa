@@ -5,6 +5,7 @@ from pathlib import Path
 import json
 
 from safa.data.affectnet_index import build_affectnet_index
+from safa.data.index_schema import VALID_LABELS, IndexRecord
 from safa.data.index_schema import write_index
 from safa.training.cache_e0 import cache_e0_from_config
 from safa.training.g_loop import train_g_from_config
@@ -26,13 +27,17 @@ def main() -> None:
     work_dir = Path(config["work_dir"])
     work_dir.mkdir(parents=True, exist_ok=True)
     index_path = work_dir / "smoke_index.jsonl"
-    records = build_affectnet_index(
-        root=Path(config["root"]),
-        default_split="smoke",
-        dataset_version="affectnet-smoke",
+    records = _balanced_smoke_records(
+        build_affectnet_index(
+            root=Path(config["root"]),
+            default_split="val",
+            dataset_version="affectnet-smoke",
+            limit=None,
+            label_policy="affectnet8",
+            csv_image_prefix="Manually_Annotated_Images",
+            only_split="val",
+        ),
         limit=int(config["limit"]),
-        label_policy="affectnet8",
-        csv_image_prefix="Manually_Annotated_Images",
     )
     write_index(records, index_path)
     feature_dir = work_dir / "features"
@@ -75,6 +80,19 @@ def main() -> None:
     out_json = work_dir / "smoke_result.json"
     out_json.write_text(json.dumps(result, indent=2, sort_keys=True, allow_nan=False), encoding="utf-8")
     print(result)
+
+
+def _balanced_smoke_records(records: list[IndexRecord], limit: int) -> list[IndexRecord]:
+    if limit <= 0 or limit % len(VALID_LABELS) != 0:
+        raise ValueError(f"Smoke limit must be a positive multiple of {len(VALID_LABELS)}, got {limit}")
+    per_label = limit // len(VALID_LABELS)
+    selected: list[IndexRecord] = []
+    for label in sorted(VALID_LABELS):
+        label_records = [record for record in records if record.label == label]
+        if len(label_records) < per_label:
+            raise ValueError(f"Smoke split has only {len(label_records)} records for label {label}; need {per_label}")
+        selected.extend(label_records[:per_label])
+    return sorted(selected, key=lambda record: record.sample_id)
 
 
 if __name__ == "__main__":
