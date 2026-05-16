@@ -41,4 +41,4 @@ Default GPU assignment on 4029:
 - `train_g`: physical GPU 1.
 - `eval_safa`: physical GPU 2.
 
-The Python config still uses `device: cuda:0`; the scripts map that visible device to the selected physical GPU through `CUDA_VISIBLE_DEVICES`.
+The Python config still uses `device: cuda:0`; the scripts map that visible device to the selected physical GPU through `SAFA_CUDA_VISIBLE_DEVICES`.

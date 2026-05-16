@@ -28,7 +28,7 @@ Default physical GPU assignment:
 - `scripts/run_train_g_tmux.sh`: GPU 1.
 - `scripts/run_eval.sh`: GPU 2.
 
-The configs keep `device: cuda:0`. Each script maps `cuda:0` to the physical GPU through `CUDA_VISIBLE_DEVICES`.
+The configs keep `device: cuda:0`. Each script maps `cuda:0` to the physical GPU through `SAFA_CUDA_VISIBLE_DEVICES`. This intentionally ignores any inherited `CUDA_VISIBLE_DEVICES` from the login shell.
 
 ## Setup
 
