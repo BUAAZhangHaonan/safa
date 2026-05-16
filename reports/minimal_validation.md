@@ -1,6 +1,6 @@
 # Minimal Validation Report
 
-Status: implementation is synchronized to 4029 at `/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization`. `E0` training is running in `tmux` session `train_e0` on physical GPU 0.
+Status: implementation is synchronized to 4029 at `/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization`. The closed-loop code path runs through `E0`, feature cache, smoke, and one-epoch `G` training. Full privacy evaluation is structurally blocked because generated images are not detected as faces by ArcFace.
 
 ## Implemented Chain
 
@@ -15,6 +15,7 @@ Status: implementation is synchronized to 4029 at `/home/hdd3/zhanghaonan/projec
 - Recognizer asset preflight and SHA256 recording for TorchScript FaceNet/AdaFace checkpoints.
 - `tmux` scripts for long-running smoke, `E0`, cache, `G`, and eval jobs.
 - RAM guard for long scripts; jobs stop if server RAM reaches 90%.
+- Explicit GPU mapping through `SAFA_CUDA_VISIBLE_DEVICES`, with the selected environment injected into the `tmux` job command.
 
 ## Local Validation
 
@@ -41,14 +42,31 @@ Status: implementation is synchronized to 4029 at `/home/hdd3/zhanghaonan/projec
   - `data/index/train.jsonl`: 287651 records.
   - `data/index/val.jsonl`: 4000 records, 500 per class.
 
-## Remote Execution Status
+## Remote Execution Results
 
 - OpenSSH batch login to `4029` still fails without remote access setup or SSH key. Paramiko remote access setup was used for setup.
 - AffectNet strict train/val indices were rebuilt after CSV repair.
-- `E0` training is running in `tmux` session `train_e0`; latest observed progress was epoch 0 around 64%.
-- Physical GPU 0 is used by `E0`; GPUs 1-3 remain free for later cache/smoke/G/eval tasks.
-- Server RAM was observed around 17 GiB used out of 251 GiB, below the 90% limit.
-- External recognizer assets for FaceNet and AdaFace must be placed at the configured paths or the evaluation must stop.
+- `E0` training completed. Best validation accuracy: `0.4685`; majority baseline: `0.125`; `passes_majority_baseline=true`.
+- Feature cache completed:
+  - train: `287651` samples, 512-d L2 features.
+  - val: `4000` samples, 512-d L2 features.
+- Smoke completed on 32 balanced validation samples. Smoke `G` metrics: loss `1.4315`, cycle `0.7562`, semantic CE `2.7011`, TV `0.0428`.
+- Full `G` one-epoch training completed. Metrics: loss `0.1759`, cycle `0.0124`, semantic CE `0.6538`, TV `0.0183`.
+- FaceNet and AdaFace privacy checkpoints were exported through the 4029 proxy:
+  - FaceNet SHA256: `e6d560aee7d379d2f1b0536338efd9142aa0ee411b9791066c6c14ea5d10152e`.
+  - AdaFace SHA256: `9953ec6b93d2bb7e771dcd2717f1e9b15ecd4760983557b006cbe00e598618d7`.
+- Affective-only diagnostic eval completed on val:
+  - latent cosine mean `0.9869`, median `0.9891`.
+  - angle mean `0.1534` rad, median `0.1481` rad.
+  - generated label accuracy `0.45925`.
+  - source prediction preservation `0.92`.
+  - logit L2 drift mean `0.4733`.
+  - anti-steg diagnostics were written for `jpeg`, `blur`, `downsample`, `crop`, and `noise`.
+- Full multi-recognizer privacy eval did not complete. ArcFace failed on generated images with `expected exactly one face, detected 0`.
+- ArcFace detection diagnostic on the first 64 validation samples:
+  - source: 64/64 had exactly one detected face.
+  - generated: 64/64 had zero detected faces.
+- Server RAM stayed below the 90% limit in observed runs; typical observed usage was 14-20 GiB out of 251 GiB after the training/cache stages.
 
 ## First Remote Acceptance Target
 
@@ -58,4 +76,9 @@ The first success criterion is a complete closed loop, not a hard latent-cosine 
 - Feature cache writes a valid manifest.
 - Smoke completes and writes `artifacts/smoke/smoke_result.json`.
 - `G` short run writes a checkpoint and finite losses.
-- Eval writes `artifacts/eval/g_val.json` with latent, classification, privacy, and perturbation metric distributions.
+- Affective diagnostic eval writes `artifacts/eval/g_val_affective_only.json` and `artifacts/eval/per_sample_affective_only.jsonl`.
+- Full privacy eval will write `artifacts/eval/g_val.json` and `artifacts/eval/per_sample.jsonl` only after generated faces are detectable by ArcFace.
+
+## Structural Issue
+
+The current `G` objective preserves the frozen affective representation well, but it does not force outputs onto a face-image manifold strongly enough for ArcFace detection. This is not a privacy success. It means the first generator is finding a machine-feature shortcut rather than producing valid anonymized faces. The next method-level fix should add a faithful non-identity image prior or generator prior, not a post-processing detector workaround.

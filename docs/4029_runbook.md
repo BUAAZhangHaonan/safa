@@ -42,6 +42,17 @@ $PYTHON_BIN -m pip install --no-cache-dir --force-reinstall "numpy==1.26.4"
 
 If ImageNet, InsightFace, FaceNet, or AdaFace weights cannot be downloaded, stop and provide local checkpoint paths. Do not replace them with random weights.
 
+Evaluation-only privacy recognizer export:
+
+```bash
+export HTTP_PROXY=http://<proxy-host>:<proxy-port>
+export HTTPS_PROXY=http://<proxy-host>:<proxy-port>
+export HF_HUB_DISABLE_XET=1
+$PYTHON_BIN -m pip install --no-cache-dir "transformers==4.44.2" "huggingface_hub<1.0" safetensors omegaconf fvcore
+$PYTHON_BIN -m pip install --no-cache-dir --no-deps facenet-pytorch
+PYTHONPATH=src CUDA_VISIBLE_DEVICES=2 $PYTHON_BIN scripts/export_privacy_recognizers.py --out-dir artifacts/privacy --which both
+```
+
 ## Data Repair
 
 The received AffectNet `training.csv` may contain one known row pointing to a missing image. Repair it explicitly and keep the audit artifact:
@@ -84,3 +95,4 @@ The `tmux` scripts start in the background and print the log path. Set `ATTACH=1
 - `artifacts/eval/g_val.json` and `artifacts/eval/per_sample.jsonl` exist after evaluation.
 - Privacy recognizers are not imported or used by training commands.
 - FaceNet and AdaFace TorchScript checkpoints exist at the configured paths before evaluation. If they are missing, evaluation must stop.
+- If ArcFace detects zero faces on generated images, report this as a generator image-quality failure. Do not bypass detection or add post-processing.
