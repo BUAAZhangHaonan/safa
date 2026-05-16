@@ -33,7 +33,7 @@ class AffectNetRecords:
         image = load_rgb_image_strict(record.image_path)
         if self.transform is not None:
             image = self.transform(image)
-        return {"image": image, "label": record.label, "sample_id": record.sample_id, "record": record}
+        return {"image": image, "label": record.label, "sample_id": record.sample_id}
 
 
 def split_records(records: list[IndexRecord], split: str) -> list[IndexRecord]:
@@ -41,4 +41,3 @@ def split_records(records: list[IndexRecord], split: str) -> list[IndexRecord]:
     if not selected:
         raise ValueError(f"No records found for split={split}")
     return selected
-
