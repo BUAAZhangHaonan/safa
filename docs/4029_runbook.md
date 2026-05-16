@@ -31,6 +31,16 @@ $PYTHON_BIN -m pip install --no-cache-dir --force-reinstall "numpy==1.26.4"
 
 If ImageNet, InsightFace, FaceNet, or AdaFace weights cannot be downloaded, stop and provide local checkpoint paths. Do not replace them with random weights.
 
+## Data Repair
+
+The received AffectNet `training.csv` may contain one known row pointing to a missing image. Repair it explicitly and keep the audit artifact:
+
+```bash
+$PYTHON_BIN scripts/repair_affectnet_missing_row.py \
+  --csv /home/hdd3/zhanghaonan/AffectNet/training.csv \
+  --out-dir artifacts/data_fixes
+```
+
 ## Milestone Commands
 
 ```bash

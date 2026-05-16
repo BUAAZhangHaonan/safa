@@ -27,6 +27,16 @@ Status: implementation prepared locally; remote login works through remote acces
 - Remote `PYTHONPATH=src CUDA_VISIBLE_DEVICES=0 /home/hdd3/zhanghaonan/anaconda3/bin/python -m unittest discover tests` passed all 18 tests.
 - `insightface` required pinning `numpy==1.26.4` to match the existing `scikit-image` ABI; `cv2` import was verified after the pin.
 
+## Data Repair and Index State
+
+- AffectNet was received as official archives and extracted with `unrar` under `/home/hdd3/zhanghaonan/AffectNet/Manually_Annotated_Images`.
+- `training.csv` contained exactly one row whose image path did not exist after extraction:
+  `2/9db2af5a1da8bd77355e8c6a655da519a899ecc42641bf254107bfc0.jpg`.
+- The row was deleted from `/home/hdd3/zhanghaonan/AffectNet/training.csv` with an audit backup at `artifacts/data_fixes/training.csv.before_missing_row_removal.bak` and row record at `artifacts/data_fixes/removed_missing_training_row.json`.
+- Rebuilt strict 8-class indices:
+  - `data/index/train.jsonl`: 287651 records.
+  - `data/index/val.jsonl`: 4000 records, 500 per class.
+
 ## Remote Execution Blockers
 
 - OpenSSH batch login to `4029` still fails without remote access setup or SSH key. Paramiko remote access setup was used for setup.
