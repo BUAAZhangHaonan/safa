@@ -1,6 +1,6 @@
 # Minimal Validation Report
 
-Status: implementation prepared locally; remote login works through remote access setup; remote repository synchronization pending path correction to `/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization`.
+Status: implementation is synchronized to 4029 at `/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization`. `E0` training is running in `tmux` session `train_e0` on physical GPU 0.
 
 ## Implemented Chain
 
@@ -10,7 +10,11 @@ Status: implementation prepared locally; remote login works through remote acces
 - `G(z)->x_hat` training path where `z` is the only generator input.
 - Explicit no-identity-supervision audit for generator training config/source.
 - Evaluation for affective preservation, privacy recognizer similarity, and anti-steganography perturbations.
-- `tmux` scripts for long-running smoke, `E0`, and `G` jobs.
+- Per-sample eval rows at `artifacts/eval/per_sample.jsonl`, keyed by `sample_id`.
+- Dataset-level deterministic impostor pairs, independent of eval batch size.
+- Recognizer asset preflight and SHA256 recording for TorchScript FaceNet/AdaFace checkpoints.
+- `tmux` scripts for long-running smoke, `E0`, cache, `G`, and eval jobs.
+- RAM guard for long scripts; jobs stop if server RAM reaches 90%.
 
 ## Local Validation
 
@@ -24,7 +28,7 @@ Status: implementation prepared locally; remote login works through remote acces
 - Repository cloned on 4029 at `/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization`.
 - Proxy `http://<proxy-host>:<proxy-port>` reaches PyPI from 4029.
 - Anaconda Python at `/home/hdd3/zhanghaonan/anaconda3/bin/python` has torch `2.11.0+cu128`, torchvision `0.26.0+cu128`, CUDA visible on GPU 0, insightface, and onnxruntime installed.
-- Remote `PYTHONPATH=src CUDA_VISIBLE_DEVICES=0 /home/hdd3/zhanghaonan/anaconda3/bin/python -m unittest discover tests` passed all 18 tests.
+- Remote `PYTHONPATH=src CUDA_VISIBLE_DEVICES=0 /home/hdd3/zhanghaonan/anaconda3/bin/python -m unittest discover tests` passed all 21 tests.
 - `insightface` required pinning `numpy==1.26.4` to match the existing `scikit-image` ABI; `cv2` import was verified after the pin.
 
 ## Data Repair and Index State
@@ -37,10 +41,13 @@ Status: implementation prepared locally; remote login works through remote acces
   - `data/index/train.jsonl`: 287651 records.
   - `data/index/val.jsonl`: 4000 records, 500 per class.
 
-## Remote Execution Blockers
+## Remote Execution Status
 
 - OpenSSH batch login to `4029` still fails without remote access setup or SSH key. Paramiko remote access setup was used for setup.
-- AffectNet root exists at `/home/hdd3/zhanghaonan/AffectNet`; full label/layout validation is pending.
+- AffectNet strict train/val indices were rebuilt after CSV repair.
+- `E0` training is running in `tmux` session `train_e0`; latest observed progress was epoch 0 around 64%.
+- Physical GPU 0 is used by `E0`; GPUs 1-3 remain free for later cache/smoke/G/eval tasks.
+- Server RAM was observed around 17 GiB used out of 251 GiB, below the 90% limit.
 - External recognizer assets for FaceNet and AdaFace must be placed at the configured paths or the evaluation must stop.
 
 ## First Remote Acceptance Target

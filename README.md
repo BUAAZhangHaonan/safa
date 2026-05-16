@@ -30,4 +30,15 @@ python -m safa.cli.eval --config configs/eval.yaml
 python -m safa.cli.smoke --config configs/smoke.yaml
 ```
 
-Long runs should be launched through the scripts in `scripts/`, which start `tmux` sessions and set `CUDA_VISIBLE_DEVICES`.
+Long runs should be launched through the scripts in `scripts/`. They start `tmux` sessions, set `CUDA_VISIBLE_DEVICES`, and run through a Linux RAM guard that stops the job if server memory reaches 90%.
+
+Default GPU assignment on 4029:
+
+- `train_e0`: physical GPU 0.
+- `cache_e0` train split: physical GPU 1.
+- `cache_e0` val split: physical GPU 2.
+- `smoke`: physical GPU 3.
+- `train_g`: physical GPU 1.
+- `eval_safa`: physical GPU 2.
+
+The Python config still uses `device: cuda:0`; the scripts map that visible device to the selected physical GPU through `CUDA_VISIBLE_DEVICES`.
