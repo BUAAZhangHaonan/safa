@@ -88,7 +88,8 @@ def export_adaface(output_path: Path, repo_id: str) -> None:
         model = AutoModel.from_pretrained(str(snapshot_path), trust_remote_code=True).eval()
     finally:
         os.chdir(cwd)
-    _EmbeddingWrapper(model).export(output_path, input_size=112)
+    backbone = getattr(model, "model", model)
+    _EmbeddingWrapper(backbone).export(output_path, input_size=112)
 
 
 def parse_args() -> argparse.Namespace:
