@@ -8,4 +8,5 @@ root: /home/hdd3/zhanghaonan/AffectNet
 work_dir: artifacts/smoke
 e0_checkpoint: artifacts/checkpoints/e0/best.pt
 privacy_enabled: false
-
+face_detection_enabled: true
+face_detection_model: buffalo_l

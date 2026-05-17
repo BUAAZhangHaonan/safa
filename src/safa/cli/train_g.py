@@ -11,7 +11,6 @@ REQUIRED_KEYS = (
     "device",
     "num_workers",
     "batch_size",
-    "epochs",
     "learning_rate",
     "weight_decay",
     "image_size",
@@ -20,12 +19,13 @@ REQUIRED_KEYS = (
     "train_features",
     "e0_checkpoint",
     "out_dir",
-    "loss_weights",
+    "generator",
+    "stages",
 )
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train z-only generator G.")
+    parser = argparse.ArgumentParser(description="Train conditional flow matching generator G.")
     parser.add_argument("--config", required=True)
     return parser.parse_args()
 
@@ -38,4 +38,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

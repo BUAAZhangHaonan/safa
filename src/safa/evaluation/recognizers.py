@@ -60,6 +60,30 @@ class InsightFaceRecognizer:
         return F.normalize(torch.stack(embeddings, dim=0).to(images.device), p=2, dim=1)
 
 
+class InsightFaceDetector:
+    def __init__(self, model_name: str, device: str):
+        try:
+            from insightface.app import FaceAnalysis
+        except ImportError as exc:
+            raise RuntimeError("insightface is required for ArcFace face detection monitoring") from exc
+        if not device.startswith("cuda"):
+            raise RuntimeError("ArcFace face detection monitoring requires a CUDA device")
+        ctx_id = int(device.split(":")[1]) if ":" in device else 0
+        self.name = model_name
+        self.app = FaceAnalysis(name=model_name)
+        self.app.prepare(ctx_id=ctx_id, det_size=(224, 224))
+
+    def detect_counts(self, images) -> list[int]:
+        import numpy as np
+
+        counts = []
+        for image in images.detach().cpu():
+            array = (image.permute(1, 2, 0).clamp(0, 1).numpy() * 255.0).astype(np.uint8)
+            bgr = array[:, :, ::-1]
+            counts.append(len(self.app.get(bgr)))
+        return counts
+
+
 def build_recognizers(configs: list[dict], device: str):
     recognizers = []
     for config in configs:

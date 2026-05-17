@@ -20,9 +20,16 @@ class NoIdentityAuditTests(unittest.TestCase):
                 audit_no_identity_supervision({}, [path])
 
     def test_accepts_current_style_config(self) -> None:
-        audit_no_identity_supervision({"loss_weights": {"cycle": 1.0, "semantic_ce": 0.25, "image_tv": 0.001}})
+        audit_no_identity_supervision(
+            {
+                "generator": {"model_type": "conditional_flow_matching", "sample_steps": 8},
+                "stages": {
+                    "stage1": {"epochs": 1},
+                    "stage2": {"epochs": 1, "lambda_initial": 0.005, "lambda_max": 0.05, "lambda_growth": 0.005},
+                },
+            }
+        )
 
 
 if __name__ == "__main__":
     unittest.main()
-

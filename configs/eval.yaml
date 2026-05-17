@@ -10,6 +10,11 @@ g_checkpoint: artifacts/checkpoints/g/best.pt
 out_json: artifacts/eval/g_val.json
 per_sample_jsonl: artifacts/eval/per_sample.jsonl
 sample_dir: artifacts/eval/samples
+face_detection:
+  enabled: true
+  model_name: buffalo_l
+  threshold: 0.95
+  latent_cosine_threshold: 0.95
 privacy:
   enabled: true
   recognizers:

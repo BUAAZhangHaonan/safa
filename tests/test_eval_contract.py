@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import inspect
+import importlib.util
 import math
 import unittest
 
 from safa.evaluation.metrics import flatten_finite_numbers, summarize
 from safa.evaluation import perturbations
-from safa.evaluation.runner import deterministic_impostor_indices
+from safa.evaluation.runner import _guard_result, _run_privacy_pass, deterministic_impostor_indices
+
+
+TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
 
 
 class EvalContractTests(unittest.TestCase):
@@ -36,6 +40,53 @@ class EvalContractTests(unittest.TestCase):
         self.assertTrue(all(index != impostor for index, impostor in enumerate(indices)))
         with self.assertRaises(ValueError):
             deterministic_impostor_indices(1)
+
+    def test_face_detection_guard_requires_both_thresholds(self) -> None:
+        metrics = {
+            "face_detection": {"detected": {"mean": 0.99}},
+            "latent_cosine": {"mean": 0.94},
+        }
+        guard = _guard_result(metrics, {"enabled": True, "threshold": 0.95, "latent_cosine_threshold": 0.95})
+        self.assertFalse(guard["passed"])
+        metrics["latent_cosine"]["mean"] = 0.96
+        guard = _guard_result(metrics, {"enabled": True, "threshold": 0.95, "latent_cosine_threshold": 0.95})
+        self.assertTrue(guard["passed"])
+
+    def test_face_detection_guard_rejects_missing_detection_metrics(self) -> None:
+        with self.assertRaises(RuntimeError):
+            _guard_result({"latent_cosine": {"mean": 0.99}}, {"enabled": True})
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for privacy cache tests")
+    def test_privacy_pass_uses_cached_generated_images(self) -> None:
+        import torch
+
+        class DummyRecognizer:
+            name = "dummy"
+
+            def embed(self, images):
+                return torch.nn.functional.normalize(images.flatten(1)[:, :4].float() + 1.0, p=2, dim=1)
+
+        loader = [{"image": torch.zeros(2, 3, 4, 4)}]
+        generated = [torch.ones(2, 3, 4, 4)]
+        store = {"dummy": {"source": [], "generated": {"clean": []}}}
+        _run_privacy_pass({}, loader, generated, [DummyRecognizer()], {}, store, torch.device("cpu"))
+        self.assertEqual(len(store["dummy"]["source"]), 1)
+        self.assertEqual(len(store["dummy"]["generated"]["clean"]), 1)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for privacy cache tests")
+    def test_privacy_pass_rejects_generated_cache_mismatch(self) -> None:
+        import torch
+
+        class DummyRecognizer:
+            name = "dummy"
+
+            def embed(self, images):
+                return torch.ones(images.shape[0], 4)
+
+        loader = [{"image": torch.zeros(2, 3, 4, 4)}]
+        store = {"dummy": {"source": [], "generated": {"clean": []}}}
+        with self.assertRaises(RuntimeError):
+            _run_privacy_pass({}, loader, [], [DummyRecognizer()], {}, store, torch.device("cpu"))
 
 
 if __name__ == "__main__":

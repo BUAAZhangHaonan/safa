@@ -7,9 +7,9 @@ import json
 from safa.data.feature_dataset import FeatureAlignedAffectNet
 from safa.evaluation.metrics import flatten_finite_numbers, summarize
 from safa.evaluation.perturbations import perturbation_map
-from safa.evaluation.recognizers import build_recognizers, describe_recognizer_assets
+from safa.evaluation.recognizers import InsightFaceDetector, build_recognizers, describe_recognizer_assets
 from safa.models.e0 import freeze_e0, load_e0_checkpoint
-from safa.models.generator import ZOnlyGenerator
+from safa.models.generator import build_generator
 from safa.training.losses import normalize_for_e0
 from safa.training.transforms import generator_image_transform
 from safa.utils.device import assert_finite_tensor, require_cuda_device
@@ -37,13 +37,14 @@ def run_eval_from_config(config: dict) -> dict:
     )
     loader = DataLoader(dataset, batch_size=int(config["batch_size"]), shuffle=False, num_workers=int(config["num_workers"]), pin_memory=True)
     privacy_cfg = config.get("privacy", {"enabled": False})
-    recognizer_assets = describe_recognizer_assets(privacy_cfg["recognizers"]) if privacy_cfg.get("enabled") else []
-    recognizers = build_recognizers(privacy_cfg["recognizers"], str(device)) if privacy_cfg.get("enabled") else []
+    face_detection_cfg = config.get("face_detection", _default_face_detection_config(privacy_cfg))
+    detector = _build_face_detector(face_detection_cfg, str(device))
+    recognizer_assets = []
     anti_cfg = config.get("anti_steg", {"enabled": False})
     perturbations = perturbation_map(anti_cfg, int(config["seed"])) if anti_cfg.get("enabled") else {}
 
     rows: list[dict] = []
-    privacy_store = _empty_privacy_store(recognizers, perturbations)
+    generated_chunks = [] if privacy_cfg.get("enabled") else None
     sample_dir = Path(config["sample_dir"])
     sample_dir.mkdir(parents=True, exist_ok=True)
     saved_samples = 0
@@ -57,26 +58,33 @@ def run_eval_from_config(config: dict) -> dict:
             sample_ids = list(batch["sample_id"])
             generated = generator(z)
             assert_finite_tensor("eval_generated", generated)
+            if generated_chunks is not None:
+                generated_chunks.append(generated.detach().cpu())
             source_out = e0(normalize_for_e0(source))
             generated_out = e0(normalize_for_e0(generated))
             batch_rows = _make_affective_rows(sample_ids, labels, source_out, generated_out, z)
+            if detector is not None:
+                _attach_face_detection_rows(batch_rows, detector.detect_counts(generated))
             rows.extend(batch_rows)
             row_start = len(rows) - len(batch_rows)
-            if recognizers:
-                _collect_privacy_embeddings(privacy_store, recognizers, source, generated, variant="clean")
             for name, perturb in perturbations.items():
                 perturbed = perturb(generated)
                 assert_finite_tensor(f"perturbed_{name}", perturbed)
                 perturbed_out = e0(normalize_for_e0(perturbed))
                 _attach_perturbed_affective_rows(rows, row_start, name, perturbed_out, z)
-                if recognizers:
-                    _collect_privacy_embeddings(privacy_store, recognizers, source, perturbed, variant=name)
             if saved_samples < 16:
                 save_image(generated[: min(4, generated.shape[0])].detach().cpu(), sample_dir / f"generated_{saved_samples:04d}.png", nrow=4)
                 saved_samples += int(min(4, generated.shape[0]))
-    if recognizers:
-        _attach_privacy_rows(rows, privacy_store)
     summarized = _summarize_rows(rows)
+    guard = _guard_result(summarized, face_detection_cfg)
+    privacy_skipped = bool(privacy_cfg.get("enabled") and not guard["passed"])
+    if privacy_cfg.get("enabled") and guard["passed"]:
+        recognizer_assets = describe_recognizer_assets(privacy_cfg["recognizers"])
+        recognizers = build_recognizers(privacy_cfg["recognizers"], str(device))
+        privacy_store = _empty_privacy_store(recognizers, perturbations)
+        _run_privacy_pass(config, loader, generated_chunks, recognizers, perturbations, privacy_store, device)
+        _attach_privacy_rows(rows, privacy_store)
+        summarized = _summarize_rows(rows)
     result = {
         "run_id": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -89,6 +97,8 @@ def run_eval_from_config(config: dict) -> dict:
         },
         "features": {"dim": 512, "l2_normalized": True, "cache": config["features"]},
         "recognizer_assets": recognizer_assets,
+        "face_detection_guard": guard,
+        "privacy_skipped": privacy_skipped,
         "metrics": summarized,
         "artifacts": {"sample_dir": str(sample_dir), "per_sample_jsonl": config["per_sample_jsonl"]},
     }
@@ -104,6 +114,13 @@ def run_eval_from_config(config: dict) -> dict:
     out_json.parent.mkdir(parents=True, exist_ok=True)
     out_json.write_text(json.dumps(result, indent=2, sort_keys=True, allow_nan=False), encoding="utf-8")
     result["out_json"] = str(out_json)
+    if privacy_skipped:
+        raise RuntimeError(
+            "Privacy evaluation skipped because generation guard failed: "
+            f"face_detection_rate={guard.get('face_detection_rate')} "
+            f"latent_cosine_mean={guard.get('latent_cosine_mean')} "
+            f"thresholds=({guard['face_detection_threshold']}, {guard['latent_cosine_threshold']})"
+        )
     return result
 
 
@@ -115,12 +132,19 @@ def _load_generator(checkpoint_path: str, config: dict, device: str):
         raise FileNotFoundError(f"Generator checkpoint does not exist: {path}")
     payload = torch.load(path, map_location=device)
     model_config = payload.get("model_config", {})
-    generator = ZOnlyGenerator(
-        embedding_dim=int(model_config.get("embedding_dim", config.get("embedding_dim", 512))),
-        image_size=int(model_config.get("image_size", config["image_size"])),
-    )
+    generator = build_generator(model_config)
     generator.load_state_dict(payload["model_state_dict"])
     return generator.to(device).eval()
+
+
+def _default_face_detection_config(privacy_cfg: dict) -> dict:
+    return {"enabled": bool(privacy_cfg.get("enabled")), "model_name": "buffalo_l", "threshold": 0.95, "latent_cosine_threshold": 0.95}
+
+
+def _build_face_detector(config: dict, device: str):
+    if not config.get("enabled", False):
+        return None
+    return InsightFaceDetector(str(config["model_name"]), device)
 
 
 def _empty_privacy_store(recognizers, perturbations):
@@ -154,11 +178,19 @@ def _make_affective_rows(sample_ids, labels, source_out, generated_out, z) -> li
                     "source_prediction_preserved": float((generated_pred[i] == source_pred[i]).detach().cpu()),
                     "logit_l2_drift": float(drift[i].detach().cpu()),
                 },
+                "face_detection": {},
                 "anti_steg": {},
                 "privacy": {},
             }
         )
     return rows
+
+
+def _attach_face_detection_rows(rows: list[dict], counts: list[int]) -> None:
+    if len(rows) != len(counts):
+        raise RuntimeError(f"Face detection count mismatch: rows={len(rows)} counts={len(counts)}")
+    for row, count in zip(rows, counts):
+        row["face_detection"] = {"count": int(count), "detected": float(count >= 1)}
 
 
 def _attach_perturbed_affective_rows(rows: list[dict], row_start: int, name: str, perturbed_out, z) -> None:
@@ -179,6 +211,26 @@ def _collect_privacy_embeddings(store: dict, recognizers, source, generated, var
         if variant == "clean":
             store[recognizer.name]["source"].append(recognizer.embed(source).detach().cpu())
         store[recognizer.name]["generated"][variant].append(recognizer.embed(generated).detach().cpu())
+
+
+def _run_privacy_pass(config: dict, loader, generated_chunks, recognizers, perturbations, privacy_store: dict, device) -> None:
+    import torch
+
+    if generated_chunks is None:
+        raise RuntimeError("Privacy pass requires cached generated images from the guard pass")
+    batch_count = 0
+    with torch.no_grad():
+        for batch, generated_cpu in zip(loader, generated_chunks):
+            batch_count += 1
+            source = batch["image"].to(device, non_blocking=True)
+            generated = generated_cpu.to(device=device, dtype=source.dtype)
+            _collect_privacy_embeddings(privacy_store, recognizers, source, generated, variant="clean")
+            for name, perturb in perturbations.items():
+                perturbed = perturb(generated)
+                assert_finite_tensor(f"privacy_perturbed_{name}", perturbed)
+                _collect_privacy_embeddings(privacy_store, recognizers, source, perturbed, variant=name)
+    if batch_count != len(generated_chunks) or batch_count != len(loader):
+        raise RuntimeError(f"Privacy pass batch mismatch: loader={len(loader)} generated_chunks={len(generated_chunks)} consumed={batch_count}")
 
 
 def deterministic_impostor_indices(num_samples: int) -> list[int]:
@@ -228,6 +280,11 @@ def _summarize_rows(rows: list[dict]) -> dict:
         raise ValueError("Cannot summarize zero eval rows")
     affective_keys = rows[0]["affective"].keys()
     summarized = {key: summarize(row["affective"][key] for row in rows) for key in affective_keys}
+    face_keys = sorted({key for row in rows for key in row.get("face_detection", {})})
+    summarized["face_detection"] = {
+        key: summarize(row["face_detection"][key] for row in rows if key in row.get("face_detection", {}))
+        for key in face_keys
+    }
     anti_names = sorted({name for row in rows for name in row["anti_steg"]})
     summarized["anti_steg"] = {
         name: {
@@ -245,3 +302,23 @@ def _summarize_rows(rows: list[dict]) -> dict:
             for metric in metric_names
         }
     return summarized
+
+
+def _guard_result(metrics: dict, config: dict) -> dict:
+    if not config.get("enabled", False):
+        return {"enabled": False, "passed": True, "reason": "disabled"}
+    face_threshold = float(config.get("threshold", 0.95))
+    cosine_threshold = float(config.get("latent_cosine_threshold", 0.95))
+    face_detection_rate = metrics.get("face_detection", {}).get("detected", {}).get("mean")
+    latent_cosine_mean = metrics.get("latent_cosine", {}).get("mean")
+    if face_detection_rate is None:
+        raise RuntimeError("Face detection guard is enabled but no face_detection metrics were produced")
+    passed = bool(face_detection_rate >= face_threshold and latent_cosine_mean is not None and latent_cosine_mean >= cosine_threshold)
+    return {
+        "enabled": True,
+        "passed": passed,
+        "face_detection_rate": face_detection_rate,
+        "latent_cosine_mean": latent_cosine_mean,
+        "face_detection_threshold": face_threshold,
+        "latent_cosine_threshold": cosine_threshold,
+    }

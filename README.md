@@ -7,15 +7,16 @@ The first validation is intentionally small. It checks whether the full chain ru
 1. Build a strict AffectNet image index.
 2. Train an AffectNet emotion encoder `E0`.
 3. Freeze `E0` and cache 512-dimensional L2-normalized embeddings.
-4. Train a generator `G(z) -> x_hat` where `z = E0(x)` is the only input.
-5. Evaluate affective preservation, empirical unlinkability, and anti-steganography perturbations.
+4. Train a conditional flow matching generator `G(z) -> x_hat` where `z = E0(x)` is the only public input.
+5. Evaluate affective preservation and ArcFace face-detection readiness before any privacy evaluation.
 
 ## Core Rules
 
 - `E0` is a ResNet-50 emotion encoder trained on 8 AffectNet classes.
 - `E0` outputs a 512-dimensional L2-normalized embedding.
-- `G` receives only `z`; no image, identity feature, landmark, pose, background, or noise input is allowed.
+- `G` receives only `z`; no image, identity feature, landmark, pose, background, or external noise input is allowed.
 - Identity recognizers are never used during training.
+- Privacy evaluation is guarded by ArcFace detection rate and latent cosine thresholds.
 - Missing files, invalid labels, missing checkpoints, CPU-only execution, and NaNs are hard errors.
 
 ## Main Commands

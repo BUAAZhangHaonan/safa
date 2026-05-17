@@ -1,18 +1,45 @@
 seed: 1337
 device: cuda:0
 num_workers: 4
-batch_size: 32
-epochs: 1
-learning_rate: 0.0002
+batch_size: 8
+learning_rate: 0.0001
 weight_decay: 0.0
 image_size: 224
 embedding_dim: 512
 train_index: data/index/train.jsonl
 val_index: data/index/val.jsonl
 train_features: artifacts/e0_features/train
+val_features: artifacts/e0_features/val
 e0_checkpoint: artifacts/checkpoints/e0/best.pt
 out_dir: artifacts/checkpoints/g
-loss_weights:
-  cycle: 1.0
-  semantic_ce: 0.25
-  image_tv: 0.001
+allow_stage2_without_stage1_gate: false
+generator:
+  model_type: conditional_flow_matching
+  base_channels: 32
+  channel_multipliers: [1, 2, 4, 4]
+  time_embedding_dim: 128
+  condition_dim: 512
+  sample_steps: 32
+  train_cycle_steps: 8
+  sampler: heun
+stages:
+  stage1:
+    epochs: 1
+    require_face_detection_gate: true
+    face_detection_threshold: 0.95
+    stable_epochs: 1
+  stage2:
+    epochs: 1
+    lambda_initial: 0.005
+    lambda_max: 0.05
+    lambda_growth: 0.005
+validation:
+  enabled: true
+  index: data/index/val.jsonl
+  features: artifacts/e0_features/val
+  max_samples: 64
+  batch_size: 8
+  face_detection:
+    enabled: true
+    model_name: buffalo_l
+    drop_tolerance: 0.02

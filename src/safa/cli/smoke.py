@@ -68,7 +68,33 @@ def main() -> None:
             "train_features": str(feature_dir),
             "e0_checkpoint": config["e0_checkpoint"],
             "out_dir": str(work_dir / "g"),
-            "loss_weights": {"cycle": 1.0, "semantic_ce": 0.25, "image_tv": 0.001},
+            "allow_stage2_without_stage1_gate": True,
+            "generator": {
+                "model_type": "conditional_flow_matching",
+                "base_channels": 8,
+                "channel_multipliers": [1, 2],
+                "time_embedding_dim": 32,
+                "condition_dim": 64,
+                "sample_steps": 2,
+                "train_cycle_steps": 2,
+                "sampler": "heun",
+            },
+            "stages": {
+                "stage1": {"epochs": 1},
+                "stage2": {"epochs": 1, "lambda_initial": 0.005, "lambda_max": 0.01, "lambda_growth": 0.005},
+            },
+            "validation": {
+                "enabled": bool(config.get("face_detection_enabled", False)),
+                "index": str(index_path),
+                "features": str(feature_dir),
+                "max_samples": int(config["limit"]),
+                "batch_size": config["batch_size"],
+                "face_detection": {
+                    "enabled": bool(config.get("face_detection_enabled", False)),
+                    "model_name": str(config.get("face_detection_model", "buffalo_l")),
+                    "drop_tolerance": 0.02,
+                },
+            },
         }
     )
     result = {
