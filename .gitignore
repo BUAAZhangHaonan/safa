@@ -6,6 +6,7 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+.vscode/
 data/raw/
 data/index/*.jsonl
 artifacts/
@@ -13,4 +14,3 @@ artifacts/
 *.pth
 *.ckpt
 *.onnx
-

@@ -27,7 +27,7 @@ Status: implementation is synchronized to 4029 at `/home/hdd3/zhanghaonan/projec
 ## Remote Environment Validation
 
 - Repository cloned on 4029 at `/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization`.
-- Proxy `http://<proxy-host>:<proxy-port>` reaches PyPI from 4029.
+- The configured HTTP/HTTPS proxy reaches PyPI from 4029.
 - Initial validation used base Anaconda Python at `/home/hdd3/zhanghaonan/anaconda3/bin/python`. The default runtime has since been migrated to `/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python`.
 - Remote `PYTHONPATH=src CUDA_VISIBLE_DEVICES=0 /home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python -m unittest discover tests` passed all 22 tests.
 - `insightface` required pinning `numpy==1.26.4` to match the existing `scikit-image` ABI; `cv2` import was verified after the pin.
@@ -45,7 +45,6 @@ Status: implementation is synchronized to 4029 at `/home/hdd3/zhanghaonan/projec
 
 ## Remote Execution Results
 
-- OpenSSH batch login to `4029` still fails without remote access setup or SSH key. Paramiko remote access setup was used for setup.
 - AffectNet strict train/val indices were rebuilt after CSV repair.
 - `E0` training completed. Best validation accuracy: `0.4685`; majority baseline: `0.125`; `passes_majority_baseline=true`.
 - Feature cache completed:
