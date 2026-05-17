@@ -52,7 +52,25 @@ export HF_HUB_DISABLE_XET=1
 PYTHONPATH=src CUDA_VISIBLE_DEVICES=2 $PYTHON_BIN scripts/export_privacy_recognizers.py --out-dir artifacts/privacy --which adaface
 ```
 
-The `safa` runtime environment intentionally does not install `facenet-pytorch`; its package metadata requires older torch and torchvision versions. Runtime evaluation uses exported TorchScript recognizers only. If `artifacts/privacy/facenet.pt` is missing, stop and create the FaceNet TorchScript file in a separate compatible export environment, then copy the exported checkpoint into `artifacts/privacy/`.
+The `safa` runtime environment intentionally does not install `facenet-pytorch`; its package metadata requires older torch and torchvision versions. Runtime evaluation uses exported TorchScript recognizers only. Export FaceNet in the separate `facenet` conda environment:
+
+```bash
+export FACENET_PYTHON_BIN=/home/hdd3/zhanghaonan/anaconda3/envs/facenet/bin/python
+
+$CONDA_BIN create -y -n facenet python=3.10
+$FACENET_PYTHON_BIN -m pip install --no-cache-dir \
+  torch==2.2.2 torchvision==0.17.2 \
+  --index-url https://download.pytorch.org/whl/cu121
+$FACENET_PYTHON_BIN -m pip install --no-cache-dir \
+  facenet-pytorch==2.6.0 \
+  numpy==1.26.4 \
+  Pillow==10.2.0
+$FACENET_PYTHON_BIN -m pip check
+PYTHONPATH=src CUDA_VISIBLE_DEVICES=2 $FACENET_PYTHON_BIN scripts/export_privacy_recognizers.py --out-dir artifacts/privacy --which facenet
+test -s artifacts/privacy/facenet.pt
+```
+
+After export, verify the TorchScript asset through the `safa` runtime before running privacy evaluation.
 
 ## Data Repair
 

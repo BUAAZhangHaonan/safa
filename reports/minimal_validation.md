@@ -54,8 +54,9 @@ Status: implementation is synchronized to 4029 at `/home/hdd3/zhanghaonan/projec
 - Smoke completed on 32 balanced validation samples. Smoke `G` metrics: loss `1.4315`, cycle `0.7562`, semantic CE `2.7011`, TV `0.0428`.
 - Full `G` one-epoch training completed. Metrics: loss `0.1759`, cycle `0.0124`, semantic CE `0.6538`, TV `0.0183`.
 - FaceNet and AdaFace privacy checkpoints were exported through the 4029 proxy:
-  - FaceNet SHA256: `e6d560aee7d379d2f1b0536338efd9142aa0ee411b9791066c6c14ea5d10152e`.
+  - FaceNet SHA256: `38855589cae480268e8c64c2556c7898c449428043aacce761fe43389c6a8c72`.
   - AdaFace SHA256: `9953ec6b93d2bb7e771dcd2717f1e9b15ecd4760983557b006cbe00e598618d7`.
+- FaceNet is exported in the separate `/home/hdd3/zhanghaonan/anaconda3/envs/facenet` environment with torch `2.2.2+cu121`, torchvision `0.17.2+cu121`, and `facenet-pytorch==2.6.0`; the `safa` runtime loads only the exported TorchScript recognizer.
 - Affective-only diagnostic eval completed on val:
   - latent cosine mean `0.9869`, median `0.9891`.
   - angle mean `0.1534` rad, median `0.1481` rad.
