@@ -28,9 +28,10 @@ Status: implementation is synchronized to 4029 at `/home/hdd3/zhanghaonan/projec
 
 - Repository cloned on 4029 at `/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization`.
 - Proxy `http://<proxy-host>:<proxy-port>` reaches PyPI from 4029.
-- Anaconda Python at `/home/hdd3/zhanghaonan/anaconda3/bin/python` has torch `2.11.0+cu128`, torchvision `0.26.0+cu128`, CUDA visible on GPU 0, insightface, and onnxruntime installed.
-- Remote `PYTHONPATH=src CUDA_VISIBLE_DEVICES=0 /home/hdd3/zhanghaonan/anaconda3/bin/python -m unittest discover tests` passed all 21 tests.
+- Initial validation used base Anaconda Python at `/home/hdd3/zhanghaonan/anaconda3/bin/python`. The default runtime has since been migrated to `/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python`.
+- Remote `PYTHONPATH=src CUDA_VISIBLE_DEVICES=0 /home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python -m unittest discover tests` passed all 22 tests.
 - `insightface` required pinning `numpy==1.26.4` to match the existing `scikit-image` ABI; `cv2` import was verified after the pin.
+- The project `.venv` on 4029 was deleted; the `safa` conda environment is the runtime target.
 
 ## Data Repair and Index State
 

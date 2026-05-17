@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Minimal validation for samplewise affective face anonymization"
 requires-python = ">=3.10"
 dependencies = [
-  "numpy>=1.24",
+  "numpy==1.26.4",
   "pillow>=10.0",
   "pyyaml>=6.0",
   "torch>=2.1",
@@ -18,7 +18,20 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
-privacy = ["insightface>=0.7.3", "onnxruntime-gpu>=1.16"]
+privacy = [
+  "insightface>=0.7.3",
+  "onnxruntime-gpu>=1.16",
+  "opencv-python-headless==4.10.0.84",
+  "scikit-image==0.26.0",
+  "tifffile==2024.8.30",
+]
+export = [
+  "transformers==4.44.2",
+  "huggingface_hub<1.0",
+  "safetensors",
+  "omegaconf",
+  "fvcore",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -26,4 +39,3 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-

@@ -11,7 +11,8 @@ Environment rules:
 ```bash
 export OMP_NUM_THREADS=8
 export MKL_NUM_THREADS=8
-export PYTHON_BIN=/home/hdd3/zhanghaonan/anaconda3/bin/python
+export CONDA_BIN=/home/hdd3/zhanghaonan/anaconda3/bin/conda
+export PYTHON_BIN=/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python
 export HTTP_PROXY=http://<proxy-host>:<proxy-port>
 export HTTPS_PROXY=http://<proxy-host>:<proxy-port>
 export MAX_RAM_FRACTION=0.90
@@ -34,24 +35,24 @@ The configs keep `device: cuda:0`. Each script maps `cuda:0` to the physical GPU
 
 ```bash
 cd /home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization
+$CONDA_BIN create -y -n safa python=3.12
 $PYTHON_BIN -m pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cu128
-$PYTHON_BIN -m pip install --no-cache-dir -e ".[test]"
-$PYTHON_BIN -m pip install --no-cache-dir insightface onnxruntime-gpu
-$PYTHON_BIN -m pip install --no-cache-dir --force-reinstall "numpy==1.26.4"
+$PYTHON_BIN -m pip install --no-cache-dir -e ".[test,privacy,export]"
+$PYTHON_BIN -m pip check
 ```
 
 If ImageNet, InsightFace, FaceNet, or AdaFace weights cannot be downloaded, stop and provide local checkpoint paths. Do not replace them with random weights.
 
-Evaluation-only privacy recognizer export:
+Evaluation-only privacy recognizer assets:
 
 ```bash
 export HTTP_PROXY=http://<proxy-host>:<proxy-port>
 export HTTPS_PROXY=http://<proxy-host>:<proxy-port>
 export HF_HUB_DISABLE_XET=1
-$PYTHON_BIN -m pip install --no-cache-dir "transformers==4.44.2" "huggingface_hub<1.0" safetensors omegaconf fvcore
-$PYTHON_BIN -m pip install --no-cache-dir --no-deps facenet-pytorch
-PYTHONPATH=src CUDA_VISIBLE_DEVICES=2 $PYTHON_BIN scripts/export_privacy_recognizers.py --out-dir artifacts/privacy --which both
+PYTHONPATH=src CUDA_VISIBLE_DEVICES=2 $PYTHON_BIN scripts/export_privacy_recognizers.py --out-dir artifacts/privacy --which adaface
 ```
+
+The `safa` runtime environment intentionally does not install `facenet-pytorch`; its package metadata requires older torch and torchvision versions. Runtime evaluation uses exported TorchScript recognizers only. If `artifacts/privacy/facenet.pt` is missing, stop and create the FaceNet TorchScript file in a separate compatible export environment, then copy the exported checkpoint into `artifacts/privacy/`.
 
 ## Data Repair
 
