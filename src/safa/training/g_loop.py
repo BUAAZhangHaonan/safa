@@ -259,7 +259,7 @@ def _barrier(distributed: DistributedContext) -> None:
         return
     import torch.distributed as dist
 
-    dist.barrier()
+    dist.barrier(device_ids=[distributed.local_rank])
 
 
 def _unwrap_model(model):
