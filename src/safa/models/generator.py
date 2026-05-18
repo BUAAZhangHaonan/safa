@@ -166,25 +166,34 @@ class ConditionalFlowGenerator:
             def forward(self, z):
                 return self.sample(z, steps=self.config.sample_steps)
 
-            def sample(self, z, steps: int | None = None):
+            def _single_step(self, x, z, step_index, total_steps):
+                dt = 1.0 / float(total_steps)
+                t = torch.full((z.shape[0],), step_index / float(total_steps), device=z.device, dtype=z.dtype)
+                velocity = self.vector_field(x, t, z)
+                if self.config.sampler == "euler":
+                    return x + dt * velocity
+                elif self.config.sampler == "heun":
+                    proposal = x + dt * velocity
+                    next_t = torch.full((z.shape[0],), (step_index + 1) / float(total_steps), device=z.device, dtype=z.dtype)
+                    next_velocity = self.vector_field(proposal, next_t, z)
+                    return x + 0.5 * dt * (velocity + next_velocity)
+                else:
+                    raise ValueError(f"Unsupported sampler: {self.config.sampler}")
+
+            def sample(self, z, steps: int | None = None, checkpoint_steps: bool = False):
                 self._validate_z(z)
                 steps = int(steps or self.config.sample_steps)
                 if steps <= 0:
                     raise ValueError(f"sample steps must be positive, got {steps}")
                 x = torch.randn(z.shape[0], 3, self.image_size, self.image_size, device=z.device, dtype=z.dtype)
-                dt = 1.0 / float(steps)
                 for index in range(steps):
-                    t = torch.full((z.shape[0],), index / float(steps), device=z.device, dtype=z.dtype)
-                    velocity = self.vector_field(x, t, z)
-                    if self.config.sampler == "euler":
-                        x = x + dt * velocity
-                    elif self.config.sampler == "heun":
-                        proposal = x + dt * velocity
-                        next_t = torch.full((z.shape[0],), (index + 1) / float(steps), device=z.device, dtype=z.dtype)
-                        next_velocity = self.vector_field(proposal, next_t, z)
-                        x = x + 0.5 * dt * (velocity + next_velocity)
+                    if checkpoint_steps:
+                        x = torch.utils.checkpoint.checkpoint(
+                            self._single_step, x, z, index, steps,
+                            use_reentrant=False,
+                        )
                     else:
-                        raise ValueError(f"Unsupported sampler: {self.config.sampler}")
+                        x = self._single_step(x, z, index, steps)
                 max_abs = x.abs().max().item()
                 if max_abs > 5.0:
                     print(f"WARNING: ODE solver divergence detected, max_abs={max_abs:.2f}, step={index}/{steps}")

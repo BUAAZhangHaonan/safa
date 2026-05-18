@@ -39,13 +39,15 @@ class _GeneratorTrainingStep:
                 self.generator_config = generator_config
 
             def forward(self, images, z, use_cycle: bool, lambda_cycle: float):
+                import torch
                 flow_loss, flow_metrics = self.generator.flow_matching_loss(images, z)
                 cycle = flow_loss.new_tensor(0.0)
                 loss = flow_loss
                 if use_cycle:
-                    generated = torch.utils.checkpoint.checkpoint(
-                        self.generator.sample, z, steps=self.generator_config.train_cycle_steps,
-                        use_reentrant=False,
+                    generated = self.generator.sample(
+                        z,
+                        steps=self.generator_config.train_cycle_steps,
+                        checkpoint_steps=True,
                     )
                     assert_finite_tensor("stage2_generated_image", generated)
                     self.e0.eval()
@@ -55,7 +57,6 @@ class _GeneratorTrainingStep:
                 return loss, flow_metrics["flow_matching_mse"].detach(), cycle.detach()
 
         return _Module()
-
 
 
 def _verify_e0_feature_cache_consistency(config: dict) -> None:
@@ -73,6 +74,7 @@ def _verify_e0_feature_cache_consistency(config: dict) -> None:
             f"Feature cache manifest expects: {manifest.encoder_checkpoint_sha256}. "
             f"Regenerate the feature cache with the current E0 checkpoint."
         )
+
 
 def train_g_from_config(config: dict) -> dict:
     import torch
@@ -180,7 +182,8 @@ def train_g_from_config(config: dict) -> dict:
                 loss_val = float(loss.detach().cpu())
                 if not math.isfinite(loss_val):
                     print(f"WARNING: non-finite G loss detected: {loss_val}, replacing with zero for DDP sync")
-                    loss = loss * 0.0 + 0.0 * sum(p.sum() for p in _unwrap_model(training_module).generator.parameters())
+                    dummy = sum(p.sum() for p in _unwrap_model(training_module).generator.parameters())
+                    loss = 0.0 * dummy
                 assert_finite_tensor("g_loss", loss)
                 loss.backward()
                 batch_grad_norm = 0.0
