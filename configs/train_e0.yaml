@@ -2,9 +2,15 @@ seed: 1337
 device: cuda:0
 num_workers: 4
 batch_size: 64
-epochs: 2
-learning_rate: 0.0001
+epochs: 80
+learning_rate: 0.0003
 weight_decay: 0.0001
+label_smoothing: 0.1
+class_weight: true
+scheduler: cosine
+warmup_epochs: 5
+early_stopping_patience: 15
+augmentation: strong
 num_classes: 8
 embedding_dim: 512
 image_size: 224
@@ -12,4 +18,3 @@ imagenet_weights: IMAGENET1K_V2
 train_index: data/index/train.jsonl
 val_index: data/index/val.jsonl
 out_dir: artifacts/checkpoints/e0
-
