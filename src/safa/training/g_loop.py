@@ -230,7 +230,7 @@ def _init_distributed(config: dict) -> DistributedContext:
         device = require_cuda_device(f"cuda:{local_rank}")
         torch.cuda.set_device(device)
         if not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
+            dist.init_process_group(backend="nccl", device_id=device)
         return DistributedContext(
             enabled=True,
             rank=rank,
