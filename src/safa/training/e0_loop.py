@@ -121,8 +121,12 @@ def train_e0_from_config(config: dict) -> dict:
     from tqdm import tqdm
 
     set_seed(int(config["seed"]))
+    torch.backends.cudnn.benchmark = True
     distributed = _init_distributed(config)
     device = distributed.device
+    num_workers = int(config["num_workers"])
+    if num_workers < 1:
+        raise ValueError(f"num_workers must be >= 1 for persistent_workers, got {num_workers}")
     out_dir = Path(config["out_dir"])
     if distributed.is_main:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -155,16 +159,20 @@ def train_e0_from_config(config: dict) -> dict:
         batch_size=int(config["batch_size"]),
         shuffle=train_sampler is None,
         sampler=train_sampler,
-        num_workers=int(config["num_workers"]),
+        num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4,
     )
     val_loader = (
         DataLoader(
             val_set,
             batch_size=int(config["batch_size"]),
             shuffle=False,
-            num_workers=int(config["num_workers"]),
+            num_workers=num_workers,
             pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=4,
         )
         if distributed.is_main
         else None
@@ -237,10 +245,10 @@ def train_e0_from_config(config: dict) -> dict:
             assert_finite_tensor("e0_logits", output["logits"])
             loss = criterion(output["logits"], labels)
             assert_finite_tensor("e0_loss", loss)
-            # --- NaN / Inf check ---
+            # --- NaN / Inf check: replace with zero-valued connected tensor for DDP sync ---
             if torch.isnan(loss) or torch.isinf(loss):
-                print(f"WARNING: loss is {loss.item()} at epoch={epoch} batch={batch_idx}, skipping backward pass")
-                continue
+                print(f"WARNING: loss is {loss.item()} at epoch={epoch} batch={batch_idx}, replacing with zero for DDP sync")
+                loss = (output["logits"] * 0.0).sum()
             loss.backward()
             optimizer.step()
             train_loss_sum += float(loss.detach().cpu()) * labels.numel()
