@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import math
 import json
 from dataclasses import dataclass
 
@@ -42,7 +43,10 @@ class _GeneratorTrainingStep:
                 cycle = flow_loss.new_tensor(0.0)
                 loss = flow_loss
                 if use_cycle:
-                    generated = self.generator.sample(z, steps=self.generator_config.train_cycle_steps)
+                    generated = torch.utils.checkpoint.checkpoint(
+                        self.generator.sample, z, steps=self.generator_config.train_cycle_steps,
+                        use_reentrant=False,
+                    )
                     assert_finite_tensor("stage2_generated_image", generated)
                     self.e0.eval()
                     e0_out = self.e0(normalize_for_e0(generated))
@@ -52,6 +56,24 @@ class _GeneratorTrainingStep:
 
         return _Module()
 
+
+
+def _verify_e0_feature_cache_consistency(config: dict) -> None:
+    """Verify that the E0 checkpoint SHA256 matches the feature cache manifest."""
+    from safa.data.feature_cache import load_manifest
+    from safa.utils.hashing import sha256_file
+
+    e0_path = config["e0_checkpoint"]
+    feature_dir = config["train_features"]
+    manifest = load_manifest(feature_dir)
+    actual_sha256 = sha256_file(e0_path)
+    if manifest.encoder_checkpoint_sha256 != actual_sha256:
+        raise RuntimeError(
+            f"SHA256 mismatch between E0 checkpoint and feature cache manifest. "
+            f"E0 checkpoint: {e0_path} (sha256={actual_sha256}) "
+            f"Feature cache manifest expects: {manifest.encoder_checkpoint_sha256}. "
+            f"Regenerate the feature cache with the current E0 checkpoint."
+        )
 
 def train_g_from_config(config: dict) -> dict:
     import torch
@@ -87,6 +109,7 @@ def train_g_from_config(config: dict) -> dict:
         config["e0_checkpoint"],
         transform=generator_image_transform(int(config["image_size"])),
     )
+    _verify_e0_feature_cache_consistency(config)
     train_sampler = (
         DistributedSampler(
             train_set,
@@ -141,7 +164,7 @@ def train_g_from_config(config: dict) -> dict:
                 train_sampler.set_epoch(stage_epoch + (0 if stage_name == "stage1" else epochs))
             training_module.train()
             e0.eval()
-            totals = {"loss": 0.0, "flow_matching_mse": 0.0, "cycle": 0.0}
+            totals = {"loss": 0.0, "flow_matching_mse": 0.0, "cycle": 0.0, "grad_norm": 0.0}
             seen = 0
             for batch in tqdm(train_loader, desc=f"train_g {stage_name} epoch={stage_epoch}", disable=not distributed.is_main):
                 images = batch["image"].to(device, non_blocking=True)
@@ -149,13 +172,26 @@ def train_g_from_config(config: dict) -> dict:
                 optimizer.zero_grad(set_to_none=True)
                 loss, flow_mse, cycle = training_module(images, z, stage_name == "stage2", lambda_cycle)
                 assert_finite_tensor("g_loss", loss)
+                loss_val = float(loss.detach().cpu())
+                if not math.isfinite(loss_val):
+                    print(f"WARNING: non-finite G loss detected: {loss_val}, skipping batch")
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
                 loss.backward()
+                batch_grad_norm = 0.0
+                if "grad_clip_norm" in config:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        _unwrap_model(training_module).generator.parameters(),
+                        config["grad_clip_norm"],
+                    )
+                    batch_grad_norm = float(grad_norm) if isinstance(grad_norm, float) else float(grad_norm.detach().cpu())
                 optimizer.step()
                 batch_size = int(z.shape[0])
                 seen += batch_size
                 totals["loss"] += float(loss.detach().cpu()) * batch_size
                 totals["flow_matching_mse"] += float(flow_mse.cpu()) * batch_size
                 totals["cycle"] += float(cycle.detach().cpu()) * batch_size
+                totals["grad_norm"] += batch_grad_norm * batch_size
 
             metrics = _reduce_epoch_metrics(totals, seen, device, distributed)
             should_break = False
@@ -293,6 +329,7 @@ def _reduce_epoch_metrics(totals: dict, seen: int, device, distributed: Distribu
             float(totals["loss"]),
             float(totals["flow_matching_mse"]),
             float(totals["cycle"]),
+            float(totals["grad_norm"]),
             float(seen),
         ],
         device=device,
@@ -302,11 +339,12 @@ def _reduce_epoch_metrics(totals: dict, seen: int, device, distributed: Distribu
         import torch.distributed as dist
 
         dist.all_reduce(values, op=dist.ReduceOp.SUM)
-    total_seen = max(float(values[3].item()), 1.0)
+    total_seen = max(float(values[4].item()), 1.0)
     return {
         "loss": float(values[0].item() / total_seen),
         "flow_matching_mse": float(values[1].item() / total_seen),
         "cycle": float(values[2].item() / total_seen),
+        "grad_norm": float(values[3].item() / total_seen),
     }
 
 

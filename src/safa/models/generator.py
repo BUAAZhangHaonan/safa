@@ -185,6 +185,9 @@ class ConditionalFlowGenerator:
                         x = x + 0.5 * dt * (velocity + next_velocity)
                     else:
                         raise ValueError(f"Unsupported sampler: {self.config.sampler}")
+                max_abs = x.abs().max().item()
+                if max_abs > 5.0:
+                    print(f"WARNING: ODE solver divergence detected, max_abs={max_abs:.2f}, step={index}/{steps}")
                 return ((x.clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0)
 
             def flow_matching_loss(self, x_1, z, generator=None):
