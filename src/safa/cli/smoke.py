@@ -92,7 +92,6 @@ def main() -> None:
                 "face_detection": {
                     "enabled": bool(config.get("face_detection_enabled", False)),
                     "model_name": str(config.get("face_detection_model", "buffalo_l")),
-                    "drop_tolerance": 0.02,
                 },
             },
         }

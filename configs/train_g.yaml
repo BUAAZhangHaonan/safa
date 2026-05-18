@@ -24,12 +24,12 @@ generator:
   sampler: heun
 stages:
   stage1:
-    epochs: 1
+    epochs: 80
     require_face_detection_gate: true
     face_detection_threshold: 0.95
     stable_epochs: 1
   stage2:
-    epochs: 1
+    epochs: 80
     lambda_initial: 0.005
     lambda_max: 0.05
     lambda_growth: 0.005
@@ -42,4 +42,3 @@ validation:
   face_detection:
     enabled: true
     model_name: buffalo_l
-    drop_tolerance: 0.02

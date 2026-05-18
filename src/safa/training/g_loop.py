@@ -53,11 +53,8 @@ def train_g_from_config(config: dict) -> dict:
     lambda_cycle = float(stages["stage2"]["lambda_initial"])
     lambda_max = float(stages["stage2"]["lambda_max"])
     lambda_growth = float(stages["stage2"]["lambda_growth"])
-    detection_drop_tolerance = float(config.get("validation", {}).get("face_detection", {}).get("drop_tolerance", 0.02))
     baseline_detection_rate = None
-    best_detection_rate = -1.0
     best_checkpoint = out_dir / "best.pt"
-    best_detectable_checkpoint = out_dir / "best_detectable.pt"
     history: list[dict] = []
     stage1_stable_hits = 0
     allow_stage2_without_stage1_gate = bool(config.get("allow_stage2_without_stage1_gate", False))
@@ -122,27 +119,16 @@ def train_g_from_config(config: dict) -> dict:
                     metrics["stage1_stable_hits"] = stage1_stable_hits
                 else:
                     stage1_stable_hits = 0
-            if stage_name == "stage2" and baseline_detection_rate is not None:
-                current_rate = validation_metrics.get("face_detection_rate")
-                if current_rate is not None and current_rate < baseline_detection_rate - detection_drop_tolerance:
-                    lambda_cycle = max(float(stages["stage2"]["lambda_initial"]), lambda_cycle * 0.5)
-                    metrics["lambda_action"] = "reduced_after_detection_drop"
-                    if best_detectable_checkpoint.is_file() and current_rate < best_detection_rate - detection_drop_tolerance:
-                        payload = torch.load(best_detectable_checkpoint, map_location=device)
-                        generator.load_state_dict(payload["model_state_dict"])
-                        metrics["checkpoint_action"] = f"restored:{best_detectable_checkpoint}"
-                else:
-                    lambda_cycle = min(lambda_max, lambda_cycle + lambda_growth)
+            if stage_name == "stage2":
+                next_lambda = min(lambda_max, lambda_cycle + lambda_growth)
+                metrics["next_lambda_cycle"] = next_lambda
+                lambda_cycle = next_lambda
 
             history.append(metrics)
             _save_generator(out_dir / "last.pt", generator, generator_config, config, metrics, history)
             _write_json(out_dir / "last_metrics.json", metrics)
             if _is_better(metrics, history[:-1]):
                 _save_generator(best_checkpoint, generator, generator_config, config, metrics, history)
-            face_rate = validation_metrics.get("face_detection_rate")
-            if face_rate is not None and face_rate >= best_detection_rate:
-                best_detection_rate = float(face_rate)
-                _save_generator(best_detectable_checkpoint, generator, generator_config, config, metrics, history)
             if stage_name == "stage1" and stage1_stable_hits >= int(stages["stage1"].get("stable_epochs", 1)):
                 break
     final_checkpoint = best_checkpoint if best_checkpoint.is_file() else out_dir / "last.pt"
@@ -267,13 +253,10 @@ def _evaluate_validation(generator, e0, loader, detector, device, generator_conf
 def _is_better(metrics: dict, previous: list[dict]) -> bool:
     if not previous:
         return True
-    current_face = metrics.get("validation_face_detection_rate")
     current_cosine = metrics.get("validation_latent_cosine_mean", -1.0)
-    best = max(previous, key=lambda item: (item.get("validation_face_detection_rate", -1.0), item.get("validation_latent_cosine_mean", -1.0), -item["loss"]))
-    best_face = best.get("validation_face_detection_rate")
-    if current_face is not None or best_face is not None:
-        return (current_face or -1.0, current_cosine, -metrics["loss"]) > (
-            best_face or -1.0,
+    best = max(previous, key=lambda item: (item.get("validation_latent_cosine_mean", -1.0), -item["loss"]))
+    if current_cosine >= 0.0 or best.get("validation_latent_cosine_mean") is not None:
+        return (current_cosine, -metrics["loss"]) > (
             best.get("validation_latent_cosine_mean", -1.0),
             -best["loss"],
         )
