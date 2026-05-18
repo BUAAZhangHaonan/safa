@@ -22,7 +22,7 @@ generator:
   time_embedding_dim: 128
   condition_dim: 512
   sample_steps: 32
-  train_cycle_steps: 8
+  train_cycle_steps: 4
   sampler: heun
 stages:
   stage1:
