@@ -59,7 +59,6 @@ class _GeneratorTrainingStep:
 
 
 def _verify_e0_feature_cache_consistency(config: dict) -> None:
-    """Verify that the E0 checkpoint SHA256 matches the feature cache manifest."""
     from safa.data.feature_cache import load_manifest
     from safa.utils.hashing import sha256_file
 
@@ -82,9 +81,13 @@ def train_g_from_config(config: dict) -> dict:
     from tqdm import tqdm
 
     set_seed(int(config["seed"]))
+    torch.backends.cudnn.benchmark = True
     audit_no_identity_supervision(config)
     distributed = _init_distributed(config)
     device = distributed.device
+    num_workers = int(config["num_workers"])
+    if num_workers < 1:
+        raise ValueError(f"num_workers must be >= 1 for persistent_workers, got {num_workers}")
     out_dir = Path(config["out_dir"])
     if distributed.is_main:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -127,8 +130,10 @@ def train_g_from_config(config: dict) -> dict:
         batch_size=int(config["batch_size"]),
         shuffle=train_sampler is None,
         sampler=train_sampler,
-        num_workers=int(config["num_workers"]),
+        num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4,
     )
     validation_loader = _build_validation_loader(config) if distributed.is_main else None
     detector = _build_detector(config, str(device)) if distributed.is_main else None
@@ -142,6 +147,7 @@ def train_g_from_config(config: dict) -> dict:
     stage1_stable_hits = 0
     allow_stage2_without_stage1_gate = bool(config.get("allow_stage2_without_stage1_gate", False))
 
+    total_epoch = 0
     for stage_name in ("stage1", "stage2"):
         if stage_name == "stage2":
             blocked = _stage2_blocked(
@@ -161,7 +167,7 @@ def train_g_from_config(config: dict) -> dict:
         epochs = int(stages[stage_name]["epochs"])
         for stage_epoch in range(epochs):
             if train_sampler is not None:
-                train_sampler.set_epoch(stage_epoch + (0 if stage_name == "stage1" else epochs))
+                train_sampler.set_epoch(total_epoch + stage_epoch)
             training_module.train()
             e0.eval()
             totals = {"loss": 0.0, "flow_matching_mse": 0.0, "cycle": 0.0, "grad_norm": 0.0}
@@ -171,12 +177,11 @@ def train_g_from_config(config: dict) -> dict:
                 z = batch["z"].to(device, non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
                 loss, flow_mse, cycle = training_module(images, z, stage_name == "stage2", lambda_cycle)
-                assert_finite_tensor("g_loss", loss)
                 loss_val = float(loss.detach().cpu())
                 if not math.isfinite(loss_val):
-                    print(f"WARNING: non-finite G loss detected: {loss_val}, skipping batch")
-                    optimizer.zero_grad(set_to_none=True)
-                    continue
+                    print(f"WARNING: non-finite G loss detected: {loss_val}, replacing with zero for DDP sync")
+                    loss = loss * 0.0 + 0.0 * sum(p.sum() for p in _unwrap_model(training_module).generator.parameters())
+                assert_finite_tensor("g_loss", loss)
                 loss.backward()
                 batch_grad_norm = 0.0
                 if "grad_clip_norm" in config:
@@ -229,6 +234,8 @@ def train_g_from_config(config: dict) -> dict:
             )
             if should_break:
                 break
+        total_epoch += stage_epoch + 1
+
     manifest = {}
     if distributed.is_main:
         final_checkpoint = best_checkpoint if best_checkpoint.is_file() else out_dir / "last.pt"
@@ -262,8 +269,6 @@ def _init_distributed(config: dict) -> DistributedContext:
             raise RuntimeError("DDP requires RANK and LOCAL_RANK when WORLD_SIZE > 1")
         rank = int(rank_raw)
         local_rank = int(local_rank_raw)
-        if local_rank not in {0, 1, 2, 3}:
-            raise RuntimeError(f"Only local ranks 0,1,2,3 are allowed, got LOCAL_RANK={local_rank}")
         backend = str(config.get("distributed", {}).get("backend", "nccl"))
         if backend not in {"nccl", "gloo"}:
             raise ValueError(f"Unsupported DDP backend: {backend}")
@@ -493,6 +498,8 @@ def _build_validation_loader(config: dict):
         shuffle=False,
         num_workers=int(config["num_workers"]),
         pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4,
     )
 
 
@@ -545,8 +552,12 @@ def _evaluate_validation(generator, e0, loader, detector, device, generator_conf
 def _is_better(metrics: dict, previous: list[dict]) -> bool:
     if not previous:
         return True
+    stage = metrics.get("stage", "stage1")
+    same_stage = [m for m in previous if m.get("stage") == stage]
+    if not same_stage:
+        return True
     current_cosine = metrics.get("validation_latent_cosine_mean", -1.0)
-    best = max(previous, key=lambda item: (item.get("validation_latent_cosine_mean", -1.0), -item["loss"]))
+    best = max(same_stage, key=lambda item: (item.get("validation_latent_cosine_mean", -1.0), -item["loss"]))
     if current_cosine >= 0.0 or best.get("validation_latent_cosine_mean") is not None:
         return (current_cosine, -metrics["loss"]) > (
             best.get("validation_latent_cosine_mean", -1.0),
