@@ -23,6 +23,7 @@ class DistributedContext:
     world_size: int
     is_main: bool
     device: object
+    backend: str
 
 
 class _GeneratorTrainingStep:
@@ -227,10 +228,16 @@ def _init_distributed(config: dict) -> DistributedContext:
         local_rank = int(local_rank_raw)
         if local_rank not in {0, 1, 2, 3}:
             raise RuntimeError(f"Only local ranks 0,1,2,3 are allowed, got LOCAL_RANK={local_rank}")
+        backend = str(config.get("distributed", {}).get("backend", "nccl"))
+        if backend not in {"nccl", "gloo"}:
+            raise ValueError(f"Unsupported DDP backend: {backend}")
         device = require_cuda_device(f"cuda:{local_rank}")
         torch.cuda.set_device(device)
         if not dist.is_initialized():
-            dist.init_process_group(backend="nccl", device_id=device)
+            if backend == "nccl":
+                dist.init_process_group(backend=backend, device_id=device)
+            else:
+                dist.init_process_group(backend=backend)
         return DistributedContext(
             enabled=True,
             rank=rank,
@@ -238,11 +245,20 @@ def _init_distributed(config: dict) -> DistributedContext:
             world_size=world_size,
             is_main=rank == 0,
             device=device,
+            backend=backend,
         )
     device = require_cuda_device(str(config["device"]))
     if device.index is not None:
         torch.cuda.set_device(device)
-    return DistributedContext(enabled=False, rank=0, local_rank=device.index or 0, world_size=1, is_main=True, device=device)
+    return DistributedContext(
+        enabled=False,
+        rank=0,
+        local_rank=device.index or 0,
+        world_size=1,
+        is_main=True,
+        device=device,
+        backend="single",
+    )
 
 
 def _cleanup_distributed(distributed: DistributedContext) -> None:
@@ -259,7 +275,10 @@ def _barrier(distributed: DistributedContext) -> None:
         return
     import torch.distributed as dist
 
-    dist.barrier(device_ids=[distributed.local_rank])
+    if distributed.backend == "nccl":
+        dist.barrier(device_ids=[distributed.local_rank])
+    else:
+        dist.barrier()
 
 
 def _unwrap_model(model):
@@ -376,6 +395,7 @@ def _distributed_manifest(distributed: DistributedContext) -> dict:
     return {
         "enabled": distributed.enabled,
         "world_size": distributed.world_size,
+        "backend": distributed.backend,
     }
 
 

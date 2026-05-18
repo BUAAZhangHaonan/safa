@@ -23,13 +23,13 @@ class DDPContractTests(unittest.TestCase):
         self.assertIn("tmux new-session", script)
 
     def test_sync_epoch_control_single_process_is_noop(self) -> None:
-        context = DistributedContext(enabled=False, rank=0, local_rank=0, world_size=1, is_main=True, device="cuda:0")
+        context = DistributedContext(enabled=False, rank=0, local_rank=0, world_size=1, is_main=True, device="cuda:0", backend="single")
         result = _sync_epoch_control(0.02, 0.8, 3, True, "cuda:0", context)
         self.assertEqual(result, (0.02, 0.8, 3, True))
 
     def test_distributed_manifest_does_not_expose_device_mapping(self) -> None:
-        context = DistributedContext(enabled=True, rank=0, local_rank=0, world_size=4, is_main=True, device="cuda:0")
-        self.assertEqual(_distributed_manifest(context), {"enabled": True, "world_size": 4})
+        context = DistributedContext(enabled=True, rank=0, local_rank=0, world_size=4, is_main=True, device="cuda:0", backend="gloo")
+        self.assertEqual(_distributed_manifest(context), {"enabled": True, "world_size": 4, "backend": "gloo"})
 
     @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for DDP init contract")
     def test_ddp_env_requires_local_rank(self) -> None:

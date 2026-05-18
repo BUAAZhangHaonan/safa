@@ -13,6 +13,8 @@ val_features: artifacts/e0_features/val
 e0_checkpoint: artifacts/checkpoints/e0/best.pt
 out_dir: artifacts/checkpoints/g
 allow_stage2_without_stage1_gate: false
+distributed:
+  backend: gloo
 generator:
   model_type: conditional_flow_matching
   base_channels: 32
