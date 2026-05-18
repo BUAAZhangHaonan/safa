@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+from dataclasses import dataclass
 
 from safa.data.feature_dataset import FeatureAlignedAffectNet
 from safa.evaluation.recognizers import InsightFaceDetector
@@ -14,16 +15,57 @@ from safa.utils.device import assert_finite_tensor, require_cuda_device
 from safa.utils.seed import set_seed
 
 
+@dataclass(frozen=True)
+class DistributedContext:
+    enabled: bool
+    rank: int
+    local_rank: int
+    world_size: int
+    is_main: bool
+    device: object
+
+
+class _GeneratorTrainingStep:
+    def __new__(cls, generator, e0, generator_config: FlowGeneratorConfig):
+        from torch import nn
+
+        class _Module(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.generator = generator
+                self.e0 = e0
+                self.generator_config = generator_config
+
+            def forward(self, images, z, use_cycle: bool, lambda_cycle: float):
+                flow_loss, flow_metrics = self.generator.flow_matching_loss(images, z)
+                cycle = flow_loss.new_tensor(0.0)
+                loss = flow_loss
+                if use_cycle:
+                    generated = self.generator.sample(z, steps=self.generator_config.train_cycle_steps)
+                    assert_finite_tensor("stage2_generated_image", generated)
+                    self.e0.eval()
+                    e0_out = self.e0(normalize_for_e0(generated))
+                    cycle = cosine_cycle_loss(e0_out["embedding"], z)
+                    loss = flow_loss + float(lambda_cycle) * cycle
+                return loss, flow_metrics["flow_matching_mse"].detach(), cycle.detach()
+
+        return _Module()
+
+
 def train_g_from_config(config: dict) -> dict:
     import torch
-    from torch.utils.data import DataLoader, Subset
+    from torch.utils.data import DataLoader, DistributedSampler
+    from torch.nn.parallel import DistributedDataParallel
     from tqdm import tqdm
 
     set_seed(int(config["seed"]))
     audit_no_identity_supervision(config)
-    device = require_cuda_device(str(config["device"]))
+    distributed = _init_distributed(config)
+    device = distributed.device
     out_dir = Path(config["out_dir"])
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if distributed.is_main:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    _barrier(distributed)
 
     e0, _ = load_e0_checkpoint(config["e0_checkpoint"], device=str(device))
     e0.to(device)
@@ -31,8 +73,12 @@ def train_g_from_config(config: dict) -> dict:
 
     generator_config = _generator_config_from_train_config(config)
     generator = build_generator(generator_config.to_dict()).to(device)
-    optimizer = torch.optim.AdamW(generator.parameters(), lr=float(config["learning_rate"]), weight_decay=float(config["weight_decay"]))
+    training_module = _GeneratorTrainingStep(generator, e0, generator_config).to(device)
+    if distributed.enabled:
+        training_module = DistributedDataParallel(training_module, device_ids=[distributed.local_rank], output_device=distributed.local_rank)
+    optimizer = torch.optim.AdamW(_unwrap_model(training_module).generator.parameters(), lr=float(config["learning_rate"]), weight_decay=float(config["weight_decay"]))
     assert_e0_frozen(e0, optimizer)
+    set_seed(int(config["seed"]) + distributed.rank)
 
     train_set = FeatureAlignedAffectNet(
         config["train_index"],
@@ -40,15 +86,28 @@ def train_g_from_config(config: dict) -> dict:
         config["e0_checkpoint"],
         transform=generator_image_transform(int(config["image_size"])),
     )
+    train_sampler = (
+        DistributedSampler(
+            train_set,
+            num_replicas=distributed.world_size,
+            rank=distributed.rank,
+            shuffle=True,
+            seed=int(config["seed"]),
+            drop_last=False,
+        )
+        if distributed.enabled
+        else None
+    )
     train_loader = DataLoader(
         train_set,
         batch_size=int(config["batch_size"]),
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=int(config["num_workers"]),
         pin_memory=True,
     )
-    validation_loader = _build_validation_loader(config, train_set)
-    detector = _build_detector(config, str(device))
+    validation_loader = _build_validation_loader(config) if distributed.is_main else None
+    detector = _build_detector(config, str(device)) if distributed.is_main else None
     stages = _stage_config(config)
     lambda_cycle = float(stages["stage2"]["lambda_initial"])
     lambda_max = float(stages["stage2"]["lambda_max"])
@@ -61,88 +120,263 @@ def train_g_from_config(config: dict) -> dict:
 
     for stage_name in ("stage1", "stage2"):
         if stage_name == "stage2":
-            try:
-                _assert_stage1_gate_allows_stage2(stages, stage1_stable_hits, baseline_detection_rate, allow_stage2_without_stage1_gate)
-            except RuntimeError as exc:
-                final_checkpoint = best_checkpoint if best_checkpoint.is_file() else out_dir / "last.pt"
-                _write_json(
-                    out_dir / "manifest.json",
-                    {
-                        "checkpoint": str(final_checkpoint),
-                        "metrics": history[-1] if history else {},
-                        "history": history,
-                        "generator_input": "z_only",
-                        "model_type": "conditional_flow_matching",
-                        "identity_supervision": False,
-                        "blocked": True,
-                        "block_reason": str(exc),
-                    },
-                )
-                raise
+            blocked = _stage2_blocked(
+                distributed,
+                device,
+                stages,
+                stage1_stable_hits,
+                baseline_detection_rate,
+                allow_stage2_without_stage1_gate,
+                out_dir,
+                best_checkpoint,
+                history,
+            )
+            if blocked:
+                _cleanup_distributed(distributed)
+                raise RuntimeError("Stage 2 is blocked by the Stage 1 face detection gate; see manifest.json on rank 0")
         epochs = int(stages[stage_name]["epochs"])
         for stage_epoch in range(epochs):
-            generator.train()
+            if train_sampler is not None:
+                train_sampler.set_epoch(stage_epoch + (0 if stage_name == "stage1" else epochs))
+            training_module.train()
+            e0.eval()
             totals = {"loss": 0.0, "flow_matching_mse": 0.0, "cycle": 0.0}
             seen = 0
-            for batch in tqdm(train_loader, desc=f"train_g {stage_name} epoch={stage_epoch}"):
+            for batch in tqdm(train_loader, desc=f"train_g {stage_name} epoch={stage_epoch}", disable=not distributed.is_main):
                 images = batch["image"].to(device, non_blocking=True)
                 z = batch["z"].to(device, non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
-                flow_loss, flow_metrics = generator.flow_matching_loss(images, z)
-                loss = flow_loss
-                cycle = flow_loss.new_tensor(0.0)
-                if stage_name == "stage2":
-                    generated = generator.sample(z, steps=generator_config.train_cycle_steps)
-                    assert_finite_tensor("stage2_generated_image", generated)
-                    e0_out = e0(normalize_for_e0(generated))
-                    cycle = cosine_cycle_loss(e0_out["embedding"], z)
-                    loss = flow_loss + lambda_cycle * cycle
+                loss, flow_mse, cycle = training_module(images, z, stage_name == "stage2", lambda_cycle)
                 assert_finite_tensor("g_loss", loss)
                 loss.backward()
                 optimizer.step()
                 batch_size = int(z.shape[0])
                 seen += batch_size
                 totals["loss"] += float(loss.detach().cpu()) * batch_size
-                totals["flow_matching_mse"] += float(flow_metrics["flow_matching_mse"].cpu()) * batch_size
+                totals["flow_matching_mse"] += float(flow_mse.cpu()) * batch_size
                 totals["cycle"] += float(cycle.detach().cpu()) * batch_size
 
-            metrics = {key: value / max(seen, 1) for key, value in totals.items()}
-            metrics.update({"stage": stage_name, "stage_epoch": stage_epoch, "lambda_cycle": lambda_cycle})
-            validation_metrics = _evaluate_validation(generator, e0, validation_loader, detector, device, generator_config)
-            metrics.update({f"validation_{key}": value for key, value in validation_metrics.items()})
-            if stage_name == "stage1" and validation_metrics.get("face_detection_rate") is not None:
-                baseline_detection_rate = validation_metrics["face_detection_rate"]
-                threshold = float(stages["stage1"].get("face_detection_threshold", 0.95))
-                stable_epochs = int(stages["stage1"].get("stable_epochs", 1))
-                if baseline_detection_rate >= threshold:
-                    stage1_stable_hits += 1
-                    metrics["stage1_stable_hits"] = stage1_stable_hits
-                else:
-                    stage1_stable_hits = 0
-            if stage_name == "stage2":
-                next_lambda = min(lambda_max, lambda_cycle + lambda_growth)
-                metrics["next_lambda_cycle"] = next_lambda
-                lambda_cycle = next_lambda
+            metrics = _reduce_epoch_metrics(totals, seen, device, distributed)
+            should_break = False
+            if distributed.is_main:
+                metrics.update({"stage": stage_name, "stage_epoch": stage_epoch, "lambda_cycle": lambda_cycle})
+                validation_metrics = _evaluate_validation(_unwrap_model(training_module).generator, e0, validation_loader, detector, device, generator_config)
+                metrics.update({f"validation_{key}": value for key, value in validation_metrics.items()})
+                if stage_name == "stage1" and validation_metrics.get("face_detection_rate") is not None:
+                    baseline_detection_rate = validation_metrics["face_detection_rate"]
+                    threshold = float(stages["stage1"].get("face_detection_threshold", 0.95))
+                    stable_epochs = int(stages["stage1"].get("stable_epochs", 1))
+                    if baseline_detection_rate >= threshold:
+                        stage1_stable_hits += 1
+                        metrics["stage1_stable_hits"] = stage1_stable_hits
+                    else:
+                        stage1_stable_hits = 0
+                if stage_name == "stage2":
+                    next_lambda = min(lambda_max, lambda_cycle + lambda_growth)
+                    metrics["next_lambda_cycle"] = next_lambda
+                    lambda_cycle = next_lambda
 
-            history.append(metrics)
-            _save_generator(out_dir / "last.pt", generator, generator_config, config, metrics, history)
-            _write_json(out_dir / "last_metrics.json", metrics)
-            if _is_better(metrics, history[:-1]):
-                _save_generator(best_checkpoint, generator, generator_config, config, metrics, history)
-            if stage_name == "stage1" and stage1_stable_hits >= int(stages["stage1"].get("stable_epochs", 1)):
+                history.append(metrics)
+                _save_generator(out_dir / "last.pt", _unwrap_model(training_module).generator, generator_config, config, metrics, history)
+                _write_json(out_dir / "last_metrics.json", metrics)
+                if _is_better(metrics, history[:-1]):
+                    _save_generator(best_checkpoint, _unwrap_model(training_module).generator, generator_config, config, metrics, history)
+                should_break = stage_name == "stage1" and stage1_stable_hits >= int(stages["stage1"].get("stable_epochs", 1))
+            lambda_cycle, baseline_detection_rate, stage1_stable_hits, should_break = _sync_epoch_control(
+                lambda_cycle,
+                baseline_detection_rate,
+                stage1_stable_hits,
+                should_break,
+                device,
+                distributed,
+            )
+            if should_break:
                 break
-    final_checkpoint = best_checkpoint if best_checkpoint.is_file() else out_dir / "last.pt"
-    final_metrics = history[-1] if history else {}
-    manifest = {
-        "checkpoint": str(final_checkpoint),
-        "metrics": final_metrics,
-        "history": history,
-        "generator_input": "z_only",
-        "model_type": "conditional_flow_matching",
-        "identity_supervision": False,
-    }
-    _write_json(out_dir / "manifest.json", manifest)
+    manifest = {}
+    if distributed.is_main:
+        final_checkpoint = best_checkpoint if best_checkpoint.is_file() else out_dir / "last.pt"
+        final_metrics = history[-1] if history else {}
+        manifest = {
+            "checkpoint": str(final_checkpoint),
+            "metrics": final_metrics,
+            "history": history,
+            "generator_input": "z_only",
+            "model_type": "conditional_flow_matching",
+            "identity_supervision": False,
+            "distributed": _distributed_manifest(distributed),
+        }
+        _write_json(out_dir / "manifest.json", manifest)
+    _barrier(distributed)
+    _cleanup_distributed(distributed)
     return manifest
+
+
+def _init_distributed(config: dict) -> DistributedContext:
+    import os
+    import torch
+    import torch.distributed as dist
+
+    world_size_raw = os.environ.get("WORLD_SIZE")
+    rank_raw = os.environ.get("RANK")
+    local_rank_raw = os.environ.get("LOCAL_RANK")
+    world_size = int(world_size_raw) if world_size_raw else 1
+    if world_size > 1:
+        if rank_raw is None or local_rank_raw is None:
+            raise RuntimeError("DDP requires RANK and LOCAL_RANK when WORLD_SIZE > 1")
+        rank = int(rank_raw)
+        local_rank = int(local_rank_raw)
+        if local_rank not in {0, 1, 2, 3}:
+            raise RuntimeError(f"Only local ranks 0,1,2,3 are allowed, got LOCAL_RANK={local_rank}")
+        device = require_cuda_device(f"cuda:{local_rank}")
+        torch.cuda.set_device(device)
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+        return DistributedContext(
+            enabled=True,
+            rank=rank,
+            local_rank=local_rank,
+            world_size=world_size,
+            is_main=rank == 0,
+            device=device,
+        )
+    device = require_cuda_device(str(config["device"]))
+    if device.index is not None:
+        torch.cuda.set_device(device)
+    return DistributedContext(enabled=False, rank=0, local_rank=device.index or 0, world_size=1, is_main=True, device=device)
+
+
+def _cleanup_distributed(distributed: DistributedContext) -> None:
+    if not distributed.enabled:
+        return
+    import torch.distributed as dist
+
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def _barrier(distributed: DistributedContext) -> None:
+    if not distributed.enabled:
+        return
+    import torch.distributed as dist
+
+    dist.barrier()
+
+
+def _unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
+
+
+def _reduce_epoch_metrics(totals: dict, seen: int, device, distributed: DistributedContext) -> dict:
+    import torch
+
+    values = torch.tensor(
+        [
+            float(totals["loss"]),
+            float(totals["flow_matching_mse"]),
+            float(totals["cycle"]),
+            float(seen),
+        ],
+        device=device,
+        dtype=torch.float64,
+    )
+    if distributed.enabled:
+        import torch.distributed as dist
+
+        dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    total_seen = max(float(values[3].item()), 1.0)
+    return {
+        "loss": float(values[0].item() / total_seen),
+        "flow_matching_mse": float(values[1].item() / total_seen),
+        "cycle": float(values[2].item() / total_seen),
+    }
+
+
+def _sync_epoch_control(
+    lambda_cycle: float,
+    baseline_detection_rate: float | None,
+    stage1_stable_hits: int,
+    should_break: bool,
+    device,
+    distributed: DistributedContext,
+) -> tuple[float, float | None, int, bool]:
+    if not distributed.enabled:
+        return lambda_cycle, baseline_detection_rate, stage1_stable_hits, should_break
+    import torch
+    import torch.distributed as dist
+
+    payload = torch.tensor(
+        [
+            float(lambda_cycle),
+            -1.0 if baseline_detection_rate is None else float(baseline_detection_rate),
+            float(stage1_stable_hits),
+            1.0 if should_break else 0.0,
+        ],
+        device=device,
+        dtype=torch.float64,
+    )
+    dist.broadcast(payload, src=0)
+    synced_baseline = float(payload[1].item())
+    return (
+        float(payload[0].item()),
+        None if synced_baseline < 0.0 else synced_baseline,
+        int(payload[2].item()),
+        bool(int(payload[3].item())),
+    )
+
+
+def _stage2_blocked(
+    distributed: DistributedContext,
+    device,
+    stages: dict,
+    stage1_stable_hits: int,
+    baseline_detection_rate: float | None,
+    allow_stage2_without_stage1_gate: bool,
+    out_dir: Path,
+    best_checkpoint: Path,
+    history: list[dict],
+) -> bool:
+    import torch
+
+    blocked = False
+    if distributed.is_main:
+        try:
+            _assert_stage1_gate_allows_stage2(
+                stages,
+                stage1_stable_hits,
+                baseline_detection_rate,
+                allow_stage2_without_stage1_gate,
+            )
+        except RuntimeError as exc:
+            final_checkpoint = best_checkpoint if best_checkpoint.is_file() else out_dir / "last.pt"
+            _write_json(
+                out_dir / "manifest.json",
+                {
+                    "checkpoint": str(final_checkpoint),
+                    "metrics": history[-1] if history else {},
+                    "history": history,
+                    "generator_input": "z_only",
+                    "model_type": "conditional_flow_matching",
+                    "identity_supervision": False,
+                    "blocked": True,
+                    "block_reason": str(exc),
+                    "distributed": _distributed_manifest(distributed),
+                },
+            )
+            blocked = True
+    if distributed.enabled:
+        import torch.distributed as dist
+
+        flag = torch.tensor([1 if blocked else 0], device=device, dtype=torch.int64)
+        dist.broadcast(flag, src=0)
+        return bool(flag.item())
+    return blocked
+
+
+def _distributed_manifest(distributed: DistributedContext) -> dict:
+    return {
+        "enabled": distributed.enabled,
+        "world_size": distributed.world_size,
+    }
 
 
 def _generator_config_from_train_config(config: dict) -> FlowGeneratorConfig:
@@ -180,7 +414,7 @@ def _assert_stage1_gate_allows_stage2(stages: dict, stable_hits: int, detection_
         )
 
 
-def _build_validation_loader(config: dict, train_set):
+def _build_validation_loader(config: dict):
     from torch.utils.data import DataLoader, Subset
 
     validation = config.get("validation", {})
@@ -266,6 +500,7 @@ def _is_better(metrics: dict, previous: list[dict]) -> bool:
 def _save_generator(path: Path, generator, generator_config: FlowGeneratorConfig, train_config: dict, metrics: dict, history: list[dict]) -> None:
     import torch
 
+    generator = _unwrap_model(generator)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
