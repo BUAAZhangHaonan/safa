@@ -16,10 +16,10 @@ TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
 class DDPContractTests(unittest.TestCase):
     def test_train_g_tmux_uses_four_gpu_torchrun(self) -> None:
         script = Path("scripts/run_train_g_tmux.sh").read_text(encoding="utf-8")
-        self.assertIn('SAFA_CUDA_VISIBLE_DEVICES:-0,1,2,3', script)
+        self.assertIn('SAFA_CUDA_VISIBLE_DEVICES:-4,5', script)
         self.assertIn("scripts/guarded_run.py", script)
         self.assertIn("torch.distributed.run", script)
-        self.assertIn("--nproc_per_node=4", script)
+        self.assertIn("--nproc_per_node=2", script)
         self.assertIn("tmux new-session", script)
 
     def test_sync_epoch_control_single_process_is_noop(self) -> None:
