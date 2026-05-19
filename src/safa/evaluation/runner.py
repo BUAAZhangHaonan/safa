@@ -313,7 +313,9 @@ def _guard_result(metrics: dict, config: dict) -> dict:
     latent_cosine_mean = metrics.get("latent_cosine", {}).get("mean")
     if face_detection_rate is None:
         raise RuntimeError("Face detection guard is enabled but no face_detection metrics were produced")
-    passed = bool(face_detection_rate >= face_threshold and latent_cosine_mean is not None and latent_cosine_mean >= cosine_threshold)
+    if latent_cosine_mean is None:
+        raise RuntimeError("Face detection guard is enabled but no latent_cosine metrics were produced")
+    passed = bool(face_detection_rate >= face_threshold and latent_cosine_mean >= cosine_threshold)
     return {
         "enabled": True,
         "passed": passed,
