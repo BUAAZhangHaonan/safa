@@ -93,9 +93,6 @@ def train_g_from_config(config: dict) -> dict:
 
     set_seed(int(config["seed"]))
     torch.backends.cudnn.benchmark = True
-    use_amp = bool(config.get("amp", False))
-    if distributed.is_main:
-        print(f"AMP (bfloat16): {"enabled" if use_amp else "disabled"}")
     audit_no_identity_supervision(config)
     distributed = _init_distributed(config)
     device = distributed.device
@@ -105,6 +102,9 @@ def train_g_from_config(config: dict) -> dict:
     out_dir = Path(config["out_dir"])
     if distributed.is_main:
         out_dir.mkdir(parents=True, exist_ok=True)
+    use_amp = bool(config.get("amp", False))
+    if distributed.is_main:
+        print(f"AMP (bfloat16): {"enabled" if use_amp else "disabled"}")
     _barrier(distributed)
 
     e0, _ = load_e0_checkpoint(config["e0_checkpoint"], device=str(device))
