@@ -99,10 +99,28 @@ def validate_manifest(cache_dir: str | Path, index_path: str | Path, checkpoint_
 
 
 def load_feature_cache(cache_dir: str | Path, index_path: str | Path, checkpoint_path: str | Path):
+    import hashlib
+    import io
+
     import torch
 
-    manifest = validate_manifest(cache_dir, index_path, checkpoint_path)
-    payload = torch.load(Path(cache_dir) / manifest.shard, map_location="cpu")
+    cache_path = Path(cache_dir)
+    manifest = load_manifest(cache_path)
+
+    if manifest.index_sha256 != sha256_file(index_path):
+        raise ValueError("Feature cache index_sha256 does not match the requested index")
+    if manifest.encoder_checkpoint_sha256 != sha256_file(checkpoint_path):
+        raise ValueError("Feature cache encoder_checkpoint_sha256 does not match the requested checkpoint")
+
+    # Read shard file once into memory, verify hash, then load from the same bytes.
+    # This eliminates the TOCTOU race where the file could change between hash
+    # verification and torch.load.
+    shard_path = cache_path / manifest.shard
+    shard_bytes = shard_path.read_bytes()
+    if manifest.shard_sha256 != hashlib.sha256(shard_bytes).hexdigest():
+        raise ValueError("Feature cache shard_sha256 does not match shard contents")
+    payload = torch.load(io.BytesIO(shard_bytes), map_location="cpu", weights_only=False)
+
     required = {"features", "sample_ids", "labels"}
     missing = required.difference(payload)
     if missing:
