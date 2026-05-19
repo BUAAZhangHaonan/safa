@@ -203,6 +203,7 @@ def train_g_from_config(config: dict) -> dict:
                 _cleanup_distributed(distributed)
                 raise RuntimeError("Stage 2 is blocked by the Stage 1 face detection gate; see manifest.json on rank 0")
         epochs = int(stages[stage_name]["epochs"])
+        stage_epoch = -1
         for stage_epoch in range(epochs):
             if train_sampler is not None:
                 train_sampler.set_epoch(total_epoch + stage_epoch)
