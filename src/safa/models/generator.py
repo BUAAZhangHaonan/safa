@@ -186,6 +186,7 @@ class ConditionalFlowGenerator:
                 if steps <= 0:
                     raise ValueError(f"sample steps must be positive, got {steps}")
                 x = torch.randn(z.shape[0], 3, self.image_size, self.image_size, device=z.device, dtype=z.dtype)
+                divergence_step = None
                 for index in range(steps):
                     if checkpoint_steps:
                         x = torch.utils.checkpoint.checkpoint(
@@ -194,9 +195,13 @@ class ConditionalFlowGenerator:
                         )
                     else:
                         x = self._single_step(x, z, index, steps)
-                max_abs = x.abs().max().item()
-                if max_abs > 5.0:
-                    print(f"WARNING: ODE solver divergence detected, max_abs={max_abs:.2f}, step={index}/{steps}")
+                    if divergence_step is None:
+                        max_abs = x.abs().max().item()
+                        if max_abs > 5.0:
+                            divergence_step = index
+                            print(f"WARNING: ODE solver divergence at step {index}/{steps}, max_abs={max_abs:.2f}")
+                if divergence_step is not None and divergence_step < steps - 1:
+                    print(f"WARNING: ODE solver diverged at step {divergence_step}, subsequent {steps - 1 - divergence_step} steps operated on diverged values")
                 return ((x.clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0)
 
             def flow_matching_loss(self, x_1, z, generator=None):
