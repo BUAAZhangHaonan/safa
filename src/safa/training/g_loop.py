@@ -124,13 +124,13 @@ def train_g_from_config(config: dict) -> dict:
     assert_e0_frozen(e0, optimizer)
     set_seed(int(config["seed"]) + distributed.rank)
 
+    _verify_e0_feature_cache_consistency(config)
     train_set = FeatureAlignedAffectNet(
         config["train_index"],
         config["train_features"],
         config["e0_checkpoint"],
         transform=generator_image_transform(int(config["image_size"])),
     )
-    _verify_e0_feature_cache_consistency(config)
     train_sampler = (
         DistributedSampler(
             train_set,

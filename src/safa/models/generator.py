@@ -176,6 +176,11 @@ class ConditionalFlowGenerator:
                 if self.config.sampler == "euler":
                     return x + dt * velocity
                 elif self.config.sampler == "heun":
+                    # Euler for the final step: t=1.0 is outside training support
+                    # (trained with t ~ Uniform[0,1)), so vector field at t=1.0
+                    # is an uncontrolled extrapolation.
+                    if step_index == total_steps - 1:
+                        return x + dt * velocity
                     proposal = x + dt * velocity
                     next_t = torch.full((z.shape[0],), (step_index + 1) / float(total_steps), device=z.device, dtype=z.dtype)
                     next_velocity = self.vector_field(proposal, next_t, z)
