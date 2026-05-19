@@ -18,9 +18,8 @@ def main() -> None:
     args = parse_args()
     config = load_yaml(args.config)
     audit_no_identity_supervision(config, [Path(item) for item in args.source])
-    print("no identity supervision terms found")
+    print("static audit passed: no identity supervision terms found in config or source text")
 
 
 if __name__ == "__main__":
     main()
-
