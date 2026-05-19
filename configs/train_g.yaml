@@ -41,7 +41,7 @@ validation:
   enabled: true
   index: data/index/val.jsonl
   features: artifacts/e0_features/val
-  max_samples: 64
+  max_samples: 512
   batch_size: 32
   face_detection:
     enabled: true
