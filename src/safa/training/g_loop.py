@@ -101,6 +101,14 @@ def train_g_from_config(config: dict) -> dict:
 
     generator_config = _generator_config_from_train_config(config)
     generator = build_generator(generator_config.to_dict()).to(device)
+    if config.get("resume_from"):
+        resume_path = Path(config["resume_from"])
+        if not resume_path.is_file():
+            raise FileNotFoundError(f"resume_from checkpoint not found: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device, weights_only=True)
+        generator.load_state_dict(ckpt["model_state_dict"])
+        if distributed.is_main:
+            print(f"Resumed generator from {resume_path}")
     training_module = _GeneratorTrainingStep(generator, e0, generator_config).to(device)
     if distributed.enabled:
         training_module = DistributedDataParallel(training_module, device_ids=[distributed.local_rank], output_device=distributed.local_rank)
@@ -241,7 +249,7 @@ def train_g_from_config(config: dict) -> dict:
             )
             if should_break:
                 break
-        total_epoch += stage_epoch + 1
+        total_epoch += epochs
 
     manifest = {}
     if distributed.is_main:
