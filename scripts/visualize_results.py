@@ -78,7 +78,7 @@ def denormalize_imagenet(tensor_chw):
 
 
 def chw_to_numpy(tensor_chw):
-    return (tensor_chw.permute(1, 2, 0).clamp(0.0, 1.0).numpy() * 255).astype(np.uint8)
+    return (tensor_chw.cpu().permute(1, 2, 0).clamp(0.0, 1.0).numpy() * 255).astype(np.uint8)
 
 
 def normalize_for_e0(images_bchw):
