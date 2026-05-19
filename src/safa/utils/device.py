@@ -11,8 +11,8 @@ def require_cuda_device(device: str):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required and is not available")
     parsed = torch.device(device)
-    if parsed.index is not None and parsed.index not in {0, 1, 2, 3}:
-        raise RuntimeError(f"Only GPU indices 0,1,2,3 are allowed; requested {parsed.index}")
+    if parsed.index is not None and parsed.index >= torch.cuda.device_count():
+        raise RuntimeError(f"GPU index {parsed.index} exceeds available count {torch.cuda.device_count()}")
     return parsed
 
 
