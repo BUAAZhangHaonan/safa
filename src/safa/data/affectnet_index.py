@@ -45,11 +45,11 @@ def build_affectnet_index(
     if only_split is not None:
         records = [record for record in records if record.split == only_split]
     records = sorted(records, key=lambda item: item.sample_id)
+    _validate_collection(records)
     if limit is not None:
         if limit <= 0:
             raise ValueError("--limit must be positive when provided")
         records = records[:limit]
-    _validate_collection(records)
     return records
 
 
