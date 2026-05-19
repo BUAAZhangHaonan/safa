@@ -200,7 +200,7 @@ class ConditionalFlowGenerator:
                         x = self._single_step(x, z, index, steps)
                     if divergence_step is None:
                         max_abs = x.abs().max().item()
-                        if max_abs > 5.0:
+                        if max_abs > 7.0:
                             divergence_step = index
                             print(f"WARNING: ODE solver divergence at step {index}/{steps}, max_abs={max_abs:.2f}")
                 if divergence_step is not None and divergence_step < steps - 1:
