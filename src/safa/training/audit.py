@@ -41,6 +41,12 @@ def _audit_config(config: dict, prefix: str = "") -> None:
             raise RuntimeError(f"Forbidden identity supervision config key: {full_key}")
         if isinstance(value, dict):
             _audit_config(value, full_key)
+        elif isinstance(value, (list, tuple)):
+            for i, item in enumerate(value):
+                if isinstance(item, dict):
+                    _audit_config(item, f"{full_key}[{i}]")
+                elif isinstance(item, str) and any(term in item.lower() for term in FORBIDDEN_TRAINING_TERMS):
+                    raise RuntimeError(f"Forbidden identity supervision config value at {full_key}[{i}]: {item}")
         elif isinstance(value, str) and any(term in value.lower() for term in FORBIDDEN_TRAINING_TERMS):
             raise RuntimeError(f"Forbidden identity supervision config value at {full_key}: {value}")
 
@@ -50,17 +56,23 @@ def _audit_source(path: Path) -> None:
         raise FileNotFoundError(f"Cannot audit missing source file: {path}")
     text = path.read_text(encoding="utf-8").lower()
     violations = [term for term in FORBIDDEN_TRAINING_TERMS if term in text]
-    allowed_comments = ("identity_supervision\": false", '"identity_supervision": false')
     filtered = []
     for term in violations:
+        if term == "identity_supervision: true":
+            allowed_comments = ('identity_supervision": false',)
+        else:
+            allowed_comments = ()
         start = 0
         has_forbidden_occurrence = False
         while True:
             idx = text.find(term, start)
             if idx == -1:
                 break
-            context = text[max(0, idx - 60):idx + len(term) + 60]
-            is_allowed = any(ac in context for ac in allowed_comments)
+            if allowed_comments:
+                context = text[max(0, idx - 60):idx + len(term) + 60]
+                is_allowed = any(ac in context for ac in allowed_comments)
+            else:
+                is_allowed = False
             if not is_allowed:
                 has_forbidden_occurrence = True
                 break
@@ -69,4 +81,3 @@ def _audit_source(path: Path) -> None:
             filtered.append(term)
     if filtered:
         raise RuntimeError(f"Forbidden identity supervision terms in {path}: {filtered}")
-
