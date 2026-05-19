@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 
 from safa.evaluation.runner import run_eval_from_config
 from safa.utils.config import load_yaml, require_keys
@@ -31,7 +32,15 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     config = load_yaml(parse_args().config)
     require_keys(config, REQUIRED_KEYS)
-    result = run_eval_from_config(config)
+    try:
+        result = run_eval_from_config(config)
+    except RuntimeError as exc:
+        msg = str(exc)
+        if "Privacy evaluation skipped" in msg:
+            print(f"GUARD FAILED: {msg}", file=sys.stderr)
+            print(config["out_json"])
+            sys.exit(1)
+        raise
     print(result["out_json"] if "out_json" in result else config["out_json"])
 
 
