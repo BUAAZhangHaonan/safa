@@ -22,7 +22,7 @@ generator:
   condition_dim: 512
   sample_steps: 32
   train_cycle_steps: 4
-  cycle_steps_schedule: [4, 8, 16]
+  cycle_steps_schedule: [4, 8, 16, 32]
   sampler: heun
 grad_clip_norm: 1.0
 stages:
