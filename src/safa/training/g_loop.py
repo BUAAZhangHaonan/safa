@@ -42,6 +42,9 @@ class _GeneratorTrainingStep:
                 self._schedule = schedule
                 self._batch_idx = 0
 
+            def reset_batch_idx(self):
+                self._batch_idx = 0
+
             def forward(self, images, z, use_cycle: bool, lambda_cycle: float):
                 import torch
                 flow_loss, flow_metrics = self.generator.flow_matching_loss(images, z)
@@ -104,7 +107,8 @@ def train_g_from_config(config: dict) -> dict:
         out_dir.mkdir(parents=True, exist_ok=True)
     use_amp = bool(config.get("amp", False))
     if distributed.is_main:
-        print(f"AMP (bfloat16): {"enabled" if use_amp else "disabled"}")
+        amp_status = "enabled" if use_amp else "disabled"
+        print(f"AMP (bfloat16): {amp_status}")
     _barrier(distributed)
 
     e0, _ = load_e0_checkpoint(config["e0_checkpoint"], device=str(device))
@@ -113,14 +117,26 @@ def train_g_from_config(config: dict) -> dict:
 
     generator_config = _generator_config_from_train_config(config)
     generator = build_generator(generator_config.to_dict()).to(device)
+    resume_history = None
+    resume_stage_epoch = None
     if config.get("resume_from"):
         resume_path = Path(config["resume_from"])
         if not resume_path.is_file():
             raise FileNotFoundError(f"resume_from checkpoint not found: {resume_path}")
         ckpt = torch.load(resume_path, map_location=device, weights_only=True)
         generator.load_state_dict(ckpt["model_state_dict"])
+        if "history" in ckpt:
+            resume_history = ckpt["history"]
+        if "metrics" in ckpt and "stage_epoch" in ckpt["metrics"]:
+            resume_stage_epoch = ckpt["metrics"]["stage_epoch"]
         if distributed.is_main:
-            print(f"Resumed generator from {resume_path}")
+            restored = ["model_state_dict"]
+            if resume_history is not None:
+                restored.append("history")
+            if resume_stage_epoch is not None:
+                restored.append("stage_epoch")
+            sep = ", ".join(restored)
+            print(f"Resumed generator from {resume_path} (restored: {sep})")
     training_module = _GeneratorTrainingStep(generator, e0, generator_config).to(device)
     if distributed.enabled:
         training_module = DistributedDataParallel(training_module, device_ids=[distributed.local_rank], output_device=distributed.local_rank)
@@ -165,7 +181,7 @@ def train_g_from_config(config: dict) -> dict:
     lambda_growth = float(stages["stage2"]["lambda_growth"])
     baseline_detection_rate = None
     best_checkpoint = out_dir / "best.pt"
-    history: list[dict] = []
+    history: list[dict] = resume_history if resume_history is not None else []
     stage1_stable_hits = 0
     allow_stage2_without_stage1_gate = bool(config.get("allow_stage2_without_stage1_gate", False))
 
@@ -191,6 +207,7 @@ def train_g_from_config(config: dict) -> dict:
             if train_sampler is not None:
                 train_sampler.set_epoch(total_epoch + stage_epoch)
             training_module.train()
+            _unwrap_model(training_module).reset_batch_idx()
             e0.eval()
             totals = {"loss": 0.0, "flow_matching_mse": 0.0, "cycle": 0.0, "grad_norm": 0.0}
             seen = 0
@@ -264,7 +281,7 @@ def train_g_from_config(config: dict) -> dict:
             )
             if should_break:
                 break
-        total_epoch += epochs
+        total_epoch += stage_epoch + 1
 
     manifest = {}
     if distributed.is_main:
@@ -584,7 +601,7 @@ def _composite_score(item: dict) -> float:
     """cosine x face_detection_rate. Penalizes degenerate checkpoints
     that achieve high cosine by generating non-face outputs."""
     cosine = item.get("validation_latent_cosine_mean", -1.0)
-    face_det = item.get("validation_face_detection_rate", 1.0)
+    face_det = item.get("validation_face_detection_rate", 0.0)
     return cosine * face_det
 
 

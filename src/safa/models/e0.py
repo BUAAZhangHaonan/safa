@@ -81,7 +81,7 @@ def load_e0_checkpoint(path: str | Path, device: str | None = None):
     checkpoint_path = Path(path)
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"E0 checkpoint does not exist: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device or "cpu")
+    checkpoint = torch.load(checkpoint_path, map_location=device or "cpu", weights_only=True)
     cfg = checkpoint.get("model_config")
     if not isinstance(cfg, dict):
         raise ValueError(f"E0 checkpoint missing model_config: {checkpoint_path}")
