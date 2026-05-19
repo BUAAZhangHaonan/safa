@@ -193,6 +193,9 @@ def train_e0_from_config(config: dict) -> dict:
     if config.get("class_weight", False):
         class_counts = Counter(record.label for record in train_set.records)
         num_classes = int(config["num_classes"])
+        missing = [i for i in range(num_classes) if class_counts.get(i, 0) == 0]
+        if missing:
+            raise ValueError(f"Classes with zero training samples: {missing}. Cannot compute class weights.")
         beta = 0.9999
         effective_num = 1.0 - beta ** torch.tensor(
             [float(class_counts.get(i, 0)) for i in range(num_classes)], dtype=torch.float64
@@ -207,7 +210,7 @@ def train_e0_from_config(config: dict) -> dict:
 
     # --- LR scheduler ---
     epochs = int(config["epochs"])
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs - warmup_epochs), eta_min=1e-6)
 
     # --- warmup ---
     warmup_epochs = int(config.get("warmup_epochs", 0))
@@ -247,8 +250,9 @@ def train_e0_from_config(config: dict) -> dict:
             assert_finite_tensor("e0_loss", loss)
             # --- NaN / Inf check: replace with zero-valued connected tensor for DDP sync ---
             if torch.isnan(loss) or torch.isinf(loss):
-                print(f"WARNING: loss is {loss.item()} at epoch={epoch} batch={batch_idx}, replacing with zero for DDP sync")
-                loss = (output["logits"] * 0.0).sum()
+                print(f"WARNING: loss is {loss.item()} at epoch={epoch} batch={batch_idx}, skipping batch entirely")
+                (output["logits"] * 0.0).sum().backward()
+                continue
             loss.backward()
             optimizer.step()
             train_loss_sum += float(loss.detach().cpu()) * labels.numel()
