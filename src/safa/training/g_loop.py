@@ -183,9 +183,8 @@ def train_g_from_config(config: dict) -> dict:
                 if not math.isfinite(loss_val):
                     print(f"WARNING: non-finite G loss detected: {loss_val}, skipping batch entirely")
                     dummy = sum(p.sum() for p in _unwrap_model(training_module).generator.parameters())
-                    loss = 0.0 * dummy
-                    flow_mse = flow_mse.new_tensor(0.0)
-                    cycle = cycle.new_tensor(0.0)
+                    (0.0 * dummy).backward()
+                    continue
                 assert_finite_tensor("g_loss", loss)
                 loss.backward()
                 batch_grad_norm = 0.0
