@@ -247,12 +247,12 @@ def train_e0_from_config(config: dict) -> dict:
             assert_finite_tensor("e0_embedding", output["embedding"])
             assert_finite_tensor("e0_logits", output["logits"])
             loss = criterion(output["logits"], labels)
-            assert_finite_tensor("e0_loss", loss)
-            # --- NaN / Inf check: replace with zero-valued connected tensor for DDP sync ---
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"WARNING: loss is {loss.item()} at epoch={epoch} batch={batch_idx}, skipping batch entirely")
+            loss_val = float(loss.detach().cpu())
+            if not math.isfinite(loss_val):
+                print(f"WARNING: non-finite E0 loss detected: {loss_val} at epoch={epoch} batch={batch_idx}, skipping batch entirely")
                 (output["logits"] * 0.0).sum().backward()
                 continue
+            assert_finite_tensor("e0_loss", loss)
             loss.backward()
             optimizer.step()
             train_loss_sum += float(loss.detach().cpu()) * labels.numel()
