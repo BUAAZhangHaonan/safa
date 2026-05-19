@@ -1,0 +1,43 @@
+seed: 1337
+device: cuda:0
+num_workers: 8
+batch_size: 32
+learning_rate: 0.0003
+weight_decay: 0.0
+image_size: 224
+embedding_dim: 512
+train_index: data/index/train.jsonl
+train_features: artifacts/e0_features/train
+e0_checkpoint: artifacts/checkpoints/e0/best.pt
+out_dir: artifacts/ablation/ablation_d_lambda_002
+allow_stage2_without_stage1_gate: true
+distributed:
+  backend: gloo
+generator:
+  model_type: conditional_flow_matching
+  base_channels: 32
+  channel_multipliers: [1, 2, 4, 4]
+  time_embedding_dim: 128
+  condition_dim: 512
+  sample_steps: 32
+  train_cycle_steps: 4
+  sampler: heun
+grad_clip_norm: 1.0
+stages:
+  stage1:
+    epochs: 0
+    require_face_detection_gate: false
+  stage2:
+    epochs: 40
+    lambda_initial: 0.02
+    lambda_max: 0.02
+    lambda_growth: 0.0
+validation:
+  enabled: true
+  index: data/index/val.jsonl
+  features: artifacts/e0_features/val
+  max_samples: 64
+  batch_size: 32
+  face_detection:
+    enabled: true
+    model_name: buffalo_l
