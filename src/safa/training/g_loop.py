@@ -30,6 +30,7 @@ class DistributedContext:
 class _GeneratorTrainingStep:
     def __new__(cls, generator, e0, generator_config: FlowGeneratorConfig):
         from torch import nn
+        schedule = generator_config.cycle_steps_schedule
 
         class _Module(nn.Module):
             def __init__(self):
@@ -37,6 +38,8 @@ class _GeneratorTrainingStep:
                 self.generator = generator
                 self.e0 = e0
                 self.generator_config = generator_config
+                self._schedule = schedule
+                self._batch_idx = 0
 
             def forward(self, images, z, use_cycle: bool, lambda_cycle: float):
                 import torch
@@ -44,9 +47,13 @@ class _GeneratorTrainingStep:
                 cycle = flow_loss.new_tensor(0.0)
                 loss = flow_loss
                 if use_cycle:
+                    if self._schedule:
+                        cycle_steps = self._schedule[self._batch_idx % len(self._schedule)]
+                    else:
+                        cycle_steps = self.generator_config.train_cycle_steps
                     generated = self.generator.sample(
                         z,
-                        steps=self.generator_config.train_cycle_steps,
+                        steps=cycle_steps,
                         checkpoint_steps=True,
                     )
                     assert_finite_tensor("stage2_generated_image", generated)
@@ -54,6 +61,7 @@ class _GeneratorTrainingStep:
                     e0_out = self.e0(normalize_for_e0(generated))
                     cycle = cosine_cycle_loss(e0_out["embedding"], z)
                     loss = flow_loss + float(lambda_cycle) * cycle
+                    self._batch_idx += 1
                 return loss, flow_metrics["flow_matching_mse"].detach(), cycle.detach()
 
         return _Module()

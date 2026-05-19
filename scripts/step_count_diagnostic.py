@@ -47,6 +47,7 @@ def main():
 
     # Load E0
     e0, _ = load_e0_checkpoint(args.e0_checkpoint, device=str(device))
+    e0.to(device)
     e0.eval()
 
     # Load validation data

@@ -14,6 +14,7 @@ class FlowGeneratorConfig:
     condition_dim: int = 512
     sample_steps: int = 32
     train_cycle_steps: int = 8
+    cycle_steps_schedule: tuple[int, ...] = ()
     sampler: str = "heun"
 
     @classmethod
@@ -27,6 +28,7 @@ class FlowGeneratorConfig:
             condition_dim=int(payload.get("condition_dim", 512)),
             sample_steps=int(payload.get("sample_steps", 32)),
             train_cycle_steps=int(payload.get("train_cycle_steps", 8)),
+            cycle_steps_schedule=tuple(int(s) for s in payload["cycle_steps_schedule"]) if "cycle_steps_schedule" in payload and payload["cycle_steps_schedule"] else (),
             sampler=str(payload.get("sampler", "heun")),
         )
 
@@ -42,6 +44,7 @@ class FlowGeneratorConfig:
             "sample_steps": self.sample_steps,
             "train_cycle_steps": self.train_cycle_steps,
             "sampler": self.sampler,
+            **({"cycle_steps_schedule": list(self.cycle_steps_schedule)} if self.cycle_steps_schedule else {}),
         }
 
 

@@ -11,8 +11,9 @@ val_index: data/index/val.jsonl
 train_features: artifacts/e0_features/train
 val_features: artifacts/e0_features/val
 e0_checkpoint: artifacts/checkpoints/e0/best.pt
-out_dir: artifacts/checkpoints/g
-allow_stage2_without_stage1_gate: false
+out_dir: artifacts/checkpoints/g_v2
+resume_from: artifacts/checkpoints/g/best.pt
+allow_stage2_without_stage1_gate: true
 distributed:
   backend: gloo
 generator:
@@ -28,10 +29,8 @@ generator:
 grad_clip_norm: 1.0
 stages:
   stage1:
-    epochs: 80
-    require_face_detection_gate: true
-    face_detection_threshold: 0.95
-    stable_epochs: 3
+    epochs: 0
+    require_face_detection_gate: false
   stage2:
     epochs: 80
     lambda_initial: 0.005
