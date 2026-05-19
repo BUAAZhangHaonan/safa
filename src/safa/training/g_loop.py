@@ -226,7 +226,10 @@ def train_g_from_config(config: dict) -> dict:
                 history.append(metrics)
                 _save_generator(out_dir / "last.pt", _unwrap_model(training_module).generator, generator_config, config, metrics, history)
                 _write_json(out_dir / "last_metrics.json", metrics)
+                stage_best_path = out_dir / f"best_{stage_name}.pt"
                 if _is_better(metrics, history[:-1]):
+                    _save_generator(stage_best_path, _unwrap_model(training_module).generator, generator_config, config, metrics, history)
+                if _is_better_overall(metrics, history[:-1]):
                     _save_generator(best_checkpoint, _unwrap_model(training_module).generator, generator_config, config, metrics, history)
                 should_break = stage_name == "stage1" and stage1_stable_hits >= int(stages["stage1"].get("stable_epochs", 1))
             lambda_cycle, baseline_detection_rate, stage1_stable_hits, should_break = _sync_epoch_control(
@@ -570,6 +573,25 @@ def _is_better(metrics: dict, previous: list[dict]) -> bool:
         )
     return metrics["loss"] < best["loss"]
 
+
+
+def _is_better_overall(metrics: dict, previous: list[dict]) -> bool:
+    """Compare current epoch against ALL previous epochs regardless of stage.
+
+    Unlike _is_better which only compares within the same stage, this function
+    compares across stages. This prevents a weak first epoch of a new stage from
+    overwriting a better checkpoint from the previous stage.
+    """
+    if not previous:
+        return True
+    current_cosine = metrics.get("validation_latent_cosine_mean", -1.0)
+    best = max(previous, key=lambda item: (item.get("validation_latent_cosine_mean", -1.0), -item["loss"]))
+    if current_cosine >= 0.0 or best.get("validation_latent_cosine_mean") is not None:
+        return (current_cosine, -metrics["loss"]) > (
+            best.get("validation_latent_cosine_mean", -1.0),
+            -best["loss"],
+        )
+    return metrics["loss"] < best["loss"]
 
 def _save_generator(path: Path, generator, generator_config: FlowGeneratorConfig, train_config: dict, metrics: dict, history: list[dict]) -> None:
     import torch
