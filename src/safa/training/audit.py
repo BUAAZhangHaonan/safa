@@ -51,7 +51,22 @@ def _audit_source(path: Path) -> None:
     text = path.read_text(encoding="utf-8").lower()
     violations = [term for term in FORBIDDEN_TRAINING_TERMS if term in text]
     allowed_comments = ("identity_supervision\": false", '"identity_supervision": false')
-    filtered = [term for term in violations if term not in allowed_comments]
+    filtered = []
+    for term in violations:
+        start = 0
+        has_forbidden_occurrence = False
+        while True:
+            idx = text.find(term, start)
+            if idx == -1:
+                break
+            context = text[max(0, idx - 60):idx + len(term) + 60]
+            is_allowed = any(ac in context for ac in allowed_comments)
+            if not is_allowed:
+                has_forbidden_occurrence = True
+                break
+            start = idx + 1
+        if has_forbidden_occurrence:
+            filtered.append(term)
     if filtered:
         raise RuntimeError(f"Forbidden identity supervision terms in {path}: {filtered}")
 
