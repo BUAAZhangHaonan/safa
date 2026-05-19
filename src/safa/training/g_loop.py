@@ -200,6 +200,7 @@ def train_g_from_config(config: dict) -> dict:
                     print(f"WARNING: non-finite G loss detected: {loss_val}, skipping batch entirely")
                     dummy = sum(p.sum() for p in _unwrap_model(training_module).generator.parameters())
                     (0.0 * dummy).backward()
+                    optimizer.step()
                     continue
                 assert_finite_tensor("g_loss", loss)
                 loss.backward()
