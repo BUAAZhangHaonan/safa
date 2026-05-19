@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import math
 import json
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 from safa.data.feature_dataset import FeatureAlignedAffectNet
@@ -92,6 +93,9 @@ def train_g_from_config(config: dict) -> dict:
 
     set_seed(int(config["seed"]))
     torch.backends.cudnn.benchmark = True
+    use_amp = bool(config.get("amp", False))
+    if distributed.is_main:
+        print(f"AMP (bfloat16): {"enabled" if use_amp else "disabled"}")
     audit_no_identity_supervision(config)
     distributed = _init_distributed(config)
     device = distributed.device
@@ -194,7 +198,9 @@ def train_g_from_config(config: dict) -> dict:
                 images = batch["image"].to(device, non_blocking=True)
                 z = batch["z"].to(device, non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
-                loss, flow_mse, cycle = training_module(images, z, stage_name == "stage2", lambda_cycle)
+                amp_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if use_amp else nullcontext()
+                with amp_ctx:
+                    loss, flow_mse, cycle = training_module(images, z, stage_name == "stage2", lambda_cycle)
                 loss_val = float(loss.detach().cpu())
                 if not math.isfinite(loss_val):
                     print(f"WARNING: non-finite G loss detected: {loss_val}, skipping batch entirely")
@@ -223,7 +229,7 @@ def train_g_from_config(config: dict) -> dict:
             should_break = False
             if distributed.is_main:
                 metrics.update({"stage": stage_name, "stage_epoch": stage_epoch, "lambda_cycle": lambda_cycle})
-                validation_metrics = _evaluate_validation(_unwrap_model(training_module).generator, e0, validation_loader, detector, device, generator_config)
+                validation_metrics = _evaluate_validation(_unwrap_model(training_module).generator, e0, validation_loader, detector, device, generator_config, use_amp=use_amp)
                 metrics.update({f"validation_{key}": value for key, value in validation_metrics.items()})
                 if stage_name == "stage1" and validation_metrics.get("face_detection_rate") is not None:
                     baseline_detection_rate = validation_metrics["face_detection_rate"]
@@ -535,7 +541,7 @@ def _build_detector(config: dict, device: str):
     return InsightFaceDetector(model_name=str(detection["model_name"]), device=device)
 
 
-def _evaluate_validation(generator, e0, loader, detector, device, generator_config: FlowGeneratorConfig) -> dict:
+def _evaluate_validation(generator, e0, loader, detector, device, generator_config: FlowGeneratorConfig, *, use_amp: bool = False) -> dict:
     if loader is None:
         return {}
     import torch
@@ -547,7 +553,8 @@ def _evaluate_validation(generator, e0, loader, detector, device, generator_conf
     detection_success = 0
     latent_cosine_sum = 0.0
     source_preserved_sum = 0.0
-    with torch.no_grad():
+    amp_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if use_amp else nullcontext()
+    with torch.no_grad(), amp_ctx:
         for batch in loader:
             source = batch["image"].to(device, non_blocking=True)
             z = batch["z"].to(device, non_blocking=True)
