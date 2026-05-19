@@ -573,6 +573,14 @@ def _evaluate_validation(generator, e0, loader, detector, device, generator_conf
     return metrics
 
 
+def _composite_score(item: dict) -> float:
+    """cosine x face_detection_rate. Penalizes degenerate checkpoints
+    that achieve high cosine by generating non-face outputs."""
+    cosine = item.get("validation_latent_cosine_mean", -1.0)
+    face_det = item.get("validation_face_detection_rate", 1.0)
+    return cosine * face_det
+
+
 def _is_better(metrics: dict, previous: list[dict]) -> bool:
     if not previous:
         return True
@@ -580,34 +588,23 @@ def _is_better(metrics: dict, previous: list[dict]) -> bool:
     same_stage = [m for m in previous if m.get("stage") == stage]
     if not same_stage:
         return True
-    current_cosine = metrics.get("validation_latent_cosine_mean", -1.0)
-    best = max(same_stage, key=lambda item: (item.get("validation_latent_cosine_mean", -1.0), -item["loss"]))
-    if current_cosine >= 0.0 or best.get("validation_latent_cosine_mean") is not None:
-        return (current_cosine, -metrics["loss"]) > (
-            best.get("validation_latent_cosine_mean", -1.0),
-            -best["loss"],
-        )
-    return metrics["loss"] < best["loss"]
-
+    current_score = _composite_score(metrics)
+    best = max(same_stage, key=lambda item: (_composite_score(item), -item["loss"]))
+    return (current_score, -metrics["loss"]) > (_composite_score(best), -best["loss"])
 
 
 def _is_better_overall(metrics: dict, previous: list[dict]) -> bool:
     """Compare current epoch against ALL previous epochs regardless of stage.
 
     Unlike _is_better which only compares within the same stage, this function
-    compares across stages. This prevents a weak first epoch of a new stage from
-    overwriting a better checkpoint from the previous stage.
+    compares across stages. Uses composite score (cosine x face_det) to prevent
+    selecting degenerate checkpoints with high cosine but zero face quality.
     """
     if not previous:
         return True
-    current_cosine = metrics.get("validation_latent_cosine_mean", -1.0)
-    best = max(previous, key=lambda item: (item.get("validation_latent_cosine_mean", -1.0), -item["loss"]))
-    if current_cosine >= 0.0 or best.get("validation_latent_cosine_mean") is not None:
-        return (current_cosine, -metrics["loss"]) > (
-            best.get("validation_latent_cosine_mean", -1.0),
-            -best["loss"],
-        )
-    return metrics["loss"] < best["loss"]
+    current_score = _composite_score(metrics)
+    best = max(previous, key=lambda item: (_composite_score(item), -item["loss"]))
+    return (current_score, -metrics["loss"]) > (_composite_score(best), -best["loss"])
 
 def _save_generator(path: Path, generator, generator_config: FlowGeneratorConfig, train_config: dict, metrics: dict, history: list[dict]) -> None:
     import torch
