@@ -208,13 +208,13 @@ def train_e0_from_config(config: dict) -> dict:
     label_smoothing = float(config.get("label_smoothing", 0.0))
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
 
-    # --- LR scheduler ---
+    # --- warmup + scheduler ---
     epochs = int(config["epochs"])
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs - warmup_epochs), eta_min=1e-6)
-
-    # --- warmup ---
     warmup_epochs = int(config.get("warmup_epochs", 0))
     base_lr = float(config["learning_rate"])
+
+    # --- LR scheduler ---
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs - warmup_epochs), eta_min=1e-6)
 
     # --- early stopping ---
     early_stopping_patience = int(config.get("early_stopping_patience", 0))
