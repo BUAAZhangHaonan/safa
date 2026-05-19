@@ -7,9 +7,7 @@ weight_decay: 0.0
 image_size: 224
 embedding_dim: 512
 train_index: data/index/train.jsonl
-val_index: data/index/val.jsonl
 train_features: artifacts/e0_features/train
-val_features: artifacts/e0_features/val
 e0_checkpoint: artifacts/checkpoints/e0/best.pt
 out_dir: artifacts/checkpoints/g_v2
 resume_from: artifacts/checkpoints/g/best.pt

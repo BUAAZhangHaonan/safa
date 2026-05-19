@@ -85,19 +85,6 @@ def load_manifest(cache_dir: str | Path) -> FeatureCacheManifest:
     return FeatureCacheManifest.from_mapping(data)
 
 
-def validate_manifest(cache_dir: str | Path, index_path: str | Path, checkpoint_path: str | Path) -> FeatureCacheManifest:
-    cache_path = Path(cache_dir)
-    manifest = load_manifest(cache_path)
-    if manifest.index_sha256 != sha256_file(index_path):
-        raise ValueError("Feature cache index_sha256 does not match the requested index")
-    if manifest.encoder_checkpoint_sha256 != sha256_file(checkpoint_path):
-        raise ValueError("Feature cache encoder_checkpoint_sha256 does not match the requested checkpoint")
-    shard_path = cache_path / manifest.shard
-    if manifest.shard_sha256 != sha256_file(shard_path):
-        raise ValueError("Feature cache shard_sha256 does not match shard contents")
-    return manifest
-
-
 def load_feature_cache(cache_dir: str | Path, index_path: str | Path, checkpoint_path: str | Path):
     import hashlib
     import io
