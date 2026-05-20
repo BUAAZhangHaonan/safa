@@ -158,8 +158,7 @@ def train_e0_from_config(config: dict) -> dict:
             loss_val = float(loss.detach().cpu())
             if not math.isfinite(loss_val):
                 print(f"WARNING: non-finite E0 loss detected: {loss_val} at epoch={epoch} batch={batch_idx}, skipping batch entirely")
-                (output["logits"] * 0.0).sum().backward()
-                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
                 continue
             assert_finite_tensor("e0_loss", loss)
             loss.backward()
