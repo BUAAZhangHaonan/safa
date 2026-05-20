@@ -216,9 +216,7 @@ def train_g_from_config(config: dict) -> dict:
                 loss_val = float(loss.detach().cpu())
                 if not math.isfinite(loss_val):
                     print(f"WARNING: non-finite G loss detected: {loss_val}, skipping batch entirely")
-                    dummy = sum(p.sum() for p in unwrap_model(training_module).generator.parameters())
-                    (0.0 * dummy).backward()
-                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
                     continue
                 assert_finite_tensor("g_loss", loss)
                 loss.backward()
@@ -233,8 +231,10 @@ def train_g_from_config(config: dict) -> dict:
                 batch_size = int(z.shape[0])
                 seen += batch_size
                 totals["loss"] += float(loss.detach().cpu()) * batch_size
-                totals["flow_matching_mse"] += float(flow_mse.cpu()) * batch_size
-                totals["cycle"] += float(cycle.detach().cpu()) * batch_size
+                if math.isfinite(flow_mse.item()):
+                    totals["flow_matching_mse"] += float(flow_mse.cpu()) * batch_size
+                if math.isfinite(cycle.item()):
+                    totals["cycle"] += float(cycle.detach().cpu()) * batch_size
                 totals["grad_norm"] += batch_grad_norm * batch_size
 
             metrics = _reduce_epoch_metrics(totals, seen, device, distributed)
