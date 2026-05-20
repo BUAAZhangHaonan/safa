@@ -4,8 +4,6 @@ from pathlib import Path
 import math
 import json
 from contextlib import nullcontext
-from dataclasses import dataclass
-
 from safa.data.feature_dataset import FeatureAlignedAffectNet
 from safa.evaluation.recognizers import InsightFaceDetector
 from safa.models.e0 import assert_e0_frozen, freeze_e0, load_e0_checkpoint
@@ -13,19 +11,15 @@ from safa.models.generator import FlowGeneratorConfig, build_generator
 from safa.training.audit import audit_no_identity_supervision
 from safa.training.losses import cosine_cycle_loss, normalize_for_e0
 from safa.training.transforms import generator_image_transform
-from safa.utils.device import assert_finite_tensor, require_cuda_device
+from safa.utils.device import assert_finite_tensor
+from safa.utils.distributed import (
+    DistributedContext,
+    barrier,
+    cleanup_distributed,
+    init_distributed,
+    unwrap_model,
+)
 from safa.utils.seed import set_seed
-
-
-@dataclass(frozen=True)
-class DistributedContext:
-    enabled: bool
-    rank: int
-    local_rank: int
-    world_size: int
-    is_main: bool
-    device: object
-    backend: str
 
 
 class _GeneratorTrainingStep:
@@ -97,7 +91,7 @@ def train_g_from_config(config: dict) -> dict:
     set_seed(int(config["seed"]))
     torch.backends.cudnn.benchmark = True
     audit_no_identity_supervision(config)
-    distributed = _init_distributed(config)
+    distributed = init_distributed(config)
     device = distributed.device
     num_workers = int(config["num_workers"])
     if num_workers < 1:
@@ -109,7 +103,7 @@ def train_g_from_config(config: dict) -> dict:
     if distributed.is_main:
         amp_status = "enabled" if use_amp else "disabled"
         print(f"AMP (bfloat16): {amp_status}")
-    _barrier(distributed)
+    barrier(distributed)
 
     e0, _ = load_e0_checkpoint(config["e0_checkpoint"], device=str(device))
     e0.to(device)
@@ -140,7 +134,7 @@ def train_g_from_config(config: dict) -> dict:
     training_module = _GeneratorTrainingStep(generator, e0, generator_config).to(device)
     if distributed.enabled:
         training_module = DistributedDataParallel(training_module, device_ids=[distributed.local_rank], output_device=distributed.local_rank)
-    optimizer = torch.optim.AdamW(_unwrap_model(training_module).generator.parameters(), lr=float(config["learning_rate"]), weight_decay=float(config["weight_decay"]))
+    optimizer = torch.optim.AdamW(unwrap_model(training_module).generator.parameters(), lr=float(config["learning_rate"]), weight_decay=float(config["weight_decay"]))
     assert_e0_frozen(e0, optimizer)
     set_seed(int(config["seed"]) + distributed.rank)
 
@@ -200,7 +194,7 @@ def train_g_from_config(config: dict) -> dict:
                 history,
             )
             if blocked:
-                _cleanup_distributed(distributed)
+                cleanup_distributed(distributed)
                 raise RuntimeError("Stage 2 is blocked by the Stage 1 face detection gate; see manifest.json on rank 0")
         epochs = int(stages[stage_name]["epochs"])
         stage_epoch = -1
@@ -208,7 +202,7 @@ def train_g_from_config(config: dict) -> dict:
             if train_sampler is not None:
                 train_sampler.set_epoch(total_epoch + stage_epoch)
             training_module.train()
-            _unwrap_model(training_module).reset_batch_idx()
+            unwrap_model(training_module).reset_batch_idx()
             e0.eval()
             totals = {"loss": 0.0, "flow_matching_mse": 0.0, "cycle": 0.0, "grad_norm": 0.0}
             seen = 0
@@ -222,7 +216,7 @@ def train_g_from_config(config: dict) -> dict:
                 loss_val = float(loss.detach().cpu())
                 if not math.isfinite(loss_val):
                     print(f"WARNING: non-finite G loss detected: {loss_val}, skipping batch entirely")
-                    dummy = sum(p.sum() for p in _unwrap_model(training_module).generator.parameters())
+                    dummy = sum(p.sum() for p in unwrap_model(training_module).generator.parameters())
                     (0.0 * dummy).backward()
                     optimizer.step()
                     continue
@@ -231,7 +225,7 @@ def train_g_from_config(config: dict) -> dict:
                 batch_grad_norm = 0.0
                 if "grad_clip_norm" in config:
                     grad_norm = torch.nn.utils.clip_grad_norm_(
-                        _unwrap_model(training_module).generator.parameters(),
+                        unwrap_model(training_module).generator.parameters(),
                         config["grad_clip_norm"],
                     )
                     batch_grad_norm = float(grad_norm) if isinstance(grad_norm, float) else float(grad_norm.detach().cpu())
@@ -247,7 +241,7 @@ def train_g_from_config(config: dict) -> dict:
             should_break = False
             if distributed.is_main:
                 metrics.update({"stage": stage_name, "stage_epoch": stage_epoch, "lambda_cycle": lambda_cycle})
-                validation_metrics = _evaluate_validation(_unwrap_model(training_module).generator, e0, validation_loader, detector, device, generator_config, use_amp=use_amp)
+                validation_metrics = _evaluate_validation(unwrap_model(training_module).generator, e0, validation_loader, detector, device, generator_config, use_amp=use_amp)
                 metrics.update({f"validation_{key}": value for key, value in validation_metrics.items()})
                 if stage_name == "stage1" and validation_metrics.get("face_detection_rate") is not None:
                     baseline_detection_rate = validation_metrics["face_detection_rate"]
@@ -264,13 +258,13 @@ def train_g_from_config(config: dict) -> dict:
                     lambda_cycle = next_lambda
 
                 history.append(metrics)
-                _save_generator(out_dir / "last.pt", _unwrap_model(training_module).generator, generator_config, config, metrics, history)
+                _save_generator(out_dir / "last.pt", unwrap_model(training_module).generator, generator_config, config, metrics, history)
                 _write_json(out_dir / "last_metrics.json", metrics)
                 stage_best_path = out_dir / f"best_{stage_name}.pt"
                 if _is_better(metrics, history[:-1]):
-                    _save_generator(stage_best_path, _unwrap_model(training_module).generator, generator_config, config, metrics, history)
+                    _save_generator(stage_best_path, unwrap_model(training_module).generator, generator_config, config, metrics, history)
                 if _is_better_overall(metrics, history[:-1]):
-                    _save_generator(best_checkpoint, _unwrap_model(training_module).generator, generator_config, config, metrics, history)
+                    _save_generator(best_checkpoint, unwrap_model(training_module).generator, generator_config, config, metrics, history)
                 should_break = stage_name == "stage1" and stage1_stable_hits >= int(stages["stage1"].get("stable_epochs", 1))
             lambda_cycle, baseline_detection_rate, stage1_stable_hits, should_break = _sync_epoch_control(
                 lambda_cycle,
@@ -298,80 +292,9 @@ def train_g_from_config(config: dict) -> dict:
             "distributed": _distributed_manifest(distributed),
         }
         _write_json(out_dir / "manifest.json", manifest)
-    _barrier(distributed)
-    _cleanup_distributed(distributed)
+    barrier(distributed)
+    cleanup_distributed(distributed)
     return manifest
-
-
-def _init_distributed(config: dict) -> DistributedContext:
-    import os
-    import torch
-    import torch.distributed as dist
-
-    world_size_raw = os.environ.get("WORLD_SIZE")
-    rank_raw = os.environ.get("RANK")
-    local_rank_raw = os.environ.get("LOCAL_RANK")
-    world_size = int(world_size_raw) if world_size_raw else 1
-    if world_size > 1:
-        if rank_raw is None or local_rank_raw is None:
-            raise RuntimeError("DDP requires RANK and LOCAL_RANK when WORLD_SIZE > 1")
-        rank = int(rank_raw)
-        local_rank = int(local_rank_raw)
-        backend = str(config.get("distributed", {}).get("backend", "nccl"))
-        if backend not in {"nccl", "gloo"}:
-            raise ValueError(f"Unsupported DDP backend: {backend}")
-        device = require_cuda_device(f"cuda:{local_rank}")
-        torch.cuda.set_device(device)
-        if not dist.is_initialized():
-            if backend == "nccl":
-                dist.init_process_group(backend=backend, device_id=device)
-            else:
-                dist.init_process_group(backend=backend)
-        return DistributedContext(
-            enabled=True,
-            rank=rank,
-            local_rank=local_rank,
-            world_size=world_size,
-            is_main=rank == 0,
-            device=device,
-            backend=backend,
-        )
-    device = require_cuda_device(str(config["device"]))
-    if device.index is not None:
-        torch.cuda.set_device(device)
-    return DistributedContext(
-        enabled=False,
-        rank=0,
-        local_rank=device.index or 0,
-        world_size=1,
-        is_main=True,
-        device=device,
-        backend="single",
-    )
-
-
-def _cleanup_distributed(distributed: DistributedContext) -> None:
-    if not distributed.enabled:
-        return
-    import torch.distributed as dist
-
-    if dist.is_available() and dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def _barrier(distributed: DistributedContext) -> None:
-    if not distributed.enabled:
-        return
-    import torch.distributed as dist
-
-    if distributed.backend == "nccl":
-        dist.barrier(device_ids=[distributed.local_rank])
-    else:
-        dist.barrier()
-
-
-def _unwrap_model(model):
-    return model.module if hasattr(model, "module") else model
 
 
 def _reduce_epoch_metrics(totals: dict, seen: int, device, distributed: DistributedContext) -> dict:
@@ -634,7 +557,7 @@ def _is_better_overall(metrics: dict, previous: list[dict]) -> bool:
 def _save_generator(path: Path, generator, generator_config: FlowGeneratorConfig, train_config: dict, metrics: dict, history: list[dict]) -> None:
     import torch
 
-    generator = _unwrap_model(generator)
+    generator = unwrap_model(generator)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
