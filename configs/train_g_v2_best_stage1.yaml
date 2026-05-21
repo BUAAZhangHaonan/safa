@@ -1,0 +1,49 @@
+# Stage 1 prerequisite for configs/train_g_v2_best.yaml.
+# Produces artifacts/checkpoints/g_v2_best_stage1/best_stage1.pt.
+seed: 1337
+sampling_seed: 1337
+device: cuda:0
+num_workers: 8
+batch_size: 32
+learning_rate: 0.0003
+weight_decay: 0.0
+image_size: 224
+embedding_dim: 512
+train_index: data/index/train.jsonl
+train_features: artifacts/e0_features/train
+e0_checkpoint: artifacts/checkpoints/e0/best.pt
+out_dir: artifacts/checkpoints/g_v2_best_stage1
+allow_stage2_without_stage1_gate: true
+distributed:
+  backend: gloo
+generator:
+  model_type: conditional_flow_matching
+  base_channels: 32
+  channel_multipliers: [1, 2, 4, 4]
+  time_embedding_dim: 128
+  condition_dim: 512
+  sample_steps: 32
+  train_cycle_steps: 4
+  cycle_steps_schedule: [4, 8, 16, 32]
+  sampler: heun
+grad_clip_norm: 1.0
+stages:
+  stage1:
+    epochs: 80
+    require_face_detection_gate: true
+    face_detection_threshold: 0.95
+    stable_epochs: 3
+  stage2:
+    epochs: 0
+    lambda_initial: 0.01
+    lambda_max: 0.01
+    lambda_growth: 0
+validation:
+  enabled: true
+  index: data/index/val.jsonl
+  features: artifacts/e0_features/val
+  max_samples: 512
+  batch_size: 32
+  face_detection:
+    enabled: true
+    model_name: buffalo_l

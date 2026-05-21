@@ -1,13 +1,48 @@
 from __future__ import annotations
 
+from argparse import Namespace
 from pathlib import Path
 import subprocess
 import unittest
+from unittest.mock import patch
 
 import yaml
 
 
 class TrainGV2BestEntrypointTests(unittest.TestCase):
+    def test_v2_best_stage1_config_is_complete_prerequisite_for_v2_best(self) -> None:
+        path = Path("configs/train_g_v2_best_stage1.yaml")
+        self.assertTrue(path.is_file())
+        config = yaml.safe_load(path.read_text(encoding="utf-8"))
+        v2_best = yaml.safe_load(Path("configs/train_g_v2_best.yaml").read_text(encoding="utf-8"))
+
+        self.assertEqual(config["out_dir"], "artifacts/checkpoints/g_v2_best_stage1")
+        self.assertEqual(v2_best["resume_from"], f"{config['out_dir']}/best_stage1.pt")
+        self.assertNotIn("resume_from", config)
+        self.assertEqual(config["stages"]["stage1"]["epochs"], 80)
+        self.assertEqual(config["stages"]["stage2"]["epochs"], 0)
+        self.assertEqual(config["generator"]["base_channels"], 32)
+        self.assertEqual(config["sampling_seed"], v2_best["sampling_seed"])
+        self.assertEqual(config["generator"]["cycle_steps_schedule"], [4, 8, 16, 32])
+        self.assertEqual(config["train_index"], v2_best["train_index"])
+        self.assertEqual(config["train_features"], v2_best["train_features"])
+        self.assertEqual(config["e0_checkpoint"], v2_best["e0_checkpoint"])
+
+        from safa.cli import train_g
+
+        captured: dict = {}
+
+        def fake_train_g_from_config(runner_config: dict) -> dict:
+            captured.update(runner_config)
+            return {"ok": True}
+
+        with patch.object(train_g, "parse_args", return_value=Namespace(config=str(path))), patch.object(
+            train_g, "train_g_from_config", side_effect=fake_train_g_from_config
+        ):
+            train_g.main()
+
+        self.assertEqual(captured["out_dir"], "artifacts/checkpoints/g_v2_best_stage1")
+
     def test_v2_best_config_documents_fixed_low_lambda_recipe(self) -> None:
         path = Path("configs/train_g_v2_best.yaml")
         self.assertTrue(path.is_file())
