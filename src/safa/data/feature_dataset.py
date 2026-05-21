@@ -9,13 +9,22 @@ from safa.data.index_schema import read_index
 
 class FeatureAlignedAffectNet:
     def __init__(self, index_path: str | Path, feature_dir: str | Path, e0_checkpoint: str | Path, transform):
+        import torch
+
         self.records = read_index(Path(index_path))
         payload, manifest = load_feature_cache(feature_dir, index_path, e0_checkpoint)
         sample_ids = list(payload["sample_ids"])
         if sample_ids != [record.sample_id for record in self.records]:
             raise ValueError("Feature cache sample_id order does not match index order")
-        self.features = payload["features"].float()
-        self.labels = [int(item) for item in payload["labels"]]
+        features = payload["features"]
+        if features.dtype != torch.float32:
+            raise ValueError(f"Feature cache tensor must be float32 for training data, got {features.dtype}")
+        labels = list(payload["labels"])
+        invalid_labels = [item for item in labels if type(item) is not int]
+        if invalid_labels:
+            raise ValueError(f"Feature cache labels must be int values, got {type(invalid_labels[0]).__name__}")
+        self.features = features
+        self.labels = labels
         self.manifest = manifest
         self.transform = transform
 
@@ -36,4 +45,3 @@ class FeatureAlignedAffectNet:
             "label": label,
             "sample_id": record.sample_id,
         }
-

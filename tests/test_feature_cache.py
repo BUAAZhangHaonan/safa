@@ -35,6 +35,26 @@ class FeatureCacheManifestTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             FeatureCacheManifest.from_mapping({**data, "l2_normalized": False})
 
+    def test_manifest_rejects_wrong_field_types_without_coercion(self) -> None:
+        data = self._manifest_payload(feature_dim=128)
+        invalid_values = {
+            "dataset": 123,
+            "index_path": Path("index.jsonl"),
+            "index_sha256": 123,
+            "encoder_checkpoint": 123,
+            "encoder_checkpoint_sha256": 123,
+            "num_samples": "1",
+            "feature_dim": "128",
+            "l2_normalized": "false",
+            "dtype": 123,
+            "shard": 123,
+            "shard_sha256": 123,
+        }
+        for field, value in invalid_values.items():
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError):
+                    FeatureCacheManifest.from_mapping({**data, field: value})
+
     def test_load_feature_cache_uses_manifest_feature_dim(self) -> None:
         import torch
 
@@ -82,6 +102,56 @@ class FeatureCacheManifestTests(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 load_feature_cache(root, index_path, checkpoint_path)
+
+    def test_load_feature_cache_rejects_dtype_mismatch(self) -> None:
+        import torch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            index_path = root / "index.jsonl"
+            checkpoint_path = root / "best.pt"
+            index_path.write_text("index", encoding="utf-8")
+            checkpoint_path.write_text("checkpoint", encoding="utf-8")
+
+            features = torch.zeros(1, 128, dtype=torch.float64)
+            features[0, 0] = 1.0
+            shard_path = root / "features.pt"
+            torch.save({"features": features, "sample_ids": ["sample-1"], "labels": [0]}, shard_path)
+
+            manifest = self._manifest_payload(feature_dim=128, shard_sha256=sha256_file(shard_path))
+            manifest["index_sha256"] = sha256_file(index_path)
+            manifest["encoder_checkpoint_sha256"] = sha256_file(checkpoint_path)
+            (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+            with self.assertRaises(ValueError):
+                load_feature_cache(root, index_path, checkpoint_path)
+
+    def test_load_feature_cache_rejects_sample_id_and_label_length_mismatch(self) -> None:
+        import torch
+
+        for payload_override in ({"sample_ids": []}, {"labels": []}):
+            with self.subTest(payload_override=payload_override):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    index_path = root / "index.jsonl"
+                    checkpoint_path = root / "best.pt"
+                    index_path.write_text("index", encoding="utf-8")
+                    checkpoint_path.write_text("checkpoint", encoding="utf-8")
+
+                    features = torch.zeros(1, 128)
+                    features[0, 0] = 1.0
+                    payload = {"features": features, "sample_ids": ["sample-1"], "labels": [0]}
+                    payload.update(payload_override)
+                    shard_path = root / "features.pt"
+                    torch.save(payload, shard_path)
+
+                    manifest = self._manifest_payload(feature_dim=128, shard_sha256=sha256_file(shard_path))
+                    manifest["index_sha256"] = sha256_file(index_path)
+                    manifest["encoder_checkpoint_sha256"] = sha256_file(checkpoint_path)
+                    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+                    with self.assertRaises(ValueError):
+                        load_feature_cache(root, index_path, checkpoint_path)
 
     def test_manifest_requires_feature_dim(self) -> None:
         data = {
