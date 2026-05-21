@@ -42,6 +42,97 @@ class GeneratorContractTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             generator(torch.randn(2, 128), image=torch.randn(2, 3, 64, 64))
 
+    def test_generator_sample_signature_accepts_keyword_only_controls(self) -> None:
+        from safa.models.generator import ConditionalFlowGenerator
+
+        generator = ConditionalFlowGenerator(self._small_config())
+        signature = inspect.signature(generator.sample)
+
+        self.assertEqual([name for name in signature.parameters], ["z", "steps", "checkpoint_steps", "x_init", "clamp_output"])
+        self.assertEqual(signature.parameters["x_init"].kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertEqual(signature.parameters["x_init"].default, None)
+        self.assertEqual(signature.parameters["clamp_output"].kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertEqual(signature.parameters["clamp_output"].default, True)
+
+    def test_generator_sample_with_x_init_is_deterministic(self) -> None:
+        import torch
+
+        from safa.models.generator import ConditionalFlowGenerator
+
+        generator = ConditionalFlowGenerator(self._small_config())
+        z = torch.randn(2, 128)
+        x_init = torch.randn(2, 3, 64, 64)
+
+        first = generator.sample(z, x_init=x_init)
+        second = generator.sample(z, x_init=x_init)
+
+        self.assertTrue(torch.equal(first, second))
+
+    def test_generator_sample_uses_x_init(self) -> None:
+        import torch
+        from torch import nn
+
+        from safa.models.generator import ConditionalFlowGenerator
+
+        class ZeroVectorField(nn.Module):
+            def forward(self, x_t, t, z):
+                return torch.zeros_like(x_t)
+
+        generator = ConditionalFlowGenerator(self._small_config())
+        generator.vector_field = ZeroVectorField()
+        z = torch.randn(2, 128)
+
+        first = generator.sample(z, x_init=torch.full((2, 3, 64, 64), -0.5))
+        second = generator.sample(z, x_init=torch.full((2, 3, 64, 64), 0.5))
+
+        self.assertFalse(torch.equal(first, second))
+
+    def test_generator_sample_rejects_invalid_x_init(self) -> None:
+        import torch
+
+        from safa.models.generator import ConditionalFlowGenerator
+
+        generator = ConditionalFlowGenerator(self._small_config())
+        z = torch.randn(2, 128)
+
+        with self.assertRaises(ValueError):
+            generator.sample(z, x_init=torch.randn(2, 3, 32, 32))
+        with self.assertRaises(TypeError):
+            generator.sample(z, x_init=torch.randn(2, 3, 64, 64, dtype=torch.float64))
+        with self.assertRaises(ValueError):
+            generator.sample(z, x_init=torch.empty((2, 3, 64, 64), device="meta"))
+
+    def test_generator_sample_clamps_output_by_default(self) -> None:
+        import torch
+
+        from safa.models.generator import ConditionalFlowGenerator
+
+        generator = ConditionalFlowGenerator(self._small_config())
+        output = generator.sample(torch.randn(2, 128))
+
+        self.assertGreaterEqual(float(output.detach().min()), 0.0)
+        self.assertLessEqual(float(output.detach().max()), 1.0)
+
+    def test_generator_sample_can_return_unclamped_image_space_values(self) -> None:
+        import torch
+        from torch import nn
+
+        from safa.models.generator import ConditionalFlowGenerator
+
+        class ZeroVectorField(nn.Module):
+            def forward(self, x_t, t, z):
+                return torch.zeros_like(x_t)
+
+        generator = ConditionalFlowGenerator(self._small_config())
+        generator.vector_field = ZeroVectorField()
+        z = torch.randn(2, 128)
+        x_init = torch.full((2, 3, 64, 64), 3.0)
+
+        output = generator.sample(z, x_init=x_init, clamp_output=False)
+
+        self.assertGreater(float(output.detach().max()), 1.0)
+        self.assertTrue(torch.equal(output, (x_init + 1.0) * 0.5))
+
     def test_generator_rejects_wrong_z_shape(self) -> None:
         import torch
 

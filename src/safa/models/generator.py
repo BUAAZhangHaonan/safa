@@ -188,12 +188,16 @@ class ConditionalFlowGenerator:
                 else:
                     raise ValueError(f"Unsupported sampler: {self.config.sampler}")
 
-            def sample(self, z, steps: int | None = None, checkpoint_steps: bool = False):
+            def sample(self, z, steps: int | None = None, checkpoint_steps: bool = False, *, x_init=None, clamp_output: bool = True):
                 self._validate_z(z)
                 steps = int(steps or self.config.sample_steps)
                 if steps <= 0:
                     raise ValueError(f"sample steps must be positive, got {steps}")
-                x = torch.randn(z.shape[0], 3, self.image_size, self.image_size, device=z.device, dtype=z.dtype)
+                if x_init is None:
+                    x = torch.randn(z.shape[0], 3, self.image_size, self.image_size, device=z.device, dtype=z.dtype)
+                else:
+                    self._validate_x_init(x_init, z)
+                    x = x_init
                 divergence_step = None
                 for index in range(steps):
                     if checkpoint_steps:
@@ -210,7 +214,9 @@ class ConditionalFlowGenerator:
                             print(f"WARNING: ODE solver divergence at step {index}/{steps}, max_abs={max_abs:.2f}")
                 if divergence_step is not None and divergence_step < steps - 1:
                     print(f"WARNING: ODE solver diverged at step {divergence_step}, subsequent {steps - 1 - divergence_step} steps operated on diverged values")
-                return ((x.clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0)
+                if clamp_output:
+                    return ((x.clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0)
+                return (x + 1.0) * 0.5
 
             def flow_matching_loss(self, x_1, z, generator=None):
                 self._validate_z(z)
@@ -233,6 +239,17 @@ class ConditionalFlowGenerator:
             def _validate_z(self, z):
                 if z.ndim != 2 or z.shape[1] != self.embedding_dim:
                     raise ValueError(f"G expects z with shape [B,{self.embedding_dim}], got {tuple(z.shape)}")
+
+            def _validate_x_init(self, x_init, z):
+                if not isinstance(x_init, torch.Tensor):
+                    raise TypeError(f"x_init must be a torch.Tensor, got {type(x_init).__name__}")
+                expected_shape = (z.shape[0], 3, self.image_size, self.image_size)
+                if tuple(x_init.shape) != expected_shape:
+                    raise ValueError(f"x_init must have shape {expected_shape}, got {tuple(x_init.shape)}")
+                if x_init.device != z.device:
+                    raise ValueError(f"x_init device must match z device {z.device}, got {x_init.device}")
+                if x_init.dtype != z.dtype:
+                    raise TypeError(f"x_init dtype must match z dtype {z.dtype}, got {x_init.dtype}")
 
         return _ConditionalFlowGenerator()
 
