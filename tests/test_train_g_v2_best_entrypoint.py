@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 import unittest
 
 import yaml
@@ -31,6 +32,21 @@ class TrainGV2BestEntrypointTests(unittest.TestCase):
         self.assertIn("tmux new-session", script)
         self.assertIn("scripts/guarded_run.py --max-ram-fraction 0.90", script)
         self.assertIn("--nproc_per_node=4", script)
+
+    def test_train_g_tmux_requires_values_for_options(self) -> None:
+        for option in ("--config", "--log", "--session"):
+            with self.subTest(option=option):
+                result = subprocess.run(
+                    ["bash", "scripts/run_train_g_tmux.sh", option],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"{option} requires a value", result.stderr)
+                self.assertIn("Usage:", result.stderr)
+                self.assertNotIn("unbound variable", result.stderr)
 
 
 if __name__ == "__main__":

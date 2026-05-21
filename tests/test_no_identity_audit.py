@@ -20,6 +20,26 @@ class NoIdentityAuditTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 audit_no_identity_supervision({}, [path])
 
+    def test_rejects_common_identity_supervision_source_spellings(self) -> None:
+        cases = {
+            "arcface_class.py": "loss = ArcFaceLoss()(x)\n",
+            "facenet_class.py": "loss = FaceNetLoss()(x)\n",
+            "adaface_class.py": "loss = AdaFaceLoss()(x)\n",
+            "loss_id.py": "loss_id = criterion(x)\n",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, source in cases.items():
+                path = root / name
+                path.write_text(source, encoding="utf-8")
+                with self.subTest(name=name):
+                    with self.assertRaises(RuntimeError):
+                        audit_no_identity_supervision({}, [path])
+
+    def test_rejects_identity_weight_config_key(self) -> None:
+        with self.assertRaises(RuntimeError):
+            audit_no_identity_supervision({"loss": {"identity_weight": 0.1}})
+
     def test_scans_source_directories(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             source_dir = Path(tmp) / "training"
@@ -42,7 +62,32 @@ class NoIdentityAuditTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "stop after audit"):
                 g_loop.train_g_from_config({"seed": 1337})
 
-        self.assertEqual(captured["source_paths"], ["src/safa/training", "src/safa/models"])
+        source_paths = [Path(path) for path in captured["source_paths"]]
+        self.assertEqual([path.name for path in source_paths], ["training", "models"])
+        self.assertTrue(all(path.is_absolute() for path in source_paths))
+
+    def test_train_g_from_config_source_audit_is_independent_of_cwd(self) -> None:
+        import os
+        from safa.training import g_loop
+
+        original_cwd = Path.cwd()
+        captured = {}
+
+        def fake_audit(config, source_paths=()):
+            captured["source_paths"] = [Path(path) for path in source_paths]
+            raise RuntimeError("stop after audit")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                os.chdir(tmp)
+                with patch.object(g_loop, "audit_no_identity_supervision", side_effect=fake_audit):
+                    with self.assertRaisesRegex(RuntimeError, "stop after audit"):
+                        g_loop.train_g_from_config({"seed": 1337})
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertEqual([path.name for path in captured["source_paths"]], ["training", "models"])
+        self.assertTrue(all(path.is_absolute() and path.exists() for path in captured["source_paths"]))
 
     def test_accepts_current_style_config(self) -> None:
         audit_no_identity_supervision(

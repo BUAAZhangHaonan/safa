@@ -7,11 +7,17 @@ from typing import Iterable
 FORBIDDEN_TRAINING_TERMS = (
     "identity_loss",
     "id_loss",
+    "loss_id",
     "face_recognition_loss",
     "arcface_loss",
+    "arcfaceloss",
     "facenet_loss",
+    "facenetloss",
     "adaface_loss",
+    "adafaceloss",
     "magface_loss",
+    "magfaceloss",
+    "identity_weight",
     "identity_supervision: true",
 )
 
@@ -25,6 +31,7 @@ FORBIDDEN_CONFIG_KEYS = {
     "magface_loss",
     "identity_weight",
     "id_weight",
+    "loss_id",
 }
 
 

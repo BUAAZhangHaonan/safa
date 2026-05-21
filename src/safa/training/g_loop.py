@@ -25,7 +25,8 @@ from safa.utils.seed import set_seed
 
 _init_distributed = init_distributed
 
-DEFAULT_NO_IDENTITY_SOURCE_PATHS = (Path("src/safa/training"), Path("src/safa/models"))
+_SAFA_PACKAGE_DIR = Path(__file__).resolve().parents[1]
+DEFAULT_NO_IDENTITY_SOURCE_PATHS = (Path(__file__).resolve().parent, _SAFA_PACKAGE_DIR / "models")
 
 
 class _GeneratorTrainingStep:

@@ -6,22 +6,39 @@ CONFIG="${CONFIG:-configs/train_g_v2_best.yaml}"
 SESSION="${SESSION:-train_g_v2_best}"
 LOG="${LOG:-artifacts/logs/train_g_v2_best.log}"
 
+usage() {
+  echo "Usage: $0 [--config PATH] [--log PATH] [--session NAME]" >&2
+}
+
+require_value() {
+  local option="$1"
+  if [[ $# -lt 2 || -z "$2" || "$2" == --* ]]; then
+    echo "$option requires a value" >&2
+    usage
+    exit 2
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config)
+      require_value "$@"
       CONFIG="$2"
       shift 2
       ;;
     --log)
+      require_value "$@"
       LOG="$2"
       shift 2
       ;;
     --session)
+      require_value "$@"
       SESSION="$2"
       shift 2
       ;;
     *)
       echo "Unknown argument: $1" >&2
+      usage
       exit 2
       ;;
   esac
