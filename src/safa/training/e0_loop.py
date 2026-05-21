@@ -179,7 +179,7 @@ def train_e0_from_config(config: dict) -> dict:
             metrics.update(
                 {
                     "epoch": epoch,
-                    "train_loss": train_metrics["train_loss"],
+                    "train_loss": train_metrics["loss"],
                     "majority_val_accuracy": majority,
                 }
             )
