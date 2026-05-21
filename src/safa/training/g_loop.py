@@ -19,8 +19,11 @@ from safa.utils.distributed import (
     init_distributed,
     unwrap_model,
 )
-from safa.utils.sampling import make_x_init_for_sample_ids, sampling_base_seed_from_config
+from safa.utils.sampling import make_x_init_for_sample_ids, optional_sampling_base_seed_from_config, sampling_base_seed_from_config
 from safa.utils.seed import set_seed
+
+
+_init_distributed = init_distributed
 
 
 class _GeneratorTrainingStep:
@@ -575,27 +578,31 @@ def _save_generator(path: Path, generator, generator_config: FlowGeneratorConfig
 
     generator = unwrap_model(generator)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model_state_dict": generator.state_dict(),
-            "model_config": generator_config.to_dict(),
-            "sampler_config": {
-                "sample_steps": generator_config.sample_steps,
-                "train_cycle_steps": generator_config.train_cycle_steps,
-                "sampler": generator_config.sampler,
-            },
-            "stage": metrics.get("stage"),
-            "metrics": metrics,
-            "history": history,
-            "training_config": {
-                "seed": train_config.get("seed"),
-                "sampling_seed": sampling_base_seed_from_config(train_config),
-                "stages": train_config.get("stages"),
-                "validation": train_config.get("validation"),
-            },
+    training_config = {
+        "stages": train_config.get("stages"),
+        "validation": train_config.get("validation"),
+    }
+    if "seed" in train_config and train_config["seed"] is not None:
+        training_config["seed"] = train_config["seed"]
+    if "sampling_seed" in train_config and train_config["sampling_seed"] is not None:
+        training_config["sampling_seed"] = train_config["sampling_seed"]
+    payload = {
+        "model_state_dict": generator.state_dict(),
+        "model_config": generator_config.to_dict(),
+        "sampler_config": {
+            "sample_steps": generator_config.sample_steps,
+            "train_cycle_steps": generator_config.train_cycle_steps,
+            "sampler": generator_config.sampler,
         },
-        path,
-    )
+        "stage": metrics.get("stage"),
+        "metrics": metrics,
+        "history": history,
+        "training_config": training_config,
+    }
+    sampling_seed = optional_sampling_base_seed_from_config(train_config)
+    if sampling_seed is not None:
+        payload["sampling"] = {"base_seed": sampling_seed, "stable_x_init": True}
+    torch.save(payload, path)
 
 
 def _write_json(path: Path, payload: dict) -> None:

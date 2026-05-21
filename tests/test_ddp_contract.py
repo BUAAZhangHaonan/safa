@@ -70,6 +70,7 @@ class DDPContractTests(unittest.TestCase):
             payload = torch.load(path, map_location="cpu")
         self.assertTrue(payload["model_state_dict"])
         self.assertFalse(any(key.startswith("module.") for key in payload["model_state_dict"]))
+        self.assertNotIn("sampling_seed", payload["training_config"])
 
 
 if __name__ == "__main__":
