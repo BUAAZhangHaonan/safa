@@ -53,8 +53,8 @@ class FeatureCacheManifest:
             shard=str(data["shard"]),
             shard_sha256=str(data["shard_sha256"]),
         )
-        if manifest.feature_dim != 512:
-            raise ValueError(f"Feature cache must use 512-d embeddings, got {manifest.feature_dim}")
+        if manifest.feature_dim <= 0:
+            raise ValueError(f"Feature cache feature_dim must be positive, got {manifest.feature_dim}")
         if not manifest.l2_normalized:
             raise ValueError("Feature cache manifest must declare l2_normalized=true")
         if manifest.num_samples <= 0:
@@ -125,4 +125,3 @@ def write_manifest(cache_dir: str | Path, manifest: FeatureCacheManifest) -> Non
     path = Path(cache_dir) / "manifest.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(manifest.to_json_dict(), indent=2, sort_keys=True, allow_nan=False), encoding="utf-8")
-

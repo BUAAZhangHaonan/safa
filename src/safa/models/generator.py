@@ -258,16 +258,22 @@ def _groups_for(channels: int) -> int:
 
 
 def _validate_config(config: FlowGeneratorConfig) -> None:
-    if config.embedding_dim != 512:
-        raise ValueError(f"Generator expects 512-d z, got {config.embedding_dim}")
-    if config.image_size != 224:
-        raise ValueError(f"Generator image_size is fixed at 224, got {config.image_size}")
+    if config.embedding_dim <= 0:
+        raise ValueError(f"embedding_dim must be positive, got {config.embedding_dim}")
+    if config.image_size <= 0:
+        raise ValueError(f"image_size must be positive, got {config.image_size}")
     if config.base_channels <= 0:
         raise ValueError(f"base_channels must be positive, got {config.base_channels}")
     if not config.channel_multipliers:
         raise ValueError("channel_multipliers must not be empty")
     if any(item <= 0 for item in config.channel_multipliers):
         raise ValueError(f"channel_multipliers must be positive, got {config.channel_multipliers}")
+    downsample_factor = 2 ** len(config.channel_multipliers)
+    if config.image_size % downsample_factor != 0:
+        raise ValueError(
+            f"image_size must be divisible by {downsample_factor} for "
+            f"{len(config.channel_multipliers)} downsampling stages, got {config.image_size}"
+        )
     if config.time_embedding_dim <= 0:
         raise ValueError(f"time_embedding_dim must be positive, got {config.time_embedding_dim}")
     if config.condition_dim <= 0:

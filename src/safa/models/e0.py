@@ -17,8 +17,8 @@ def build_e0(config: E0Config, allow_random_init: bool = False):
     from torch import nn
     from torchvision.models import ResNet50_Weights, resnet50
 
-    if config.embedding_dim != 512:
-        raise ValueError(f"E0 embedding_dim must be 512 for the minimal validation, got {config.embedding_dim}")
+    if config.embedding_dim <= 0:
+        raise ValueError(f"E0 embedding_dim must be positive, got {config.embedding_dim}")
     weights = None
     if config.imagenet_weights:
         try:

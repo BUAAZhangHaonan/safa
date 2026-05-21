@@ -9,14 +9,14 @@ TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None and importlib.ut
 
 @unittest.skipUnless(TORCH_AVAILABLE, "torch and torchvision are required for E0 contract tests")
 class E0ContractTests(unittest.TestCase):
-    def test_e0_embedding_contract_with_random_init_for_unit_test_only(self) -> None:
+    def test_e0_embedding_contract_uses_configured_embedding_dim(self) -> None:
         import torch
 
         from safa.models.e0 import E0Config, build_e0
 
-        model = build_e0(E0Config(imagenet_weights=""), allow_random_init=True)
+        model = build_e0(E0Config(embedding_dim=128, imagenet_weights=""), allow_random_init=True)
         output = model(torch.randn(2, 3, 224, 224))
-        self.assertEqual(tuple(output["embedding"].shape), (2, 512))
+        self.assertEqual(tuple(output["embedding"].shape), (2, 128))
         norms = output["embedding"].float().norm(dim=1)
         torch.testing.assert_close(norms, torch.ones_like(norms), rtol=1e-4, atol=1e-4)
 
@@ -35,4 +35,3 @@ class E0ContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

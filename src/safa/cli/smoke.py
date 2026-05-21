@@ -63,7 +63,7 @@ def main() -> None:
             "learning_rate": 0.0002,
             "weight_decay": 0.0,
             "image_size": config["image_size"],
-            "embedding_dim": 512,
+            "embedding_dim": int(cache_manifest["feature_dim"]),
             "train_index": str(index_path),
             "train_features": str(feature_dir),
             "e0_checkpoint": config["e0_checkpoint"],

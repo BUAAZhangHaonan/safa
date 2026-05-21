@@ -14,8 +14,8 @@ TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
 class GeneratorContractTests(unittest.TestCase):
     def _small_config(self) -> dict:
         return {
-            "embedding_dim": 512,
-            "image_size": 224,
+            "embedding_dim": 128,
+            "image_size": 64,
             "base_channels": 4,
             "channel_multipliers": [1],
             "time_embedding_dim": 16,
@@ -33,14 +33,14 @@ class GeneratorContractTests(unittest.TestCase):
         generator = ConditionalFlowGenerator(self._small_config())
         parameters = [name for name in inspect.signature(generator.forward).parameters]
         self.assertEqual(parameters, ["z"])
-        output = generator(torch.randn(2, 512))
-        self.assertEqual(tuple(output.shape), (2, 3, 224, 224))
+        output = generator(torch.randn(2, 128))
+        self.assertEqual(tuple(output.shape), (2, 3, 64, 64))
         self.assertTrue(torch.isfinite(output).all())
         detached = output.detach()
         self.assertGreaterEqual(float(detached.min()), 0.0)
         self.assertLessEqual(float(detached.max()), 1.0)
         with self.assertRaises(TypeError):
-            generator(torch.randn(2, 512), image=torch.randn(2, 3, 224, 224))
+            generator(torch.randn(2, 128), image=torch.randn(2, 3, 64, 64))
 
     def test_generator_rejects_wrong_z_shape(self) -> None:
         import torch
@@ -49,7 +49,7 @@ class GeneratorContractTests(unittest.TestCase):
 
         generator = ConditionalFlowGenerator(self._small_config())
         with self.assertRaises(ValueError):
-            generator(torch.randn(2, 128))
+            generator(torch.randn(2, 512))
 
     def test_flow_matching_loss_contract(self) -> None:
         import torch
@@ -57,7 +57,7 @@ class GeneratorContractTests(unittest.TestCase):
         from safa.models.generator import ConditionalFlowGenerator
 
         generator = ConditionalFlowGenerator(self._small_config())
-        loss, metrics = generator.flow_matching_loss(torch.rand(2, 3, 224, 224), torch.randn(2, 512))
+        loss, metrics = generator.flow_matching_loss(torch.rand(2, 3, 64, 64), torch.randn(2, 128))
         self.assertEqual(tuple(loss.shape), ())
         self.assertTrue(torch.isfinite(loss))
         self.assertIn("flow_matching_mse", metrics)
@@ -80,9 +80,9 @@ class GeneratorContractTests(unittest.TestCase):
                 },
                 path,
             )
-            loaded = _load_generator(str(path), {"image_size": 224}, "cpu")
-        output = loaded(torch.randn(1, 512))
-        self.assertEqual(tuple(output.shape), (1, 3, 224, 224))
+            loaded = _load_generator(str(path), {"image_size": 64}, "cpu")
+        output = loaded(torch.randn(1, 128))
+        self.assertEqual(tuple(output.shape), (1, 3, 64, 64))
 
 
 if __name__ == "__main__":
