@@ -19,11 +19,12 @@ from safa.utils.distributed import (
     init_distributed,
     unwrap_model,
 )
+from safa.utils.sampling import make_x_init_for_sample_ids, sampling_base_seed_from_config
 from safa.utils.seed import set_seed
 
 
 class _GeneratorTrainingStep:
-    def __new__(cls, generator, e0, generator_config: FlowGeneratorConfig):
+    def __new__(cls, generator, e0, generator_config: FlowGeneratorConfig, sampling_seed: int):
         from torch import nn
         schedule = generator_config.cycle_steps_schedule
 
@@ -33,13 +34,14 @@ class _GeneratorTrainingStep:
                 self.generator = generator
                 self.e0 = e0
                 self.generator_config = generator_config
+                self.sampling_seed = int(sampling_seed)
                 self._schedule = schedule
                 self._batch_idx = 0
 
             def reset_batch_idx(self):
                 self._batch_idx = 0
 
-            def forward(self, images, z, use_cycle: bool, lambda_cycle: float):
+            def forward(self, images, z, sample_ids, use_cycle: bool, lambda_cycle: float):
                 import torch
                 flow_loss, flow_metrics = self.generator.flow_matching_loss(images, z)
                 cycle = flow_loss.new_tensor(0.0)
@@ -49,10 +51,19 @@ class _GeneratorTrainingStep:
                         cycle_steps = self._schedule[self._batch_idx % len(self._schedule)]
                     else:
                         cycle_steps = self.generator_config.train_cycle_steps
+                    x_init = make_x_init_for_sample_ids(
+                        sample_ids,
+                        self.sampling_seed,
+                        self.generator_config.image_size,
+                        z.device,
+                        z.dtype,
+                    )
                     generated = self.generator.sample(
                         z,
                         steps=cycle_steps,
                         checkpoint_steps=True,
+                        x_init=x_init,
+                        clamp_output=False,
                     )
                     assert_finite_tensor("stage2_generated_image", generated)
                     self.e0.eval()
@@ -110,6 +121,7 @@ def train_g_from_config(config: dict) -> dict:
     freeze_e0(e0)
 
     generator_config = _generator_config_from_train_config(config)
+    sampling_seed = sampling_base_seed_from_config(config)
     generator = build_generator(generator_config.to_dict()).to(device)
     resume_history = None
     resume_stage_epoch = None
@@ -131,7 +143,7 @@ def train_g_from_config(config: dict) -> dict:
                 restored.append("stage_epoch")
             sep = ", ".join(restored)
             print(f"Resumed generator from {resume_path} (restored: {sep})")
-    training_module = _GeneratorTrainingStep(generator, e0, generator_config).to(device)
+    training_module = _GeneratorTrainingStep(generator, e0, generator_config, sampling_seed).to(device)
     if distributed.enabled:
         training_module = DistributedDataParallel(training_module, device_ids=[distributed.local_rank], output_device=distributed.local_rank)
     optimizer = torch.optim.AdamW(unwrap_model(training_module).generator.parameters(), lr=float(config["learning_rate"]), weight_decay=float(config["weight_decay"]))
@@ -211,8 +223,9 @@ def train_g_from_config(config: dict) -> dict:
                 z = batch["z"].to(device, non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
                 amp_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if use_amp else nullcontext()
+                sample_ids = list(batch["sample_id"])
                 with amp_ctx:
-                    loss, flow_mse, cycle = training_module(images, z, stage_name == "stage2", lambda_cycle)
+                    loss, flow_mse, cycle = training_module(images, z, sample_ids, stage_name == "stage2", lambda_cycle)
                 loss_val = float(loss.detach().cpu())
                 if not math.isfinite(loss_val):
                     print(f"WARNING: non-finite G loss detected: {loss_val}, skipping batch entirely")
@@ -241,7 +254,7 @@ def train_g_from_config(config: dict) -> dict:
             should_break = False
             if distributed.is_main:
                 metrics.update({"stage": stage_name, "stage_epoch": stage_epoch, "lambda_cycle": lambda_cycle})
-                validation_metrics = _evaluate_validation(unwrap_model(training_module).generator, e0, validation_loader, detector, device, generator_config, use_amp=use_amp)
+                validation_metrics = _evaluate_validation(unwrap_model(training_module).generator, e0, validation_loader, detector, device, generator_config, sampling_seed=sampling_seed, use_amp=use_amp)
                 metrics.update({f"validation_{key}": value for key, value in validation_metrics.items()})
                 if stage_name == "stage1" and validation_metrics.get("face_detection_rate") is not None:
                     baseline_detection_rate = validation_metrics["face_detection_rate"]
@@ -290,6 +303,7 @@ def train_g_from_config(config: dict) -> dict:
             "model_type": "conditional_flow_matching",
             "identity_supervision": False,
             "distributed": _distributed_manifest(distributed),
+            "sampling": {"base_seed": sampling_seed, "stable_x_init": True},
         }
         _write_json(out_dir / "manifest.json", manifest)
     barrier(distributed)
@@ -482,7 +496,7 @@ def _build_detector(config: dict, device: str):
     return InsightFaceDetector(model_name=str(detection["model_name"]), device=device)
 
 
-def _evaluate_validation(generator, e0, loader, detector, device, generator_config: FlowGeneratorConfig, *, use_amp: bool = False) -> dict:
+def _evaluate_validation(generator, e0, loader, detector, device, generator_config: FlowGeneratorConfig, *, sampling_seed: int, use_amp: bool = False) -> dict:
     if loader is None:
         return {}
     import torch
@@ -499,7 +513,9 @@ def _evaluate_validation(generator, e0, loader, detector, device, generator_conf
         for batch in loader:
             source = batch["image"].to(device, non_blocking=True)
             z = batch["z"].to(device, non_blocking=True)
-            generated = generator.sample(z, steps=generator_config.sample_steps)
+            sample_ids = list(batch["sample_id"])
+            x_init = make_x_init_for_sample_ids(sample_ids, sampling_seed, generator_config.image_size, z.device, z.dtype)
+            generated = generator.sample(z, steps=generator_config.sample_steps, x_init=x_init)
             assert_finite_tensor("validation_generated_image", generated)
             source_out = e0(normalize_for_e0(source))
             generated_out = e0(normalize_for_e0(generated))
@@ -572,6 +588,8 @@ def _save_generator(path: Path, generator, generator_config: FlowGeneratorConfig
             "metrics": metrics,
             "history": history,
             "training_config": {
+                "seed": train_config.get("seed"),
+                "sampling_seed": sampling_base_seed_from_config(train_config),
                 "stages": train_config.get("stages"),
                 "validation": train_config.get("validation"),
             },

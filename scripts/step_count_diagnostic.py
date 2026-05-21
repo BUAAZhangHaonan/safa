@@ -18,6 +18,7 @@ from safa.models.e0 import load_e0_checkpoint
 from safa.models.generator import build_generator
 from safa.training.losses import normalize_for_e0
 from safa.training.transforms import generator_image_transform
+from safa.utils.sampling import make_x_init_for_sample_ids, sampling_base_seed_from_config
 
 
 def main():
@@ -31,6 +32,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--step_counts", type=int, nargs="+", default=[4, 8, 16, 32])
+    parser.add_argument("--sampling-seed", type=int, default=None)
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -40,6 +42,7 @@ def main():
     generator = build_generator(ckpt["model_config"]).to(device)
     generator.load_state_dict(ckpt["model_state_dict"])
     generator.eval()
+    sampling_seed = _sampling_seed(args.sampling_seed, ckpt)
     print(f"Loaded generator from {args.checkpoint}")
     if "metrics" in ckpt:
         print(f"  Checkpoint cosine: {ckpt['metrics'].get('validation_latent_cosine_mean', 'N/A')}")
@@ -68,7 +71,9 @@ def main():
         with torch.no_grad():
             for batch in loader:
                 z = batch["z"].to(device, non_blocking=True)
-                generated = generator.sample(z, steps=steps)
+                sample_ids = list(batch["sample_id"])
+                x_init = make_x_init_for_sample_ids(sample_ids, sampling_seed, args.image_size, z.device, z.dtype)
+                generated = generator.sample(z, steps=steps, x_init=x_init)
                 e0_out = e0(normalize_for_e0(generated))
                 cosine = F.cosine_similarity(e0_out["embedding"], z, dim=1)
                 total_cosine += float(cosine.sum().cpu())
@@ -81,6 +86,15 @@ def main():
     out_path = Path(args.checkpoint).parent / "step_count_diagnostic.json"
     out_path.write_text(json.dumps(results, indent=2))
     print(f"Results saved to {out_path}")
+
+
+def _sampling_seed(arg_seed: int | None, checkpoint: dict) -> int:
+    if arg_seed is not None:
+        return int(arg_seed)
+    training_config = checkpoint.get("training_config")
+    if isinstance(training_config, dict):
+        return sampling_base_seed_from_config(training_config)
+    raise KeyError("Pass --sampling-seed or use a checkpoint with training_config.seed/sampling_seed")
 
 
 if __name__ == "__main__":

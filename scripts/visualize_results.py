@@ -32,6 +32,7 @@ from safa.models.generator import build_generator
 from safa.models.e0 import load_e0_checkpoint, freeze_e0
 from safa.data.dataset import AffectNetRecords
 from safa.training.transforms import eval_transform
+from safa.utils.sampling import make_x_init_for_sample_ids, sampling_base_seed_from_config
 
 EMOTION_LABELS = [
     "neutral", "happy", "sad", "surprise",
@@ -58,6 +59,8 @@ def parse_args():
                    help="Heun sampler steps for G (default 32)")
     p.add_argument("--device", default="cuda:0",
                    help="Torch device (default cuda:0)")
+    p.add_argument("--sampling-seed", type=int, default=None,
+                   help="Stable x_init base seed. Defaults to checkpoint training_config seed when present.")
     return p.parse_args()
 
 
@@ -67,7 +70,7 @@ def load_generator(path, device):
     model = build_generator(g_config).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
-    return model
+    return model, ckpt
 
 
 def denormalize_imagenet(tensor_chw):
@@ -98,7 +101,8 @@ def main():
     freeze_e0(e0)
 
     print(f"Loading G  from {args.g_checkpoint} ...")
-    g = load_generator(args.g_checkpoint, device)
+    g, g_ckpt = load_generator(args.g_checkpoint, device)
+    sampling_seed = _sampling_seed(args.sampling_seed, g_ckpt)
 
     print(f"Loading val set from {args.val_index} ...")
     dataset = AffectNetRecords(
@@ -122,7 +126,9 @@ def main():
             z = e0_out["embedding"].squeeze(0)
             pred_orig = e0_out["logits"].argmax(dim=1).item()
 
-            gen_img = g.sample(z.unsqueeze(0), steps=args.sample_steps)
+            sample_id = sample["sample_id"]
+            x_init = make_x_init_for_sample_ids([sample_id], sampling_seed, int(getattr(g, "image_size", 224)), z.device, z.dtype)
+            gen_img = g.sample(z.unsqueeze(0), steps=args.sample_steps, x_init=x_init)
 
             gen_normalized = normalize_for_e0(gen_img)
             gen_e0_out = e0(gen_normalized)
@@ -196,6 +202,15 @@ def main():
           f"({100 * label_consistent / total:.1f}% orig==gen)")
     print(f"  E0 accuracy  : {true_correct}/{total} "
           f"({100 * true_correct / total:.1f}% pred==true)")
+
+
+def _sampling_seed(arg_seed: int | None, checkpoint: dict) -> int:
+    if arg_seed is not None:
+        return int(arg_seed)
+    training_config = checkpoint.get("training_config")
+    if isinstance(training_config, dict):
+        return sampling_base_seed_from_config(training_config)
+    raise KeyError("Pass --sampling-seed or use a checkpoint with training_config.seed/sampling_seed")
 
 
 if __name__ == "__main__":

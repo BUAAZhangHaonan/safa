@@ -23,6 +23,7 @@ from safa.models.generator import build_generator
 from safa.models.e0 import load_e0_checkpoint, freeze_e0
 from safa.data.dataset import AffectNetRecords
 from safa.training.transforms import eval_transform
+from safa.utils.sampling import make_x_init_for_sample_ids, sampling_base_seed_from_config
 
 EMOTION_LABELS = [
     "neutral", "happy", "sad", "surprise",
@@ -41,6 +42,8 @@ def parse_args():
     p.add_argument("--num-samples", type=int, default=8)
     p.add_argument("--sample-steps", type=int, default=32)
     p.add_argument("--device", default="cuda:0")
+    p.add_argument("--sampling-seed", type=int, default=None,
+                   help="Stable x_init base seed. Defaults to checkpoint training_config seed when all checkpoints agree.")
     return p.parse_args()
 
 
@@ -50,7 +53,7 @@ def load_generator(path, device):
     model = build_generator(g_config).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
-    return model, ckpt.get("metrics", {})
+    return model, ckpt.get("metrics", {}), ckpt.get("training_config")
 
 
 def denormalize_imagenet(tensor_chw):
@@ -70,14 +73,15 @@ def normalize_for_e0(images_bchw):
     return (images_bchw - mean) / std
 
 
-def process_sample(e0, generator, img_tensor, device, sample_steps):
+def process_sample(e0, generator, img_tensor, device, sample_steps, sample_id, sampling_seed):
     """Process one image through E0 -> G -> E0 pipeline."""
     with torch.no_grad():
         e0_out = e0(img_tensor)
         z = e0_out["embedding"]
         pred_orig = e0_out["logits"].argmax(dim=1).item()
 
-        gen_img = generator.sample(z, steps=sample_steps)
+        x_init = make_x_init_for_sample_ids([sample_id], sampling_seed, int(getattr(generator, "image_size", 224)), z.device, z.dtype)
+        gen_img = generator.sample(z, steps=sample_steps, x_init=x_init)
         gen_clamped = gen_img.clamp(-1, 1)
 
         gen_normalized = normalize_for_e0(gen_clamped)
@@ -134,14 +138,18 @@ def main():
     # Load all generators
     generators = {}
     exp_metrics = {}
+    training_configs = []
     for name, path in experiments:
         print(f"Loading G from {path} ...")
-        gen, metrics = load_generator(path, device)
+        gen, metrics, training_config = load_generator(path, device)
         generators[name] = gen
         exp_metrics[name] = metrics
+        training_configs.append(training_config)
         cos = metrics.get("validation_latent_cosine_mean", -1)
         fd = metrics.get("validation_face_detection_rate", -1)
         print(f"  {name}: cosine={cos:.4f}, face_det={fd:.4f}")
+
+    sampling_seed = _sampling_seed(args.sampling_seed, training_configs)
 
     # Process all samples
     all_results = {}  # {exp_name: [results_per_sample]}
@@ -160,7 +168,7 @@ def main():
         })
 
         for name, gen in generators.items():
-            r = process_sample(e0, gen, img_tensor, device, args.sample_steps)
+            r = process_sample(e0, gen, img_tensor, device, args.sample_steps, sample["sample_id"], sampling_seed)
             all_results[name].append(r)
 
         if (count + 1) % 4 == 0 or count == num_samples - 1:
@@ -280,6 +288,19 @@ def main():
     fig2.savefig(chart_path, bbox_inches="tight", dpi=120)
     plt.close(fig2)
     print(f"Saved metrics chart to {chart_path}")
+
+
+def _sampling_seed(arg_seed: int | None, training_configs: list) -> int:
+    if arg_seed is not None:
+        return int(arg_seed)
+    seeds = []
+    for config in training_configs:
+        if isinstance(config, dict):
+            seeds.append(sampling_base_seed_from_config(config))
+    unique = set(seeds)
+    if len(seeds) == len(training_configs) and len(unique) == 1:
+        return seeds[0]
+    raise KeyError("Pass --sampling-seed or use checkpoints with one shared training_config.seed/sampling_seed")
 
 
 if __name__ == "__main__":

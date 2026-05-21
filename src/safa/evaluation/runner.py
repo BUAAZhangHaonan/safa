@@ -14,6 +14,7 @@ from safa.training.losses import normalize_for_e0
 from safa.training.transforms import generator_image_transform
 from safa.utils.device import assert_finite_tensor, require_cuda_device
 from safa.utils.hashing import sha256_file
+from safa.utils.sampling import make_x_init_for_sample_ids, sampling_base_seed_from_config
 from safa.utils.seed import set_seed
 
 
@@ -29,6 +30,7 @@ def run_eval_from_config(config: dict) -> dict:
     e0.to(device)
     freeze_e0(e0)
     generator = _load_generator(config["g_checkpoint"], config, str(device))
+    sampling_seed = sampling_base_seed_from_config(config)
     dataset = FeatureAlignedAffectNet(
         config["index"],
         config["features"],
@@ -56,7 +58,7 @@ def run_eval_from_config(config: dict) -> dict:
             z = batch["z"].to(device, non_blocking=True)
             labels = batch["label"].to(device, non_blocking=True)
             sample_ids = list(batch["sample_id"])
-            generated = generator(z)
+            generated = _sample_generated_for_eval(generator, z, sample_ids, sampling_seed, int(config["image_size"]))
             assert_finite_tensor("eval_generated", generated)
             if generated_chunks is not None:
                 generated_chunks.append(generated.detach().cpu())
@@ -101,6 +103,7 @@ def run_eval_from_config(config: dict) -> dict:
         "privacy_skipped": privacy_skipped,
         "metrics": summarized,
         "artifacts": {"sample_dir": str(sample_dir), "per_sample_jsonl": config["per_sample_jsonl"]},
+        "sampling": {"base_seed": sampling_seed, "stable_x_init": True},
     }
     flatten_finite_numbers(result["metrics"])
     if len(rows) != len(dataset):
@@ -135,6 +138,11 @@ def _load_generator(checkpoint_path: str, config: dict, device: str):
     generator = build_generator(model_config)
     generator.load_state_dict(payload["model_state_dict"])
     return generator.to(device).eval()
+
+
+def _sample_generated_for_eval(generator, z, sample_ids, sampling_seed: int, image_size: int):
+    x_init = make_x_init_for_sample_ids(sample_ids, sampling_seed, image_size, z.device, z.dtype)
+    return generator.sample(z, x_init=x_init)
 
 
 def _default_face_detection_config(privacy_cfg: dict) -> dict:
