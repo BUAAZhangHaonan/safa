@@ -31,7 +31,7 @@ FORBIDDEN_CONFIG_KEYS = {
 def audit_no_identity_supervision(config: dict, source_paths: Iterable[str | Path] = ()) -> None:
     _audit_config(config)
     for path in source_paths:
-        _audit_source(Path(path))
+        _audit_source_path(Path(path))
 
 
 def _audit_config(config: dict, prefix: str = "") -> None:
@@ -51,9 +51,25 @@ def _audit_config(config: dict, prefix: str = "") -> None:
             raise RuntimeError(f"Forbidden identity supervision config value at {full_key}: {value}")
 
 
-def _audit_source(path: Path) -> None:
+def _audit_source_path(path: Path) -> None:
+    if not path.exists():
+        raise FileNotFoundError(f"Cannot audit missing source path: {path}")
+    if path.is_dir():
+        for source_file in sorted(path.rglob("*.py")):
+            if "__pycache__" in source_file.parts or _is_audit_catalog(source_file):
+                continue
+            _audit_source_file(source_file)
+        return
     if not path.is_file():
-        raise FileNotFoundError(f"Cannot audit missing source file: {path}")
+        raise FileNotFoundError(f"Cannot audit non-file source path: {path}")
+    _audit_source_file(path)
+
+
+def _is_audit_catalog(path: Path) -> bool:
+    return path.name == "audit.py" and len(path.parts) >= 2 and path.parts[-2:] == ("training", "audit.py")
+
+
+def _audit_source_file(path: Path) -> None:
     text = path.read_text(encoding="utf-8").lower()
     violations = [term for term in FORBIDDEN_TRAINING_TERMS if term in text]
     filtered = []

@@ -25,6 +25,8 @@ from safa.utils.seed import set_seed
 
 _init_distributed = init_distributed
 
+DEFAULT_NO_IDENTITY_SOURCE_PATHS = (Path("src/safa/training"), Path("src/safa/models"))
+
 
 class _GeneratorTrainingStep:
     def __new__(cls, generator, e0, generator_config: FlowGeneratorConfig, sampling_seed: int):
@@ -104,7 +106,7 @@ def train_g_from_config(config: dict) -> dict:
 
     set_seed(int(config["seed"]))
     torch.backends.cudnn.benchmark = True
-    audit_no_identity_supervision(config)
+    audit_no_identity_supervision(config, DEFAULT_NO_IDENTITY_SOURCE_PATHS)
     distributed = init_distributed(config)
     device = distributed.device
     num_workers = int(config["num_workers"])

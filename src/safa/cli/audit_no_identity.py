@@ -10,7 +10,7 @@ from safa.utils.config import load_yaml
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Audit training config/source for forbidden identity supervision.")
     parser.add_argument("--config", required=True)
-    parser.add_argument("--source", nargs="*", default=["src/safa/training/g_loop.py"])
+    parser.add_argument("--source", nargs="*", default=["src/safa/training", "src/safa/models"])
     return parser.parse_args()
 
 
