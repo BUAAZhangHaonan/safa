@@ -47,7 +47,12 @@ class TrainGV2BestEntrypointTests(unittest.TestCase):
         path = Path("configs/train_g_v2_best.yaml")
         self.assertTrue(path.is_file())
         config = yaml.safe_load(path.read_text(encoding="utf-8"))
+        stage1_config = yaml.safe_load(Path("configs/train_g_v2_best_stage1.yaml").read_text(encoding="utf-8"))
 
+        self.assertEqual(config["batch_size"], 16)
+        self.assertEqual(config["validation"]["batch_size"], 16)
+        self.assertEqual(stage1_config["batch_size"], 32)
+        self.assertEqual(stage1_config["validation"]["batch_size"], 32)
         self.assertEqual(config["sampling_seed"], 1337)
         self.assertEqual(config["generator"]["cycle_steps_schedule"], [4, 8, 16, 32])
         self.assertEqual(config["stages"]["stage2"]["lambda_initial"], 0.01)

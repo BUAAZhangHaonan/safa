@@ -9,7 +9,7 @@ seed: 1337
 sampling_seed: 1337
 device: cuda:0
 num_workers: 8
-batch_size: 32
+batch_size: 16
 learning_rate: 0.0003
 weight_decay: 0.0
 image_size: 224
@@ -47,7 +47,7 @@ validation:
   index: data/index/val.jsonl
   features: artifacts/e0_features/val
   max_samples: 512
-  batch_size: 32
+  batch_size: 16
   face_detection:
     enabled: true
     model_name: buffalo_l
