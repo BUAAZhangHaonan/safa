@@ -83,7 +83,12 @@ class EvalContractTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             _guard_result(
                 {"latent_cosine": {"mean": 0.99}},
-                {"enabled": True, "model_name": "buffalo_l", "threshold": 0.95, "latent_cosine_threshold": 0.95},
+                {
+                    "enabled": True,
+                    "model_name": "buffalo_l",
+                    "threshold": 0.95,
+                    "latent_cosine_threshold": 0.95,
+                },
             )
 
     def test_face_detection_guard_requires_explicit_threshold_fields(self) -> None:
@@ -101,6 +106,27 @@ class EvalContractTests(unittest.TestCase):
             _guard_result(metrics, {"enabled": True, "model_name": "buffalo_l", "latent_cosine_threshold": 0.95})
         with self.assertRaisesRegex(ValueError, "latent_cosine_threshold"):
             _guard_result(metrics, {"enabled": True, "model_name": "buffalo_l", "threshold": 0.95})
+
+    def test_face_detection_guard_requires_explicit_enabled_flag(self) -> None:
+        with self.assertRaisesRegex(ValueError, "face_detection.enabled"):
+            _guard_result({}, {})
+
+    def test_face_detection_guard_requires_rate_summary_fields(self) -> None:
+        metrics = {
+            "face_detection": {"detected": {"mean": 1.0}},
+            "latent_cosine": {"mean": 1.0},
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "face_detection.face_detect_ge1_rate.mean"):
+            _guard_result(
+                metrics,
+                {
+                    "enabled": True,
+                    "model_name": "buffalo_l",
+                    "threshold": 0.95,
+                    "latent_cosine_threshold": 0.95,
+                },
+            )
 
     def test_eval_monitor_config_requires_explicit_blocks(self) -> None:
         from safa.evaluation import runner

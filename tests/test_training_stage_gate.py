@@ -10,6 +10,7 @@ class StageGateTests(unittest.TestCase):
         return {
             "embedding_dim": 2,
             "image_size": 4,
+            "allow_stage2_without_stage1_gate": False,
             "generator": {
                 "model_type": "conditional_flow_matching",
                 "base_channels": 4,
@@ -62,6 +63,18 @@ class StageGateTests(unittest.TestCase):
     def test_smoke_bypass_is_explicit(self) -> None:
         stages = {"stage1": {"require_face_detection_gate": True, "face_detection_threshold": 0.95, "stable_epochs": 1}}
         _assert_stage1_gate_allows_stage2(stages, stable_hits=0, detection_rate=0.0, allow_bypass=True)
+
+    def test_stage1_gate_requires_explicit_gate_switch(self) -> None:
+        from safa.training import g_loop
+
+        config = self._base_train_config()
+        config["stages"]["stage1"].pop("require_face_detection_gate")
+        with self.assertRaisesRegex(ValueError, "stages.stage1.require_face_detection_gate"):
+            g_loop._validate_train_g_config(config)
+
+        stages = {"stage1": {"face_detection_threshold": 0.95, "stable_epochs": 1}}
+        with self.assertRaisesRegex(ValueError, "stages.stage1.require_face_detection_gate"):
+            _assert_stage1_gate_allows_stage2(stages, stable_hits=1, detection_rate=1.0, allow_bypass=False)
 
     def test_stage1_gate_requires_explicit_threshold_and_stable_epochs(self) -> None:
         with self.assertRaisesRegex(ValueError, "face_detection_threshold"):
@@ -251,6 +264,37 @@ class StageGateTests(unittest.TestCase):
         with self.assertRaisesRegex(KeyError, "validation_single_face_eq1_rate"):
             _composite_score({"validation_latent_cosine_mean": 0.90, "validation_face_detection_rate": 1.00})
 
+    def test_checkpoint_writer_validates_composite_metrics_before_writing(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        import torch
+
+        from safa.models.generator import FlowGeneratorConfig
+        from safa.training.g_loop import _save_generator
+
+        generator = torch.nn.Linear(2, 2)
+        generator_config = FlowGeneratorConfig(
+            embedding_dim=2,
+            image_size=4,
+            sample_steps=1,
+            train_cycle_steps=1,
+        )
+        metrics = {"stage": "stage2", "loss": 1.0, "validation_latent_cosine_mean": 0.90}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint_path = Path(tmp) / "last.pt"
+            with self.assertRaisesRegex(ValueError, "validation_single_face_eq1_rate"):
+                _save_generator(
+                    checkpoint_path,
+                    generator,
+                    generator_config,
+                    {"stages": {}, "validation": {}},
+                    metrics,
+                    [],
+                )
+            self.assertFalse(checkpoint_path.exists())
+
     def test_epoch_metrics_include_gradient_conflict_when_recorded(self) -> None:
         import torch
 
@@ -328,10 +372,22 @@ class StageGateTests(unittest.TestCase):
         from safa.training.g_loop import _is_better, _is_better_overall
 
         metrics = {"stage": "stage2", "loss": 1.0}
-        with self.assertRaisesRegex(KeyError, "validation_latent_cosine_mean"):
+        with self.assertRaisesRegex(ValueError, "validation_latent_cosine_mean"):
             _is_better(metrics, [])
-        with self.assertRaisesRegex(KeyError, "validation_latent_cosine_mean"):
+        with self.assertRaisesRegex(ValueError, "validation_latent_cosine_mean"):
             _is_better_overall(metrics, [])
+
+    def test_checkpoint_comparison_requires_explicit_stage(self) -> None:
+        from safa.training.g_loop import _is_better
+
+        metrics = {
+            "loss": 1.0,
+            "validation_latent_cosine_mean": 0.9,
+            "validation_single_face_eq1_rate": 0.8,
+        }
+
+        with self.assertRaisesRegex(ValueError, "stage"):
+            _is_better(metrics, [])
 
 
 if __name__ == "__main__":

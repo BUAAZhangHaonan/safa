@@ -10,6 +10,7 @@ train_index: data/index/train.jsonl
 train_features: artifacts/e0_features/train
 e0_checkpoint: artifacts/checkpoints/e0/best.pt
 out_dir: artifacts/checkpoints/g_v3
+allow_stage2_without_stage1_gate: false
 grad_clip_norm: 1.0
 distributed:
   backend: gloo

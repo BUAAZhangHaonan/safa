@@ -42,10 +42,10 @@ def run_eval_from_config(config: dict) -> dict:
     loader = DataLoader(dataset, batch_size=int(config["batch_size"]), shuffle=False, num_workers=int(config["num_workers"]), pin_memory=True)
     detector = _build_face_detector(face_detection_cfg, str(device))
     recognizer_assets = []
-    perturbations = perturbation_map(anti_cfg, int(config["seed"])) if anti_cfg.get("enabled") else {}
+    perturbations = perturbation_map(anti_cfg, int(config["seed"])) if anti_cfg["enabled"] else {}
 
     rows: list[dict] = []
-    generated_chunks = [] if privacy_cfg.get("enabled") else None
+    generated_chunks = [] if privacy_cfg["enabled"] else None
     sample_dir = Path(config["sample_dir"])
     sample_dir.mkdir(parents=True, exist_ok=True)
     saved_samples = 0
@@ -78,8 +78,8 @@ def run_eval_from_config(config: dict) -> dict:
                 saved_samples += int(min(4, generated.shape[0]))
     summarized = _summarize_rows(rows)
     guard = _guard_result(summarized, face_detection_cfg)
-    privacy_skipped = bool(privacy_cfg.get("enabled") and not guard["passed"])
-    if privacy_cfg.get("enabled") and guard["passed"]:
+    privacy_skipped = bool(privacy_cfg["enabled"] and not guard["passed"])
+    if privacy_cfg["enabled"] and guard["passed"]:
         recognizer_assets = describe_recognizer_assets(privacy_cfg["recognizers"])
         recognizers = build_recognizers(privacy_cfg["recognizers"], str(device))
         privacy_store = _empty_privacy_store(recognizers, perturbations)
@@ -119,8 +119,8 @@ def run_eval_from_config(config: dict) -> dict:
     if privacy_skipped:
         raise RuntimeError(
             "Privacy evaluation skipped because generation guard failed: "
-            f"face_detection_rate={guard.get('face_detection_rate')} "
-            f"latent_cosine_mean={guard.get('latent_cosine_mean')} "
+            f"face_detection_rate={guard['face_detection_rate']} "
+            f"latent_cosine_mean={guard['latent_cosine_mean']} "
             f"thresholds=({guard['face_detection_threshold']}, {guard['latent_cosine_threshold']})"
         )
     return result
@@ -237,7 +237,7 @@ def _validate_anti_steg_config(config: dict) -> None:
 
 
 def _build_face_detector(config: dict, device: str):
-    if not config.get("enabled", False):
+    if not _require_enabled_flag(config, "face_detection"):
         return None
     return InsightFaceDetector(str(config["model_name"]), device)
 
@@ -380,6 +380,7 @@ def _summarize_rows(rows: list[dict]) -> dict:
         raise ValueError("Cannot summarize zero eval rows")
     affective_keys = rows[0]["affective"].keys()
     summarized = {key: summarize(row["affective"][key] for row in rows) for key in affective_keys}
+    # Optional: rows omit face_detection when the face detector monitor is disabled.
     face_keys = sorted({key for row in rows for key in row.get("face_detection", {})})
     summarized["face_detection"] = {
         key: summarize(row["face_detection"][key] for row in rows if key in row.get("face_detection", {}))
@@ -396,6 +397,7 @@ def _summarize_rows(rows: list[dict]) -> dict:
     recognizer_names = sorted({name for row in rows for name in row["privacy"]})
     summarized["privacy"] = {}
     for recognizer_name in recognizer_names:
+        # Optional: a recognizer may be absent from a row before privacy metrics are attached.
         metric_names = sorted({metric for row in rows for metric in row["privacy"].get(recognizer_name, {})})
         summarized["privacy"][recognizer_name] = {
             metric: summarize(row["privacy"][recognizer_name][metric] for row in rows)
@@ -404,24 +406,35 @@ def _summarize_rows(rows: list[dict]) -> dict:
     return summarized
 
 
+def _require_summary_mean(metrics: dict, field_path: tuple[str, ...]) -> float:
+    context = ".".join(field_path)
+    current = metrics
+    for field in field_path:
+        if not isinstance(current, dict) or field not in current:
+            raise RuntimeError(f"Face detection guard requires {context}")
+        current = current[field]
+    if isinstance(current, bool):
+        raise RuntimeError(f"Face detection guard requires numeric {context}, got bool")
+    try:
+        return float(current)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"Face detection guard requires numeric {context}, got {current!r}") from exc
+
+
 def _guard_result(metrics: dict, config: dict) -> dict:
-    if not config.get("enabled", False):
+    if not _require_enabled_flag(config, "face_detection"):
         return {"enabled": False, "passed": True, "reason": "disabled"}
     _validate_face_detection_config(config)
     face_threshold = float(config["threshold"])
     cosine_threshold = float(config["latent_cosine_threshold"])
-    face_detection_rate = metrics.get("face_detection", {}).get("detected", {}).get("mean")
+    face_detection_rate = _require_summary_mean(metrics, ("face_detection", "detected", "mean"))
     face_rates = {
-        "face_detect_ge1_rate": metrics.get("face_detection", {}).get("face_detect_ge1_rate", {}).get("mean"),
-        "single_face_eq1_rate": metrics.get("face_detection", {}).get("single_face_eq1_rate", {}).get("mean"),
-        "zero_face_rate": metrics.get("face_detection", {}).get("zero_face_rate", {}).get("mean"),
-        "multi_face_rate": metrics.get("face_detection", {}).get("multi_face_rate", {}).get("mean"),
+        "face_detect_ge1_rate": _require_summary_mean(metrics, ("face_detection", "face_detect_ge1_rate", "mean")),
+        "single_face_eq1_rate": _require_summary_mean(metrics, ("face_detection", "single_face_eq1_rate", "mean")),
+        "zero_face_rate": _require_summary_mean(metrics, ("face_detection", "zero_face_rate", "mean")),
+        "multi_face_rate": _require_summary_mean(metrics, ("face_detection", "multi_face_rate", "mean")),
     }
-    latent_cosine_mean = metrics.get("latent_cosine", {}).get("mean")
-    if face_detection_rate is None:
-        raise RuntimeError("Face detection guard is enabled but no face_detection metrics were produced")
-    if latent_cosine_mean is None:
-        raise RuntimeError("Face detection guard is enabled but no latent_cosine metrics were produced")
+    latent_cosine_mean = _require_summary_mean(metrics, ("latent_cosine", "mean"))
     passed = bool(face_detection_rate >= face_threshold and latent_cosine_mean >= cosine_threshold)
     return {
         "enabled": True,

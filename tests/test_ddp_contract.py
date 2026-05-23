@@ -66,7 +66,13 @@ class DDPContractTests(unittest.TestCase):
         generator = ConditionalFlowGenerator(config)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "g.pt"
-            _save_generator(path, Wrapper(generator), generator.config, {}, {"loss": 1.0}, [])
+            metrics = {
+                "stage": "stage1",
+                "loss": 1.0,
+                "validation_latent_cosine_mean": 0.9,
+                "validation_single_face_eq1_rate": 0.8,
+            }
+            _save_generator(path, Wrapper(generator), generator.config, {}, metrics, [])
             payload = torch.load(path, map_location="cpu")
         self.assertTrue(payload["model_state_dict"])
         self.assertFalse(any(key.startswith("module.") for key in payload["model_state_dict"]))

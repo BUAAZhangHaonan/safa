@@ -125,6 +125,7 @@ def train_g_from_config(config: dict) -> dict:
     out_dir = Path(config["out_dir"])
     if distributed.is_main:
         out_dir.mkdir(parents=True, exist_ok=True)
+    # Optional: absent amp means full precision.
     use_amp = bool(config.get("amp", False))
     if distributed.is_main:
         amp_status = "enabled" if use_amp else "disabled"
@@ -140,6 +141,7 @@ def train_g_from_config(config: dict) -> dict:
     generator = build_generator(generator_config.to_dict()).to(device)
     resume_history = None
     resume_stage_epoch = None
+    # Optional: absent resume_from starts a fresh generator run.
     if config.get("resume_from"):
         resume_path = Path(config["resume_from"])
         if not resume_path.is_file():
@@ -205,7 +207,7 @@ def train_g_from_config(config: dict) -> dict:
     best_checkpoint = out_dir / "best.pt"
     history: list[dict] = resume_history if resume_history is not None else []
     stage1_stable_hits = 0
-    allow_stage2_without_stage1_gate = bool(config.get("allow_stage2_without_stage1_gate", False))
+    allow_stage2_without_stage1_gate = _require_bool(config, "allow_stage2_without_stage1_gate", "train_g config")
 
     total_epoch = 0
     for stage_name in ("stage1", "stage2"):
@@ -299,6 +301,7 @@ def train_g_from_config(config: dict) -> dict:
                     metrics["next_lambda_cycle"] = next_lambda
                     lambda_cycle = next_lambda
 
+                _validate_checkpoint_selection_metrics(metrics)
                 history.append(metrics)
                 _save_generator(out_dir / "last.pt", unwrap_model(training_module).generator, generator_config, config, metrics, history)
                 _write_json(out_dir / "last_metrics.json", metrics)
@@ -350,6 +353,7 @@ def _reduce_epoch_metrics(totals: dict, seen: int, device, distributed: Distribu
             float(totals["cycle"]),
             float(totals["grad_norm"]),
             float(seen),
+            # These totals are present only when the Stage 2 gradient-conflict monitor records a batch.
             float(totals.get("gradient_conflict_count", 0.0)),
             float(totals.get("gradient_cosine_fm_cycle", 0.0)),
             float(totals.get("gradient_norm_fm", 0.0)),
@@ -501,6 +505,7 @@ def _distributed_manifest(distributed: DistributedContext) -> dict:
 
 def _validate_train_g_config(config: dict) -> None:
     _generator_config_from_train_config(config)
+    _require_bool(config, "allow_stage2_without_stage1_gate", "train_g config")
     stages = _stage_config(config)
     _validate_stage1_gate_config(stages["stage1"])
     _stage2_gradient_conflict_config(stages)
@@ -532,7 +537,7 @@ def _require_bool(config: dict, field: str, context: str) -> bool:
 
 
 def _validate_stage1_gate_config(stage1: dict) -> None:
-    if not bool(stage1.get("require_face_detection_gate", True)):
+    if not _require_bool(stage1, "require_face_detection_gate", "stages.stage1"):
         return
     _require_field(stage1, "face_detection_threshold", "stages.stage1")
     _require_field(stage1, "stable_epochs", "stages.stage1")
@@ -675,7 +680,7 @@ def _assert_stage1_gate_allows_stage2(stages: dict, stable_hits: int, detection_
     stage1 = stages["stage1"]
     if allow_bypass:
         return
-    if not bool(stage1.get("require_face_detection_gate", True)):
+    if not _require_bool(stage1, "require_face_detection_gate", "stages.stage1"):
         return
     _validate_stage1_gate_config(stage1)
     threshold = float(stage1["face_detection_threshold"])
@@ -778,12 +783,32 @@ def _composite_score(item: dict) -> float:
     return cosine * single_face
 
 
+def _validate_checkpoint_selection_metrics(metrics: dict, context: str = "checkpoint metrics") -> None:
+    for field in ("validation_latent_cosine_mean", "validation_single_face_eq1_rate", "loss", "stage"):
+        _require_field(metrics, field, context)
+    for field in ("validation_latent_cosine_mean", "validation_single_face_eq1_rate", "loss"):
+        value = metrics[field]
+        if isinstance(value, bool):
+            raise ValueError(f"{context}.{field} must be numeric, got bool")
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{context}.{field} must be numeric, got {value!r}") from exc
+        if not math.isfinite(numeric):
+            raise ValueError(f"{context}.{field} must be finite, got {value!r}")
+
+
 def _is_better(metrics: dict, previous: list[dict]) -> bool:
+    _validate_checkpoint_selection_metrics(metrics)
     current_score = _composite_score(metrics)
     if not previous:
         return True
-    stage = metrics.get("stage", "stage1")
-    same_stage = [m for m in previous if m.get("stage") == stage]
+    stage = metrics["stage"]
+    same_stage = []
+    for item in previous:
+        _validate_checkpoint_selection_metrics(item, "checkpoint history item")
+        if item["stage"] == stage:
+            same_stage.append(item)
     if not same_stage:
         return True
     best = max(same_stage, key=lambda item: (_composite_score(item), -item["loss"]))
@@ -797,15 +822,20 @@ def _is_better_overall(metrics: dict, previous: list[dict]) -> bool:
     compares across stages. Uses composite score (cosine x single_face_eq1_rate)
     to prevent selecting degenerate checkpoints with high cosine but invalid face counts.
     """
+    _validate_checkpoint_selection_metrics(metrics)
     current_score = _composite_score(metrics)
     if not previous:
         return True
+    for item in previous:
+        _validate_checkpoint_selection_metrics(item, "checkpoint history item")
     best = max(previous, key=lambda item: (_composite_score(item), -item["loss"]))
     return (current_score, -metrics["loss"]) > (_composite_score(best), -best["loss"])
+
 
 def _save_generator(path: Path, generator, generator_config: FlowGeneratorConfig, train_config: dict, metrics: dict, history: list[dict]) -> None:
     import torch
 
+    _validate_checkpoint_selection_metrics(metrics)
     generator = unwrap_model(generator)
     path.parent.mkdir(parents=True, exist_ok=True)
     training_config = {
@@ -824,7 +854,7 @@ def _save_generator(path: Path, generator, generator_config: FlowGeneratorConfig
             "train_cycle_steps": generator_config.train_cycle_steps,
             "sampler": generator_config.sampler,
         },
-        "stage": metrics.get("stage"),
+        "stage": metrics["stage"],
         "metrics": metrics,
         "history": history,
         "training_config": training_config,
