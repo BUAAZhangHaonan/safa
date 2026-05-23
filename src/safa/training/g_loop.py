@@ -6,6 +6,7 @@ import math
 import json
 from contextlib import nullcontext
 from safa.data.feature_dataset import FeatureAlignedAffectNet
+from safa.evaluation.metrics import face_count_rates
 from safa.evaluation.recognizers import InsightFaceDetector
 from safa.models.e0 import assert_e0_frozen, freeze_e0, load_e0_checkpoint
 from safa.models.generator import FlowGeneratorConfig, build_generator
@@ -646,7 +647,7 @@ def _evaluate_validation(generator, e0, loader, detector, device, generator_conf
     generator.eval()
     e0.eval()
     total = 0
-    detection_success = 0
+    detected_counts = []
     latent_cosine_sum = 0.0
     source_preserved_sum = 0.0
     amp_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if use_amp else nullcontext()
@@ -665,7 +666,9 @@ def _evaluate_validation(generator, e0, loader, detector, device, generator_conf
             source_preserved_sum += float((generated_out["logits"].argmax(dim=1) == source_out["logits"].argmax(dim=1)).float().sum().cpu())
             if detector is not None:
                 counts = detector.detect_counts(generated)
-                detection_success += sum(1 for count in counts if count >= 1)
+                if len(counts) != int(z.shape[0]):
+                    raise RuntimeError(f"Validation face detection count mismatch: batch={int(z.shape[0])} counts={len(counts)}")
+                detected_counts.extend(counts)
             total += int(z.shape[0])
     if total == 0:
         raise ValueError("Validation monitor received zero samples")
@@ -674,16 +677,19 @@ def _evaluate_validation(generator, e0, loader, detector, device, generator_conf
         "source_prediction_preserved": source_preserved_sum / total,
     }
     if detector is not None:
-        metrics["face_detection_rate"] = detection_success / total
+        metrics.update(face_count_rates(detected_counts))
+        metrics["face_detection_rate"] = metrics["face_detect_ge1_rate"]
     return metrics
 
 
 def _composite_score(item: dict) -> float:
-    """cosine x face_detection_rate. Penalizes degenerate checkpoints
-    that achieve high cosine by generating non-face outputs."""
-    cosine = item.get("validation_latent_cosine_mean", -1.0)
-    face_det = item.get("validation_face_detection_rate", 0.0)
-    return cosine * face_det
+    """New checkpoint composite: cosine x single_face_eq1_rate.
+
+    Old reports used validation_face_detection_rate, which is the ge1 rate.
+    """
+    cosine = item["validation_latent_cosine_mean"]
+    single_face = item["validation_single_face_eq1_rate"]
+    return cosine * single_face
 
 
 def _is_better(metrics: dict, previous: list[dict]) -> bool:
@@ -702,8 +708,8 @@ def _is_better_overall(metrics: dict, previous: list[dict]) -> bool:
     """Compare current epoch against ALL previous epochs regardless of stage.
 
     Unlike _is_better which only compares within the same stage, this function
-    compares across stages. Uses composite score (cosine x face_det) to prevent
-    selecting degenerate checkpoints with high cosine but zero face quality.
+    compares across stages. Uses composite score (cosine x single_face_eq1_rate)
+    to prevent selecting degenerate checkpoints with high cosine but invalid face counts.
     """
     if not previous:
         return True

@@ -4,6 +4,26 @@ import math
 from typing import Iterable
 
 
+def face_count_rates(counts: Iterable[int]) -> dict[str, float]:
+    count_list = []
+    for count in counts:
+        if isinstance(count, bool):
+            raise ValueError(f"Face count must be an integer count, got bool {count!r}")
+        parsed = int(count)
+        if parsed < 0:
+            raise ValueError(f"Face count must be non-negative, got {count!r}")
+        count_list.append(parsed)
+    if not count_list:
+        raise ValueError("Cannot compute face count rates from an empty count list")
+    total = float(len(count_list))
+    return {
+        "face_detect_ge1_rate": sum(1 for count in count_list if count >= 1) / total,
+        "single_face_eq1_rate": sum(1 for count in count_list if count == 1) / total,
+        "zero_face_rate": sum(1 for count in count_list if count == 0) / total,
+        "multi_face_rate": sum(1 for count in count_list if count > 1) / total,
+    }
+
+
 def summarize(values: Iterable[float]) -> dict[str, float]:
     import numpy as np
 
@@ -39,4 +59,3 @@ def flatten_finite_numbers(payload) -> list[float]:
             raise ValueError("Non-finite number in metrics payload")
         values.append(value)
     return values
-

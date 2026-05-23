@@ -11,7 +11,13 @@ from unittest.mock import patch
 
 from safa.evaluation.metrics import flatten_finite_numbers, summarize
 from safa.evaluation import perturbations
-from safa.evaluation.runner import _guard_result, _run_privacy_pass, deterministic_impostor_indices
+from safa.evaluation.runner import (
+    _attach_face_detection_rows,
+    _guard_result,
+    _run_privacy_pass,
+    _summarize_rows,
+    deterministic_impostor_indices,
+)
 
 
 TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
@@ -47,11 +53,22 @@ class EvalContractTests(unittest.TestCase):
 
     def test_face_detection_guard_requires_both_thresholds(self) -> None:
         metrics = {
-            "face_detection": {"detected": {"mean": 0.99}},
+            "face_detection": {
+                "detected": {"mean": 0.99},
+                "face_detect_ge1_rate": {"mean": 0.99},
+                "single_face_eq1_rate": {"mean": 0.98},
+                "zero_face_rate": {"mean": 0.01},
+                "multi_face_rate": {"mean": 0.01},
+            },
             "latent_cosine": {"mean": 0.94},
         }
         guard = _guard_result(metrics, {"enabled": True, "threshold": 0.95, "latent_cosine_threshold": 0.95})
         self.assertFalse(guard["passed"])
+        self.assertEqual(guard["face_detection_rate"], metrics["face_detection"]["detected"]["mean"])
+        self.assertEqual(guard["face_detect_ge1_rate"], metrics["face_detection"]["face_detect_ge1_rate"]["mean"])
+        self.assertEqual(guard["single_face_eq1_rate"], metrics["face_detection"]["single_face_eq1_rate"]["mean"])
+        self.assertEqual(guard["zero_face_rate"], metrics["face_detection"]["zero_face_rate"]["mean"])
+        self.assertEqual(guard["multi_face_rate"], metrics["face_detection"]["multi_face_rate"]["mean"])
         metrics["latent_cosine"]["mean"] = 0.96
         guard = _guard_result(metrics, {"enabled": True, "threshold": 0.95, "latent_cosine_threshold": 0.95})
         self.assertTrue(guard["passed"])
@@ -59,6 +76,25 @@ class EvalContractTests(unittest.TestCase):
     def test_face_detection_guard_rejects_missing_detection_metrics(self) -> None:
         with self.assertRaises(RuntimeError):
             _guard_result({"latent_cosine": {"mean": 0.99}}, {"enabled": True})
+
+    def test_eval_face_count_rows_and_summary_expose_new_rates_with_legacy_ge1(self) -> None:
+        rows = [
+            {"affective": {"latent_cosine": 0.9}, "face_detection": {}, "anti_steg": {}, "privacy": {}},
+            {"affective": {"latent_cosine": 0.8}, "face_detection": {}, "anti_steg": {}, "privacy": {}},
+            {"affective": {"latent_cosine": 0.7}, "face_detection": {}, "anti_steg": {}, "privacy": {}},
+        ]
+
+        _attach_face_detection_rows(rows, [0, 1, 2])
+        summary = _summarize_rows(rows)["face_detection"]
+
+        self.assertEqual(rows[0]["face_detection"]["zero_face_rate"], 1.0)
+        self.assertEqual(rows[1]["face_detection"]["single_face_eq1_rate"], 1.0)
+        self.assertEqual(rows[2]["face_detection"]["multi_face_rate"], 1.0)
+        self.assertAlmostEqual(summary["face_detect_ge1_rate"]["mean"], 2.0 / 3.0)
+        self.assertAlmostEqual(summary["single_face_eq1_rate"]["mean"], 1.0 / 3.0)
+        self.assertAlmostEqual(summary["zero_face_rate"]["mean"], 1.0 / 3.0)
+        self.assertAlmostEqual(summary["multi_face_rate"]["mean"], 1.0 / 3.0)
+        self.assertAlmostEqual(summary["detected"]["mean"], summary["face_detect_ge1_rate"]["mean"])
 
     @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for eval checkpoint tests")
     def test_eval_generator_loader_rejects_checkpoint_missing_model_config(self) -> None:
@@ -162,6 +198,50 @@ class EvalContractTests(unittest.TestCase):
 
         self.assertEqual(len(generator.x_inits), 2)
         self.assertTrue(torch.equal(generator.x_inits[0], generator.x_inits[1]))
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for validation metric tests")
+    def test_validation_face_count_rates_aggregate_counts_with_legacy_ge1(self) -> None:
+        import torch
+
+        from safa.models.generator import FlowGeneratorConfig
+        from safa.training.g_loop import _evaluate_validation
+
+        class DummyGenerator(torch.nn.Module):
+            def sample(self, z, **kwargs):
+                return torch.zeros(z.shape[0], 3, 4, 4, device=z.device, dtype=z.dtype)
+
+        class DummyE0(torch.nn.Module):
+            def forward(self, images):
+                batch = images.shape[0]
+                return {"embedding": torch.ones(batch, 2, device=images.device), "logits": torch.zeros(batch, 2, device=images.device)}
+
+        class DummyDetector:
+            def detect_counts(self, images):
+                return [0, 1, 2]
+
+        loader = [
+            {
+                "image": torch.zeros(3, 3, 4, 4),
+                "z": torch.ones(3, 2),
+                "sample_id": ["zero", "single", "multi"],
+            }
+        ]
+
+        metrics = _evaluate_validation(
+            DummyGenerator(),
+            DummyE0(),
+            loader,
+            detector=DummyDetector(),
+            device=torch.device("cpu"),
+            generator_config=FlowGeneratorConfig(embedding_dim=2, image_size=4, sample_steps=1),
+            sampling_seed=1337,
+        )
+
+        self.assertAlmostEqual(metrics["face_detect_ge1_rate"], 2.0 / 3.0)
+        self.assertAlmostEqual(metrics["single_face_eq1_rate"], 1.0 / 3.0)
+        self.assertAlmostEqual(metrics["zero_face_rate"], 1.0 / 3.0)
+        self.assertAlmostEqual(metrics["multi_face_rate"], 1.0 / 3.0)
+        self.assertAlmostEqual(metrics["face_detection_rate"], metrics["face_detect_ge1_rate"])
 
     @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for privacy cache tests")
     def test_privacy_pass_uses_cached_generated_images(self) -> None:

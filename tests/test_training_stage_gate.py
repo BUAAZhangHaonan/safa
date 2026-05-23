@@ -118,6 +118,30 @@ class StageGateTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "zero norm"):
             _compute_gradient_conflict_metrics(flow_loss, cycle_loss, [parameter])
 
+    def test_checkpoint_composite_uses_single_face_eq1_rate_not_legacy_ge1(self) -> None:
+        from safa.training.g_loop import _composite_score
+
+        ge1_high_single_low = {
+            "validation_latent_cosine_mean": 0.90,
+            "validation_face_detection_rate": 1.00,
+            "validation_single_face_eq1_rate": 0.10,
+        }
+        ge1_low_single_high = {
+            "validation_latent_cosine_mean": 0.80,
+            "validation_face_detection_rate": 0.20,
+            "validation_single_face_eq1_rate": 0.90,
+        }
+
+        self.assertAlmostEqual(_composite_score(ge1_high_single_low), 0.09)
+        self.assertAlmostEqual(_composite_score(ge1_low_single_high), 0.72)
+        self.assertGreater(_composite_score(ge1_low_single_high), _composite_score(ge1_high_single_low))
+
+    def test_checkpoint_composite_requires_single_face_eq1_rate(self) -> None:
+        from safa.training.g_loop import _composite_score
+
+        with self.assertRaisesRegex(KeyError, "validation_single_face_eq1_rate"):
+            _composite_score({"validation_latent_cosine_mean": 0.90, "validation_face_detection_rate": 1.00})
+
     def test_epoch_metrics_include_gradient_conflict_when_recorded(self) -> None:
         import torch
 

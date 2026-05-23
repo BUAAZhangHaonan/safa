@@ -19,6 +19,15 @@ The first validation is intentionally small. It checks whether the full chain ru
 - Privacy evaluation is guarded by ArcFace detection rate and latent cosine thresholds.
 - Missing files, invalid labels, missing checkpoints, CPU-only execution, and NaNs are hard errors.
 
+## Metric Semantics
+
+- `face_detect_ge1_rate` is the count >= 1 rate.
+- `single_face_eq1_rate` is the count == 1 rate.
+- `zero_face_rate` is the count == 0 rate.
+- `multi_face_rate` is the count > 1 rate.
+- Legacy `face_detection_rate` and eval `face_detection.detected.mean` remain ge1 metrics for old report compatibility.
+- New checkpoint composite uses `validation_latent_cosine_mean * validation_single_face_eq1_rate`. Old reports used `face_detection_rate`/ge1.
+
 ## Main Commands
 
 ```bash

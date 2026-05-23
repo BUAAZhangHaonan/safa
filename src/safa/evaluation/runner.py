@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import json
 
 from safa.data.feature_dataset import FeatureAlignedAffectNet
-from safa.evaluation.metrics import flatten_finite_numbers, summarize
+from safa.evaluation.metrics import face_count_rates, flatten_finite_numbers, summarize
 from safa.evaluation.perturbations import perturbation_map
 from safa.evaluation.recognizers import InsightFaceDetector, build_recognizers, describe_recognizer_assets
 from safa.models.e0 import freeze_e0, load_e0_checkpoint
@@ -230,7 +230,12 @@ def _attach_face_detection_rows(rows: list[dict], counts: list[int]) -> None:
     if len(rows) != len(counts):
         raise RuntimeError(f"Face detection count mismatch: rows={len(rows)} counts={len(counts)}")
     for row, count in zip(rows, counts):
-        row["face_detection"] = {"count": int(count), "detected": float(count >= 1)}
+        rates = face_count_rates([count])
+        row["face_detection"] = {
+            "count": int(count),
+            "detected": rates["face_detect_ge1_rate"],
+            **rates,
+        }
 
 
 def _attach_perturbed_affective_rows(rows: list[dict], row_start: int, name: str, perturbed_out, z) -> None:
@@ -350,6 +355,12 @@ def _guard_result(metrics: dict, config: dict) -> dict:
     face_threshold = float(config.get("threshold", 0.95))
     cosine_threshold = float(config.get("latent_cosine_threshold", 0.95))
     face_detection_rate = metrics.get("face_detection", {}).get("detected", {}).get("mean")
+    face_rates = {
+        "face_detect_ge1_rate": metrics.get("face_detection", {}).get("face_detect_ge1_rate", {}).get("mean"),
+        "single_face_eq1_rate": metrics.get("face_detection", {}).get("single_face_eq1_rate", {}).get("mean"),
+        "zero_face_rate": metrics.get("face_detection", {}).get("zero_face_rate", {}).get("mean"),
+        "multi_face_rate": metrics.get("face_detection", {}).get("multi_face_rate", {}).get("mean"),
+    }
     latent_cosine_mean = metrics.get("latent_cosine", {}).get("mean")
     if face_detection_rate is None:
         raise RuntimeError("Face detection guard is enabled but no face_detection metrics were produced")
@@ -360,6 +371,7 @@ def _guard_result(metrics: dict, config: dict) -> dict:
         "enabled": True,
         "passed": passed,
         "face_detection_rate": face_detection_rate,
+        **face_rates,
         "latent_cosine_mean": latent_cosine_mean,
         "face_detection_threshold": face_threshold,
         "latent_cosine_threshold": cosine_threshold,
