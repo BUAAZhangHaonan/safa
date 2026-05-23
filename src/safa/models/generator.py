@@ -4,6 +4,20 @@ from dataclasses import dataclass
 from typing import Any
 
 
+GENERATOR_CHECKPOINT_MODEL_CONFIG_FIELDS = (
+    "model_type",
+    "embedding_dim",
+    "image_size",
+    "base_channels",
+    "channel_multipliers",
+    "time_embedding_dim",
+    "condition_dim",
+    "sample_steps",
+    "train_cycle_steps",
+    "sampler",
+)
+
+
 @dataclass(frozen=True)
 class FlowGeneratorConfig:
     embedding_dim: int = 512
@@ -46,6 +60,16 @@ class FlowGeneratorConfig:
             "sampler": self.sampler,
             **({"cycle_steps_schedule": list(self.cycle_steps_schedule)} if self.cycle_steps_schedule else {}),
         }
+
+
+def require_generator_model_config(payload: dict[str, Any], checkpoint_path: str) -> dict[str, Any]:
+    model_config = payload.get("model_config") if isinstance(payload, dict) else None
+    if not isinstance(model_config, dict):
+        raise ValueError(f"Generator checkpoint missing model_config: {checkpoint_path}")
+    missing = [field for field in GENERATOR_CHECKPOINT_MODEL_CONFIG_FIELDS if field not in model_config]
+    if missing:
+        raise ValueError(f"Generator checkpoint model_config missing fields {missing}: {checkpoint_path}")
+    return dict(model_config)
 
 
 class ConditionalFlowGenerator:

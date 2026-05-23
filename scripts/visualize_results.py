@@ -2,7 +2,7 @@
 """SAFA reconstruction visualization: 4x4 grid of original vs generated pairs.
 
 For each of 16 validation images:
-  1. E0 encodes original -> z (512-dim embedding)
+  1. E0 encodes original -> z
   2. G generates from z -> reconstructed image
   3. E0 re-encodes generated -> z_hat
   4. Compute cosine(z, z_hat) and predicted emotion labels
@@ -28,7 +28,7 @@ for _candidate in [_SCRIPT_DIR, os.path.join(_SCRIPT_DIR, "src")]:
     if _candidate not in sys.path:
         sys.path.insert(0, _candidate)
 
-from safa.models.generator import build_generator
+from safa.models.generator import build_generator, require_generator_model_config
 from safa.models.e0 import load_e0_checkpoint, freeze_e0
 from safa.data.dataset import AffectNetRecords
 from safa.training.transforms import eval_transform
@@ -66,7 +66,7 @@ def parse_args():
 
 def load_generator(path, device):
     ckpt = torch.load(path, map_location=device, weights_only=False)
-    g_config = ckpt["model_config"]
+    g_config = require_generator_model_config(ckpt, path)
     model = build_generator(g_config).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
@@ -102,12 +102,13 @@ def main():
 
     print(f"Loading G  from {args.g_checkpoint} ...")
     g, g_ckpt = load_generator(args.g_checkpoint, device)
+    image_size = _checkpoint_image_size(g_ckpt)
     sampling_seed = _sampling_seed(args.sampling_seed, g_ckpt)
 
     print(f"Loading val set from {args.val_index} ...")
     dataset = AffectNetRecords(
         index_path=args.val_index,
-        transform=eval_transform(224),
+        transform=eval_transform(image_size),
     )
     total = min(num_samples, len(dataset))
     print(f"  Dataset size: {len(dataset)}, using {total} samples")
@@ -127,7 +128,7 @@ def main():
             pred_orig = e0_out["logits"].argmax(dim=1).item()
 
             sample_id = sample["sample_id"]
-            x_init = make_x_init_for_sample_ids([sample_id], sampling_seed, int(getattr(g, "image_size", 224)), z.device, z.dtype)
+            x_init = make_x_init_for_sample_ids([sample_id], sampling_seed, image_size, z.device, z.dtype)
             gen_img = g.sample(z.unsqueeze(0), steps=args.sample_steps, x_init=x_init)
 
             gen_normalized = normalize_for_e0(gen_img)
@@ -211,6 +212,22 @@ def _sampling_seed(arg_seed: int | None, checkpoint: dict) -> int:
     if isinstance(training_config, dict):
         return sampling_base_seed_from_config(training_config)
     raise KeyError("Pass --sampling-seed or use a checkpoint with training_config.seed/sampling_seed")
+
+
+def _checkpoint_image_size(checkpoint: dict) -> int:
+    model_config = checkpoint.get("model_config") if isinstance(checkpoint, dict) else None
+    if not isinstance(model_config, dict) or "image_size" not in model_config:
+        raise ValueError("Generator checkpoint missing model_config.image_size")
+    value = model_config["image_size"]
+    if isinstance(value, bool):
+        raise ValueError(f"Generator checkpoint model_config.image_size must be a positive integer, got {value!r}")
+    try:
+        image_size = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Generator checkpoint model_config.image_size must be a positive integer, got {value!r}") from exc
+    if image_size <= 0:
+        raise ValueError(f"Generator checkpoint model_config.image_size must be a positive integer, got {value!r}")
+    return image_size
 
 
 if __name__ == "__main__":

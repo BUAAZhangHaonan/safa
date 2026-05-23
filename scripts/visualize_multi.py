@@ -19,7 +19,7 @@ for _candidate in [_SCRIPT_DIR, os.path.join(_SCRIPT_DIR, "src")]:
     if _candidate not in sys.path:
         sys.path.insert(0, _candidate)
 
-from safa.models.generator import build_generator
+from safa.models.generator import build_generator, require_generator_model_config
 from safa.models.e0 import load_e0_checkpoint, freeze_e0
 from safa.data.dataset import AffectNetRecords
 from safa.training.transforms import eval_transform
@@ -49,11 +49,11 @@ def parse_args():
 
 def load_generator(path, device):
     ckpt = torch.load(path, map_location=device, weights_only=False)
-    g_config = ckpt["model_config"]
+    g_config = require_generator_model_config(ckpt, path)
     model = build_generator(g_config).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
-    return model, ckpt.get("metrics", {}), ckpt.get("training_config")
+    return model, ckpt.get("metrics", {}), ckpt.get("training_config"), _checkpoint_image_size(ckpt)
 
 
 def denormalize_imagenet(tensor_chw):
@@ -73,14 +73,14 @@ def normalize_for_e0(images_bchw):
     return (images_bchw - mean) / std
 
 
-def process_sample(e0, generator, img_tensor, device, sample_steps, sample_id, sampling_seed):
+def process_sample(e0, generator, img_tensor, device, sample_steps, sample_id, sampling_seed, image_size):
     """Process one image through E0 -> G -> E0 pipeline."""
     with torch.no_grad():
         e0_out = e0(img_tensor)
         z = e0_out["embedding"]
         pred_orig = e0_out["logits"].argmax(dim=1).item()
 
-        x_init = make_x_init_for_sample_ids([sample_id], sampling_seed, int(getattr(generator, "image_size", 224)), z.device, z.dtype)
+        x_init = make_x_init_for_sample_ids([sample_id], sampling_seed, image_size, z.device, z.dtype)
         gen_img = generator.sample(z, steps=sample_steps, x_init=x_init)
         gen_clamped = gen_img.clamp(-1, 1)
 
@@ -129,25 +129,29 @@ def main():
     e0.to(device)
     freeze_e0(e0)
 
-    print(f"Loading val set from {args.val_index} ...")
-    dataset = AffectNetRecords(index_path=args.val_index, transform=eval_transform(224))
-    num_samples = min(args.num_samples, len(dataset))
-    indices = np.linspace(0, len(dataset) - 1, num_samples, dtype=int)
-    print(f"  Dataset size: {len(dataset)}, using {num_samples} samples")
-
     # Load all generators
     generators = {}
     exp_metrics = {}
     training_configs = []
+    image_sizes = []
     for name, path in experiments:
         print(f"Loading G from {path} ...")
-        gen, metrics, training_config = load_generator(path, device)
+        gen, metrics, training_config, image_size = load_generator(path, device)
         generators[name] = gen
         exp_metrics[name] = metrics
         training_configs.append(training_config)
+        image_sizes.append(image_size)
         cos = metrics.get("validation_latent_cosine_mean", -1)
         fd = metrics.get("validation_face_detection_rate", -1)
         print(f"  {name}: cosine={cos:.4f}, face_det={fd:.4f}")
+
+    image_size = _shared_image_size(image_sizes)
+
+    print(f"Loading val set from {args.val_index} ...")
+    dataset = AffectNetRecords(index_path=args.val_index, transform=eval_transform(image_size))
+    num_samples = min(args.num_samples, len(dataset))
+    indices = np.linspace(0, len(dataset) - 1, num_samples, dtype=int)
+    print(f"  Dataset size: {len(dataset)}, using {num_samples} samples")
 
     sampling_seed = _sampling_seed(args.sampling_seed, training_configs)
 
@@ -168,7 +172,7 @@ def main():
         })
 
         for name, gen in generators.items():
-            r = process_sample(e0, gen, img_tensor, device, args.sample_steps, sample["sample_id"], sampling_seed)
+            r = process_sample(e0, gen, img_tensor, device, args.sample_steps, sample["sample_id"], sampling_seed, image_size)
             all_results[name].append(r)
 
         if (count + 1) % 4 == 0 or count == num_samples - 1:
@@ -301,6 +305,29 @@ def _sampling_seed(arg_seed: int | None, training_configs: list) -> int:
     if len(seeds) == len(training_configs) and len(unique) == 1:
         return seeds[0]
     raise KeyError("Pass --sampling-seed or use checkpoints with one shared training_config.seed/sampling_seed")
+
+
+def _checkpoint_image_size(checkpoint: dict) -> int:
+    model_config = checkpoint.get("model_config") if isinstance(checkpoint, dict) else None
+    if not isinstance(model_config, dict) or "image_size" not in model_config:
+        raise ValueError("Generator checkpoint missing model_config.image_size")
+    value = model_config["image_size"]
+    if isinstance(value, bool):
+        raise ValueError(f"Generator checkpoint model_config.image_size must be a positive integer, got {value!r}")
+    try:
+        image_size = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Generator checkpoint model_config.image_size must be a positive integer, got {value!r}") from exc
+    if image_size <= 0:
+        raise ValueError(f"Generator checkpoint model_config.image_size must be a positive integer, got {value!r}")
+    return image_size
+
+
+def _shared_image_size(image_sizes: list[int]) -> int:
+    unique = sorted(set(image_sizes))
+    if len(unique) != 1:
+        raise RuntimeError(f"Multi-checkpoint visualization requires one shared model_config.image_size, got {unique}")
+    return unique[0]
 
 
 if __name__ == "__main__":

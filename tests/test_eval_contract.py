@@ -3,7 +3,11 @@ from __future__ import annotations
 import inspect
 import importlib.util
 import math
+from types import SimpleNamespace
+import tempfile
+from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 from safa.evaluation.metrics import flatten_finite_numbers, summarize
 from safa.evaluation import perturbations
@@ -55,6 +59,41 @@ class EvalContractTests(unittest.TestCase):
     def test_face_detection_guard_rejects_missing_detection_metrics(self) -> None:
         with self.assertRaises(RuntimeError):
             _guard_result({"latent_cosine": {"mean": 0.99}}, {"enabled": True})
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for eval checkpoint tests")
+    def test_eval_generator_loader_rejects_checkpoint_missing_model_config(self) -> None:
+        import torch
+
+        from safa.evaluation.runner import _load_generator
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "g.pt"
+            torch.save({"model_state_dict": {}}, path)
+
+            with patch("safa.evaluation.runner.build_generator", side_effect=AssertionError("must not build without model_config")):
+                with self.assertRaisesRegex(ValueError, "model_config"):
+                    _load_generator(str(path), {}, "cpu")
+
+    def test_eval_feature_metadata_uses_cache_dim_and_checks_model_dims(self) -> None:
+        from safa.evaluation.runner import _feature_metadata_for_eval
+
+        dataset = SimpleNamespace(manifest=SimpleNamespace(feature_dim=128))
+        generator = SimpleNamespace(config=SimpleNamespace(embedding_dim=128))
+        e0_checkpoint = {"model_config": {"embedding_dim": 128}}
+
+        metadata = _feature_metadata_for_eval(dataset, generator, e0_checkpoint, "features/cache")
+
+        self.assertEqual(metadata, {"dim": 128, "l2_normalized": True, "cache": "features/cache"})
+
+    def test_eval_feature_metadata_rejects_generator_dim_mismatch(self) -> None:
+        from safa.evaluation.runner import _feature_metadata_for_eval
+
+        dataset = SimpleNamespace(manifest=SimpleNamespace(feature_dim=128))
+        generator = SimpleNamespace(config=SimpleNamespace(embedding_dim=64))
+        e0_checkpoint = {"model_config": {"embedding_dim": 128}}
+
+        with self.assertRaisesRegex(RuntimeError, "feature_dim"):
+            _feature_metadata_for_eval(dataset, generator, e0_checkpoint, "features/cache")
 
     @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for eval sampling tests")
     def test_eval_generation_uses_sample_with_stable_x_init_not_forward(self) -> None:

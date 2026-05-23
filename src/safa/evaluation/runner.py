@@ -9,7 +9,7 @@ from safa.evaluation.metrics import flatten_finite_numbers, summarize
 from safa.evaluation.perturbations import perturbation_map
 from safa.evaluation.recognizers import InsightFaceDetector, build_recognizers, describe_recognizer_assets
 from safa.models.e0 import freeze_e0, load_e0_checkpoint
-from safa.models.generator import build_generator
+from safa.models.generator import build_generator, require_generator_model_config
 from safa.training.losses import normalize_for_e0
 from safa.training.transforms import generator_image_transform
 from safa.utils.device import assert_finite_tensor, require_cuda_device
@@ -26,7 +26,7 @@ def run_eval_from_config(config: dict) -> dict:
 
     set_seed(int(config["seed"]))
     device = require_cuda_device(str(config["device"]))
-    e0, _ = load_e0_checkpoint(config["e0_checkpoint"], device=str(device))
+    e0, e0_checkpoint = load_e0_checkpoint(config["e0_checkpoint"], device=str(device))
     e0.to(device)
     freeze_e0(e0)
     generator = _load_generator(config["g_checkpoint"], config, str(device))
@@ -37,6 +37,7 @@ def run_eval_from_config(config: dict) -> dict:
         config["e0_checkpoint"],
         transform=generator_image_transform(int(config["image_size"])),
     )
+    feature_metadata = _feature_metadata_for_eval(dataset, generator, e0_checkpoint, config["features"])
     loader = DataLoader(dataset, batch_size=int(config["batch_size"]), shuffle=False, num_workers=int(config["num_workers"]), pin_memory=True)
     privacy_cfg = config.get("privacy", {"enabled": False})
     face_detection_cfg = config.get("face_detection", _default_face_detection_config(privacy_cfg))
@@ -97,7 +98,7 @@ def run_eval_from_config(config: dict) -> dict:
             "g": config["g_checkpoint"],
             "g_sha256": sha256_file(config["g_checkpoint"]),
         },
-        "features": {"dim": 512, "l2_normalized": True, "cache": config["features"]},
+        "features": feature_metadata,
         "recognizer_assets": recognizer_assets,
         "face_detection_guard": guard,
         "privacy_skipped": privacy_skipped,
@@ -134,10 +135,41 @@ def _load_generator(checkpoint_path: str, config: dict, device: str):
     if not path.is_file():
         raise FileNotFoundError(f"Generator checkpoint does not exist: {path}")
     payload = torch.load(path, map_location=device)
-    model_config = payload.get("model_config", {})
+    model_config = require_generator_model_config(payload, str(path))
     generator = build_generator(model_config)
     generator.load_state_dict(payload["model_state_dict"])
     return generator.to(device).eval()
+
+
+def _feature_metadata_for_eval(dataset, generator, e0_checkpoint: dict, cache_path: str) -> dict:
+    manifest = getattr(dataset, "manifest", None)
+    feature_dim = _positive_int_metadata(getattr(manifest, "feature_dim", None), "feature cache manifest feature_dim")
+    if getattr(manifest, "l2_normalized", True) is not True:
+        raise RuntimeError("Feature cache manifest must declare l2_normalized=true for eval")
+    generator_config = getattr(generator, "config", None)
+    generator_dim = _positive_int_metadata(getattr(generator_config, "embedding_dim", None), "generator model_config.embedding_dim")
+    e0_config = e0_checkpoint.get("model_config") if isinstance(e0_checkpoint, dict) else None
+    if not isinstance(e0_config, dict) or "embedding_dim" not in e0_config:
+        raise ValueError("E0 checkpoint missing model_config.embedding_dim")
+    e0_dim = _positive_int_metadata(e0_config["embedding_dim"], "E0 model_config.embedding_dim")
+    if feature_dim != generator_dim or feature_dim != e0_dim:
+        raise RuntimeError(
+            "feature_dim mismatch: "
+            f"cache={feature_dim}, generator={generator_dim}, e0={e0_dim}"
+        )
+    return {"dim": feature_dim, "l2_normalized": True, "cache": cache_path}
+
+
+def _positive_int_metadata(value, field: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a positive integer, got bool")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a positive integer, got {value!r}") from exc
+    if parsed <= 0:
+        raise ValueError(f"{field} must be a positive integer, got {value!r}")
+    return parsed
 
 
 def _sample_generated_for_eval(generator, z, sample_ids, sampling_seed: int, image_size: int):
