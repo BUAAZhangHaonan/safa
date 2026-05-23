@@ -32,6 +32,11 @@ export = [
   "omegaconf",
   "fvcore",
 ]
+quality = [
+  "torchmetrics[image]==1.9.0",
+  "pyiqa==0.1.15.post2",
+  "opencv-python==4.10.0.84",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
