@@ -6,8 +6,26 @@ import tempfile
 from pathlib import Path
 import unittest
 
+import yaml
+
 
 TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
+
+
+class GeneratorConfigFileContractTests(unittest.TestCase):
+    def test_ablation_configs_satisfy_flow_generator_required_fields(self) -> None:
+        from safa.models.generator import FlowGeneratorConfig
+
+        config_paths = sorted(Path("configs/ablation").glob("*.yaml"))
+        self.assertTrue(config_paths)
+        for path in config_paths:
+            with self.subTest(path=str(path)):
+                config = yaml.safe_load(path.read_text(encoding="utf-8"))
+                generator_config = dict(config["generator"])
+                generator_config["embedding_dim"] = config["embedding_dim"]
+                generator_config["image_size"] = config["image_size"]
+
+                FlowGeneratorConfig.from_dict(generator_config)
 
 
 @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for generator contract tests")

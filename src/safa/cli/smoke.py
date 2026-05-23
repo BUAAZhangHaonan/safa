@@ -12,7 +12,19 @@ from safa.training.g_loop import train_g_from_config
 from safa.utils.config import load_yaml, require_keys
 
 
-REQUIRED_KEYS = ("seed", "device", "num_workers", "batch_size", "image_size", "limit", "root", "work_dir", "e0_checkpoint")
+REQUIRED_KEYS = (
+    "seed",
+    "device",
+    "num_workers",
+    "batch_size",
+    "image_size",
+    "limit",
+    "root",
+    "work_dir",
+    "e0_checkpoint",
+    "face_detection_enabled",
+    "face_detection_model",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,6 +36,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     config = load_yaml(parse_args().config)
     require_keys(config, REQUIRED_KEYS)
+    face_detection_enabled = config["face_detection_enabled"]
+    face_detection_model = config["face_detection_model"]
     work_dir = Path(config["work_dir"])
     work_dir.mkdir(parents=True, exist_ok=True)
     index_path = work_dir / "smoke_index.jsonl"
@@ -82,7 +96,7 @@ def main() -> None:
                 "sampler": "heun",
             },
             "stages": {
-                "stage1": {"epochs": 1},
+                "stage1": {"epochs": 1, "require_face_detection_gate": False},
                 "stage2": {
                     "epochs": 1,
                     "lambda_initial": 0.005,
@@ -92,14 +106,14 @@ def main() -> None:
                 },
             },
             "validation": {
-                "enabled": bool(config.get("face_detection_enabled", False)),
+                "enabled": face_detection_enabled,
                 "index": str(index_path),
                 "features": str(feature_dir),
                 "max_samples": int(config["limit"]),
                 "batch_size": config["batch_size"],
                 "face_detection": {
-                    "enabled": bool(config.get("face_detection_enabled", False)),
-                    "model_name": str(config.get("face_detection_model", "buffalo_l")),
+                    "enabled": face_detection_enabled,
+                    "model_name": face_detection_model,
                 },
             },
         }

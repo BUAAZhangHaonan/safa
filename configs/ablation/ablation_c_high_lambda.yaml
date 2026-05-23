@@ -20,7 +20,9 @@ grad_clip_norm: 1.0
 
 generator:
   base_channels: 32
+  channel_multipliers: [1, 2, 4, 4]
   cycle_steps_schedule: [4, 8, 16]
+  condition_dim: 512
   sample_steps: 32
   train_cycle_steps: 4
   sampler: "heun"
