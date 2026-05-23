@@ -66,7 +66,8 @@ def cache_e0_from_config(config: dict) -> dict:
         dtype=str(tensor.dtype).replace("torch.", ""),
         shard=shard,
         shard_sha256=sha256_file(shard_path),
+        sample_ids=sample_ids,
+        labels=labels,
     )
     write_manifest(out_dir, manifest)
     return manifest.to_json_dict()
-

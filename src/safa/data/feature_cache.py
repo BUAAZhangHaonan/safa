@@ -21,6 +21,42 @@ class FeatureCacheManifest:
     dtype: str
     shard: str
     shard_sha256: str
+    sample_ids: list[str]
+    labels: list[int]
+
+    def __post_init__(self) -> None:
+        if type(self.num_samples) is not int:
+            raise ValueError(
+                f"Feature cache manifest field num_samples must be int, got {type(self.num_samples).__name__}"
+            )
+        if type(self.feature_dim) is not int:
+            raise ValueError(
+                f"Feature cache manifest field feature_dim must be int, got {type(self.feature_dim).__name__}"
+            )
+        if type(self.l2_normalized) is not bool:
+            raise ValueError(
+                f"Feature cache manifest field l2_normalized must be bool, got {type(self.l2_normalized).__name__}"
+            )
+        if self.feature_dim <= 0:
+            raise ValueError(f"Feature cache feature_dim must be positive, got {self.feature_dim}")
+        if not self.l2_normalized:
+            raise ValueError("Feature cache manifest must declare l2_normalized=true")
+        if self.num_samples <= 0:
+            raise ValueError("Feature cache manifest num_samples must be positive")
+        sample_ids = _validate_str_list(self.sample_ids, "Feature cache manifest field sample_ids")
+        labels = _validate_int_list(self.labels, "Feature cache manifest field labels")
+        if len(sample_ids) != self.num_samples:
+            raise ValueError(
+                f"Feature cache manifest sample_ids length mismatch: got {len(sample_ids)}, expected {self.num_samples}"
+            )
+        if len(labels) != self.num_samples:
+            raise ValueError(
+                f"Feature cache manifest labels length mismatch: got {len(labels)}, expected {self.num_samples}"
+            )
+        if len(set(sample_ids)) != len(sample_ids):
+            raise ValueError("Feature cache manifest sample_ids must be unique")
+        object.__setattr__(self, "sample_ids", sample_ids)
+        object.__setattr__(self, "labels", labels)
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> "FeatureCacheManifest":
@@ -38,11 +74,13 @@ class FeatureCacheManifest:
             "dtype",
             "shard",
             "shard_sha256",
+            "sample_ids",
+            "labels",
         }
         missing = required.difference(data)
         if missing:
             raise ValueError(f"Feature cache manifest missing fields: {sorted(missing)}")
-        manifest = cls(
+        return cls(
             dataset=_require_str(data, "dataset"),
             index_path=_require_str(data, "index_path"),
             index_sha256=_require_str(data, "index_sha256"),
@@ -54,14 +92,9 @@ class FeatureCacheManifest:
             dtype=_require_str(data, "dtype"),
             shard=_require_str(data, "shard"),
             shard_sha256=_require_str(data, "shard_sha256"),
+            sample_ids=_require_str_list(data, "sample_ids"),
+            labels=_require_int_list(data, "labels"),
         )
-        if manifest.feature_dim <= 0:
-            raise ValueError(f"Feature cache feature_dim must be positive, got {manifest.feature_dim}")
-        if not manifest.l2_normalized:
-            raise ValueError("Feature cache manifest must declare l2_normalized=true")
-        if manifest.num_samples <= 0:
-            raise ValueError("Feature cache manifest num_samples must be positive")
-        return manifest
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
@@ -76,6 +109,8 @@ class FeatureCacheManifest:
             "dtype": self.dtype,
             "shard": self.shard,
             "shard_sha256": self.shard_sha256,
+            "sample_ids": list(self.sample_ids),
+            "labels": list(self.labels),
         }
 
 
@@ -106,6 +141,40 @@ def _require_bool(data: dict[str, Any], field: str) -> bool:
     if type(value) is not bool:
         raise ValueError(f"Feature cache manifest field {field} must be bool, got {type(value).__name__}")
     return value
+
+
+def _validate_str_list(value: Any, context: str) -> list[str]:
+    if type(value) is not list:
+        raise ValueError(f"{context} must be list, got {type(value).__name__}")
+    for index, item in enumerate(value):
+        if type(item) is not str:
+            raise ValueError(f"{context}[{index}] must be str, got {type(item).__name__}")
+    return list(value)
+
+
+def _validate_int_list(value: Any, context: str) -> list[int]:
+    if type(value) is not list:
+        raise ValueError(f"{context} must be list, got {type(value).__name__}")
+    for index, item in enumerate(value):
+        if type(item) is not int:
+            raise ValueError(f"{context}[{index}] must be int, got {type(item).__name__}")
+    return list(value)
+
+
+def _require_str_list(data: dict[str, Any], field: str) -> list[str]:
+    return _validate_str_list(data[field], f"Feature cache manifest field {field}")
+
+
+def _require_int_list(data: dict[str, Any], field: str) -> list[int]:
+    return _validate_int_list(data[field], f"Feature cache manifest field {field}")
+
+
+def _require_shard_str_list(payload: dict[str, Any], field: str) -> list[str]:
+    return _validate_str_list(payload[field], f"Feature shard {field}")
+
+
+def _require_shard_int_list(payload: dict[str, Any], field: str) -> list[int]:
+    return _validate_int_list(payload[field], f"Feature shard {field}")
 
 
 def load_feature_cache(cache_dir: str | Path, index_path: str | Path, checkpoint_path: str | Path):
@@ -143,12 +212,16 @@ def load_feature_cache(cache_dir: str | Path, index_path: str | Path, checkpoint
     feature_dtype = str(features.dtype).replace("torch.", "")
     if feature_dtype != manifest.dtype:
         raise ValueError(f"Feature dtype mismatch: got {feature_dtype}, expected {manifest.dtype}")
-    sample_ids = payload["sample_ids"]
-    labels = payload["labels"]
+    sample_ids = _require_shard_str_list(payload, "sample_ids")
+    labels = _require_shard_int_list(payload, "labels")
     if len(sample_ids) != manifest.num_samples:
         raise ValueError(f"Feature sample_ids length mismatch: got {len(sample_ids)}, expected {manifest.num_samples}")
     if len(labels) != manifest.num_samples:
         raise ValueError(f"Feature labels length mismatch: got {len(labels)}, expected {manifest.num_samples}")
+    if sample_ids != manifest.sample_ids:
+        raise ValueError("Feature shard sample_ids do not match manifest sample_ids")
+    if labels != manifest.labels:
+        raise ValueError("Feature shard labels do not match manifest labels")
     norms = features.float().norm(dim=1)
     if not torch.allclose(norms, torch.ones_like(norms), rtol=1e-4, atol=1e-4):
         raise ValueError("Cached features are not L2-normalized")

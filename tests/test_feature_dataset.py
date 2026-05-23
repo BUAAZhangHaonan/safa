@@ -49,6 +49,8 @@ class FeatureDatasetTests(unittest.TestCase):
             "dtype": str(features.dtype).replace("torch.", ""),
             "shard": "features.pt",
             "shard_sha256": sha256_file(shard_path),
+            "sample_ids": ["sample-1"],
+            "labels": labels,
         }
         (cache_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
         return index_path, cache_dir, checkpoint_path
