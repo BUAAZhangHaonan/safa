@@ -7,6 +7,8 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
+import yaml
+
 from safa.data.index_schema import IndexRecord
 
 
@@ -57,6 +59,31 @@ class SmokeCliTests(unittest.TestCase):
                 smoke.main()
 
         self.assertEqual(captured["embedding_dim"], 128)
+        required_generator_fields = {
+            "embedding_dim",
+            "image_size",
+            "base_channels",
+            "channel_multipliers",
+            "condition_dim",
+            "sample_steps",
+            "train_cycle_steps",
+            "sampler",
+        }
+        self.assertFalse(required_generator_fields - set(captured["generator"]))
+        self.assertEqual(captured["generator"]["embedding_dim"], 128)
+        self.assertEqual(captured["generator"]["image_size"], 64)
+
+    def test_smoke_yaml_uses_positive_num_workers_required_by_training(self) -> None:
+        config = yaml.safe_load(Path("configs/smoke.yaml").read_text(encoding="utf-8"))
+
+        self.assertGreaterEqual(config["num_workers"], 1)
+
+    def test_runbook_referenced_smoke_script_exists(self) -> None:
+        runbook = Path("docs/4029_runbook.md").read_text(encoding="utf-8")
+        script = Path("scripts/run_smoke_tmux.sh")
+
+        self.assertIn(str(script), runbook)
+        self.assertTrue(script.is_file())
 
 
 if __name__ == "__main__":

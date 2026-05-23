@@ -17,6 +17,17 @@ GENERATOR_CHECKPOINT_MODEL_CONFIG_FIELDS = (
     "sampler",
 )
 
+FLOW_GENERATOR_REQUIRED_CONFIG_FIELDS = (
+    "embedding_dim",
+    "image_size",
+    "base_channels",
+    "channel_multipliers",
+    "condition_dim",
+    "sample_steps",
+    "train_cycle_steps",
+    "sampler",
+)
+
 
 @dataclass(frozen=True)
 class FlowGeneratorConfig:
@@ -33,17 +44,20 @@ class FlowGeneratorConfig:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "FlowGeneratorConfig":
+        missing = [field for field in FLOW_GENERATOR_REQUIRED_CONFIG_FIELDS if field not in payload]
+        if missing:
+            raise ValueError(f"FlowGeneratorConfig.from_dict missing required fields: {missing}")
         return cls(
-            embedding_dim=int(payload.get("embedding_dim", 512)),
-            image_size=int(payload.get("image_size", 224)),
-            base_channels=int(payload.get("base_channels", 32)),
-            channel_multipliers=tuple(int(item) for item in payload.get("channel_multipliers", (1, 2, 4, 4))),
+            embedding_dim=int(payload["embedding_dim"]),
+            image_size=int(payload["image_size"]),
+            base_channels=int(payload["base_channels"]),
+            channel_multipliers=tuple(int(item) for item in payload["channel_multipliers"]),
             time_embedding_dim=int(payload.get("time_embedding_dim", 128)),
-            condition_dim=int(payload.get("condition_dim", 512)),
-            sample_steps=int(payload.get("sample_steps", 32)),
-            train_cycle_steps=int(payload.get("train_cycle_steps", 8)),
+            condition_dim=int(payload["condition_dim"]),
+            sample_steps=int(payload["sample_steps"]),
+            train_cycle_steps=int(payload["train_cycle_steps"]),
             cycle_steps_schedule=tuple(int(s) for s in payload["cycle_steps_schedule"]) if "cycle_steps_schedule" in payload and payload["cycle_steps_schedule"] else (),
-            sampler=str(payload.get("sampler", "heun")),
+            sampler=str(payload["sampler"]),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -82,6 +96,8 @@ class ConditionalFlowGenerator:
         cfg_payload = {}
         if isinstance(config, FlowGeneratorConfig):
             cfg = config
+        elif config is None and not kwargs:
+            cfg = FlowGeneratorConfig()
         else:
             if config is not None:
                 cfg_payload.update(config)
@@ -282,6 +298,8 @@ def build_generator(config: dict[str, Any] | FlowGeneratorConfig | None = None, 
     payload: dict[str, Any] = {}
     if isinstance(config, FlowGeneratorConfig):
         return ConditionalFlowGenerator(config)
+    if config is None and not kwargs:
+        return ConditionalFlowGenerator()
     if config is not None:
         payload.update(config)
     payload.update(kwargs)

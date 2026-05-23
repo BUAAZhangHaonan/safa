@@ -155,12 +155,7 @@ def train_e0_from_config(config: dict) -> dict:
             assert_finite_tensor("e0_embedding", output["embedding"])
             assert_finite_tensor("e0_logits", output["logits"])
             loss = criterion(output["logits"], labels)
-            loss_val = float(loss.detach().cpu())
-            if not math.isfinite(loss_val):
-                print(f"WARNING: non-finite E0 loss detected: {loss_val} at epoch={epoch} batch={batch_idx}, skipping batch entirely")
-                optimizer.zero_grad(set_to_none=True)
-                continue
-            assert_finite_tensor("e0_loss", loss)
+            _assert_finite_e0_loss(loss, epoch, batch_idx)
             loss.backward()
             optimizer.step()
             train_loss_sum += float(loss.detach().cpu()) * labels.numel()
@@ -219,6 +214,13 @@ def train_e0_from_config(config: dict) -> dict:
     barrier(distributed)
     cleanup_distributed(distributed)
     return manifest
+
+
+def _assert_finite_e0_loss(loss, epoch: int, batch_idx: int) -> None:
+    loss_val = float(loss.detach().cpu()) if hasattr(loss, "detach") else float(loss)
+    if not math.isfinite(loss_val):
+        raise RuntimeError(f"non-finite E0 loss detected: {loss_val} at epoch={epoch} batch={batch_idx}")
+    assert_finite_tensor("e0_loss", loss)
 
 
 def evaluate_e0(model, loader, device) -> dict:

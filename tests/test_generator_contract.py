@@ -25,6 +25,28 @@ class GeneratorContractTests(unittest.TestCase):
             "sampler": "euler",
         }
 
+    def test_flow_generator_config_from_dict_requires_core_fields(self) -> None:
+        from safa.models.generator import FlowGeneratorConfig
+
+        required_fields = (
+            "embedding_dim",
+            "image_size",
+            "base_channels",
+            "channel_multipliers",
+            "condition_dim",
+            "sample_steps",
+            "train_cycle_steps",
+            "sampler",
+        )
+
+        for field in required_fields:
+            with self.subTest(field=field):
+                payload = self._small_config()
+                payload.pop(field)
+
+                with self.assertRaisesRegex(ValueError, field):
+                    FlowGeneratorConfig.from_dict(payload)
+
     def test_generator_forward_accepts_only_z(self) -> None:
         import torch
 

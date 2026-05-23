@@ -1,6 +1,6 @@
 seed: 1337
 device: cuda:0
-num_workers: 0
+num_workers: 1
 batch_size: 4
 image_size: 224
 limit: 32

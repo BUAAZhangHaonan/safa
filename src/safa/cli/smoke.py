@@ -71,6 +71,8 @@ def main() -> None:
             "allow_stage2_without_stage1_gate": True,
             "generator": {
                 "model_type": "conditional_flow_matching",
+                "embedding_dim": int(cache_manifest["feature_dim"]),
+                "image_size": int(config["image_size"]),
                 "base_channels": 8,
                 "channel_multipliers": [1, 2],
                 "time_embedding_dim": 32,
