@@ -34,6 +34,8 @@ stages:
     lambda_initial: 0.005
     lambda_max: 0.05
     lambda_growth: 0.005
+    gradient_conflict:
+      enabled: false
 validation:
   enabled: true
   index: data/index/val.jsonl

@@ -67,6 +67,90 @@ class StageGateTests(unittest.TestCase):
         expected = make_x_init_for_sample_ids(["sample-b", "sample-a"], 1337, 4, z.device, z.dtype)
         self.assertTrue(torch.equal(sample_kwargs["x_init"], expected))
 
+    def test_stage2_gradient_conflict_config_requires_explicit_setting(self) -> None:
+        from safa.training.g_loop import _stage2_gradient_conflict_config
+
+        with self.assertRaisesRegex(ValueError, "stages.stage2.gradient_conflict"):
+            _stage2_gradient_conflict_config({"stage1": {"epochs": 0}, "stage2": {"epochs": 1}})
+
+    def test_stage2_gradient_conflict_config_rejects_invalid_interval(self) -> None:
+        from safa.training.g_loop import _stage2_gradient_conflict_config
+
+        stages = {
+            "stage1": {"epochs": 0},
+            "stage2": {"epochs": 1, "gradient_conflict": {"enabled": True, "interval": 0}},
+        }
+
+        with self.assertRaisesRegex(ValueError, "interval"):
+            _stage2_gradient_conflict_config(stages)
+
+    def test_stage2_gradient_conflict_config_is_not_required_without_stage2(self) -> None:
+        from safa.training.g_loop import _stage2_gradient_conflict_config
+
+        config = _stage2_gradient_conflict_config({"stage1": {"epochs": 1}, "stage2": {"epochs": 0}})
+
+        self.assertFalse(config.enabled)
+
+    def test_stage2_gradient_conflict_metrics_compute_cosine_and_norms(self) -> None:
+        import torch
+
+        from safa.training.g_loop import _compute_gradient_conflict_metrics
+
+        parameter = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
+        flow_loss = parameter[0] * 2.0
+        cycle_loss = parameter[1] * 3.0
+
+        metrics = _compute_gradient_conflict_metrics(flow_loss, cycle_loss, [parameter])
+
+        self.assertAlmostEqual(metrics["gradient_cosine_fm_cycle"], 0.0, places=6)
+        self.assertAlmostEqual(metrics["gradient_norm_fm"], 2.0, places=6)
+        self.assertAlmostEqual(metrics["gradient_norm_cycle"], 3.0, places=6)
+
+    def test_stage2_gradient_conflict_metrics_reject_zero_norm_gradient(self) -> None:
+        import torch
+
+        from safa.training.g_loop import _compute_gradient_conflict_metrics
+
+        parameter = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
+        flow_loss = parameter[0] * 0.0
+        cycle_loss = parameter[1] * 3.0
+
+        with self.assertRaisesRegex(RuntimeError, "zero norm"):
+            _compute_gradient_conflict_metrics(flow_loss, cycle_loss, [parameter])
+
+    def test_epoch_metrics_include_gradient_conflict_when_recorded(self) -> None:
+        import torch
+
+        from safa.training.g_loop import _reduce_epoch_metrics
+        from safa.utils.distributed import DistributedContext
+
+        totals = {
+            "loss": 8.0,
+            "flow_matching_mse": 4.0,
+            "cycle": 2.0,
+            "grad_norm": 0.0,
+            "gradient_conflict_count": 2.0,
+            "gradient_cosine_fm_cycle": -0.5,
+            "gradient_norm_fm": 4.0,
+            "gradient_norm_cycle": 6.0,
+        }
+
+        distributed = DistributedContext(
+            enabled=False,
+            rank=0,
+            local_rank=0,
+            world_size=1,
+            is_main=True,
+            device=torch.device("cpu"),
+            backend="single",
+        )
+
+        metrics = _reduce_epoch_metrics(totals, seen=4, device=torch.device("cpu"), distributed=distributed)
+
+        self.assertAlmostEqual(metrics["gradient_cosine_fm_cycle"], -0.25)
+        self.assertAlmostEqual(metrics["gradient_norm_fm"], 2.0)
+        self.assertAlmostEqual(metrics["gradient_norm_cycle"], 3.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -81,7 +81,13 @@ def main() -> None:
             },
             "stages": {
                 "stage1": {"epochs": 1},
-                "stage2": {"epochs": 1, "lambda_initial": 0.005, "lambda_max": 0.01, "lambda_growth": 0.005},
+                "stage2": {
+                    "epochs": 1,
+                    "lambda_initial": 0.005,
+                    "lambda_max": 0.01,
+                    "lambda_growth": 0.005,
+                    "gradient_conflict": {"enabled": False},
+                },
             },
             "validation": {
                 "enabled": bool(config.get("face_detection_enabled", False)),

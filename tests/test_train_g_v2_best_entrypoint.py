@@ -58,6 +58,7 @@ class TrainGV2BestEntrypointTests(unittest.TestCase):
         self.assertEqual(config["stages"]["stage2"]["lambda_initial"], 0.01)
         self.assertEqual(config["stages"]["stage2"]["lambda_max"], 0.01)
         self.assertEqual(config["stages"]["stage2"]["lambda_growth"], 0)
+        self.assertEqual(config["stages"]["stage2"]["gradient_conflict"], {"enabled": True, "interval": 50})
         self.assertIn("resume_from", config)
         self.assertNotEqual(config["resume_from"], "artifacts/checkpoints/g_v2/best.pt")
         self.assertNotIn("g_v2/best.pt", str(config["resume_from"]))

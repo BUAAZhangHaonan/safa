@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import dataclass
 import math
 import json
 from contextlib import nullcontext
@@ -29,6 +30,12 @@ _SAFA_PACKAGE_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_NO_IDENTITY_SOURCE_PATHS = (Path(__file__).resolve().parent, _SAFA_PACKAGE_DIR / "models")
 
 
+@dataclass(frozen=True)
+class _GradientConflictConfig:
+    enabled: bool
+    interval: int | None = None
+
+
 class _GeneratorTrainingStep:
     def __new__(cls, generator, e0, generator_config: FlowGeneratorConfig, sampling_seed: int):
         from torch import nn
@@ -50,7 +57,7 @@ class _GeneratorTrainingStep:
             def forward(self, images, z, sample_ids, use_cycle: bool, lambda_cycle: float):
                 import torch
                 flow_loss, flow_metrics = self.generator.flow_matching_loss(images, z)
-                cycle = flow_loss.new_tensor(0.0)
+                cycle_loss = flow_loss.new_tensor(0.0)
                 loss = flow_loss
                 if use_cycle:
                     if self._schedule:
@@ -74,10 +81,10 @@ class _GeneratorTrainingStep:
                     assert_finite_tensor("stage2_generated_image", generated)
                     self.e0.eval()
                     e0_out = self.e0(normalize_for_e0(generated))
-                    cycle = cosine_cycle_loss(e0_out["embedding"], z)
-                    loss = flow_loss + float(lambda_cycle) * cycle
+                    cycle_loss = cosine_cycle_loss(e0_out["embedding"], z)
+                    loss = flow_loss + float(lambda_cycle) * cycle_loss
                     self._batch_idx += 1
-                return loss, flow_metrics["flow_matching_mse"].detach(), cycle.detach()
+                return loss, flow_metrics["flow_matching_mse"].detach(), cycle_loss.detach(), flow_loss, cycle_loss
 
         return _Module()
 
@@ -188,6 +195,7 @@ def train_g_from_config(config: dict) -> dict:
     validation_loader = _build_validation_loader(config) if distributed.is_main else None
     detector = _build_detector(config, str(device)) if distributed.is_main else None
     stages = _stage_config(config)
+    gradient_conflict_config = _stage2_gradient_conflict_config(stages)
     lambda_cycle = float(stages["stage2"]["lambda_initial"])
     lambda_max = float(stages["stage2"]["lambda_max"])
     lambda_growth = float(stages["stage2"]["lambda_growth"])
@@ -222,16 +230,35 @@ def train_g_from_config(config: dict) -> dict:
             training_module.train()
             unwrap_model(training_module).reset_batch_idx()
             e0.eval()
-            totals = {"loss": 0.0, "flow_matching_mse": 0.0, "cycle": 0.0, "grad_norm": 0.0}
+            totals = {
+                "loss": 0.0,
+                "flow_matching_mse": 0.0,
+                "cycle": 0.0,
+                "grad_norm": 0.0,
+                "gradient_conflict_count": 0.0,
+                "gradient_cosine_fm_cycle": 0.0,
+                "gradient_norm_fm": 0.0,
+                "gradient_norm_cycle": 0.0,
+            }
             seen = 0
-            for batch in tqdm(train_loader, desc=f"train_g {stage_name} epoch={stage_epoch}", disable=not distributed.is_main):
+            for batch_index, batch in enumerate(tqdm(train_loader, desc=f"train_g {stage_name} epoch={stage_epoch}", disable=not distributed.is_main)):
                 images = batch["image"].to(device, non_blocking=True)
                 z = batch["z"].to(device, non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
                 amp_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if use_amp else nullcontext()
                 sample_ids = list(batch["sample_id"])
                 with amp_ctx:
-                    loss, flow_mse, cycle = training_module(images, z, sample_ids, stage_name == "stage2", lambda_cycle)
+                    loss, flow_mse, cycle, flow_loss, cycle_loss = training_module(images, z, sample_ids, stage_name == "stage2", lambda_cycle)
+                if _should_record_gradient_conflict(stage_name, batch_index, gradient_conflict_config):
+                    gradient_metrics = _compute_gradient_conflict_metrics(
+                        flow_loss,
+                        cycle_loss,
+                        unwrap_model(training_module).generator.parameters(),
+                    )
+                    totals["gradient_conflict_count"] += 1.0
+                    totals["gradient_cosine_fm_cycle"] += gradient_metrics["gradient_cosine_fm_cycle"]
+                    totals["gradient_norm_fm"] += gradient_metrics["gradient_norm_fm"]
+                    totals["gradient_norm_cycle"] += gradient_metrics["gradient_norm_cycle"]
                 loss_val = float(loss.detach().cpu())
                 if not math.isfinite(loss_val):
                     print(f"WARNING: non-finite G loss detected: {loss_val}, skipping batch entirely")
@@ -327,6 +354,10 @@ def _reduce_epoch_metrics(totals: dict, seen: int, device, distributed: Distribu
             float(totals["cycle"]),
             float(totals["grad_norm"]),
             float(seen),
+            float(totals.get("gradient_conflict_count", 0.0)),
+            float(totals.get("gradient_cosine_fm_cycle", 0.0)),
+            float(totals.get("gradient_norm_fm", 0.0)),
+            float(totals.get("gradient_norm_cycle", 0.0)),
         ],
         device=device,
         dtype=torch.float64,
@@ -336,12 +367,23 @@ def _reduce_epoch_metrics(totals: dict, seen: int, device, distributed: Distribu
 
         dist.all_reduce(values, op=dist.ReduceOp.SUM)
     total_seen = max(float(values[4].item()), 1.0)
-    return {
+    metrics = {
         "loss": float(values[0].item() / total_seen),
         "flow_matching_mse": float(values[1].item() / total_seen),
         "cycle": float(values[2].item() / total_seen),
         "grad_norm": float(values[3].item() / total_seen),
     }
+    gradient_conflict_count = float(values[5].item())
+    if gradient_conflict_count > 0.0:
+        metrics.update(
+            {
+                "gradient_cosine_fm_cycle": float(values[6].item() / gradient_conflict_count),
+                "gradient_norm_fm": float(values[7].item() / gradient_conflict_count),
+                "gradient_norm_cycle": float(values[8].item() / gradient_conflict_count),
+                "gradient_conflict_count": int(gradient_conflict_count),
+            }
+        )
+    return metrics
 
 
 def _sync_epoch_control(
@@ -448,6 +490,99 @@ def _stage_config(config: dict) -> dict:
         if name not in stages:
             raise ValueError(f"train_g stages missing {name}")
     return stages
+
+
+def _stage2_gradient_conflict_config(stages: dict) -> _GradientConflictConfig:
+    stage2 = stages["stage2"]
+    epochs = int(stage2.get("epochs", 0))
+    payload = stage2.get("gradient_conflict")
+    if payload is None:
+        if epochs <= 0:
+            return _GradientConflictConfig(enabled=False)
+        raise ValueError("stages.stage2.gradient_conflict is required when Stage 2 epochs > 0")
+    if not isinstance(payload, dict):
+        raise ValueError("stages.stage2.gradient_conflict must be a mapping")
+    if "enabled" not in payload:
+        raise ValueError("stages.stage2.gradient_conflict.enabled is required")
+    enabled = payload["enabled"]
+    if not isinstance(enabled, bool):
+        raise ValueError("stages.stage2.gradient_conflict.enabled must be true or false")
+    if not enabled:
+        if "interval" in payload:
+            _validate_gradient_conflict_interval(payload["interval"])
+        return _GradientConflictConfig(enabled=False)
+    if "interval" not in payload:
+        raise ValueError("stages.stage2.gradient_conflict.interval is required when enabled")
+    return _GradientConflictConfig(enabled=True, interval=_validate_gradient_conflict_interval(payload["interval"]))
+
+
+def _validate_gradient_conflict_interval(value) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"stages.stage2.gradient_conflict.interval must be a positive integer, got {value!r}")
+    return int(value)
+
+
+def _should_record_gradient_conflict(stage_name: str, batch_index: int, config: _GradientConflictConfig) -> bool:
+    if stage_name != "stage2" or not config.enabled:
+        return False
+    if config.interval is None:
+        raise RuntimeError("Stage 2 gradient conflict monitor is enabled without an interval")
+    return batch_index % config.interval == 0
+
+
+def _compute_gradient_conflict_metrics(flow_loss, cycle_loss, parameters) -> dict[str, float]:
+    import torch
+
+    params = [param for param in parameters if param.requires_grad]
+    if not params:
+        raise RuntimeError("Cannot compute gradient conflict metrics without trainable generator parameters")
+    flow_gradient = _gradient_vector_for_loss("flow matching", flow_loss, params)
+    cycle_gradient = _gradient_vector_for_loss("cycle", cycle_loss, params)
+    flow_norm = torch.linalg.vector_norm(flow_gradient)
+    cycle_norm = torch.linalg.vector_norm(cycle_gradient)
+    if not torch.isfinite(flow_norm):
+        raise RuntimeError("flow matching gradient norm is not finite")
+    if not torch.isfinite(cycle_norm):
+        raise RuntimeError("cycle gradient norm is not finite")
+    if float(flow_norm.detach().cpu()) <= 0.0:
+        raise RuntimeError("flow matching gradient has zero norm")
+    if float(cycle_norm.detach().cpu()) <= 0.0:
+        raise RuntimeError("cycle gradient has zero norm")
+    cosine = torch.dot(flow_gradient, cycle_gradient) / (flow_norm * cycle_norm)
+    if not torch.isfinite(cosine):
+        raise RuntimeError("gradient cosine between flow matching and cycle losses is not finite")
+    return {
+        "gradient_cosine_fm_cycle": float(cosine.detach().cpu()),
+        "gradient_norm_fm": float(flow_norm.detach().cpu()),
+        "gradient_norm_cycle": float(cycle_norm.detach().cpu()),
+    }
+
+
+def _gradient_vector_for_loss(name: str, loss, params) -> object:
+    import torch
+
+    if not hasattr(loss, "requires_grad") or not loss.requires_grad:
+        raise RuntimeError(f"{name} loss is not connected to a gradient graph")
+    if not torch.isfinite(loss.detach()).all():
+        raise RuntimeError(f"{name} loss is not finite")
+    gradients = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
+    chunks = []
+    has_gradient = False
+    for param, gradient in zip(params, gradients):
+        if gradient is None:
+            chunks.append(torch.zeros(param.numel(), device=param.device, dtype=torch.float64))
+            continue
+        has_gradient = True
+        flat = gradient.detach().reshape(-1).to(dtype=torch.float64)
+        if not torch.isfinite(flat).all():
+            raise RuntimeError(f"{name} gradient contains non-finite values")
+        chunks.append(flat)
+    if not has_gradient:
+        raise RuntimeError(f"No valid gradient for {name} loss")
+    vector = torch.cat(chunks)
+    if vector.numel() == 0:
+        raise RuntimeError(f"No valid gradient entries for {name} loss")
+    return vector
 
 
 def _assert_stage1_gate_allows_stage2(stages: dict, stable_hits: int, detection_rate: float | None, allow_bypass: bool) -> None:
