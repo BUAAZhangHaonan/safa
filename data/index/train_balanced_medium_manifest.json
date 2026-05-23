@@ -1,0 +1,32 @@
+{
+  "class_counts": {
+    "0": 3750,
+    "1": 3750,
+    "2": 3750,
+    "3": 3750,
+    "4": 3750,
+    "5": 3750,
+    "6": 3750,
+    "7": 3750
+  },
+  "label_order": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "num_samples": 30000,
+  "ordered_sample_id_sha256": "8b6eadf5f2b9a344c11fc4ba2dece44c255d38df8f22e092b17a61b38f8041fb",
+  "output_index": "data/index/train_balanced_medium.jsonl",
+  "output_index_sha256": "bcdab61f555ffae532646e0f0402537070149fb0e775ef30d7ceccdd53924544",
+  "output_order_rule": "labels sorted ascending; each label sampled with random.Random(f'{seed}:{label}') from source-order rows; combined rows shuffled with random.Random(f'{seed}:output')",
+  "samples_per_class": 3750,
+  "schema_version": 1,
+  "seed": 1337,
+  "source_index": "data/index/train.jsonl",
+  "source_index_sha256": "5660f0ff8c2977478aad29c22d1a17ffea4fb1f2a3e9b8b047ede6194c6a568b"
+}

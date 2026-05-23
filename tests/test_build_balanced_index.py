@@ -19,20 +19,29 @@ def _read_jsonl(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
 
 
-def _run_builder(source: Path, output: Path, samples_per_class: int = 2, seed: int = 1337) -> subprocess.CompletedProcess[str]:
+def _run_builder(
+    source: Path,
+    output: Path,
+    samples_per_class: int = 2,
+    seed: int = 1337,
+    expected_labels: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    command = [
+        sys.executable,
+        str(SCRIPT),
+        "--source-index",
+        str(source),
+        "--output-index",
+        str(output),
+        "--samples-per-class",
+        str(samples_per_class),
+        "--seed",
+        str(seed),
+    ]
+    if expected_labels is not None:
+        command.extend(["--expected-labels", expected_labels])
     return subprocess.run(
-        [
-            sys.executable,
-            str(SCRIPT),
-            "--source-index",
-            str(source),
-            "--output-index",
-            str(output),
-            "--samples-per-class",
-            str(samples_per_class),
-            "--seed",
-            str(seed),
-        ],
+        command,
         cwd=REPO_ROOT,
         text=True,
         capture_output=True,
@@ -51,8 +60,8 @@ def test_cli_writes_balanced_index_manifest_and_repeats_byte_identically(tmp_pat
 
     output_a = tmp_path / "balanced.jsonl"
     output_b = tmp_path / "balanced_again.jsonl"
-    result_a = _run_builder(source, output_a)
-    result_b = _run_builder(source, output_b)
+    result_a = _run_builder(source, output_a, expected_labels="0,1,2")
+    result_b = _run_builder(source, output_b, expected_labels="0,1,2")
 
     assert result_a.returncode == 0, result_a.stderr
     assert result_b.returncode == 0, result_b.stderr
@@ -115,6 +124,19 @@ def test_duplicate_sample_id_fails_fast(tmp_path: Path) -> None:
     assert "duplicate" in result.stderr
 
 
+def test_missing_expected_affectnet_label_fails(tmp_path: Path) -> None:
+    source = tmp_path / "source.jsonl"
+    _write_jsonl(
+        source,
+        [{"sample_id": f"s-{label}", "label": label} for label in range(7)],
+    )
+
+    result = _run_builder(source, tmp_path / "out.jsonl", samples_per_class=1)
+
+    assert result.returncode != 0
+    assert "label 7" in result.stderr
+
+
 def test_insufficient_class_count_fails_with_label_and_count(tmp_path: Path) -> None:
     source = tmp_path / "source.jsonl"
     _write_jsonl(
@@ -126,7 +148,7 @@ def test_insufficient_class_count_fails_with_label_and_count(tmp_path: Path) -> 
         ],
     )
 
-    result = _run_builder(source, tmp_path / "out.jsonl", samples_per_class=2)
+    result = _run_builder(source, tmp_path / "out.jsonl", samples_per_class=2, expected_labels="0,1")
 
     assert result.returncode != 0
     assert "label 0" in result.stderr

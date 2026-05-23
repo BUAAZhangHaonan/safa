@@ -15,6 +15,8 @@ OUTPUT_ORDER_RULE = (
     "labels sorted ascending; each label sampled with random.Random(f'{seed}:{label}') "
     "from source-order rows; combined rows shuffled with random.Random(f'{seed}:output')"
 )
+DEFAULT_EXPECTED_LABELS = tuple(range(8))
+DEFAULT_EXPECTED_LABELS_ARG = ",".join(str(label) for label in DEFAULT_EXPECTED_LABELS)
 
 
 def sha256_file(path: Path) -> str:
@@ -31,6 +33,25 @@ def sha256_sample_ids(rows: list[dict[str, Any]]) -> str:
         digest.update(str(row["sample_id"]).encode("utf-8"))
         digest.update(b"\n")
     return digest.hexdigest()
+
+
+def parse_expected_labels(value: str) -> tuple[int, ...]:
+    labels: list[int] = []
+    for raw_token in value.split(","):
+        token = raw_token.strip()
+        if not token:
+            raise argparse.ArgumentTypeError("--expected-labels must be a comma-separated list of integers")
+        try:
+            labels.append(int(token))
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"--expected-labels contains non-integer label {token!r}") from exc
+    if not labels:
+        raise argparse.ArgumentTypeError("--expected-labels must include at least one label")
+    duplicates = sorted(label for label, count in Counter(labels).items() if count > 1)
+    if duplicates:
+        details = ", ".join(f"label {label}" for label in duplicates)
+        raise argparse.ArgumentTypeError(f"--expected-labels contains duplicate label(s): {details}")
+    return tuple(sorted(labels))
 
 
 def read_source_index(path: Path) -> list[dict[str, Any]]:
@@ -63,7 +84,12 @@ def read_source_index(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def build_balanced_rows(rows: list[dict[str, Any]], samples_per_class: int, seed: int) -> tuple[list[dict[str, Any]], list[int]]:
+def build_balanced_rows(
+    rows: list[dict[str, Any]],
+    samples_per_class: int,
+    seed: int,
+    expected_labels: tuple[int, ...] = DEFAULT_EXPECTED_LABELS,
+) -> tuple[list[dict[str, Any]], list[int]]:
     if samples_per_class <= 0:
         raise ValueError("--samples-per-class must be a positive integer")
 
@@ -71,7 +97,21 @@ def build_balanced_rows(rows: list[dict[str, Any]], samples_per_class: int, seed
     for row in rows:
         rows_by_label[row["label"]].append(row)
 
-    label_order = sorted(rows_by_label)
+    label_order = list(expected_labels)
+    expected_label_set = set(label_order)
+    missing = [label for label in label_order if label not in rows_by_label]
+    unexpected = sorted(label for label in rows_by_label if label not in expected_label_set)
+    label_errors: list[str] = []
+    if missing:
+        details = ", ".join(f"label {label}" for label in missing)
+        label_errors.append(f"missing expected label(s): {details}")
+    if unexpected:
+        details = ", ".join(f"label {label}" for label in unexpected)
+        label_errors.append(f"unexpected label(s): {details}")
+    if label_errors:
+        expected = ", ".join(str(label) for label in label_order)
+        raise ValueError(f"source labels must match expected labels [{expected}]: {'; '.join(label_errors)}")
+
     insufficient = [
         (label, len(rows_by_label[label]))
         for label in label_order
@@ -130,9 +170,15 @@ def write_manifest(
     return manifest_path
 
 
-def build_balanced_index(source_index: Path, output_index: Path, samples_per_class: int, seed: int) -> Path:
+def build_balanced_index(
+    source_index: Path,
+    output_index: Path,
+    samples_per_class: int,
+    seed: int,
+    expected_labels: tuple[int, ...] = DEFAULT_EXPECTED_LABELS,
+) -> Path:
     rows = read_source_index(source_index)
-    selected_rows, label_order = build_balanced_rows(rows, samples_per_class, seed)
+    selected_rows, label_order = build_balanced_rows(rows, samples_per_class, seed, expected_labels)
     write_jsonl(selected_rows, output_index)
     return write_manifest(
         source_index=source_index,
@@ -150,6 +196,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-index", required=True, type=Path)
     parser.add_argument("--samples-per-class", required=True, type=int)
     parser.add_argument("--seed", required=True, type=int)
+    parser.add_argument(
+        "--expected-labels",
+        default=DEFAULT_EXPECTED_LABELS_ARG,
+        type=parse_expected_labels,
+        metavar="CSV",
+        help=f"Comma-separated expected labels. Default: {DEFAULT_EXPECTED_LABELS_ARG}",
+    )
     return parser.parse_args(argv)
 
 
@@ -161,6 +214,7 @@ def main(argv: list[str] | None = None) -> int:
             output_index=args.output_index,
             samples_per_class=args.samples_per_class,
             seed=args.seed,
+            expected_labels=args.expected_labels,
         )
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
