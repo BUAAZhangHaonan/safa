@@ -5,10 +5,12 @@ from typing import Iterable
 
 
 def face_count_rates(counts: Iterable[int]) -> dict[str, float]:
+    import numpy as np
+
     count_list = []
     for count in counts:
-        if isinstance(count, bool):
-            raise ValueError(f"Face count must be an integer count, got bool {count!r}")
+        if isinstance(count, bool) or not isinstance(count, (int, np.integer)):
+            raise ValueError(f"Face count must be an integer count, got {type(count).__name__} {count!r}")
         parsed = int(count)
         if parsed < 0:
             raise ValueError(f"Face count must be non-negative, got {count!r}")

@@ -7,7 +7,7 @@ import json
 from safa.data.feature_dataset import FeatureAlignedAffectNet
 from safa.evaluation.metrics import face_count_rates, flatten_finite_numbers, summarize
 from safa.evaluation.perturbations import perturbation_map
-from safa.evaluation.recognizers import InsightFaceDetector, build_recognizers, describe_recognizer_assets
+from safa.evaluation.recognizers import InsightFaceDetector, build_recognizers, describe_recognizer_assets, validate_recognizer_configs
 from safa.models.e0 import freeze_e0, load_e0_checkpoint
 from safa.models.generator import build_generator, require_generator_model_config
 from safa.training.losses import normalize_for_e0
@@ -24,6 +24,7 @@ def run_eval_from_config(config: dict) -> dict:
     from torch.utils.data import DataLoader
     from torchvision.utils import save_image
 
+    privacy_cfg, face_detection_cfg, anti_cfg = _eval_monitor_configs(config)
     set_seed(int(config["seed"]))
     device = require_cuda_device(str(config["device"]))
     e0, e0_checkpoint = load_e0_checkpoint(config["e0_checkpoint"], device=str(device))
@@ -39,11 +40,8 @@ def run_eval_from_config(config: dict) -> dict:
     )
     feature_metadata = _feature_metadata_for_eval(dataset, generator, e0_checkpoint, config["features"])
     loader = DataLoader(dataset, batch_size=int(config["batch_size"]), shuffle=False, num_workers=int(config["num_workers"]), pin_memory=True)
-    privacy_cfg = config.get("privacy", {"enabled": False})
-    face_detection_cfg = config.get("face_detection", _default_face_detection_config(privacy_cfg))
     detector = _build_face_detector(face_detection_cfg, str(device))
     recognizer_assets = []
-    anti_cfg = config.get("anti_steg", {"enabled": False})
     perturbations = perturbation_map(anti_cfg, int(config["seed"])) if anti_cfg.get("enabled") else {}
 
     rows: list[dict] = []
@@ -177,8 +175,65 @@ def _sample_generated_for_eval(generator, z, sample_ids, sampling_seed: int, ima
     return generator.sample(z, x_init=x_init)
 
 
-def _default_face_detection_config(privacy_cfg: dict) -> dict:
-    return {"enabled": bool(privacy_cfg.get("enabled")), "model_name": "buffalo_l", "threshold": 0.95, "latent_cosine_threshold": 0.95}
+def _eval_monitor_configs(config: dict) -> tuple[dict, dict, dict]:
+    privacy_cfg = _require_config_block(config, "privacy")
+    face_detection_cfg = _require_config_block(config, "face_detection")
+    anti_cfg = _require_config_block(config, "anti_steg")
+    _validate_privacy_config(privacy_cfg)
+    _validate_face_detection_config(face_detection_cfg)
+    _validate_anti_steg_config(anti_cfg)
+    return privacy_cfg, face_detection_cfg, anti_cfg
+
+
+def _require_config_block(config: dict, name: str) -> dict:
+    if name not in config:
+        raise ValueError(f"eval config requires explicit {name} block")
+    block = config[name]
+    if not isinstance(block, dict):
+        raise ValueError(f"eval config {name} block must be a mapping")
+    _require_enabled_flag(block, name)
+    return block
+
+
+def _require_enabled_flag(config: dict, context: str) -> bool:
+    if "enabled" not in config:
+        raise ValueError(f"{context}.enabled is required")
+    enabled = config["enabled"]
+    if not isinstance(enabled, bool):
+        raise ValueError(f"{context}.enabled must be true or false")
+    return enabled
+
+
+def _require_fields(config: dict, fields: tuple[str, ...], context: str) -> None:
+    for field in fields:
+        if field not in config:
+            raise ValueError(f"{context}.{field} is required")
+
+
+def _validate_privacy_config(config: dict) -> None:
+    if not _require_enabled_flag(config, "privacy"):
+        return
+    if "recognizers" not in config:
+        raise ValueError("privacy.recognizers is required")
+    if not config["recognizers"]:
+        raise ValueError("privacy.recognizers must not be empty when privacy is enabled")
+    validate_recognizer_configs(config["recognizers"])
+
+
+def _validate_face_detection_config(config: dict) -> None:
+    if not _require_enabled_flag(config, "face_detection"):
+        return
+    _require_fields(config, ("model_name", "threshold", "latent_cosine_threshold"), "face_detection")
+
+
+def _validate_anti_steg_config(config: dict) -> None:
+    if not _require_enabled_flag(config, "anti_steg"):
+        return
+    _require_fields(
+        config,
+        ("jpeg_quality", "blur_radius", "downsample_scale", "crop_fraction", "noise_std"),
+        "anti_steg",
+    )
 
 
 def _build_face_detector(config: dict, device: str):
@@ -352,8 +407,9 @@ def _summarize_rows(rows: list[dict]) -> dict:
 def _guard_result(metrics: dict, config: dict) -> dict:
     if not config.get("enabled", False):
         return {"enabled": False, "passed": True, "reason": "disabled"}
-    face_threshold = float(config.get("threshold", 0.95))
-    cosine_threshold = float(config.get("latent_cosine_threshold", 0.95))
+    _validate_face_detection_config(config)
+    face_threshold = float(config["threshold"])
+    cosine_threshold = float(config["latent_cosine_threshold"])
     face_detection_rate = metrics.get("face_detection", {}).get("detected", {}).get("mean")
     face_rates = {
         "face_detect_ge1_rate": metrics.get("face_detection", {}).get("face_detect_ge1_rate", {}).get("mean"),

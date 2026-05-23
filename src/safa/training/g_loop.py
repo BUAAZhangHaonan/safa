@@ -116,6 +116,7 @@ def train_g_from_config(config: dict) -> dict:
     set_seed(int(config["seed"]))
     torch.backends.cudnn.benchmark = True
     audit_no_identity_supervision(config, DEFAULT_NO_IDENTITY_SOURCE_PATHS)
+    _validate_train_g_config(config)
     distributed = init_distributed(config)
     device = distributed.device
     num_workers = int(config["num_workers"])
@@ -250,6 +251,7 @@ def train_g_from_config(config: dict) -> dict:
                 sample_ids = list(batch["sample_id"])
                 with amp_ctx:
                     loss, flow_mse, cycle, flow_loss, cycle_loss = training_module(images, z, sample_ids, stage_name == "stage2", lambda_cycle)
+                _assert_finite_training_scalars(loss, flow_mse, cycle)
                 if _should_record_gradient_conflict(stage_name, batch_index, gradient_conflict_config):
                     gradient_metrics = _compute_gradient_conflict_metrics(
                         flow_loss,
@@ -260,11 +262,6 @@ def train_g_from_config(config: dict) -> dict:
                     totals["gradient_cosine_fm_cycle"] += gradient_metrics["gradient_cosine_fm_cycle"]
                     totals["gradient_norm_fm"] += gradient_metrics["gradient_norm_fm"]
                     totals["gradient_norm_cycle"] += gradient_metrics["gradient_norm_cycle"]
-                loss_val = float(loss.detach().cpu())
-                if not math.isfinite(loss_val):
-                    print(f"WARNING: non-finite G loss detected: {loss_val}, skipping batch entirely")
-                    optimizer.zero_grad(set_to_none=True)
-                    continue
                 assert_finite_tensor("g_loss", loss)
                 loss.backward()
                 batch_grad_norm = 0.0
@@ -278,10 +275,8 @@ def train_g_from_config(config: dict) -> dict:
                 batch_size = int(z.shape[0])
                 seen += batch_size
                 totals["loss"] += float(loss.detach().cpu()) * batch_size
-                if math.isfinite(flow_mse.item()):
-                    totals["flow_matching_mse"] += float(flow_mse.cpu()) * batch_size
-                if math.isfinite(cycle.item()):
-                    totals["cycle"] += float(cycle.detach().cpu()) * batch_size
+                totals["flow_matching_mse"] += float(flow_mse.cpu()) * batch_size
+                totals["cycle"] += float(cycle.detach().cpu()) * batch_size
                 totals["grad_norm"] += batch_grad_norm * batch_size
 
             metrics = _reduce_epoch_metrics(totals, seen, device, distributed)
@@ -292,8 +287,8 @@ def train_g_from_config(config: dict) -> dict:
                 metrics.update({f"validation_{key}": value for key, value in validation_metrics.items()})
                 if stage_name == "stage1" and validation_metrics.get("face_detection_rate") is not None:
                     baseline_detection_rate = validation_metrics["face_detection_rate"]
-                    threshold = float(stages["stage1"].get("face_detection_threshold", 0.95))
-                    stable_epochs = int(stages["stage1"].get("stable_epochs", 1))
+                    threshold = float(stages["stage1"]["face_detection_threshold"])
+                    stable_epochs = int(stages["stage1"]["stable_epochs"])
                     if baseline_detection_rate >= threshold:
                         stage1_stable_hits += 1
                         metrics["stage1_stable_hits"] = stage1_stable_hits
@@ -312,7 +307,7 @@ def train_g_from_config(config: dict) -> dict:
                     _save_generator(stage_best_path, unwrap_model(training_module).generator, generator_config, config, metrics, history)
                 if _is_better_overall(metrics, history[:-1]):
                     _save_generator(best_checkpoint, unwrap_model(training_module).generator, generator_config, config, metrics, history)
-                should_break = stage_name == "stage1" and stage1_stable_hits >= int(stages["stage1"].get("stable_epochs", 1))
+                should_break = stage_name == "stage1" and stage1_stable_hits >= int(stages["stage1"]["stable_epochs"])
             lambda_cycle, baseline_detection_rate, stage1_stable_hits, should_break = _sync_epoch_control(
                 lambda_cycle,
                 baseline_detection_rate,
@@ -367,7 +362,23 @@ def _reduce_epoch_metrics(totals: dict, seen: int, device, distributed: Distribu
         import torch.distributed as dist
 
         dist.all_reduce(values, op=dist.ReduceOp.SUM)
-    total_seen = max(float(values[4].item()), 1.0)
+    metric_names = (
+        "loss",
+        "flow_matching_mse",
+        "cycle",
+        "grad_norm",
+        "seen",
+        "gradient_conflict_count",
+        "gradient_cosine_fm_cycle",
+        "gradient_norm_fm",
+        "gradient_norm_cycle",
+    )
+    for index, name in enumerate(metric_names):
+        if not bool(torch.isfinite(values[index]).item()):
+            raise RuntimeError(f"Epoch metric {name} is not finite")
+    total_seen = float(values[4].item())
+    if total_seen <= 0.0:
+        raise RuntimeError("Cannot reduce epoch metrics from zero samples")
     metrics = {
         "loss": float(values[0].item() / total_seen),
         "flow_matching_mse": float(values[1].item() / total_seen),
@@ -385,6 +396,18 @@ def _reduce_epoch_metrics(totals: dict, seen: int, device, distributed: Distribu
             }
         )
     return metrics
+
+
+def _assert_finite_training_scalars(loss, flow_mse, cycle) -> None:
+    import torch
+
+    for name, value in (("loss", loss), ("flow_matching_mse", flow_mse), ("cycle", cycle)):
+        if hasattr(value, "detach"):
+            finite = bool(torch.isfinite(value.detach()).all().item())
+        else:
+            finite = math.isfinite(float(value))
+        if not finite:
+            raise RuntimeError(f"{name} is not finite")
 
 
 def _sync_epoch_control(
@@ -476,8 +499,68 @@ def _distributed_manifest(distributed: DistributedContext) -> dict:
     }
 
 
+def _validate_train_g_config(config: dict) -> None:
+    _generator_config_from_train_config(config)
+    stages = _stage_config(config)
+    _validate_stage1_gate_config(stages["stage1"])
+    _stage2_gradient_conflict_config(stages)
+    _validate_validation_block(config)
+    if int(_require_field(stages["stage2"], "epochs", "stages.stage2")) > 0:
+        _validate_stage2_validation_config(config)
+
+
+def _require_mapping(config: dict, field: str, context: str) -> dict:
+    if field not in config:
+        raise ValueError(f"{context}.{field} is required")
+    value = config[field]
+    if not isinstance(value, dict):
+        raise ValueError(f"{context}.{field} must be a mapping")
+    return value
+
+
+def _require_field(config: dict, field: str, context: str):
+    if field not in config:
+        raise ValueError(f"{context}.{field} is required")
+    return config[field]
+
+
+def _require_bool(config: dict, field: str, context: str) -> bool:
+    value = _require_field(config, field, context)
+    if not isinstance(value, bool):
+        raise ValueError(f"{context}.{field} must be true or false")
+    return value
+
+
+def _validate_stage1_gate_config(stage1: dict) -> None:
+    if not bool(stage1.get("require_face_detection_gate", True)):
+        return
+    _require_field(stage1, "face_detection_threshold", "stages.stage1")
+    _require_field(stage1, "stable_epochs", "stages.stage1")
+
+
+def _validate_validation_block(config: dict) -> dict:
+    validation = _require_mapping(config, "validation", "train_g config")
+    _require_bool(validation, "enabled", "validation")
+    detection = _require_mapping(validation, "face_detection", "validation")
+    if _require_bool(detection, "enabled", "validation.face_detection"):
+        _require_field(detection, "model_name", "validation.face_detection")
+    return validation
+
+
+def _validate_stage2_validation_config(config: dict) -> None:
+    validation = _validate_validation_block(config)
+    if not _require_bool(validation, "enabled", "validation"):
+        raise ValueError("validation.enabled must be true when Stage 2 epochs > 0")
+    for field in ("index", "features", "max_samples", "batch_size"):
+        _require_field(validation, field, "validation")
+    detection = _require_mapping(validation, "face_detection", "validation")
+    if not _require_bool(detection, "enabled", "validation.face_detection"):
+        raise ValueError("validation.face_detection.enabled must be true when Stage 2 epochs > 0")
+    _require_field(detection, "model_name", "validation.face_detection")
+
+
 def _generator_config_from_train_config(config: dict) -> FlowGeneratorConfig:
-    model_config = dict(config.get("generator", {}))
+    model_config = dict(_require_mapping(config, "generator", "train_g config"))
     model_config.setdefault("embedding_dim", int(config["embedding_dim"]))
     model_config.setdefault("image_size", int(config["image_size"]))
     return FlowGeneratorConfig.from_dict(model_config)
@@ -490,12 +573,14 @@ def _stage_config(config: dict) -> dict:
     for name in ("stage1", "stage2"):
         if name not in stages:
             raise ValueError(f"train_g stages missing {name}")
+        if not isinstance(stages[name], dict):
+            raise ValueError(f"train_g stages.{name} must be a mapping")
     return stages
 
 
 def _stage2_gradient_conflict_config(stages: dict) -> _GradientConflictConfig:
     stage2 = stages["stage2"]
-    epochs = int(stage2.get("epochs", 0))
+    epochs = int(_require_field(stage2, "epochs", "stages.stage2"))
     payload = stage2.get("gradient_conflict")
     if payload is None:
         if epochs <= 0:
@@ -592,8 +677,9 @@ def _assert_stage1_gate_allows_stage2(stages: dict, stable_hits: int, detection_
         return
     if not bool(stage1.get("require_face_detection_gate", True)):
         return
-    threshold = float(stage1.get("face_detection_threshold", 0.95))
-    stable_epochs = int(stage1.get("stable_epochs", 1))
+    _validate_stage1_gate_config(stage1)
+    threshold = float(stage1["face_detection_threshold"])
+    stable_epochs = int(stage1["stable_epochs"])
     if detection_rate is None:
         raise RuntimeError("Stage 2 is blocked because Stage 1 did not produce ArcFace detection metrics")
     if stable_hits < stable_epochs:
@@ -607,8 +693,8 @@ def _assert_stage1_gate_allows_stage2(stages: dict, stable_hits: int, detection_
 def _build_validation_loader(config: dict):
     from torch.utils.data import DataLoader, Subset
 
-    validation = config.get("validation", {})
-    if not validation.get("enabled", False):
+    validation = _require_mapping(config, "validation", "train_g config")
+    if not _require_bool(validation, "enabled", "validation"):
         return None
     val_set = FeatureAlignedAffectNet(
         validation["index"],
@@ -616,12 +702,12 @@ def _build_validation_loader(config: dict):
         config["e0_checkpoint"],
         transform=generator_image_transform(int(config["image_size"])),
     )
-    max_samples = int(validation.get("max_samples", 0))
+    max_samples = int(validation["max_samples"])
     if max_samples > 0:
         val_set = Subset(val_set, list(range(min(max_samples, len(val_set)))))
     return DataLoader(
         val_set,
-        batch_size=int(validation.get("batch_size", config["batch_size"])),
+        batch_size=int(validation["batch_size"]),
         shuffle=False,
         num_workers=int(config["num_workers"]),
         pin_memory=True,
@@ -631,9 +717,9 @@ def _build_validation_loader(config: dict):
 
 
 def _build_detector(config: dict, device: str):
-    validation = config.get("validation", {})
-    detection = validation.get("face_detection", {})
-    if not validation.get("enabled", False) or not detection.get("enabled", False):
+    validation = _require_mapping(config, "validation", "train_g config")
+    detection = _require_mapping(validation, "face_detection", "validation")
+    if not _require_bool(validation, "enabled", "validation") or not _require_bool(detection, "enabled", "validation.face_detection"):
         return None
     return InsightFaceDetector(model_name=str(detection["model_name"]), device=device)
 
@@ -693,13 +779,13 @@ def _composite_score(item: dict) -> float:
 
 
 def _is_better(metrics: dict, previous: list[dict]) -> bool:
+    current_score = _composite_score(metrics)
     if not previous:
         return True
     stage = metrics.get("stage", "stage1")
     same_stage = [m for m in previous if m.get("stage") == stage]
     if not same_stage:
         return True
-    current_score = _composite_score(metrics)
     best = max(same_stage, key=lambda item: (_composite_score(item), -item["loss"]))
     return (current_score, -metrics["loss"]) > (_composite_score(best), -best["loss"])
 
@@ -711,9 +797,9 @@ def _is_better_overall(metrics: dict, previous: list[dict]) -> bool:
     compares across stages. Uses composite score (cosine x single_face_eq1_rate)
     to prevent selecting degenerate checkpoints with high cosine but invalid face counts.
     """
+    current_score = _composite_score(metrics)
     if not previous:
         return True
-    current_score = _composite_score(metrics)
     best = max(previous, key=lambda item: (_composite_score(item), -item["loss"]))
     return (current_score, -metrics["loss"]) > (_composite_score(best), -best["loss"])
 

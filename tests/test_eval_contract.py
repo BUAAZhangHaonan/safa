@@ -9,7 +9,7 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-from safa.evaluation.metrics import flatten_finite_numbers, summarize
+from safa.evaluation.metrics import face_count_rates, flatten_finite_numbers, summarize
 from safa.evaluation import perturbations
 from safa.evaluation.runner import (
     _attach_face_detection_rows,
@@ -62,7 +62,10 @@ class EvalContractTests(unittest.TestCase):
             },
             "latent_cosine": {"mean": 0.94},
         }
-        guard = _guard_result(metrics, {"enabled": True, "threshold": 0.95, "latent_cosine_threshold": 0.95})
+        guard = _guard_result(
+            metrics,
+            {"enabled": True, "model_name": "buffalo_l", "threshold": 0.95, "latent_cosine_threshold": 0.95},
+        )
         self.assertFalse(guard["passed"])
         self.assertEqual(guard["face_detection_rate"], metrics["face_detection"]["detected"]["mean"])
         self.assertEqual(guard["face_detect_ge1_rate"], metrics["face_detection"]["face_detect_ge1_rate"]["mean"])
@@ -70,12 +73,119 @@ class EvalContractTests(unittest.TestCase):
         self.assertEqual(guard["zero_face_rate"], metrics["face_detection"]["zero_face_rate"]["mean"])
         self.assertEqual(guard["multi_face_rate"], metrics["face_detection"]["multi_face_rate"]["mean"])
         metrics["latent_cosine"]["mean"] = 0.96
-        guard = _guard_result(metrics, {"enabled": True, "threshold": 0.95, "latent_cosine_threshold": 0.95})
+        guard = _guard_result(
+            metrics,
+            {"enabled": True, "model_name": "buffalo_l", "threshold": 0.95, "latent_cosine_threshold": 0.95},
+        )
         self.assertTrue(guard["passed"])
 
     def test_face_detection_guard_rejects_missing_detection_metrics(self) -> None:
         with self.assertRaises(RuntimeError):
-            _guard_result({"latent_cosine": {"mean": 0.99}}, {"enabled": True})
+            _guard_result(
+                {"latent_cosine": {"mean": 0.99}},
+                {"enabled": True, "model_name": "buffalo_l", "threshold": 0.95, "latent_cosine_threshold": 0.95},
+            )
+
+    def test_face_detection_guard_requires_explicit_threshold_fields(self) -> None:
+        metrics = {
+            "face_detection": {
+                "detected": {"mean": 1.0},
+                "face_detect_ge1_rate": {"mean": 1.0},
+                "single_face_eq1_rate": {"mean": 1.0},
+                "zero_face_rate": {"mean": 0.0},
+                "multi_face_rate": {"mean": 0.0},
+            },
+            "latent_cosine": {"mean": 1.0},
+        }
+        with self.assertRaisesRegex(ValueError, "threshold"):
+            _guard_result(metrics, {"enabled": True, "model_name": "buffalo_l", "latent_cosine_threshold": 0.95})
+        with self.assertRaisesRegex(ValueError, "latent_cosine_threshold"):
+            _guard_result(metrics, {"enabled": True, "model_name": "buffalo_l", "threshold": 0.95})
+
+    def test_eval_monitor_config_requires_explicit_blocks(self) -> None:
+        from safa.evaluation import runner
+
+        base = {
+            "privacy": {"enabled": False},
+            "face_detection": {"enabled": False},
+            "anti_steg": {"enabled": False},
+        }
+        privacy_cfg, face_detection_cfg, anti_cfg = runner._eval_monitor_configs(base)
+        self.assertFalse(privacy_cfg["enabled"])
+        self.assertFalse(face_detection_cfg["enabled"])
+        self.assertFalse(anti_cfg["enabled"])
+
+        for missing in ("privacy", "face_detection", "anti_steg"):
+            config = {key: dict(value) for key, value in base.items()}
+            config.pop(missing)
+            with self.subTest(missing=missing):
+                with self.assertRaisesRegex(ValueError, missing):
+                    runner._eval_monitor_configs(config)
+
+    def test_eval_monitor_config_requires_enabled_flags_and_enabled_fields(self) -> None:
+        from safa.evaluation import runner
+
+        cases = [
+            (
+                "privacy.enabled",
+                {
+                    "privacy": {},
+                    "face_detection": {"enabled": False},
+                    "anti_steg": {"enabled": False},
+                },
+            ),
+            (
+                "privacy.recognizers",
+                {
+                    "privacy": {"enabled": True},
+                    "face_detection": {"enabled": False},
+                    "anti_steg": {"enabled": False},
+                },
+            ),
+            (
+                "face_detection.model_name",
+                {
+                    "privacy": {"enabled": False},
+                    "face_detection": {"enabled": True, "threshold": 0.95, "latent_cosine_threshold": 0.95},
+                    "anti_steg": {"enabled": False},
+                },
+            ),
+            (
+                "face_detection.threshold",
+                {
+                    "privacy": {"enabled": False},
+                    "face_detection": {"enabled": True, "model_name": "buffalo_l", "latent_cosine_threshold": 0.95},
+                    "anti_steg": {"enabled": False},
+                },
+            ),
+            (
+                "face_detection.latent_cosine_threshold",
+                {
+                    "privacy": {"enabled": False},
+                    "face_detection": {"enabled": True, "model_name": "buffalo_l", "threshold": 0.95},
+                    "anti_steg": {"enabled": False},
+                },
+            ),
+            (
+                "anti_steg.jpeg_quality",
+                {
+                    "privacy": {"enabled": False},
+                    "face_detection": {"enabled": False},
+                    "anti_steg": {
+                        "enabled": True,
+                        "blur_radius": 1.5,
+                        "downsample_scale": 0.5,
+                        "crop_fraction": 0.9,
+                        "noise_std": 0.01,
+                    },
+                },
+            ),
+        ]
+
+        for field, config in cases:
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, field):
+                    runner._eval_monitor_configs(config)
 
     def test_eval_face_count_rows_and_summary_expose_new_rates_with_legacy_ge1(self) -> None:
         rows = [
@@ -95,6 +205,37 @@ class EvalContractTests(unittest.TestCase):
         self.assertAlmostEqual(summary["zero_face_rate"]["mean"], 1.0 / 3.0)
         self.assertAlmostEqual(summary["multi_face_rate"]["mean"], 1.0 / 3.0)
         self.assertAlmostEqual(summary["detected"]["mean"], summary["face_detect_ge1_rate"]["mean"])
+
+    def test_face_count_rates_rejects_non_integer_counts_without_truncation(self) -> None:
+        import numpy as np
+
+        rates = face_count_rates([np.int64(1), 0])
+        self.assertAlmostEqual(rates["face_detect_ge1_rate"], 0.5)
+        for bad in (True, 1.0, "1"):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(ValueError, "integer"):
+                    face_count_rates([bad])
+
+    def test_torchscript_recognizer_config_requires_embedding_dim_before_loading(self) -> None:
+        from safa.evaluation import recognizers
+
+        with patch.object(recognizers, "TorchScriptRecognizer", side_effect=AssertionError("must validate before loading")):
+            with self.assertRaisesRegex(ValueError, "embedding_dim"):
+                recognizers.build_recognizers(
+                    [{"name": "ts", "type": "torchscript", "checkpoint": "unused.pt", "input_size": 112}],
+                    "cpu",
+                )
+
+    def test_torchscript_recognizer_asset_description_requires_input_size(self) -> None:
+        from safa.evaluation import recognizers
+
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / "recognizer.pt"
+            checkpoint.write_bytes(b"not a real torchscript checkpoint")
+            with self.assertRaisesRegex(ValueError, "input_size"):
+                recognizers.describe_recognizer_assets(
+                    [{"name": "ts", "type": "torchscript", "checkpoint": str(checkpoint), "embedding_dim": 512}]
+                )
 
     @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for eval checkpoint tests")
     def test_eval_generator_loader_rejects_checkpoint_missing_model_config(self) -> None:

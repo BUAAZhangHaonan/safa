@@ -6,6 +6,45 @@ from safa.training.g_loop import _assert_stage1_gate_allows_stage2
 
 
 class StageGateTests(unittest.TestCase):
+    def _base_train_config(self) -> dict:
+        return {
+            "embedding_dim": 2,
+            "image_size": 4,
+            "generator": {
+                "model_type": "conditional_flow_matching",
+                "base_channels": 4,
+                "channel_multipliers": [1],
+                "time_embedding_dim": 4,
+                "condition_dim": 4,
+                "sample_steps": 1,
+                "train_cycle_steps": 1,
+                "sampler": "heun",
+            },
+            "stages": {
+                "stage1": {
+                    "epochs": 1,
+                    "require_face_detection_gate": True,
+                    "face_detection_threshold": 0.95,
+                    "stable_epochs": 1,
+                },
+                "stage2": {
+                    "epochs": 1,
+                    "lambda_initial": 0.005,
+                    "lambda_max": 0.01,
+                    "lambda_growth": 0.005,
+                    "gradient_conflict": {"enabled": False},
+                },
+            },
+            "validation": {
+                "enabled": True,
+                "index": "val.jsonl",
+                "features": "features",
+                "max_samples": 8,
+                "batch_size": 2,
+                "face_detection": {"enabled": True, "model_name": "buffalo_l"},
+            },
+        }
+
     def test_blocks_stage2_when_detection_rate_missing(self) -> None:
         stages = {"stage1": {"require_face_detection_gate": True, "face_detection_threshold": 0.95, "stable_epochs": 1}}
         with self.assertRaises(RuntimeError):
@@ -23,6 +62,76 @@ class StageGateTests(unittest.TestCase):
     def test_smoke_bypass_is_explicit(self) -> None:
         stages = {"stage1": {"require_face_detection_gate": True, "face_detection_threshold": 0.95, "stable_epochs": 1}}
         _assert_stage1_gate_allows_stage2(stages, stable_hits=0, detection_rate=0.0, allow_bypass=True)
+
+    def test_stage1_gate_requires_explicit_threshold_and_stable_epochs(self) -> None:
+        with self.assertRaisesRegex(ValueError, "face_detection_threshold"):
+            _assert_stage1_gate_allows_stage2(
+                {"stage1": {"require_face_detection_gate": True, "stable_epochs": 1}},
+                stable_hits=1,
+                detection_rate=1.0,
+                allow_bypass=False,
+            )
+        with self.assertRaisesRegex(ValueError, "stable_epochs"):
+            _assert_stage1_gate_allows_stage2(
+                {"stage1": {"require_face_detection_gate": True, "face_detection_threshold": 0.95}},
+                stable_hits=1,
+                detection_rate=1.0,
+                allow_bypass=False,
+            )
+
+    def test_stage1_gate_fields_are_not_required_when_gate_disabled(self) -> None:
+        _assert_stage1_gate_allows_stage2(
+            {"stage1": {"require_face_detection_gate": False}},
+            stable_hits=0,
+            detection_rate=None,
+            allow_bypass=False,
+        )
+
+    def test_generator_config_requires_explicit_generator_block(self) -> None:
+        from safa.training.g_loop import _generator_config_from_train_config
+
+        with self.assertRaisesRegex(ValueError, "generator"):
+            _generator_config_from_train_config({"embedding_dim": 2, "image_size": 4})
+
+    def test_stage2_requires_validation_face_detection_config(self) -> None:
+        import copy
+
+        from safa.training import g_loop
+
+        cases = [
+            ("validation", lambda config: config.pop("validation")),
+            ("validation.enabled", lambda config: config["validation"].pop("enabled")),
+            ("validation.enabled", lambda config: config["validation"].update({"enabled": False})),
+            ("validation.index", lambda config: config["validation"].pop("index")),
+            ("validation.features", lambda config: config["validation"].pop("features")),
+            ("validation.max_samples", lambda config: config["validation"].pop("max_samples")),
+            ("validation.batch_size", lambda config: config["validation"].pop("batch_size")),
+            ("validation.face_detection", lambda config: config["validation"].pop("face_detection")),
+            ("validation.face_detection.enabled", lambda config: config["validation"]["face_detection"].pop("enabled")),
+            ("validation.face_detection.enabled", lambda config: config["validation"]["face_detection"].update({"enabled": False})),
+            ("validation.face_detection.model_name", lambda config: config["validation"]["face_detection"].pop("model_name")),
+        ]
+        for field, mutate in cases:
+            config = copy.deepcopy(self._base_train_config())
+            mutate(config)
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, field):
+                    g_loop._validate_train_g_config(config)
+
+    def test_stage2_accepts_explicit_validation_face_detection_config(self) -> None:
+        from safa.training import g_loop
+
+        g_loop._validate_train_g_config(self._base_train_config())
+
+    def test_training_config_requires_explicit_validation_block_even_without_stage2(self) -> None:
+        from safa.training import g_loop
+
+        config = self._base_train_config()
+        config["stages"]["stage2"]["epochs"] = 0
+        config.pop("validation")
+
+        with self.assertRaisesRegex(ValueError, "validation"):
+            g_loop._validate_train_g_config(config)
 
     def test_stage2_cycle_uses_stable_x_init_and_unclamped_sampling(self) -> None:
         import torch
@@ -174,6 +283,55 @@ class StageGateTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["gradient_cosine_fm_cycle"], -0.25)
         self.assertAlmostEqual(metrics["gradient_norm_fm"], 2.0)
         self.assertAlmostEqual(metrics["gradient_norm_cycle"], 3.0)
+
+    def test_epoch_metrics_reject_zero_seen_samples(self) -> None:
+        import torch
+
+        from safa.training.g_loop import _reduce_epoch_metrics
+        from safa.utils.distributed import DistributedContext
+
+        distributed = DistributedContext(
+            enabled=False,
+            rank=0,
+            local_rank=0,
+            world_size=1,
+            is_main=True,
+            device=torch.device("cpu"),
+            backend="single",
+        )
+        totals = {
+            "loss": 0.0,
+            "flow_matching_mse": 0.0,
+            "cycle": 0.0,
+            "grad_norm": 0.0,
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "zero samples"):
+            _reduce_epoch_metrics(totals, seen=0, device=torch.device("cpu"), distributed=distributed)
+
+    def test_training_scalar_metrics_reject_non_finite_values(self) -> None:
+        import torch
+
+        from safa.training import g_loop
+
+        cases = [
+            ("loss", torch.tensor(float("nan")), torch.tensor(0.0), torch.tensor(0.0)),
+            ("flow_matching_mse", torch.tensor(0.0), torch.tensor(float("inf")), torch.tensor(0.0)),
+            ("cycle", torch.tensor(0.0), torch.tensor(0.0), torch.tensor(float("nan"))),
+        ]
+        for metric_name, loss, flow_mse, cycle in cases:
+            with self.subTest(metric_name=metric_name):
+                with self.assertRaisesRegex(RuntimeError, metric_name):
+                    g_loop._assert_finite_training_scalars(loss, flow_mse, cycle)
+
+    def test_first_epoch_checkpoint_comparison_requires_validation_composite_metrics(self) -> None:
+        from safa.training.g_loop import _is_better, _is_better_overall
+
+        metrics = {"stage": "stage2", "loss": 1.0}
+        with self.assertRaisesRegex(KeyError, "validation_latent_cosine_mean"):
+            _is_better(metrics, [])
+        with self.assertRaisesRegex(KeyError, "validation_latent_cosine_mean"):
+            _is_better_overall(metrics, [])
 
 
 if __name__ == "__main__":

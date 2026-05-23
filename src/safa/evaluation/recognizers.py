@@ -6,7 +6,7 @@ from safa.utils.hashing import sha256_file
 
 
 class TorchScriptRecognizer:
-    def __init__(self, name: str, checkpoint: str | Path, device: str, embedding_dim: int = 512, input_size: int = 112):
+    def __init__(self, name: str, checkpoint: str | Path, device: str, embedding_dim: int, input_size: int):
         import torch
 
         self.name = name
@@ -17,6 +17,8 @@ class TorchScriptRecognizer:
         self.model = torch.jit.load(str(checkpoint_path), map_location=self.device).eval()
         self.embedding_dim = int(embedding_dim)
         self.input_size = int(input_size)
+        if self.embedding_dim <= 0:
+            raise ValueError(f"Recognizer {name} embedding_dim must be positive, got {embedding_dim}")
         if self.input_size <= 0:
             raise ValueError(f"Recognizer {name} input_size must be positive, got {input_size}")
 
@@ -84,7 +86,43 @@ class InsightFaceDetector:
         return counts
 
 
+def validate_recognizer_configs(configs: list[dict]) -> None:
+    if not isinstance(configs, list):
+        raise ValueError("privacy.recognizers must be a list")
+    for index, config in enumerate(configs):
+        context = f"privacy.recognizers[{index}]"
+        if not isinstance(config, dict):
+            raise ValueError(f"{context} must be a mapping")
+        _require_field(config, "name", context)
+        kind = _require_field(config, "type", context)
+        if kind == "insightface":
+            _require_field(config, "model_name", context)
+        elif kind == "torchscript":
+            _require_field(config, "checkpoint", context)
+            _positive_int_field(config, "embedding_dim", context)
+            _positive_int_field(config, "input_size", context)
+        else:
+            raise ValueError(f"Unknown recognizer type: {kind}")
+
+
+def _require_field(config: dict, field: str, context: str):
+    if field not in config:
+        raise ValueError(f"{context}.{field} is required")
+    return config[field]
+
+
+def _positive_int_field(config: dict, field: str, context: str) -> int:
+    value = _require_field(config, field, context)
+    if isinstance(value, bool):
+        raise ValueError(f"{context}.{field} must be a positive integer, got bool")
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f"{context}.{field} must be a positive integer, got {value!r}")
+    return parsed
+
+
 def build_recognizers(configs: list[dict], device: str):
+    validate_recognizer_configs(configs)
     recognizers = []
     for config in configs:
         kind = config["type"]
@@ -96,8 +134,8 @@ def build_recognizers(configs: list[dict], device: str):
                     name=config["name"],
                     checkpoint=config["checkpoint"],
                     device=device,
-                    embedding_dim=int(config.get("embedding_dim", 512)),
-                    input_size=int(config.get("input_size", 112)),
+                    embedding_dim=int(config["embedding_dim"]),
+                    input_size=int(config["input_size"]),
                 )
             )
         else:
@@ -106,6 +144,7 @@ def build_recognizers(configs: list[dict], device: str):
 
 
 def describe_recognizer_assets(configs: list[dict]) -> list[dict]:
+    validate_recognizer_configs(configs)
     assets = []
     for config in configs:
         kind = config["type"]
@@ -121,8 +160,8 @@ def describe_recognizer_assets(configs: list[dict]) -> list[dict]:
                     "type": kind,
                     "checkpoint": str(checkpoint),
                     "checkpoint_sha256": sha256_file(checkpoint),
-                    "embedding_dim": int(config.get("embedding_dim", 512)),
-                    "input_size": int(config.get("input_size", 112)),
+                    "embedding_dim": int(config["embedding_dim"]),
+                    "input_size": int(config["input_size"]),
                 }
             )
         else:
