@@ -5,8 +5,9 @@ Date: 2026-05-24
 ## Completed Scope
 
 Phase A produced the balanced train indexes, the single-face validation index,
-the balanced debug E0 feature cache, and the metric plumbing needed to avoid
-selecting checkpoints only by any-face detection rate.
+the balanced debug E0 feature cache, the validation single-face E0 feature
+cache, and the metric plumbing needed to avoid selecting checkpoints only by
+any-face detection rate.
 
 This document records generated artifacts and their current limits. It does not
 claim any new training, evaluation, or cache run beyond the existing Phase A
@@ -64,6 +65,21 @@ The cache manifest and shard were verified with
 ignored by Git because `artifacts/` and `*.pt` are ignored and the repository has
 no tracked `artifacts/e0_features` convention.
 
+## Validation Single-Face Feature Cache
+
+- Cache directory: `artifacts/e0_features/val_single_face`
+- Manifest: `artifacts/e0_features/val_single_face/manifest.json`
+- Shard: `artifacts/e0_features/val_single_face/features.pt`
+- Index path: `data/index/val_single_face.jsonl`
+- Index SHA256: `da14e23eacefecbc2948d1374fb93961a13d017a9183aa1fe2a2f62b33a4b4ea`
+- Encoder checkpoint: `artifacts/checkpoints/e0/best.pt`
+- Encoder checkpoint SHA256:
+  `5f165c520fad315dd1550676c6515c3480585e8ea0dcf1841fd678c8f1963e0f`
+- Samples: 3969
+- Feature dimension: 512
+- Dtype: `float32`
+- L2 normalized: true
+
 ## Metrics And Quality Scripts
 
 - Single-face metrics are implemented: `face_detect_ge1_rate`,
@@ -75,7 +91,37 @@ no tracked `artifacts/e0_features` convention.
 - FID/KID/IQA dependencies are installed.
 - The quality script is implemented at `scripts/eval_generation_quality.py` for
   FID, KID, and pyIQA no-reference IQA.
-- Real `generation_quality` metrics have not been run yet.
+- Real `generation_quality` metrics have been run for the fixed16 raw
+  single-face evaluation artifact:
+  `artifacts/eval/stability_balanced_debug_monitor10_rawbest_fixed16_single_face/generation_quality.json`
+
+## Fixed16 Raw Single-Face Generation Quality
+
+This quality run compares 3969 generated single PNG files against 3969 real
+single-face validation images. FID, KID, and NIQE are distribution-level or
+no-reference image-quality metrics here. They are not paired PSNR or SSIM.
+
+- Evaluation artifact:
+  `artifacts/eval/stability_balanced_debug_monitor10_rawbest_fixed16_single_face`
+- Generated images:
+  `artifacts/eval/stability_balanced_debug_monitor10_rawbest_fixed16_single_face/generated_images`
+- Generated PNG count: 3969
+- Real image count for quality metrics: 3969
+- Generated image count for quality metrics: 3969
+- FID: 124.33562469482422
+- KID mean: 0.12673257291316986
+- KID std: 0.011795842088758945
+- NIQE mean: 4.491209701214922
+- NIQE std: 0.6980395217797578
+
+These quality metrics do not imply a privacy pass. The corresponding fixed16
+raw single-face evaluation stopped before full privacy metrics because the
+fail-fast privacy guard did not pass.
+
+## Related Phase Documents
+
+- Phase C cycle-step ablation is already recorded and locally committed at
+  `docs/experiments/PHASE_C_CYCLE_STEP_ABLATION.md`.
 
 ## Stale Artifacts
 
