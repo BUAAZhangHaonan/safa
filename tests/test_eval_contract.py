@@ -359,6 +359,91 @@ class EvalContractTests(unittest.TestCase):
         expected = make_x_init_for_sample_ids(["sample-a", "sample-b"], 1337, 4, z.device, z.dtype)
         self.assertTrue(torch.equal(generator.sample_kwargs["x_init"], expected))
 
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for eval image export tests")
+    def test_eval_single_image_export_uses_default_or_explicit_dir_and_rejects_overwrite(self) -> None:
+        import torch
+
+        from safa.evaluation.runner import _generated_image_output_dir, _save_generated_image_for_eval
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample_dir = root / "samples"
+            explicit_dir = root / "explicit"
+
+            self.assertIsNone(_generated_image_output_dir({"sample_dir": str(sample_dir)}))
+            self.assertEqual(
+                _generated_image_output_dir({"sample_dir": str(sample_dir), "save_generated_images": True}),
+                sample_dir / "generated_images",
+            )
+            self.assertEqual(
+                _generated_image_output_dir(
+                    {
+                        "sample_dir": str(sample_dir),
+                        "save_generated_images": True,
+                        "generated_image_dir": str(explicit_dir),
+                    }
+                ),
+                explicit_dir,
+            )
+
+            row = {"sample_id": "../subject 01:abc", "artifacts": {}}
+            path = _save_generated_image_for_eval(
+                torch.zeros(3, 4, 4),
+                explicit_dir,
+                global_index=7,
+                sample_id=row["sample_id"],
+                row=row,
+            )
+
+            self.assertEqual(path, explicit_dir / "00000007__subject_01_abc.png")
+            self.assertTrue(path.is_file())
+            self.assertEqual(path.parent, explicit_dir)
+            self.assertNotIn("/", path.name)
+            self.assertNotIn("\\", path.name)
+            self.assertEqual(row["artifacts"]["generated_image_path"], str(path))
+            with self.assertRaises(FileExistsError):
+                _save_generated_image_for_eval(
+                    torch.zeros(3, 4, 4),
+                    explicit_dir,
+                    global_index=7,
+                    sample_id=row["sample_id"],
+                    row={"artifacts": {}},
+                )
+
+    def test_privacy_summary_adds_roc_metrics_from_clean_same_and_impostor_scores(self) -> None:
+        rows = []
+        for same, impostor in [(0.9, 0.1), (0.8, 0.4), (0.4, 0.4)]:
+            rows.append(
+                {
+                    "affective": {"latent_cosine": 1.0},
+                    "face_detection": {},
+                    "anti_steg": {},
+                    "privacy": {"dummy": {"same_similarity": same, "impostor_similarity": impostor}},
+                }
+            )
+
+        summary = _summarize_rows(rows)["privacy"]["dummy"]
+
+        self.assertAlmostEqual(summary["same_identity_similarity_mean"], 0.7)
+        self.assertAlmostEqual(summary["tar_at_far_1e-3"], 2.0 / 3.0)
+        self.assertAlmostEqual(summary["tar_at_far_1e-4"], 2.0 / 3.0)
+        self.assertAlmostEqual(summary["auc"], 8.0 / 9.0)
+        self.assertGreaterEqual(summary["eer"], 0.0)
+        self.assertLess(summary["eer"], 0.35)
+
+    def test_privacy_summary_rejects_missing_clean_same_or_impostor_scores(self) -> None:
+        rows = [
+            {
+                "affective": {"latent_cosine": 1.0},
+                "face_detection": {},
+                "anti_steg": {},
+                "privacy": {"dummy": {"same_similarity": 0.9}},
+            }
+        ]
+
+        with self.assertRaisesRegex(ValueError, "same_similarity.*impostor_similarity"):
+            _summarize_rows(rows)
+
     @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for validation sampling tests")
     def test_validation_reuses_stable_x_init_for_same_sample_id(self) -> None:
         import torch

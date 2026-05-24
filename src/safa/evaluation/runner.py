@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from datetime import datetime, timezone
 import json
+import re
 
 from safa.data.feature_dataset import FeatureAlignedAffectNet
 from safa.evaluation.metrics import face_count_rates, flatten_finite_numbers, summarize
@@ -48,6 +49,8 @@ def run_eval_from_config(config: dict) -> dict:
     generated_chunks = [] if privacy_cfg["enabled"] else None
     sample_dir = Path(config["sample_dir"])
     sample_dir.mkdir(parents=True, exist_ok=True)
+    generated_image_dir = _generated_image_output_dir(config)
+    generated_image_count = 0
     saved_samples = 0
     e0.eval()
     generator.eval()
@@ -68,6 +71,16 @@ def run_eval_from_config(config: dict) -> dict:
                 _attach_face_detection_rows(batch_rows, detector.detect_counts(generated))
             rows.extend(batch_rows)
             row_start = len(rows) - len(batch_rows)
+            if generated_image_dir is not None:
+                for i, sample_id in enumerate(sample_ids):
+                    _save_generated_image_for_eval(
+                        generated[i],
+                        generated_image_dir,
+                        global_index=row_start + i,
+                        sample_id=sample_id,
+                        row=rows[row_start + i],
+                    )
+                    generated_image_count += 1
             for name, perturb in perturbations.items():
                 perturbed = perturb(generated)
                 assert_finite_tensor(f"perturbed_{name}", perturbed)
@@ -101,7 +114,12 @@ def run_eval_from_config(config: dict) -> dict:
         "face_detection_guard": guard,
         "privacy_skipped": privacy_skipped,
         "metrics": summarized,
-        "artifacts": {"sample_dir": str(sample_dir), "per_sample_jsonl": config["per_sample_jsonl"]},
+        "artifacts": {
+            "sample_dir": str(sample_dir),
+            "per_sample_jsonl": config["per_sample_jsonl"],
+            "generated_image_dir": str(generated_image_dir) if generated_image_dir is not None else None,
+            "generated_image_count": generated_image_count,
+        },
         "sampling": {"base_seed": sampling_seed, "stable_x_init": True},
     }
     flatten_finite_numbers(result["metrics"])
@@ -198,6 +216,40 @@ def _positive_int_metadata(value, field: str) -> int:
 def _sample_generated_for_eval(generator, z, sample_ids, sampling_seed: int, image_size: int):
     x_init = make_x_init_for_sample_ids(sample_ids, sampling_seed, image_size, z.device, z.dtype)
     return generator.sample(z, x_init=x_init)
+
+
+_SAFE_SAMPLE_ID_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _generated_image_output_dir(config: dict) -> Path | None:
+    generated_image_dir = config.get("generated_image_dir")
+    if generated_image_dir is not None and str(generated_image_dir).strip():
+        return Path(str(generated_image_dir))
+    save_generated_images = config.get("save_generated_images", False)
+    if not isinstance(save_generated_images, bool):
+        raise ValueError("save_generated_images must be true or false")
+    if save_generated_images:
+        return Path(config["sample_dir"]) / "generated_images"
+    return None
+
+
+def _safe_sample_id(sample_id) -> str:
+    raw = str(sample_id).replace(chr(92), "_").replace("/", "_")
+    safe = _SAFE_SAMPLE_ID_RE.sub("_", raw)
+    safe = re.sub(r"_+", "_", safe).strip("._-")
+    return safe or "sample"
+
+
+def _save_generated_image_for_eval(image, output_dir: Path, *, global_index: int, sample_id, row: dict) -> Path:
+    from torchvision.utils import save_image
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"{int(global_index):08d}__{_safe_sample_id(sample_id)}.png"
+    if path.exists():
+        raise FileExistsError(f"Generated image already exists: {path}")
+    save_image(image.detach().cpu(), path)
+    row.setdefault("artifacts", {})["generated_image_path"] = str(path)
+    return path
 
 
 def _eval_monitor_configs(config: dict) -> tuple[dict, dict, dict]:
@@ -400,6 +452,72 @@ def _attach_privacy_rows(rows: list[dict], store: dict) -> None:
                     privacy[f"same_similarity_rebound_{variant}"] = float(delta > 0.0)
 
 
+def _privacy_score_array(values, context: str):
+    import numpy as np
+
+    array = np.asarray(list(values), dtype=np.float64)
+    if array.size == 0:
+        raise ValueError(f"Privacy ROC metrics require non-empty {context}")
+    if not np.isfinite(array).all():
+        raise ValueError(f"Privacy ROC metrics require finite {context}")
+    return array
+
+
+def _tar_at_far(same_scores, impostor_scores, target_far: float) -> float:
+    import numpy as np
+
+    thresholds = [float("inf"), float(np.nextafter(impostor_scores.max(), np.inf))]
+    thresholds.extend(float(value) for value in np.unique(impostor_scores)[::-1])
+    best_tar = 0.0
+    for threshold in thresholds:
+        far = float(np.mean(impostor_scores >= threshold))
+        if far <= target_far + 1e-12:
+            best_tar = max(best_tar, float(np.mean(same_scores >= threshold)))
+    return best_tar
+
+
+def _privacy_auc(same_scores, impostor_scores) -> float:
+    import numpy as np
+
+    sorted_impostor = np.sort(impostor_scores)
+    wins = np.searchsorted(sorted_impostor, same_scores, side="left")
+    ties = np.searchsorted(sorted_impostor, same_scores, side="right") - wins
+    return float(np.sum(wins + 0.5 * ties) / (same_scores.size * impostor_scores.size))
+
+
+def _privacy_eer(same_scores, impostor_scores) -> float:
+    import numpy as np
+
+    unique_scores = np.unique(np.concatenate([same_scores, impostor_scores]))[::-1]
+    thresholds = [float("inf")]
+    for value in unique_scores:
+        thresholds.append(float(np.nextafter(value, np.inf)))
+        thresholds.append(float(value))
+    thresholds.append(float("-inf"))
+    best = 1.0
+    best_gap = float("inf")
+    for threshold in thresholds:
+        far = float(np.mean(impostor_scores >= threshold))
+        fnr = float(np.mean(same_scores < threshold))
+        gap = abs(far - fnr)
+        if gap < best_gap:
+            best_gap = gap
+            best = (far + fnr) / 2.0
+    return float(best)
+
+
+def _privacy_roc_metrics(same_values, impostor_values) -> dict[str, float]:
+    same_scores = _privacy_score_array(same_values, "same_similarity")
+    impostor_scores = _privacy_score_array(impostor_values, "impostor_similarity")
+    return {
+        "same_identity_similarity_mean": float(same_scores.mean()),
+        "tar_at_far_1e-3": _tar_at_far(same_scores, impostor_scores, 1e-3),
+        "tar_at_far_1e-4": _tar_at_far(same_scores, impostor_scores, 1e-4),
+        "eer": _privacy_eer(same_scores, impostor_scores),
+        "auc": _privacy_auc(same_scores, impostor_scores),
+    }
+
+
 def _summarize_rows(rows: list[dict]) -> dict:
     if not rows:
         raise ValueError("Cannot summarize zero eval rows")
@@ -422,12 +540,23 @@ def _summarize_rows(rows: list[dict]) -> dict:
     recognizer_names = sorted({name for row in rows for name in row["privacy"]})
     summarized["privacy"] = {}
     for recognizer_name in recognizer_names:
-        # Optional: a recognizer may be absent from a row before privacy metrics are attached.
         metric_names = sorted({metric for row in rows for metric in row["privacy"].get(recognizer_name, {})})
+        if "same_similarity" not in metric_names or "impostor_similarity" not in metric_names:
+            raise ValueError(
+                f"Privacy ROC metrics for {recognizer_name} require both same_similarity and impostor_similarity"
+            )
         summarized["privacy"][recognizer_name] = {
             metric: summarize(row["privacy"][recognizer_name][metric] for row in rows)
             for metric in metric_names
         }
+        try:
+            same_values = [row["privacy"][recognizer_name]["same_similarity"] for row in rows]
+            impostor_values = [row["privacy"][recognizer_name]["impostor_similarity"] for row in rows]
+        except KeyError as exc:
+            raise ValueError(
+                f"Privacy ROC metrics for {recognizer_name} require both same_similarity and impostor_similarity"
+            ) from exc
+        summarized["privacy"][recognizer_name].update(_privacy_roc_metrics(same_values, impostor_values))
     return summarized
 
 

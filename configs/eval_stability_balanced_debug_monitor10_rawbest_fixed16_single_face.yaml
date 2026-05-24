@@ -1,0 +1,42 @@
+seed: 1337
+device: cuda:0
+num_workers: 2
+batch_size: 16
+image_size: 224
+index: data/index/val_single_face.jsonl
+features: artifacts/e0_features/val_single_face
+e0_checkpoint: artifacts/checkpoints/e0/best.pt
+g_checkpoint: artifacts/checkpoints/stability_balanced_debug_monitor10_rawbest_fixed16/best.pt
+checkpoint_model: raw
+out_json: artifacts/eval/stability_balanced_debug_monitor10_rawbest_fixed16_single_face/result.json
+per_sample_jsonl: artifacts/eval/stability_balanced_debug_monitor10_rawbest_fixed16_single_face/per_sample.jsonl
+sample_dir: artifacts/eval/stability_balanced_debug_monitor10_rawbest_fixed16_single_face/samples
+generated_image_dir: artifacts/eval/stability_balanced_debug_monitor10_rawbest_fixed16_single_face/generated_images
+face_detection:
+  enabled: true
+  model_name: buffalo_l
+  threshold: 0.95
+  latent_cosine_threshold: 0.95
+privacy:
+  enabled: true
+  recognizers:
+    - name: arcface
+      type: insightface
+      model_name: buffalo_l
+    - name: facenet
+      type: torchscript
+      checkpoint: artifacts/privacy/facenet.pt
+      embedding_dim: 512
+      input_size: 160
+    - name: adaface
+      type: torchscript
+      checkpoint: artifacts/privacy/adaface.pt
+      embedding_dim: 512
+      input_size: 112
+anti_steg:
+  enabled: true
+  jpeg_quality: 75
+  blur_radius: 1.5
+  downsample_scale: 0.5
+  crop_fraction: 0.9
+  noise_std: 0.01
