@@ -256,6 +256,8 @@ def train_g_from_config(config: dict) -> dict:
                 "gradient_cosine_fm_cycle": 0.0,
                 "gradient_norm_fm": 0.0,
                 "gradient_norm_cycle": 0.0,
+                "weighted_gradient_norm_cycle": 0.0,
+                "weighted_gradient_ratio_cycle_to_fm": 0.0,
                 "gradient_conflict_samples": [],
             }
             seen = 0
@@ -273,11 +275,14 @@ def train_g_from_config(config: dict) -> dict:
                         flow_loss,
                         cycle_loss,
                         unwrap_model(training_module).generator.parameters(),
+                        lambda_cycle=lambda_cycle,
                     )
                     totals["gradient_conflict_count"] += 1.0
                     totals["gradient_cosine_fm_cycle"] += gradient_metrics["gradient_cosine_fm_cycle"]
                     totals["gradient_norm_fm"] += gradient_metrics["gradient_norm_fm"]
                     totals["gradient_norm_cycle"] += gradient_metrics["gradient_norm_cycle"]
+                    totals["weighted_gradient_norm_cycle"] += gradient_metrics["weighted_gradient_norm_cycle"]
+                    totals["weighted_gradient_ratio_cycle_to_fm"] += gradient_metrics["weighted_gradient_ratio_cycle_to_fm"]
                     totals["gradient_conflict_samples"].append(gradient_metrics)
                 assert_finite_tensor("g_loss", loss)
                 loss.backward()
@@ -384,6 +389,12 @@ def train_g_from_config(config: dict) -> dict:
 def _reduce_epoch_metrics(totals: dict, seen: int, device, distributed: DistributedContext) -> dict:
     import torch
 
+    local_gradient_conflict_count = float(totals.get("gradient_conflict_count", 0.0))
+    weighted_gradient_norm_cycle = 0.0
+    weighted_gradient_ratio_cycle_to_fm = 0.0
+    if local_gradient_conflict_count > 0.0:
+        weighted_gradient_norm_cycle = float(totals["weighted_gradient_norm_cycle"])
+        weighted_gradient_ratio_cycle_to_fm = float(totals["weighted_gradient_ratio_cycle_to_fm"])
     values = torch.tensor(
         [
             float(totals["loss"]),
@@ -392,10 +403,12 @@ def _reduce_epoch_metrics(totals: dict, seen: int, device, distributed: Distribu
             float(totals["grad_norm"]),
             float(seen),
             # These totals are present only when the Stage 2 gradient-conflict monitor records a batch.
-            float(totals.get("gradient_conflict_count", 0.0)),
+            local_gradient_conflict_count,
             float(totals.get("gradient_cosine_fm_cycle", 0.0)),
             float(totals.get("gradient_norm_fm", 0.0)),
             float(totals.get("gradient_norm_cycle", 0.0)),
+            weighted_gradient_norm_cycle,
+            weighted_gradient_ratio_cycle_to_fm,
         ],
         device=device,
         dtype=torch.float64,
@@ -414,6 +427,8 @@ def _reduce_epoch_metrics(totals: dict, seen: int, device, distributed: Distribu
         "gradient_cosine_fm_cycle",
         "gradient_norm_fm",
         "gradient_norm_cycle",
+        "weighted_gradient_norm_cycle",
+        "weighted_gradient_ratio_cycle_to_fm",
     )
     for index, name in enumerate(metric_names):
         if not bool(torch.isfinite(values[index]).item()):
@@ -440,6 +455,8 @@ def _reduce_epoch_metrics(totals: dict, seen: int, device, distributed: Distribu
                 "gradient_cosine_fm_cycle": float(values[6].item() / gradient_conflict_count),
                 "gradient_norm_fm": float(values[7].item() / gradient_conflict_count),
                 "gradient_norm_cycle": float(values[8].item() / gradient_conflict_count),
+                "weighted_gradient_norm_cycle": float(values[9].item() / gradient_conflict_count),
+                "weighted_gradient_ratio_cycle_to_fm": float(values[10].item() / gradient_conflict_count),
                 "gradient_conflict_count": int(gradient_conflict_count),
                 **_summarize_gradient_conflict_samples(gradient_samples),
             }
@@ -468,11 +485,17 @@ def _summarize_gradient_conflict_samples(samples: list[dict]) -> dict[str, float
     cosines = torch.tensor([_finite_sample_value(sample, "gradient_cosine_fm_cycle") for sample in samples], dtype=torch.float64)
     norm_fm = torch.tensor([_finite_sample_value(sample, "gradient_norm_fm") for sample in samples], dtype=torch.float64)
     norm_cycle = torch.tensor([_finite_sample_value(sample, "gradient_norm_cycle") for sample in samples], dtype=torch.float64)
+    weighted_norm_cycle = torch.tensor([_finite_sample_value(sample, "weighted_gradient_norm_cycle") for sample in samples], dtype=torch.float64)
+    weighted_ratios = torch.tensor([_finite_sample_value(sample, "weighted_gradient_ratio_cycle_to_fm") for sample in samples], dtype=torch.float64)
     ratios = norm_cycle / norm_fm
     if not torch.isfinite(ratios).all():
         raise RuntimeError("Gradient norm ratio contains non-finite values")
+    if not torch.isfinite(weighted_ratios).all():
+        raise RuntimeError("Weighted gradient norm ratio contains non-finite values")
     if bool((norm_fm <= 0.0).any().item()) or bool((norm_cycle <= 0.0).any().item()):
         raise RuntimeError("Gradient norm samples must be positive")
+    if bool((weighted_norm_cycle <= 0.0).any().item()) or bool((weighted_ratios <= 0.0).any().item()):
+        raise RuntimeError("Weighted gradient norm samples must be positive")
     return {
         "gradient_cosine_fm_cycle_mean": float(cosines.mean().item()),
         "gradient_cosine_fm_cycle_p10": float(torch.quantile(cosines, 0.10).item()),
@@ -481,6 +504,8 @@ def _summarize_gradient_conflict_samples(samples: list[dict]) -> dict[str, float
         "gradient_norm_fm_mean": float(norm_fm.mean().item()),
         "gradient_norm_cycle_mean": float(norm_cycle.mean().item()),
         "gradient_norm_ratio_cycle_to_fm_mean": float(ratios.mean().item()),
+        "weighted_gradient_norm_cycle_mean": float(weighted_norm_cycle.mean().item()),
+        "weighted_gradient_ratio_cycle_to_fm_mean": float(weighted_ratios.mean().item()),
         "gradient_conflict_fraction": float((cosines < 0.0).to(dtype=torch.float64).mean().item()),
     }
 
@@ -809,9 +834,14 @@ def _resume_history_for_checkpoint_selection(history: list[dict], checkpoint_pat
     return []
 
 
-def _compute_gradient_conflict_metrics(flow_loss, cycle_loss, parameters) -> dict[str, float]:
+def _compute_gradient_conflict_metrics(flow_loss, cycle_loss, parameters, *, lambda_cycle: float) -> dict[str, float]:
     import torch
 
+    if isinstance(lambda_cycle, bool):
+        raise RuntimeError("lambda_cycle must be numeric, got bool")
+    lambda_cycle = float(lambda_cycle)
+    if not math.isfinite(lambda_cycle):
+        raise RuntimeError("lambda_cycle must be finite")
     params = [param for param in parameters if param.requires_grad]
     if not params:
         raise RuntimeError("Cannot compute gradient conflict metrics without trainable generator parameters")
@@ -830,10 +860,18 @@ def _compute_gradient_conflict_metrics(flow_loss, cycle_loss, parameters) -> dic
     cosine = torch.dot(flow_gradient, cycle_gradient) / (flow_norm * cycle_norm)
     if not torch.isfinite(cosine):
         raise RuntimeError("gradient cosine between flow matching and cycle losses is not finite")
+    weighted_cycle_norm = lambda_cycle * cycle_norm
+    weighted_ratio = weighted_cycle_norm / flow_norm
+    if not torch.isfinite(weighted_cycle_norm):
+        raise RuntimeError("weighted cycle gradient norm is not finite")
+    if not torch.isfinite(weighted_ratio):
+        raise RuntimeError("weighted cycle-to-flow gradient norm ratio is not finite")
     return {
         "gradient_cosine_fm_cycle": float(cosine.detach().cpu()),
         "gradient_norm_fm": float(flow_norm.detach().cpu()),
         "gradient_norm_cycle": float(cycle_norm.detach().cpu()),
+        "weighted_gradient_norm_cycle": float(weighted_cycle_norm.detach().cpu()),
+        "weighted_gradient_ratio_cycle_to_fm": float(weighted_ratio.detach().cpu()),
     }
 
 

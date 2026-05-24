@@ -279,11 +279,13 @@ class StageGateTests(unittest.TestCase):
         flow_loss = parameter[0] * 2.0
         cycle_loss = parameter[1] * 3.0
 
-        metrics = _compute_gradient_conflict_metrics(flow_loss, cycle_loss, [parameter])
+        metrics = _compute_gradient_conflict_metrics(flow_loss, cycle_loss, [parameter], lambda_cycle=0.01)
 
         self.assertAlmostEqual(metrics["gradient_cosine_fm_cycle"], 0.0, places=6)
         self.assertAlmostEqual(metrics["gradient_norm_fm"], 2.0, places=6)
         self.assertAlmostEqual(metrics["gradient_norm_cycle"], 3.0, places=6)
+        self.assertAlmostEqual(metrics["weighted_gradient_norm_cycle"], 0.03, places=6)
+        self.assertAlmostEqual(metrics["weighted_gradient_ratio_cycle_to_fm"], 0.015, places=6)
 
     def test_stage2_gradient_conflict_metrics_reject_zero_norm_gradient(self) -> None:
         import torch
@@ -295,7 +297,7 @@ class StageGateTests(unittest.TestCase):
         cycle_loss = parameter[1] * 3.0
 
         with self.assertRaisesRegex(RuntimeError, "zero norm"):
-            _compute_gradient_conflict_metrics(flow_loss, cycle_loss, [parameter])
+            _compute_gradient_conflict_metrics(flow_loss, cycle_loss, [parameter], lambda_cycle=0.01)
 
     def test_checkpoint_composite_uses_single_face_eq1_rate_not_legacy_ge1(self) -> None:
         from safa.training.g_loop import _composite_score
@@ -372,9 +374,23 @@ class StageGateTests(unittest.TestCase):
             "gradient_cosine_fm_cycle": -0.5,
             "gradient_norm_fm": 4.0,
             "gradient_norm_cycle": 6.0,
+            "weighted_gradient_norm_cycle": 0.06,
+            "weighted_gradient_ratio_cycle_to_fm": 0.03,
             "gradient_conflict_samples": [
-                {"gradient_cosine_fm_cycle": -0.5, "gradient_norm_fm": 2.0, "gradient_norm_cycle": 3.0},
-                {"gradient_cosine_fm_cycle": 0.0, "gradient_norm_fm": 2.0, "gradient_norm_cycle": 3.0},
+                {
+                    "gradient_cosine_fm_cycle": -0.5,
+                    "gradient_norm_fm": 2.0,
+                    "gradient_norm_cycle": 3.0,
+                    "weighted_gradient_norm_cycle": 0.03,
+                    "weighted_gradient_ratio_cycle_to_fm": 0.015,
+                },
+                {
+                    "gradient_cosine_fm_cycle": 0.0,
+                    "gradient_norm_fm": 2.0,
+                    "gradient_norm_cycle": 3.0,
+                    "weighted_gradient_norm_cycle": 0.03,
+                    "weighted_gradient_ratio_cycle_to_fm": 0.015,
+                },
             ],
         }
 
@@ -409,10 +425,30 @@ class StageGateTests(unittest.TestCase):
             "gradient_cosine_fm_cycle": 0.0,
             "gradient_norm_fm": 6.0,
             "gradient_norm_cycle": 12.0,
+            "weighted_gradient_norm_cycle": 0.12,
+            "weighted_gradient_ratio_cycle_to_fm": 0.06,
             "gradient_conflict_samples": [
-                {"gradient_cosine_fm_cycle": -1.0, "gradient_norm_fm": 1.0, "gradient_norm_cycle": 2.0},
-                {"gradient_cosine_fm_cycle": 0.0, "gradient_norm_fm": 2.0, "gradient_norm_cycle": 4.0},
-                {"gradient_cosine_fm_cycle": 1.0, "gradient_norm_fm": 3.0, "gradient_norm_cycle": 6.0},
+                {
+                    "gradient_cosine_fm_cycle": -1.0,
+                    "gradient_norm_fm": 1.0,
+                    "gradient_norm_cycle": 2.0,
+                    "weighted_gradient_norm_cycle": 0.02,
+                    "weighted_gradient_ratio_cycle_to_fm": 0.02,
+                },
+                {
+                    "gradient_cosine_fm_cycle": 0.0,
+                    "gradient_norm_fm": 2.0,
+                    "gradient_norm_cycle": 4.0,
+                    "weighted_gradient_norm_cycle": 0.04,
+                    "weighted_gradient_ratio_cycle_to_fm": 0.02,
+                },
+                {
+                    "gradient_cosine_fm_cycle": 1.0,
+                    "gradient_norm_fm": 3.0,
+                    "gradient_norm_cycle": 6.0,
+                    "weighted_gradient_norm_cycle": 0.06,
+                    "weighted_gradient_ratio_cycle_to_fm": 0.02,
+                },
             ],
         }
         distributed = DistributedContext(
@@ -433,6 +469,73 @@ class StageGateTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["gradient_cosine_fm_cycle_p90"], 0.8)
         self.assertAlmostEqual(metrics["gradient_norm_ratio_cycle_to_fm_mean"], 2.0)
         self.assertAlmostEqual(metrics["gradient_conflict_fraction"], 1.0 / 3.0)
+
+    def test_epoch_metrics_include_weighted_gradient_norm_and_ratio(self) -> None:
+        import torch
+
+        from safa.training.g_loop import _reduce_epoch_metrics
+        from safa.utils.distributed import DistributedContext
+
+        totals = {
+            "loss": 8.0,
+            "flow_matching_mse": 4.0,
+            "cycle": 2.0,
+            "grad_norm": 0.0,
+            "gradient_conflict_count": 2.0,
+            "gradient_cosine_fm_cycle": 0.0,
+            "gradient_norm_fm": 4.0,
+            "gradient_norm_cycle": 6.0,
+            "weighted_gradient_norm_cycle": 0.06,
+            "weighted_gradient_ratio_cycle_to_fm": 0.03,
+            "gradient_conflict_samples": [
+                {
+                    "gradient_cosine_fm_cycle": -0.5,
+                    "gradient_norm_fm": 2.0,
+                    "gradient_norm_cycle": 3.0,
+                    "weighted_gradient_norm_cycle": 0.03,
+                    "weighted_gradient_ratio_cycle_to_fm": 0.015,
+                },
+                {
+                    "gradient_cosine_fm_cycle": 0.5,
+                    "gradient_norm_fm": 2.0,
+                    "gradient_norm_cycle": 3.0,
+                    "weighted_gradient_norm_cycle": 0.03,
+                    "weighted_gradient_ratio_cycle_to_fm": 0.015,
+                },
+            ],
+        }
+        distributed = DistributedContext(
+            enabled=False,
+            rank=0,
+            local_rank=0,
+            world_size=1,
+            is_main=True,
+            device=torch.device("cpu"),
+            backend="single",
+        )
+
+        metrics = _reduce_epoch_metrics(totals, seen=4, device=torch.device("cpu"), distributed=distributed)
+
+        self.assertAlmostEqual(metrics["gradient_norm_cycle_mean"], 3.0)
+        self.assertAlmostEqual(metrics["gradient_norm_ratio_cycle_to_fm_mean"], 1.5)
+        self.assertAlmostEqual(metrics["weighted_gradient_norm_cycle_mean"], 0.03)
+        self.assertAlmostEqual(metrics["weighted_gradient_ratio_cycle_to_fm_mean"], 0.015)
+
+    def test_weighted_gradient_ratio_rejects_zero_flow_norm_like_raw_ratio(self) -> None:
+        from safa.training.g_loop import _summarize_gradient_conflict_samples
+
+        with self.assertRaisesRegex(RuntimeError, "Gradient norm ratio contains non-finite values"):
+            _summarize_gradient_conflict_samples(
+                [
+                    {
+                        "gradient_cosine_fm_cycle": 0.0,
+                        "gradient_norm_fm": 0.0,
+                        "gradient_norm_cycle": 3.0,
+                        "weighted_gradient_norm_cycle": 0.03,
+                        "weighted_gradient_ratio_cycle_to_fm": 0.015,
+                    }
+                ]
+            )
 
     def test_epoch_metrics_reject_zero_seen_samples(self) -> None:
         import torch

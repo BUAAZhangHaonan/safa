@@ -92,6 +92,94 @@ class TrainGV2BestEntrypointTests(unittest.TestCase):
         self.assertIn("artifacts/eval/stability_balanced_debug_fixed16", text)
         g_loop._validate_train_g_config(config)
 
+    def test_phase_c_balanced_debug_monitor10_rawbest_configs_validate(self) -> None:
+        from safa.training import g_loop
+
+        cases = {
+            "fixed8": {
+                "path": Path("configs/stability/train_g_balanced_debug_monitor10_rawbest_fixed8.yaml"),
+                "base": Path("configs/stability/train_g_balanced_debug_ema_monitor_fixed8.yaml"),
+                "out_dir": "artifacts/checkpoints/stability_balanced_debug_monitor10_rawbest_fixed8",
+                "eval_dir": "artifacts/eval/stability_balanced_debug_monitor10_rawbest_fixed8",
+                "train_cycle_steps": 8,
+                "cycle_steps_schedule": [],
+            },
+            "fixed16": {
+                "path": Path("configs/stability/train_g_balanced_debug_monitor10_rawbest_fixed16.yaml"),
+                "base": Path("configs/stability/train_g_balanced_debug_ema_monitor_fixed16.yaml"),
+                "out_dir": "artifacts/checkpoints/stability_balanced_debug_monitor10_rawbest_fixed16",
+                "eval_dir": "artifacts/eval/stability_balanced_debug_monitor10_rawbest_fixed16",
+                "train_cycle_steps": 16,
+                "cycle_steps_schedule": [],
+            },
+            "schedule_4_8_16": {
+                "path": Path("configs/stability/train_g_balanced_debug_monitor10_rawbest_schedule_4_8_16.yaml"),
+                "base": Path("configs/stability/train_g_balanced_debug_ema_monitor_schedule_4_8_16.yaml"),
+                "out_dir": "artifacts/checkpoints/stability_balanced_debug_monitor10_rawbest_schedule_4_8_16",
+                "eval_dir": "artifacts/eval/stability_balanced_debug_monitor10_rawbest_schedule_4_8_16",
+                "train_cycle_steps": 16,
+                "cycle_steps_schedule": [4, 8, 16],
+            },
+            "schedule_4_8_16_32": {
+                "path": Path("configs/stability/train_g_balanced_debug_monitor10_rawbest_schedule_4_8_16_32.yaml"),
+                "base": Path("configs/stability/train_g_balanced_debug_ema_monitor_schedule_4_8_16_32.yaml"),
+                "out_dir": "artifacts/checkpoints/stability_balanced_debug_monitor10_rawbest_schedule_4_8_16_32",
+                "eval_dir": "artifacts/eval/stability_balanced_debug_monitor10_rawbest_schedule_4_8_16_32",
+                "train_cycle_steps": 16,
+                "cycle_steps_schedule": [4, 8, 16, 32],
+            },
+        }
+
+        unchanged_fields = (
+            "seed",
+            "sampling_seed",
+            "batch_size",
+            "train_index",
+            "train_features",
+            "e0_checkpoint",
+            "resume_from",
+            "resume_from_legacy_stage1_metrics",
+            "allow_stage2_without_stage1_gate",
+            "ema",
+            "validation",
+        )
+        unchanged_generator_fields = (
+            "model_type",
+            "base_channels",
+            "channel_multipliers",
+            "time_embedding_dim",
+            "condition_dim",
+            "sample_steps",
+            "sampler",
+        )
+
+        for name, expected in cases.items():
+            with self.subTest(name=name):
+                self.assertTrue(expected["path"].is_file())
+                text = expected["path"].read_text(encoding="utf-8")
+                config = yaml.safe_load(text)
+                base_config = yaml.safe_load(expected["base"].read_text(encoding="utf-8"))
+
+                self.assertEqual(config["out_dir"], expected["out_dir"])
+                self.assertIn(expected["eval_dir"], text)
+                self.assertEqual(config["best_model"], "raw")
+                self.assertEqual(config["stages"]["stage2"]["gradient_conflict"], {"enabled": True, "interval": 10})
+                self.assertEqual(config["generator"]["train_cycle_steps"], expected["train_cycle_steps"])
+                self.assertEqual(config["generator"]["cycle_steps_schedule"], expected["cycle_steps_schedule"])
+                self.assertEqual(config["stages"]["stage2"]["lambda_initial"], 0.01)
+                self.assertEqual(config["stages"]["stage2"]["lambda_max"], 0.01)
+                self.assertEqual(config["stages"]["stage2"]["lambda_growth"], 0)
+                self.assertIs(config["ema"]["enabled"], True)
+                self.assertIs(config["ema"]["evaluate_raw"], True)
+                self.assertIs(config["ema"]["evaluate_ema"], True)
+                self.assertIs(config["ema"]["save_ema_checkpoint"], True)
+                for field in unchanged_fields:
+                    self.assertEqual(config[field], base_config[field], field)
+                for field in unchanged_generator_fields:
+                    self.assertEqual(config["generator"][field], base_config["generator"][field], field)
+                self.assertNotEqual(config["out_dir"], base_config["out_dir"])
+                g_loop._validate_train_g_config(config)
+
     def test_train_g_tmux_defaults_to_v2_best_on_gpu_4_to_7_with_ram_guard(self) -> None:
         script = Path("scripts/run_train_g_tmux.sh").read_text(encoding="utf-8")
 
