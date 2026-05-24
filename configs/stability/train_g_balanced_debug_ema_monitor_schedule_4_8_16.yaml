@@ -1,0 +1,62 @@
+# Balanced-debug Stage 2 EMA monitor run.
+# The resume checkpoint is an explicit legacy Stage 1 prerequisite. Its saved
+# history predates single-face checkpoint-selection metrics, so this config
+# starts new Stage 2 best selection history from the resumed raw model.
+# Next eval output path: artifacts/eval/stability_balanced_debug_schedule_4_8_16
+seed: 1337
+sampling_seed: 1337
+device: cuda:0
+num_workers: 8
+batch_size: 16
+learning_rate: 0.0003
+weight_decay: 0.0
+image_size: 224
+embedding_dim: 512
+train_index: data/index/train_balanced_debug.jsonl
+train_features: artifacts/e0_features/train_balanced_debug
+e0_checkpoint: artifacts/checkpoints/e0/best.pt
+out_dir: artifacts/checkpoints/stability_balanced_debug_schedule_4_8_16
+resume_from: artifacts/checkpoints/g_v2_best_stage1/best.pt
+resume_from_legacy_stage1_metrics: true
+allow_stage2_without_stage1_gate: true
+ema:
+  enabled: true
+  decay: 0.999
+  evaluate_raw: true
+  evaluate_ema: true
+  save_ema_checkpoint: true
+best_model: ema
+distributed:
+  backend: gloo
+generator:
+  model_type: conditional_flow_matching
+  base_channels: 32
+  channel_multipliers: [1, 2, 4, 4]
+  time_embedding_dim: 128
+  condition_dim: 512
+  sample_steps: 32
+  train_cycle_steps: 16
+  cycle_steps_schedule: [4, 8, 16]
+  sampler: heun
+grad_clip_norm: 1.0
+stages:
+  stage1:
+    epochs: 0
+    require_face_detection_gate: false
+  stage2:
+    epochs: 5
+    lambda_initial: 0.01
+    lambda_max: 0.01
+    lambda_growth: 0
+    gradient_conflict:
+      enabled: true
+      interval: 50
+validation:
+  enabled: true
+  index: data/index/val.jsonl
+  features: artifacts/e0_features/val
+  max_samples: 512
+  batch_size: 16
+  face_detection:
+    enabled: true
+    model_name: buffalo_l
