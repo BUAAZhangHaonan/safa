@@ -1,10 +1,8 @@
-# Reproducible V2-best recipe: Stage 2 from a clean Stage 1 checkpoint,
-# with fixed low cycle lambda and aligned training/inference step counts.
-#
-# The resume checkpoint below is a prerequisite output, not a fallback.
-# Produce it first with the same ch=32 generator Stage 1 recipe, then run
-# this Stage 2 config. Do not replace it with artifacts/checkpoints/g_v2/best.pt
-# or any other Stage 2 best checkpoint.
+# Balanced-debug Stage 2 EMA monitor run.
+# The resume checkpoint is an explicit legacy Stage 1 prerequisite. Its saved
+# history predates single-face checkpoint-selection metrics, so this config
+# starts new Stage 2 best selection history from the resumed raw model.
+# Next eval output path: artifacts/eval/stability_balanced_debug_fixed16
 seed: 1337
 sampling_seed: 1337
 device: cuda:0
@@ -14,19 +12,20 @@ learning_rate: 0.0003
 weight_decay: 0.0
 image_size: 224
 embedding_dim: 512
-train_index: data/index/train.jsonl
-train_features: artifacts/e0_features/train
+train_index: data/index/train_balanced_debug.jsonl
+train_features: artifacts/e0_features/train_balanced_debug
 e0_checkpoint: artifacts/checkpoints/e0/best.pt
-out_dir: artifacts/checkpoints/g_v2_best
-resume_from: artifacts/checkpoints/g_v2_best_stage1/best_stage1.pt
+out_dir: artifacts/checkpoints/stability_balanced_debug_fixed16
+resume_from: artifacts/checkpoints/g_v2_best_stage1/best.pt
+resume_from_legacy_stage1_metrics: true
 allow_stage2_without_stage1_gate: true
 ema:
-  enabled: false
+  enabled: true
   decay: 0.999
   evaluate_raw: true
-  evaluate_ema: false
-  save_ema_checkpoint: false
-best_model: raw
+  evaluate_ema: true
+  save_ema_checkpoint: true
+best_model: ema
 distributed:
   backend: gloo
 generator:
@@ -36,8 +35,8 @@ generator:
   time_embedding_dim: 128
   condition_dim: 512
   sample_steps: 32
-  train_cycle_steps: 4
-  cycle_steps_schedule: [4, 8, 16, 32]
+  train_cycle_steps: 16
+  cycle_steps_schedule: []
   sampler: heun
 grad_clip_norm: 1.0
 stages:
@@ -45,7 +44,7 @@ stages:
     epochs: 0
     require_face_detection_gate: false
   stage2:
-    epochs: 80
+    epochs: 5
     lambda_initial: 0.01
     lambda_max: 0.01
     lambda_growth: 0

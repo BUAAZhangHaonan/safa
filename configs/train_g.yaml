@@ -13,6 +13,13 @@ val_features: artifacts/e0_features/val
 e0_checkpoint: artifacts/checkpoints/e0/best.pt
 out_dir: artifacts/checkpoints/g
 allow_stage2_without_stage1_gate: false
+ema:
+  enabled: false
+  decay: 0.999
+  evaluate_raw: true
+  evaluate_ema: false
+  save_ema_checkpoint: false
+best_model: raw
 distributed:
   backend: gloo
 generator:

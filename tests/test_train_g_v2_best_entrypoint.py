@@ -63,6 +63,35 @@ class TrainGV2BestEntrypointTests(unittest.TestCase):
         self.assertNotEqual(config["resume_from"], "artifacts/checkpoints/g_v2/best.pt")
         self.assertNotIn("g_v2/best.pt", str(config["resume_from"]))
 
+    def test_balanced_debug_fixed16_ema_monitor_config_validates(self) -> None:
+        from safa.training import g_loop
+
+        path = Path("configs/stability/train_g_balanced_debug_ema_monitor_fixed16.yaml")
+        self.assertTrue(path.is_file())
+        text = path.read_text(encoding="utf-8")
+        config = yaml.safe_load(text)
+
+        self.assertEqual(config["train_index"], "data/index/train_balanced_debug.jsonl")
+        self.assertEqual(config["train_features"], "artifacts/e0_features/train_balanced_debug")
+        self.assertEqual(config["resume_from"], "artifacts/checkpoints/g_v2_best_stage1/best.pt")
+        self.assertIs(config["resume_from_legacy_stage1_metrics"], True)
+        self.assertEqual(config["stages"]["stage1"]["epochs"], 0)
+        self.assertEqual(config["stages"]["stage2"]["epochs"], 5)
+        self.assertEqual(config["stages"]["stage2"]["lambda_initial"], 0.01)
+        self.assertEqual(config["stages"]["stage2"]["lambda_max"], 0.01)
+        self.assertEqual(config["stages"]["stage2"]["lambda_growth"], 0)
+        self.assertEqual(config["stages"]["stage2"]["gradient_conflict"], {"enabled": True, "interval": 50})
+        self.assertEqual(config["generator"]["cycle_steps_schedule"], [])
+        self.assertEqual(config["generator"]["train_cycle_steps"], 16)
+        self.assertEqual(config["ema"]["decay"], 0.999)
+        self.assertEqual(config["ema"]["enabled"], True)
+        self.assertEqual(config["ema"]["evaluate_raw"], True)
+        self.assertEqual(config["ema"]["evaluate_ema"], True)
+        self.assertEqual(config["best_model"], "ema")
+        self.assertEqual(config["out_dir"], "artifacts/checkpoints/stability_balanced_debug_fixed16")
+        self.assertIn("artifacts/eval/stability_balanced_debug_fixed16", text)
+        g_loop._validate_train_g_config(config)
+
     def test_train_g_tmux_defaults_to_v2_best_on_gpu_4_to_7_with_ram_guard(self) -> None:
         script = Path("scripts/run_train_g_tmux.sh").read_text(encoding="utf-8")
 

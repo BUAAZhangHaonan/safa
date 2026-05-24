@@ -83,6 +83,14 @@ def main() -> None:
             "e0_checkpoint": config["e0_checkpoint"],
             "out_dir": str(work_dir / "g"),
             "allow_stage2_without_stage1_gate": True,
+            "ema": {
+                "enabled": False,
+                "decay": 0.999,
+                "evaluate_raw": True,
+                "evaluate_ema": False,
+                "save_ema_checkpoint": False,
+            },
+            "best_model": "raw",
             "generator": {
                 "model_type": "conditional_flow_matching",
                 "embedding_dim": int(cache_manifest["feature_dim"]),

@@ -82,6 +82,8 @@ class SmokeCliTests(unittest.TestCase):
         self.assertIs(captured["stages"]["stage1"]["require_face_detection_gate"], False)
         self.assertIs(captured["validation"]["enabled"], True)
         self.assertEqual(captured["validation"]["face_detection"]["model_name"], "buffalo_l")
+        self.assertEqual(captured["ema"]["enabled"], False)
+        self.assertEqual(captured["best_model"], "raw")
 
     def test_smoke_requires_explicit_face_detection_fields(self) -> None:
         from safa.cli import smoke

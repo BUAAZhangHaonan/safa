@@ -11,6 +11,14 @@ class StageGateTests(unittest.TestCase):
             "embedding_dim": 2,
             "image_size": 4,
             "allow_stage2_without_stage1_gate": False,
+            "ema": {
+                "enabled": False,
+                "decay": 0.999,
+                "evaluate_raw": True,
+                "evaluate_ema": False,
+                "save_ema_checkpoint": False,
+            },
+            "best_model": "raw",
             "generator": {
                 "model_type": "conditional_flow_matching",
                 "base_channels": 4,
@@ -144,6 +152,55 @@ class StageGateTests(unittest.TestCase):
         config.pop("validation")
 
         with self.assertRaisesRegex(ValueError, "validation"):
+            g_loop._validate_train_g_config(config)
+
+    def test_stage2_requires_explicit_ema_block(self) -> None:
+        from safa.training import g_loop
+
+        config = self._base_train_config()
+        config.pop("ema")
+
+        with self.assertRaisesRegex(ValueError, "ema"):
+            g_loop._validate_train_g_config(config)
+
+    def test_ema_config_requires_explicit_fields(self) -> None:
+        import copy
+
+        from safa.training import g_loop
+
+        for field in ("enabled", "decay", "evaluate_raw", "evaluate_ema", "save_ema_checkpoint"):
+            config = copy.deepcopy(self._base_train_config())
+            config["ema"].pop(field)
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, f"ema.{field}"):
+                    g_loop._validate_train_g_config(config)
+
+    def test_enabled_ema_requires_ema_evaluation_for_ema_best(self) -> None:
+        from safa.training import g_loop
+
+        config = self._base_train_config()
+        config["ema"].update({"enabled": True, "evaluate_raw": True, "evaluate_ema": False, "save_ema_checkpoint": True})
+        config["best_model"] = "ema"
+
+        with self.assertRaisesRegex(ValueError, "ema.evaluate_ema"):
+            g_loop._validate_train_g_config(config)
+
+    def test_stage2_requires_explicit_best_model(self) -> None:
+        from safa.training import g_loop
+
+        config = self._base_train_config()
+        config.pop("best_model")
+
+        with self.assertRaisesRegex(ValueError, "best_model"):
+            g_loop._validate_train_g_config(config)
+
+    def test_best_model_ema_requires_enabled_ema(self) -> None:
+        from safa.training import g_loop
+
+        config = self._base_train_config()
+        config["best_model"] = "ema"
+
+        with self.assertRaisesRegex(ValueError, "ema.enabled"):
             g_loop._validate_train_g_config(config)
 
     def test_stage2_cycle_uses_stable_x_init_and_unclamped_sampling(self) -> None:
@@ -289,7 +346,12 @@ class StageGateTests(unittest.TestCase):
                     checkpoint_path,
                     generator,
                     generator_config,
-                    {"stages": {}, "validation": {}},
+                    {
+                        "stages": {},
+                        "validation": {},
+                        "ema": {"enabled": False, "decay": 0.999, "evaluate_raw": True, "evaluate_ema": False, "save_ema_checkpoint": False},
+                        "best_model": "raw",
+                    },
                     metrics,
                     [],
                 )
@@ -310,6 +372,10 @@ class StageGateTests(unittest.TestCase):
             "gradient_cosine_fm_cycle": -0.5,
             "gradient_norm_fm": 4.0,
             "gradient_norm_cycle": 6.0,
+            "gradient_conflict_samples": [
+                {"gradient_cosine_fm_cycle": -0.5, "gradient_norm_fm": 2.0, "gradient_norm_cycle": 3.0},
+                {"gradient_cosine_fm_cycle": 0.0, "gradient_norm_fm": 2.0, "gradient_norm_cycle": 3.0},
+            ],
         }
 
         distributed = DistributedContext(
@@ -327,6 +393,46 @@ class StageGateTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["gradient_cosine_fm_cycle"], -0.25)
         self.assertAlmostEqual(metrics["gradient_norm_fm"], 2.0)
         self.assertAlmostEqual(metrics["gradient_norm_cycle"], 3.0)
+
+    def test_epoch_metrics_include_gradient_quantiles_norm_ratio_and_conflict_fraction(self) -> None:
+        import torch
+
+        from safa.training.g_loop import _reduce_epoch_metrics
+        from safa.utils.distributed import DistributedContext
+
+        totals = {
+            "loss": 8.0,
+            "flow_matching_mse": 4.0,
+            "cycle": 2.0,
+            "grad_norm": 0.0,
+            "gradient_conflict_count": 3.0,
+            "gradient_cosine_fm_cycle": 0.0,
+            "gradient_norm_fm": 6.0,
+            "gradient_norm_cycle": 12.0,
+            "gradient_conflict_samples": [
+                {"gradient_cosine_fm_cycle": -1.0, "gradient_norm_fm": 1.0, "gradient_norm_cycle": 2.0},
+                {"gradient_cosine_fm_cycle": 0.0, "gradient_norm_fm": 2.0, "gradient_norm_cycle": 4.0},
+                {"gradient_cosine_fm_cycle": 1.0, "gradient_norm_fm": 3.0, "gradient_norm_cycle": 6.0},
+            ],
+        }
+        distributed = DistributedContext(
+            enabled=False,
+            rank=0,
+            local_rank=0,
+            world_size=1,
+            is_main=True,
+            device=torch.device("cpu"),
+            backend="single",
+        )
+
+        metrics = _reduce_epoch_metrics(totals, seen=4, device=torch.device("cpu"), distributed=distributed)
+
+        self.assertAlmostEqual(metrics["gradient_cosine_fm_cycle_mean"], 0.0)
+        self.assertAlmostEqual(metrics["gradient_cosine_fm_cycle_p10"], -0.8)
+        self.assertAlmostEqual(metrics["gradient_cosine_fm_cycle_p50"], 0.0)
+        self.assertAlmostEqual(metrics["gradient_cosine_fm_cycle_p90"], 0.8)
+        self.assertAlmostEqual(metrics["gradient_norm_ratio_cycle_to_fm_mean"], 2.0)
+        self.assertAlmostEqual(metrics["gradient_conflict_fraction"], 1.0 / 3.0)
 
     def test_epoch_metrics_reject_zero_seen_samples(self) -> None:
         import torch
@@ -388,6 +494,141 @@ class StageGateTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "stage"):
             _is_better(metrics, [])
+
+    def test_checkpoint_selection_uses_ema_metrics_when_configured(self) -> None:
+        from safa.training.g_loop import _is_better
+
+        previous = {
+            "stage": "stage2",
+            "loss": 1.0,
+            "validation_raw_latent_cosine_mean": 0.20,
+            "validation_raw_single_face_eq1_rate": 0.20,
+            "validation_ema_latent_cosine_mean": 0.90,
+            "validation_ema_single_face_eq1_rate": 0.90,
+            "validation_latent_cosine_mean": 0.20,
+            "validation_single_face_eq1_rate": 0.20,
+        }
+        current = {
+            "stage": "stage2",
+            "loss": 0.5,
+            "validation_raw_latent_cosine_mean": 1.00,
+            "validation_raw_single_face_eq1_rate": 1.00,
+            "validation_ema_latent_cosine_mean": 0.50,
+            "validation_ema_single_face_eq1_rate": 0.50,
+            "validation_latent_cosine_mean": 1.00,
+            "validation_single_face_eq1_rate": 1.00,
+        }
+
+        self.assertFalse(_is_better(current, [previous], best_model="ema"))
+        self.assertTrue(_is_better(current, [previous], best_model="raw"))
+
+    def test_checkpoint_writer_persists_ema_payload_fields(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        import torch
+
+        from safa.models.generator import FlowGeneratorConfig
+        from safa.training.g_loop import _save_generator
+
+        generator = torch.nn.Linear(2, 2)
+        generator_config = FlowGeneratorConfig(embedding_dim=2, image_size=4, sample_steps=1, train_cycle_steps=1)
+        metrics_raw = {
+            "latent_cosine_mean": 0.50,
+            "single_face_eq1_rate": 0.60,
+        }
+        metrics_ema = {
+            "latent_cosine_mean": 0.90,
+            "single_face_eq1_rate": 0.80,
+        }
+        metrics = {
+            "stage": "stage2",
+            "loss": 1.0,
+            "validation_raw_latent_cosine_mean": 0.50,
+            "validation_raw_single_face_eq1_rate": 0.60,
+            "validation_ema_latent_cosine_mean": 0.90,
+            "validation_ema_single_face_eq1_rate": 0.80,
+            "validation_latent_cosine_mean": 0.50,
+            "validation_single_face_eq1_rate": 0.60,
+        }
+        ema_config = {
+            "enabled": True,
+            "decay": 0.999,
+            "evaluate_raw": True,
+            "evaluate_ema": True,
+            "save_ema_checkpoint": True,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint_path = Path(tmp) / "last.pt"
+            _save_generator(
+                checkpoint_path,
+                generator,
+                generator_config,
+                {"stages": {}, "validation": {}, "ema": ema_config, "best_model": "ema"},
+                metrics,
+                [],
+                ema_model_state_dict=generator.state_dict(),
+                metrics_raw=metrics_raw,
+                metrics_ema=metrics_ema,
+                ema_config=ema_config,
+                best_model="ema",
+            )
+            payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+
+        self.assertIn("model_state_dict", payload)
+        self.assertIn("ema_model_state_dict", payload)
+        self.assertEqual(payload["model_config"], generator_config.to_dict())
+        self.assertEqual(payload["metrics_raw"], metrics_raw)
+        self.assertEqual(payload["metrics_ema"], metrics_ema)
+        self.assertEqual(payload["ema_config"], ema_config)
+
+    def test_checkpoint_writer_rejects_enabled_ema_without_state_dict(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        import torch
+
+        from safa.models.generator import FlowGeneratorConfig
+        from safa.training.g_loop import _save_generator
+
+        generator = torch.nn.Linear(2, 2)
+        generator_config = FlowGeneratorConfig(embedding_dim=2, image_size=4, sample_steps=1, train_cycle_steps=1)
+        metrics = {
+            "stage": "stage2",
+            "loss": 1.0,
+            "validation_ema_latent_cosine_mean": 0.90,
+            "validation_ema_single_face_eq1_rate": 0.80,
+            "validation_latent_cosine_mean": 0.50,
+            "validation_single_face_eq1_rate": 0.60,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint_path = Path(tmp) / "last.pt"
+            with self.assertRaisesRegex(ValueError, "ema_model_state_dict"):
+                _save_generator(
+                    checkpoint_path,
+                    generator,
+                    generator_config,
+                    {"stages": {}, "validation": {}, "best_model": "ema"},
+                    metrics,
+                    [],
+                    ema_config={"enabled": True, "save_ema_checkpoint": True},
+                    best_model="ema",
+                )
+
+    def test_legacy_stage1_resume_history_requires_explicit_gate(self) -> None:
+        from safa.training import g_loop
+
+        history = [{"stage": "stage1", "loss": 1.0, "validation_latent_cosine_mean": 0.8}]
+        stages = {"stage1": {"epochs": 0}, "stage2": {"epochs": 5}}
+        config = {"resume_from_legacy_stage1_metrics": False}
+
+        with self.assertRaisesRegex(ValueError, "resume_from_legacy_stage1_metrics"):
+            g_loop._resume_history_for_checkpoint_selection(history, "legacy.pt", config, stages)
+
+        config["resume_from_legacy_stage1_metrics"] = True
+        self.assertEqual(g_loop._resume_history_for_checkpoint_selection(history, "legacy.pt", config, stages), [])
 
 
 if __name__ == "__main__":

@@ -134,9 +134,34 @@ def _load_generator(checkpoint_path: str, config: dict, device: str):
         raise FileNotFoundError(f"Generator checkpoint does not exist: {path}")
     payload = torch.load(path, map_location=device)
     model_config = require_generator_model_config(payload, str(path))
+    state_dict = _generator_state_dict_for_eval(payload, config, str(path))
     generator = build_generator(model_config)
-    generator.load_state_dict(payload["model_state_dict"])
+    generator.load_state_dict(state_dict)
     return generator.to(device).eval()
+
+
+def _generator_state_dict_for_eval(payload: dict, config: dict, checkpoint_path: str):
+    source = _eval_checkpoint_model_source(payload, config)
+    if source == "raw":
+        return payload["model_state_dict"]
+    if source == "ema":
+        state_dict = payload.get("ema_model_state_dict")
+        if state_dict is None:
+            raise ValueError(f"Generator checkpoint requested EMA weights but missing ema_model_state_dict: {checkpoint_path}")
+        return state_dict
+    raise ValueError(f"checkpoint_model must be 'raw' or 'ema', got {source!r}")
+
+
+def _eval_checkpoint_model_source(payload: dict, config: dict) -> str:
+    if "checkpoint_model" in config:
+        source = config["checkpoint_model"]
+        if source not in ("raw", "ema"):
+            raise ValueError(f"checkpoint_model must be 'raw' or 'ema', got {source!r}")
+        return str(source)
+    training_config = payload.get("training_config") if isinstance(payload, dict) else None
+    if isinstance(training_config, dict) and training_config.get("best_model") == "ema":
+        return "ema"
+    return "raw"
 
 
 def _feature_metadata_for_eval(dataset, generator, e0_checkpoint: dict, cache_path: str) -> dict:

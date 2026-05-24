@@ -277,6 +277,39 @@ class EvalContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "model_config"):
                     _load_generator(str(path), {}, "cpu")
 
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for eval checkpoint tests")
+    def test_eval_generator_loader_rejects_requested_ema_without_state_dict(self) -> None:
+        import torch
+
+        from safa.evaluation.runner import _load_generator
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "g.pt"
+            torch.save(
+                {
+                    "model_config": {
+                        "model_type": "conditional_flow_matching",
+                        "embedding_dim": 2,
+                        "image_size": 4,
+                        "base_channels": 4,
+                        "channel_multipliers": [1],
+                        "time_embedding_dim": 4,
+                        "condition_dim": 4,
+                        "sample_steps": 1,
+                        "train_cycle_steps": 1,
+                        "sampler": "euler",
+                    },
+                    "model_state_dict": {},
+                    "ema_config": {"enabled": True},
+                    "training_config": {"best_model": "ema"},
+                },
+                path,
+            )
+
+            with patch("safa.evaluation.runner.build_generator", side_effect=AssertionError("must not build without ema state")):
+                with self.assertRaisesRegex(ValueError, "ema_model_state_dict"):
+                    _load_generator(str(path), {}, "cpu")
+
     def test_eval_feature_metadata_uses_cache_dim_and_checks_model_dims(self) -> None:
         from safa.evaluation.runner import _feature_metadata_for_eval
 

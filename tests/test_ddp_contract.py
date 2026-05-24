@@ -72,7 +72,17 @@ class DDPContractTests(unittest.TestCase):
                 "validation_latent_cosine_mean": 0.9,
                 "validation_single_face_eq1_rate": 0.8,
             }
-            _save_generator(path, Wrapper(generator), generator.config, {}, metrics, [])
+            _save_generator(
+                path,
+                Wrapper(generator),
+                generator.config,
+                {
+                    "ema": {"enabled": False, "decay": 0.999, "evaluate_raw": True, "evaluate_ema": False, "save_ema_checkpoint": False},
+                    "best_model": "raw",
+                },
+                metrics,
+                [],
+            )
             payload = torch.load(path, map_location="cpu")
         self.assertTrue(payload["model_state_dict"])
         self.assertFalse(any(key.startswith("module.") for key in payload["model_state_dict"]))

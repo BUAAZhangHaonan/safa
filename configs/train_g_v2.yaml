@@ -12,6 +12,13 @@ e0_checkpoint: artifacts/checkpoints/e0/best.pt
 out_dir: artifacts/checkpoints/g_v2
 resume_from: artifacts/checkpoints/g/best.pt
 allow_stage2_without_stage1_gate: true
+ema:
+  enabled: false
+  decay: 0.999
+  evaluate_raw: true
+  evaluate_ema: false
+  save_ema_checkpoint: false
+best_model: raw
 distributed:
   backend: gloo
 generator:

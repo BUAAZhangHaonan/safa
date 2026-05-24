@@ -11,6 +11,13 @@ train_features: artifacts/e0_features/train
 e0_checkpoint: artifacts/checkpoints/e0/best.pt
 out_dir: artifacts/ablation/ablation_e_aligned_plus_fixed_lambda
 allow_stage2_without_stage1_gate: true
+ema:
+  enabled: false
+  decay: 0.999
+  evaluate_raw: true
+  evaluate_ema: false
+  save_ema_checkpoint: false
+best_model: raw
 distributed:
   backend: gloo
 generator:

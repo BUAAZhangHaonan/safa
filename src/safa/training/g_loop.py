@@ -21,6 +21,7 @@ from safa.utils.distributed import (
     init_distributed,
     unwrap_model,
 )
+from safa.utils.ema import ExponentialMovingAverage
 from safa.utils.sampling import make_x_init_for_sample_ids, optional_sampling_base_seed_from_config, sampling_base_seed_from_config
 from safa.utils.seed import set_seed
 
@@ -137,10 +138,14 @@ def train_g_from_config(config: dict) -> dict:
     freeze_e0(e0)
 
     generator_config = _generator_config_from_train_config(config)
+    stages = _stage_config(config)
+    ema_config = _ema_config(config)
+    best_model = _best_model(config, ema_config)
     sampling_seed = sampling_base_seed_from_config(config)
     generator = build_generator(generator_config.to_dict()).to(device)
     resume_history = None
     resume_stage_epoch = None
+    resume_ema_state_dict = None
     # Optional: absent resume_from starts a fresh generator run.
     if config.get("resume_from"):
         resume_path = Path(config["resume_from"])
@@ -149,17 +154,26 @@ def train_g_from_config(config: dict) -> dict:
         ckpt = torch.load(resume_path, map_location=device, weights_only=True)
         generator.load_state_dict(ckpt["model_state_dict"])
         if "history" in ckpt:
-            resume_history = ckpt["history"]
+            resume_history = _resume_history_for_checkpoint_selection(ckpt["history"], str(resume_path), config, stages)
         if "metrics" in ckpt and "stage_epoch" in ckpt["metrics"]:
             resume_stage_epoch = ckpt["metrics"]["stage_epoch"]
+        if "ema_model_state_dict" in ckpt:
+            resume_ema_state_dict = ckpt["ema_model_state_dict"]
         if distributed.is_main:
             restored = ["model_state_dict"]
             if resume_history is not None:
                 restored.append("history")
             if resume_stage_epoch is not None:
                 restored.append("stage_epoch")
+            if resume_ema_state_dict is not None:
+                restored.append("ema_model_state_dict")
             sep = ", ".join(restored)
             print(f"Resumed generator from {resume_path} (restored: {sep})")
+    ema = None
+    if ema_config["enabled"]:
+        ema = ExponentialMovingAverage(generator, decay=float(ema_config["decay"]))
+        if resume_ema_state_dict is not None:
+            ema.load_state_dict(resume_ema_state_dict)
     training_module = _GeneratorTrainingStep(generator, e0, generator_config, sampling_seed).to(device)
     if distributed.enabled:
         training_module = DistributedDataParallel(training_module, device_ids=[distributed.local_rank], output_device=distributed.local_rank)
@@ -198,7 +212,6 @@ def train_g_from_config(config: dict) -> dict:
     )
     validation_loader = _build_validation_loader(config) if distributed.is_main else None
     detector = _build_detector(config, str(device)) if distributed.is_main else None
-    stages = _stage_config(config)
     gradient_conflict_config = _stage2_gradient_conflict_config(stages)
     lambda_cycle = float(stages["stage2"]["lambda_initial"])
     lambda_max = float(stages["stage2"]["lambda_max"])
@@ -243,6 +256,7 @@ def train_g_from_config(config: dict) -> dict:
                 "gradient_cosine_fm_cycle": 0.0,
                 "gradient_norm_fm": 0.0,
                 "gradient_norm_cycle": 0.0,
+                "gradient_conflict_samples": [],
             }
             seen = 0
             for batch_index, batch in enumerate(tqdm(train_loader, desc=f"train_g {stage_name} epoch={stage_epoch}", disable=not distributed.is_main)):
@@ -264,6 +278,7 @@ def train_g_from_config(config: dict) -> dict:
                     totals["gradient_cosine_fm_cycle"] += gradient_metrics["gradient_cosine_fm_cycle"]
                     totals["gradient_norm_fm"] += gradient_metrics["gradient_norm_fm"]
                     totals["gradient_norm_cycle"] += gradient_metrics["gradient_norm_cycle"]
+                    totals["gradient_conflict_samples"].append(gradient_metrics)
                 assert_finite_tensor("g_loss", loss)
                 loss.backward()
                 batch_grad_norm = 0.0
@@ -274,6 +289,8 @@ def train_g_from_config(config: dict) -> dict:
                     )
                     batch_grad_norm = float(grad_norm) if isinstance(grad_norm, float) else float(grad_norm.detach().cpu())
                 optimizer.step()
+                if ema is not None:
+                    ema.update(unwrap_model(training_module).generator)
                 batch_size = int(z.shape[0])
                 seen += batch_size
                 totals["loss"] += float(loss.detach().cpu()) * batch_size
@@ -285,10 +302,21 @@ def train_g_from_config(config: dict) -> dict:
             should_break = False
             if distributed.is_main:
                 metrics.update({"stage": stage_name, "stage_epoch": stage_epoch, "lambda_cycle": lambda_cycle})
-                validation_metrics = _evaluate_validation(unwrap_model(training_module).generator, e0, validation_loader, detector, device, generator_config, sampling_seed=sampling_seed, use_amp=use_amp)
-                metrics.update({f"validation_{key}": value for key, value in validation_metrics.items()})
-                if stage_name == "stage1" and validation_metrics.get("face_detection_rate") is not None:
-                    baseline_detection_rate = validation_metrics["face_detection_rate"]
+                raw_validation_metrics, ema_validation_metrics = _evaluate_validation_variants(
+                    unwrap_model(training_module).generator,
+                    ema,
+                    e0,
+                    validation_loader,
+                    detector,
+                    device,
+                    generator_config,
+                    sampling_seed=sampling_seed,
+                    use_amp=use_amp,
+                    ema_config=ema_config,
+                )
+                _attach_validation_metrics(metrics, raw_validation_metrics, ema_validation_metrics)
+                if stage_name == "stage1" and raw_validation_metrics is not None and raw_validation_metrics.get("face_detection_rate") is not None:
+                    baseline_detection_rate = raw_validation_metrics["face_detection_rate"]
                     threshold = float(stages["stage1"]["face_detection_threshold"])
                     stable_epochs = int(stages["stage1"]["stable_epochs"])
                     if baseline_detection_rate >= threshold:
@@ -301,15 +329,22 @@ def train_g_from_config(config: dict) -> dict:
                     metrics["next_lambda_cycle"] = next_lambda
                     lambda_cycle = next_lambda
 
-                _validate_checkpoint_selection_metrics(metrics)
+                _validate_checkpoint_selection_metrics(metrics, best_model=best_model)
                 history.append(metrics)
-                _save_generator(out_dir / "last.pt", unwrap_model(training_module).generator, generator_config, config, metrics, history)
+                checkpoint_kwargs = {
+                    "ema_model_state_dict": ema.state_dict() if ema is not None and ema_config["save_ema_checkpoint"] else None,
+                    "metrics_raw": raw_validation_metrics,
+                    "metrics_ema": ema_validation_metrics,
+                    "ema_config": ema_config,
+                    "best_model": best_model,
+                }
+                _save_generator(out_dir / "last.pt", unwrap_model(training_module).generator, generator_config, config, metrics, history, **checkpoint_kwargs)
                 _write_json(out_dir / "last_metrics.json", metrics)
                 stage_best_path = out_dir / f"best_{stage_name}.pt"
-                if _is_better(metrics, history[:-1]):
-                    _save_generator(stage_best_path, unwrap_model(training_module).generator, generator_config, config, metrics, history)
-                if _is_better_overall(metrics, history[:-1]):
-                    _save_generator(best_checkpoint, unwrap_model(training_module).generator, generator_config, config, metrics, history)
+                if _is_better(metrics, history[:-1], best_model=best_model):
+                    _save_generator(stage_best_path, unwrap_model(training_module).generator, generator_config, config, metrics, history, **checkpoint_kwargs)
+                if _is_better_overall(metrics, history[:-1], best_model=best_model):
+                    _save_generator(best_checkpoint, unwrap_model(training_module).generator, generator_config, config, metrics, history, **checkpoint_kwargs)
                 should_break = stage_name == "stage1" and stage1_stable_hits >= int(stages["stage1"]["stable_epochs"])
             lambda_cycle, baseline_detection_rate, stage1_stable_hits, should_break = _sync_epoch_control(
                 lambda_cycle,
@@ -336,6 +371,9 @@ def train_g_from_config(config: dict) -> dict:
             "identity_supervision": False,
             "distributed": _distributed_manifest(distributed),
             "sampling": {"base_seed": sampling_seed, "stable_x_init": True},
+            "ema_config": ema_config,
+            "best_model": best_model,
+            "resume_from_legacy_stage1_metrics": bool(config.get("resume_from_legacy_stage1_metrics", False)),
         }
         _write_json(out_dir / "manifest.json", manifest)
     barrier(distributed)
@@ -391,15 +429,75 @@ def _reduce_epoch_metrics(totals: dict, seen: int, device, distributed: Distribu
     }
     gradient_conflict_count = float(values[5].item())
     if gradient_conflict_count > 0.0:
+        gradient_samples = _gather_gradient_conflict_samples(totals.get("gradient_conflict_samples", []), distributed)
+        if len(gradient_samples) != int(gradient_conflict_count):
+            raise RuntimeError(
+                "Gradient conflict monitor sample count mismatch: "
+                f"samples={len(gradient_samples)} count={int(gradient_conflict_count)}"
+            )
         metrics.update(
             {
                 "gradient_cosine_fm_cycle": float(values[6].item() / gradient_conflict_count),
                 "gradient_norm_fm": float(values[7].item() / gradient_conflict_count),
                 "gradient_norm_cycle": float(values[8].item() / gradient_conflict_count),
                 "gradient_conflict_count": int(gradient_conflict_count),
+                **_summarize_gradient_conflict_samples(gradient_samples),
             }
         )
     return metrics
+
+
+def _gather_gradient_conflict_samples(samples: list[dict], distributed: DistributedContext) -> list[dict]:
+    if not distributed.enabled:
+        return list(samples)
+    import torch.distributed as dist
+
+    gathered: list[list[dict]] = [list() for _ in range(distributed.world_size)]
+    dist.all_gather_object(gathered, list(samples))
+    flattened = []
+    for rank_samples in gathered:
+        flattened.extend(rank_samples)
+    return flattened
+
+
+def _summarize_gradient_conflict_samples(samples: list[dict]) -> dict[str, float]:
+    import torch
+
+    if not samples:
+        raise RuntimeError("Gradient conflict monitor recorded no samples")
+    cosines = torch.tensor([_finite_sample_value(sample, "gradient_cosine_fm_cycle") for sample in samples], dtype=torch.float64)
+    norm_fm = torch.tensor([_finite_sample_value(sample, "gradient_norm_fm") for sample in samples], dtype=torch.float64)
+    norm_cycle = torch.tensor([_finite_sample_value(sample, "gradient_norm_cycle") for sample in samples], dtype=torch.float64)
+    ratios = norm_cycle / norm_fm
+    if not torch.isfinite(ratios).all():
+        raise RuntimeError("Gradient norm ratio contains non-finite values")
+    if bool((norm_fm <= 0.0).any().item()) or bool((norm_cycle <= 0.0).any().item()):
+        raise RuntimeError("Gradient norm samples must be positive")
+    return {
+        "gradient_cosine_fm_cycle_mean": float(cosines.mean().item()),
+        "gradient_cosine_fm_cycle_p10": float(torch.quantile(cosines, 0.10).item()),
+        "gradient_cosine_fm_cycle_p50": float(torch.quantile(cosines, 0.50).item()),
+        "gradient_cosine_fm_cycle_p90": float(torch.quantile(cosines, 0.90).item()),
+        "gradient_norm_fm_mean": float(norm_fm.mean().item()),
+        "gradient_norm_cycle_mean": float(norm_cycle.mean().item()),
+        "gradient_norm_ratio_cycle_to_fm_mean": float(ratios.mean().item()),
+        "gradient_conflict_fraction": float((cosines < 0.0).to(dtype=torch.float64).mean().item()),
+    }
+
+
+def _finite_sample_value(sample: dict, field: str) -> float:
+    if field not in sample:
+        raise RuntimeError(f"Gradient conflict sample missing {field}")
+    value = sample[field]
+    if isinstance(value, bool):
+        raise RuntimeError(f"Gradient conflict sample {field} must be numeric, got bool")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"Gradient conflict sample {field} must be numeric, got {value!r}") from exc
+    if not math.isfinite(parsed):
+        raise RuntimeError(f"Gradient conflict sample {field} must be finite, got {value!r}")
+    return parsed
 
 
 def _assert_finite_training_scalars(loss, flow_mse, cycle) -> None:
@@ -507,6 +605,8 @@ def _validate_train_g_config(config: dict) -> None:
     _generator_config_from_train_config(config)
     _require_bool(config, "allow_stage2_without_stage1_gate", "train_g config")
     stages = _stage_config(config)
+    ema_config = _ema_config(config)
+    _best_model(config, ema_config)
     _validate_stage1_gate_config(stages["stage1"])
     _stage2_gradient_conflict_config(stages)
     _validate_validation_block(config)
@@ -534,6 +634,63 @@ def _require_bool(config: dict, field: str, context: str) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"{context}.{field} must be true or false")
     return value
+
+
+def _ema_config(config: dict) -> dict:
+    payload = dict(_require_mapping(config, "ema", "train_g config"))
+    enabled = _require_bool(payload, "enabled", "ema")
+    decay = _require_numeric(payload, "decay", "ema")
+    if not 0.0 < decay < 1.0:
+        raise ValueError(f"ema.decay must be in (0, 1), got {payload['decay']!r}")
+    evaluate_raw = _require_bool(payload, "evaluate_raw", "ema")
+    evaluate_ema = _require_bool(payload, "evaluate_ema", "ema")
+    save_ema_checkpoint = _require_bool(payload, "save_ema_checkpoint", "ema")
+    if enabled:
+        if not evaluate_raw:
+            raise ValueError("ema.evaluate_raw must be true when ema.enabled is true")
+        if not evaluate_ema:
+            raise ValueError("ema.evaluate_ema must be true when ema.enabled is true")
+        if not save_ema_checkpoint:
+            raise ValueError("ema.save_ema_checkpoint must be true when ema.enabled is true")
+    else:
+        if evaluate_ema:
+            raise ValueError("ema.evaluate_ema must be false when ema.enabled is false")
+        if save_ema_checkpoint:
+            raise ValueError("ema.save_ema_checkpoint must be false when ema.enabled is false")
+    return {
+        "enabled": enabled,
+        "decay": decay,
+        "evaluate_raw": evaluate_raw,
+        "evaluate_ema": evaluate_ema,
+        "save_ema_checkpoint": save_ema_checkpoint,
+    }
+
+
+def _best_model(config: dict, ema_config: dict) -> str:
+    value = _require_field(config, "best_model", "train_g config")
+    if value not in ("raw", "ema"):
+        raise ValueError(f"train_g config.best_model must be 'raw' or 'ema', got {value!r}")
+    if value == "raw" and not ema_config["evaluate_raw"]:
+        raise ValueError("ema.evaluate_raw must be true when best_model is raw")
+    if value == "ema":
+        if not ema_config["enabled"]:
+            raise ValueError("ema.enabled must be true when best_model is ema")
+        if not ema_config["evaluate_ema"]:
+            raise ValueError("ema.evaluate_ema must be true when best_model is ema")
+    return str(value)
+
+
+def _require_numeric(config: dict, field: str, context: str) -> float:
+    value = _require_field(config, field, context)
+    if isinstance(value, bool):
+        raise ValueError(f"{context}.{field} must be numeric, got bool")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{context}.{field} must be numeric, got {value!r}") from exc
+    if not math.isfinite(numeric):
+        raise ValueError(f"{context}.{field} must be finite, got {value!r}")
+    return numeric
 
 
 def _validate_stage1_gate_config(stage1: dict) -> None:
@@ -619,6 +776,37 @@ def _should_record_gradient_conflict(stage_name: str, batch_index: int, config: 
     if config.interval is None:
         raise RuntimeError("Stage 2 gradient conflict monitor is enabled without an interval")
     return batch_index % config.interval == 0
+
+
+def _resume_history_for_checkpoint_selection(history: list[dict], checkpoint_path: str, config: dict, stages: dict) -> list[dict]:
+    if not isinstance(history, list):
+        raise ValueError(f"resume_from checkpoint history must be a list: {checkpoint_path}")
+    invalid_history = []
+    for index, item in enumerate(history):
+        try:
+            _validate_checkpoint_selection_metrics(item, f"resume history item {index}")
+        except (KeyError, ValueError) as exc:
+            invalid_history.append((index, item, exc))
+    if not invalid_history:
+        return list(history)
+    if not _require_bool(config, "resume_from_legacy_stage1_metrics", "train_g config"):
+        first_index, _, first_error = invalid_history[0]
+        raise ValueError(
+            "resume_from_legacy_stage1_metrics must be true to use a legacy Stage 1 checkpoint "
+            f"whose history is missing current checkpoint-selection metrics: {checkpoint_path} "
+            f"history_index={first_index} error={first_error}"
+        )
+    if int(_require_field(stages["stage1"], "epochs", "stages.stage1")) != 0:
+        raise ValueError("resume_from_legacy_stage1_metrics requires stages.stage1.epochs == 0")
+    if int(_require_field(stages["stage2"], "epochs", "stages.stage2")) <= 0:
+        raise ValueError("resume_from_legacy_stage1_metrics requires stages.stage2.epochs > 0")
+    non_stage1 = [index for index, item, _ in invalid_history if item.get("stage") != "stage1"]
+    if non_stage1:
+        raise ValueError(
+            "resume_from_legacy_stage1_metrics only permits legacy Stage 1 history; "
+            f"non_stage1_indices={non_stage1}"
+        )
+    return []
 
 
 def _compute_gradient_conflict_metrics(flow_loss, cycle_loss, parameters) -> dict[str, float]:
@@ -729,6 +917,58 @@ def _build_detector(config: dict, device: str):
     return InsightFaceDetector(model_name=str(detection["model_name"]), device=device)
 
 
+def _evaluate_validation_variants(
+    generator,
+    ema: ExponentialMovingAverage | None,
+    e0,
+    loader,
+    detector,
+    device,
+    generator_config: FlowGeneratorConfig,
+    *,
+    sampling_seed: int,
+    use_amp: bool,
+    ema_config: dict,
+) -> tuple[dict | None, dict | None]:
+    raw_metrics = None
+    if ema_config["evaluate_raw"]:
+        raw_metrics = _evaluate_validation(
+            generator,
+            e0,
+            loader,
+            detector,
+            device,
+            generator_config,
+            sampling_seed=sampling_seed,
+            use_amp=use_amp,
+        )
+    ema_metrics = None
+    if ema_config["enabled"] and ema_config["evaluate_ema"]:
+        if ema is None:
+            raise RuntimeError("EMA validation requested but EMA state is not initialized")
+        ema_generator = build_generator(generator_config.to_dict()).to(device)
+        ema.copy_to(ema_generator)
+        ema_metrics = _evaluate_validation(
+            ema_generator,
+            e0,
+            loader,
+            detector,
+            device,
+            generator_config,
+            sampling_seed=sampling_seed,
+            use_amp=use_amp,
+        )
+    return raw_metrics, ema_metrics
+
+
+def _attach_validation_metrics(metrics: dict, raw_metrics: dict | None, ema_metrics: dict | None) -> None:
+    if raw_metrics is not None:
+        metrics.update({f"validation_raw_{key}": value for key, value in raw_metrics.items()})
+        metrics.update({f"validation_{key}": value for key, value in raw_metrics.items()})
+    if ema_metrics is not None:
+        metrics.update({f"validation_ema_{key}": value for key, value in ema_metrics.items()})
+
+
 def _evaluate_validation(generator, e0, loader, detector, device, generator_config: FlowGeneratorConfig, *, sampling_seed: int, use_amp: bool = False) -> dict:
     if loader is None:
         return {}
@@ -773,20 +1013,43 @@ def _evaluate_validation(generator, e0, loader, detector, device, generator_conf
     return metrics
 
 
-def _composite_score(item: dict) -> float:
+def _composite_score(item: dict, best_model: str = "raw") -> float:
     """New checkpoint composite: cosine x single_face_eq1_rate.
 
     Old reports used validation_face_detection_rate, which is the ge1 rate.
     """
-    cosine = item["validation_latent_cosine_mean"]
-    single_face = item["validation_single_face_eq1_rate"]
+    cosine = item[_checkpoint_metric_field(item, "latent_cosine_mean", best_model)]
+    single_face = item[_checkpoint_metric_field(item, "single_face_eq1_rate", best_model)]
     return cosine * single_face
 
 
-def _validate_checkpoint_selection_metrics(metrics: dict, context: str = "checkpoint metrics") -> None:
-    for field in ("validation_latent_cosine_mean", "validation_single_face_eq1_rate", "loss", "stage"):
+def _checkpoint_metric_field(item: dict, metric_name: str, best_model: str) -> str:
+    if best_model not in ("raw", "ema"):
+        raise ValueError(f"best_model must be 'raw' or 'ema', got {best_model!r}")
+    prefixed = f"validation_{best_model}_{metric_name}"
+    if prefixed in item:
+        return prefixed
+    if best_model == "raw":
+        legacy = f"validation_{metric_name}"
+        if legacy in item:
+            return legacy
+        raise KeyError(legacy)
+    raise KeyError(prefixed)
+
+
+def _validate_checkpoint_selection_metrics(metrics: dict, context: str = "checkpoint metrics", best_model: str = "raw") -> None:
+    for field in ("loss", "stage"):
         _require_field(metrics, field, context)
-    for field in ("validation_latent_cosine_mean", "validation_single_face_eq1_rate", "loss"):
+    try:
+        metric_fields = (
+            _checkpoint_metric_field(metrics, "latent_cosine_mean", best_model),
+            _checkpoint_metric_field(metrics, "single_face_eq1_rate", best_model),
+            "loss",
+        )
+    except KeyError as exc:
+        missing = exc.args[0]
+        raise ValueError(f"{context}.{missing} is required") from exc
+    for field in metric_fields:
         value = metrics[field]
         if isinstance(value, bool):
             raise ValueError(f"{context}.{field} must be numeric, got bool")
@@ -798,50 +1061,73 @@ def _validate_checkpoint_selection_metrics(metrics: dict, context: str = "checkp
             raise ValueError(f"{context}.{field} must be finite, got {value!r}")
 
 
-def _is_better(metrics: dict, previous: list[dict]) -> bool:
-    _validate_checkpoint_selection_metrics(metrics)
-    current_score = _composite_score(metrics)
+def _is_better(metrics: dict, previous: list[dict], best_model: str = "raw") -> bool:
+    _validate_checkpoint_selection_metrics(metrics, best_model=best_model)
+    current_score = _composite_score(metrics, best_model)
     if not previous:
         return True
     stage = metrics["stage"]
     same_stage = []
     for item in previous:
-        _validate_checkpoint_selection_metrics(item, "checkpoint history item")
+        _validate_checkpoint_selection_metrics(item, "checkpoint history item", best_model=best_model)
         if item["stage"] == stage:
             same_stage.append(item)
     if not same_stage:
         return True
-    best = max(same_stage, key=lambda item: (_composite_score(item), -item["loss"]))
-    return (current_score, -metrics["loss"]) > (_composite_score(best), -best["loss"])
+    best = max(same_stage, key=lambda item: (_composite_score(item, best_model), -item["loss"]))
+    return (current_score, -metrics["loss"]) > (_composite_score(best, best_model), -best["loss"])
 
 
-def _is_better_overall(metrics: dict, previous: list[dict]) -> bool:
+def _is_better_overall(metrics: dict, previous: list[dict], best_model: str = "raw") -> bool:
     """Compare current epoch against ALL previous epochs regardless of stage.
 
     Unlike _is_better which only compares within the same stage, this function
     compares across stages. Uses composite score (cosine x single_face_eq1_rate)
     to prevent selecting degenerate checkpoints with high cosine but invalid face counts.
     """
-    _validate_checkpoint_selection_metrics(metrics)
-    current_score = _composite_score(metrics)
+    _validate_checkpoint_selection_metrics(metrics, best_model=best_model)
+    current_score = _composite_score(metrics, best_model)
     if not previous:
         return True
     for item in previous:
-        _validate_checkpoint_selection_metrics(item, "checkpoint history item")
-    best = max(previous, key=lambda item: (_composite_score(item), -item["loss"]))
-    return (current_score, -metrics["loss"]) > (_composite_score(best), -best["loss"])
+        _validate_checkpoint_selection_metrics(item, "checkpoint history item", best_model=best_model)
+    best = max(previous, key=lambda item: (_composite_score(item, best_model), -item["loss"]))
+    return (current_score, -metrics["loss"]) > (_composite_score(best, best_model), -best["loss"])
 
 
-def _save_generator(path: Path, generator, generator_config: FlowGeneratorConfig, train_config: dict, metrics: dict, history: list[dict]) -> None:
+def _save_generator(
+    path: Path,
+    generator,
+    generator_config: FlowGeneratorConfig,
+    train_config: dict,
+    metrics: dict,
+    history: list[dict],
+    *,
+    ema_model_state_dict: dict | None = None,
+    metrics_raw: dict | None = None,
+    metrics_ema: dict | None = None,
+    ema_config: dict | None = None,
+    best_model: str | None = None,
+) -> None:
     import torch
 
-    _validate_checkpoint_selection_metrics(metrics)
+    ema_config = dict(ema_config if ema_config is not None else _ema_config(train_config))
+    best_model = str(best_model if best_model is not None else _best_model(train_config, ema_config))
+    _validate_checkpoint_selection_metrics(metrics, best_model=best_model)
+    if ema_config["enabled"] and ema_config["save_ema_checkpoint"] and ema_model_state_dict is None:
+        raise ValueError("ema_model_state_dict is required when ema.enabled and ema.save_ema_checkpoint are true")
+    if not ema_config["enabled"] and ema_model_state_dict is not None:
+        raise ValueError("ema_model_state_dict must not be provided when ema.enabled is false")
     generator = unwrap_model(generator)
     path.parent.mkdir(parents=True, exist_ok=True)
     training_config = {
         "stages": train_config.get("stages"),
         "validation": train_config.get("validation"),
+        "ema": ema_config,
+        "best_model": best_model,
     }
+    if "resume_from_legacy_stage1_metrics" in train_config:
+        training_config["resume_from_legacy_stage1_metrics"] = train_config["resume_from_legacy_stage1_metrics"]
     if "seed" in train_config and train_config["seed"] is not None:
         training_config["seed"] = train_config["seed"]
     if "sampling_seed" in train_config and train_config["sampling_seed"] is not None:
@@ -856,9 +1142,14 @@ def _save_generator(path: Path, generator, generator_config: FlowGeneratorConfig
         },
         "stage": metrics["stage"],
         "metrics": metrics,
+        "metrics_raw": metrics_raw,
+        "metrics_ema": metrics_ema,
+        "ema_config": ema_config,
         "history": history,
         "training_config": training_config,
     }
+    if ema_config["enabled"] and ema_config["save_ema_checkpoint"]:
+        payload["ema_model_state_dict"] = ema_model_state_dict
     sampling_seed = optional_sampling_base_seed_from_config(train_config)
     if sampling_seed is not None:
         payload["sampling"] = {"base_seed": sampling_seed, "stable_x_init": True}
