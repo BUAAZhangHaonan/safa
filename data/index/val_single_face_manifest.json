@@ -1,0 +1,12 @@
+{
+  "detector": "insightface_buffalo_l",
+  "device": "cuda:0",
+  "num_multi_face": 29,
+  "num_single_face": 3969,
+  "num_source": 4000,
+  "num_zero_face": 2,
+  "output_index": "data/index/val_single_face.jsonl",
+  "output_index_sha256": "da14e23eacefecbc2948d1374fb93961a13d017a9183aa1fe2a2f62b33a4b4ea",
+  "source_index": "data/index/val.jsonl",
+  "source_index_sha256": "e830904f7bd028c9c646dfc8ae9050a02783469b92978869777fd3a4d1335918"
+}
