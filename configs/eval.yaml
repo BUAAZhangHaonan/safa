@@ -14,6 +14,7 @@ face_detection:
   enabled: true
   model_name: buffalo_l
   threshold: 0.95
+  single_face_eq1_threshold: 0.98
   latent_cosine_threshold: 0.95
 privacy:
   enabled: true

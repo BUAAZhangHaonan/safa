@@ -19,6 +19,10 @@ from safa.utils.sampling import make_x_init_for_sample_ids, sampling_base_seed_f
 from safa.utils.seed import set_seed
 
 
+class PrivacyProtocolError(RuntimeError):
+    """Raised when privacy pairs cannot be formed under the one-face protocol."""
+
+
 def run_eval_from_config(config: dict) -> dict:
     import torch
     import torch.nn.functional as F
@@ -91,15 +95,86 @@ def run_eval_from_config(config: dict) -> dict:
                 saved_samples += int(min(4, generated.shape[0]))
     summarized = _summarize_rows(rows)
     guard = _guard_result(summarized, face_detection_cfg)
-    privacy_skipped = bool(privacy_cfg["enabled"] and not guard["passed"])
+    privacy_guard_pass = bool(guard["passed"])
+    privacy_skipped = bool(privacy_cfg["enabled"] and not privacy_guard_pass)
+    skip_reason = "privacy_guard_failed" if privacy_skipped else None
+    result = _build_eval_result(
+        config,
+        dataset,
+        feature_metadata,
+        e0_checkpoint,
+        recognizer_assets,
+        guard,
+        privacy_skipped,
+        skip_reason,
+        summarized,
+        sample_dir,
+        generated_image_dir,
+        generated_image_count,
+        sampling_seed,
+    )
+    _write_eval_outputs(config, result, rows, len(dataset))
     if privacy_cfg["enabled"] and guard["passed"]:
         recognizer_assets = describe_recognizer_assets(privacy_cfg["recognizers"])
         recognizers = build_recognizers(privacy_cfg["recognizers"], str(device))
         privacy_store = _empty_privacy_store(recognizers, perturbations)
-        _run_privacy_pass(config, loader, generated_chunks, recognizers, perturbations, privacy_store, device)
+        try:
+            _run_privacy_pass(config, loader, generated_chunks, recognizers, perturbations, privacy_store, device)
+        except PrivacyProtocolError:
+            result = _build_eval_result(
+                config,
+                dataset,
+                feature_metadata,
+                e0_checkpoint,
+                recognizer_assets,
+                guard,
+                True,
+                "privacy_protocol_blocker",
+                summarized,
+                sample_dir,
+                generated_image_dir,
+                generated_image_count,
+                sampling_seed,
+            )
+            _write_eval_outputs(config, result, rows, len(dataset))
+            raise
         _attach_privacy_rows(rows, privacy_store)
         summarized = _summarize_rows(rows)
-    result = {
+        result = _build_eval_result(
+            config,
+            dataset,
+            feature_metadata,
+            e0_checkpoint,
+            recognizer_assets,
+            guard,
+            False,
+            None,
+            summarized,
+            sample_dir,
+            generated_image_dir,
+            generated_image_count,
+            sampling_seed,
+        )
+        _write_eval_outputs(config, result, rows, len(dataset))
+    return result
+
+
+def _build_eval_result(
+    config: dict,
+    dataset,
+    feature_metadata: dict,
+    e0_checkpoint: dict,
+    recognizer_assets: list,
+    guard: dict,
+    privacy_skipped: bool,
+    skip_reason: str | None,
+    metrics: dict,
+    sample_dir: Path,
+    generated_image_dir: Path | None,
+    generated_image_count: int,
+    sampling_seed: int,
+) -> dict:
+    return {
         "run_id": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "dataset": {"name": "AffectNet", "num_samples": len(dataset), "index": config["index"]},
@@ -112,8 +187,10 @@ def run_eval_from_config(config: dict) -> dict:
         "features": feature_metadata,
         "recognizer_assets": recognizer_assets,
         "face_detection_guard": guard,
+        "privacy_guard_pass": bool(guard["passed"]),
         "privacy_skipped": privacy_skipped,
-        "metrics": summarized,
+        "skip_reason": skip_reason,
+        "metrics": metrics,
         "artifacts": {
             "sample_dir": str(sample_dir),
             "per_sample_jsonl": config["per_sample_jsonl"],
@@ -122,9 +199,12 @@ def run_eval_from_config(config: dict) -> dict:
         },
         "sampling": {"base_seed": sampling_seed, "stable_x_init": True},
     }
+
+
+def _write_eval_outputs(config: dict, result: dict, rows: list[dict], dataset_len: int) -> None:
     flatten_finite_numbers(result["metrics"])
-    if len(rows) != len(dataset):
-        raise RuntimeError(f"Per-sample eval row count mismatch: rows={len(rows)} dataset={len(dataset)}")
+    if len(rows) != dataset_len:
+        raise RuntimeError(f"Per-sample eval row count mismatch: rows={len(rows)} dataset={dataset_len}")
     per_sample_jsonl = Path(config["per_sample_jsonl"])
     per_sample_jsonl.parent.mkdir(parents=True, exist_ok=True)
     with per_sample_jsonl.open("w", encoding="utf-8", newline="\n") as handle:
@@ -134,14 +214,6 @@ def run_eval_from_config(config: dict) -> dict:
     out_json.parent.mkdir(parents=True, exist_ok=True)
     out_json.write_text(json.dumps(result, indent=2, sort_keys=True, allow_nan=False), encoding="utf-8")
     result["out_json"] = str(out_json)
-    if privacy_skipped:
-        raise RuntimeError(
-            "Privacy evaluation skipped because generation guard failed: "
-            f"face_detection_rate={guard['face_detection_rate']} "
-            f"latent_cosine_mean={guard['latent_cosine_mean']} "
-            f"thresholds=({guard['face_detection_threshold']}, {guard['latent_cosine_threshold']})"
-        )
-    return result
 
 
 def _load_generator(checkpoint_path: str, config: dict, device: str):
@@ -258,6 +330,7 @@ def _eval_monitor_configs(config: dict) -> tuple[dict, dict, dict]:
     anti_cfg = _require_config_block(config, "anti_steg")
     _validate_privacy_config(privacy_cfg)
     _validate_face_detection_config(face_detection_cfg)
+    _validate_privacy_guard_config(privacy_cfg, face_detection_cfg)
     _validate_anti_steg_config(anti_cfg)
     return privacy_cfg, face_detection_cfg, anti_cfg
 
@@ -301,6 +374,14 @@ def _validate_face_detection_config(config: dict) -> None:
     if not _require_enabled_flag(config, "face_detection"):
         return
     _require_fields(config, ("model_name", "threshold", "latent_cosine_threshold"), "face_detection")
+
+
+def _validate_privacy_guard_config(privacy_config: dict, face_detection_config: dict) -> None:
+    if not _require_enabled_flag(privacy_config, "privacy"):
+        return
+    if not _require_enabled_flag(face_detection_config, "face_detection"):
+        raise ValueError("face_detection.enabled must be true when privacy.enabled is true")
+    _require_fields(face_detection_config, ("single_face_eq1_threshold",), "face_detection")
 
 
 def _validate_anti_steg_config(config: dict) -> None:
@@ -383,11 +464,25 @@ def _attach_perturbed_affective_rows(rows: list[dict], row_start: int, name: str
         }
 
 
+def _embed_privacy_batch(recognizer, images, *, role: str, variant: str):
+    try:
+        return recognizer.embed(images).detach().cpu()
+    except RuntimeError as exc:
+        if "expected exactly one face" not in str(exc):
+            raise
+        raise PrivacyProtocolError(
+            "Privacy protocol blocker: privacy recognizers require exactly one detected face "
+            f"for each {role} image in variant {variant!r}; {exc}"
+        ) from exc
+
+
 def _collect_privacy_embeddings(store: dict, recognizers, source, generated, variant: str) -> None:
     for recognizer in recognizers:
         if variant == "clean":
-            store[recognizer.name]["source"].append(recognizer.embed(source).detach().cpu())
-        store[recognizer.name]["generated"][variant].append(recognizer.embed(generated).detach().cpu())
+            store[recognizer.name]["source"].append(_embed_privacy_batch(recognizer, source, role="source", variant=variant))
+        store[recognizer.name]["generated"][variant].append(
+            _embed_privacy_batch(recognizer, generated, role="generated", variant=variant)
+        )
 
 
 def _run_privacy_pass(config: dict, loader, generated_chunks, recognizers, perturbations, privacy_store: dict, device) -> None:
@@ -579,7 +674,9 @@ def _guard_result(metrics: dict, config: dict) -> dict:
     if not _require_enabled_flag(config, "face_detection"):
         return {"enabled": False, "passed": True, "reason": "disabled"}
     _validate_face_detection_config(config)
+    _require_fields(config, ("single_face_eq1_threshold",), "face_detection")
     face_threshold = float(config["threshold"])
+    single_face_threshold = float(config["single_face_eq1_threshold"])
     cosine_threshold = float(config["latent_cosine_threshold"])
     face_detection_rate = _require_summary_mean(metrics, ("face_detection", "detected", "mean"))
     face_rates = {
@@ -589,7 +686,7 @@ def _guard_result(metrics: dict, config: dict) -> dict:
         "multi_face_rate": _require_summary_mean(metrics, ("face_detection", "multi_face_rate", "mean")),
     }
     latent_cosine_mean = _require_summary_mean(metrics, ("latent_cosine", "mean"))
-    passed = bool(face_detection_rate >= face_threshold and latent_cosine_mean >= cosine_threshold)
+    passed = bool(face_rates["single_face_eq1_rate"] >= single_face_threshold and latent_cosine_mean >= cosine_threshold)
     return {
         "enabled": True,
         "passed": passed,
@@ -597,5 +694,6 @@ def _guard_result(metrics: dict, config: dict) -> dict:
         **face_rates,
         "latent_cosine_mean": latent_cosine_mean,
         "face_detection_threshold": face_threshold,
+        "single_face_eq1_threshold": single_face_threshold,
         "latent_cosine_threshold": cosine_threshold,
     }

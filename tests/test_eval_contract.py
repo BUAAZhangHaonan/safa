@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import importlib.util
+import json
 import math
 from types import SimpleNamespace
 import tempfile
@@ -54,17 +55,23 @@ class EvalContractTests(unittest.TestCase):
     def test_face_detection_guard_requires_both_thresholds(self) -> None:
         metrics = {
             "face_detection": {
-                "detected": {"mean": 0.99},
-                "face_detect_ge1_rate": {"mean": 0.99},
-                "single_face_eq1_rate": {"mean": 0.98},
-                "zero_face_rate": {"mean": 0.01},
-                "multi_face_rate": {"mean": 0.01},
+                "detected": {"mean": 1.0},
+                "face_detect_ge1_rate": {"mean": 1.0},
+                "single_face_eq1_rate": {"mean": 0.97},
+                "zero_face_rate": {"mean": 0.0},
+                "multi_face_rate": {"mean": 0.03},
             },
             "latent_cosine": {"mean": 0.94},
         }
         guard = _guard_result(
             metrics,
-            {"enabled": True, "model_name": "buffalo_l", "threshold": 0.95, "latent_cosine_threshold": 0.95},
+            {
+                "enabled": True,
+                "model_name": "buffalo_l",
+                "threshold": 0.95,
+                "single_face_eq1_threshold": 0.98,
+                "latent_cosine_threshold": 0.95,
+            },
         )
         self.assertFalse(guard["passed"])
         self.assertEqual(guard["face_detection_rate"], metrics["face_detection"]["detected"]["mean"])
@@ -72,10 +79,29 @@ class EvalContractTests(unittest.TestCase):
         self.assertEqual(guard["single_face_eq1_rate"], metrics["face_detection"]["single_face_eq1_rate"]["mean"])
         self.assertEqual(guard["zero_face_rate"], metrics["face_detection"]["zero_face_rate"]["mean"])
         self.assertEqual(guard["multi_face_rate"], metrics["face_detection"]["multi_face_rate"]["mean"])
+        self.assertEqual(guard["single_face_eq1_threshold"], 0.98)
         metrics["latent_cosine"]["mean"] = 0.96
         guard = _guard_result(
             metrics,
-            {"enabled": True, "model_name": "buffalo_l", "threshold": 0.95, "latent_cosine_threshold": 0.95},
+            {
+                "enabled": True,
+                "model_name": "buffalo_l",
+                "threshold": 0.95,
+                "single_face_eq1_threshold": 0.98,
+                "latent_cosine_threshold": 0.95,
+            },
+        )
+        self.assertFalse(guard["passed"])
+        metrics["face_detection"]["single_face_eq1_rate"]["mean"] = 0.99
+        guard = _guard_result(
+            metrics,
+            {
+                "enabled": True,
+                "model_name": "buffalo_l",
+                "threshold": 0.95,
+                "single_face_eq1_threshold": 0.98,
+                "latent_cosine_threshold": 0.95,
+            },
         )
         self.assertTrue(guard["passed"])
 
@@ -87,6 +113,7 @@ class EvalContractTests(unittest.TestCase):
                     "enabled": True,
                     "model_name": "buffalo_l",
                     "threshold": 0.95,
+                    "single_face_eq1_threshold": 0.98,
                     "latent_cosine_threshold": 0.95,
                 },
             )
@@ -105,7 +132,25 @@ class EvalContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "threshold"):
             _guard_result(metrics, {"enabled": True, "model_name": "buffalo_l", "latent_cosine_threshold": 0.95})
         with self.assertRaisesRegex(ValueError, "latent_cosine_threshold"):
-            _guard_result(metrics, {"enabled": True, "model_name": "buffalo_l", "threshold": 0.95})
+            _guard_result(
+                metrics,
+                {
+                    "enabled": True,
+                    "model_name": "buffalo_l",
+                    "threshold": 0.95,
+                    "single_face_eq1_threshold": 0.98,
+                },
+            )
+        with self.assertRaisesRegex(ValueError, "single_face_eq1_threshold"):
+            _guard_result(
+                metrics,
+                {
+                    "enabled": True,
+                    "model_name": "buffalo_l",
+                    "threshold": 0.95,
+                    "latent_cosine_threshold": 0.95,
+                },
+            )
 
     def test_face_detection_guard_requires_explicit_enabled_flag(self) -> None:
         with self.assertRaisesRegex(ValueError, "face_detection.enabled"):
@@ -124,9 +169,55 @@ class EvalContractTests(unittest.TestCase):
                     "enabled": True,
                     "model_name": "buffalo_l",
                     "threshold": 0.95,
+                    "single_face_eq1_threshold": 0.98,
                     "latent_cosine_threshold": 0.95,
                 },
             )
+
+    def test_privacy_enabled_requires_single_face_guard_threshold(self) -> None:
+        from safa.evaluation import runner
+
+        config = {
+            "privacy": {
+                "enabled": True,
+                "recognizers": [{"name": "arcface", "type": "insightface", "model_name": "buffalo_l"}],
+            },
+            "face_detection": {
+                "enabled": True,
+                "model_name": "buffalo_l",
+                "threshold": 0.95,
+                "latent_cosine_threshold": 0.95,
+            },
+            "anti_steg": {"enabled": False},
+        }
+
+        with self.assertRaisesRegex(ValueError, "face_detection.single_face_eq1_threshold"):
+            runner._eval_monitor_configs(config)
+
+    def test_privacy_guard_uses_single_face_rate_not_legacy_ge1_rate(self) -> None:
+        metrics = {
+            "face_detection": {
+                "detected": {"mean": 1.0},
+                "face_detect_ge1_rate": {"mean": 1.0},
+                "single_face_eq1_rate": {"mean": 0.5},
+                "zero_face_rate": {"mean": 0.0},
+                "multi_face_rate": {"mean": 0.5},
+            },
+            "latent_cosine": {"mean": 0.99},
+        }
+
+        guard = _guard_result(
+            metrics,
+            {
+                "enabled": True,
+                "model_name": "buffalo_l",
+                "threshold": 0.95,
+                "single_face_eq1_threshold": 0.98,
+                "latent_cosine_threshold": 0.95,
+            },
+        )
+
+        self.assertFalse(guard["passed"])
 
     def test_eval_monitor_config_requires_explicit_blocks(self) -> None:
         from safa.evaluation import runner
@@ -189,6 +280,22 @@ class EvalContractTests(unittest.TestCase):
                 {
                     "privacy": {"enabled": False},
                     "face_detection": {"enabled": True, "model_name": "buffalo_l", "threshold": 0.95},
+                    "anti_steg": {"enabled": False},
+                },
+            ),
+            (
+                "face_detection.single_face_eq1_threshold",
+                {
+                    "privacy": {
+                        "enabled": True,
+                        "recognizers": [{"name": "arcface", "type": "insightface", "model_name": "buffalo_l"}],
+                    },
+                    "face_detection": {
+                        "enabled": True,
+                        "model_name": "buffalo_l",
+                        "threshold": 0.95,
+                        "latent_cosine_threshold": 0.95,
+                    },
                     "anti_steg": {"enabled": False},
                 },
             ),
@@ -410,6 +517,99 @@ class EvalContractTests(unittest.TestCase):
                     row={"artifacts": {}},
                 )
 
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for eval runner tests")
+    def test_run_eval_skips_privacy_without_recognizers_when_single_face_guard_fails(self) -> None:
+        import torch
+
+        from safa.evaluation import runner
+
+        class DummyDataset(torch.utils.data.Dataset):
+            manifest = SimpleNamespace(feature_dim=2, l2_normalized=True)
+
+            def __len__(self):
+                return 2
+
+            def __getitem__(self, index):
+                return {
+                    "image": torch.zeros(3, 4, 4),
+                    "z": torch.tensor([1.0, 0.0]),
+                    "label": torch.tensor(0),
+                    "sample_id": f"sample-{index}",
+                }
+
+        class DummyE0(torch.nn.Module):
+            def forward(self, images):
+                batch = images.shape[0]
+                return {
+                    "embedding": torch.tensor([[1.0, 0.0]], device=images.device).repeat(batch, 1),
+                    "logits": torch.tensor([[1.0, 0.0]], device=images.device).repeat(batch, 1),
+                }
+
+        class DummyGenerator(torch.nn.Module):
+            config = SimpleNamespace(embedding_dim=2)
+
+            def sample(self, z, **kwargs):
+                return torch.zeros(z.shape[0], 3, 4, 4, device=z.device)
+
+        class DummyDetector:
+            def detect_counts(self, images):
+                return [1, 2]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            e0_path = root / "e0.pt"
+            g_path = root / "g.pt"
+            e0_path.write_bytes(b"e0")
+            g_path.write_bytes(b"g")
+            config = {
+                "seed": 1337,
+                "sampling_seed": 1337,
+                "device": "cuda:0",
+                "num_workers": 0,
+                "batch_size": 2,
+                "image_size": 4,
+                "index": "dummy-index",
+                "features": "dummy-features",
+                "e0_checkpoint": str(e0_path),
+                "g_checkpoint": str(g_path),
+                "out_json": str(root / "result.json"),
+                "per_sample_jsonl": str(root / "per_sample.jsonl"),
+                "sample_dir": str(root / "samples"),
+                "face_detection": {
+                    "enabled": True,
+                    "model_name": "buffalo_l",
+                    "threshold": 0.95,
+                    "single_face_eq1_threshold": 0.98,
+                    "latent_cosine_threshold": 0.95,
+                },
+                "privacy": {
+                    "enabled": True,
+                    "recognizers": [{"name": "arcface", "type": "insightface", "model_name": "buffalo_l"}],
+                },
+                "anti_steg": {"enabled": False},
+            }
+
+            with (
+                patch.object(runner, "require_cuda_device", return_value=torch.device("cpu")),
+                patch.object(runner, "FeatureAlignedAffectNet", return_value=DummyDataset()),
+                patch.object(runner, "load_e0_checkpoint", return_value=(DummyE0(), {"model_config": {"embedding_dim": 2}})),
+                patch.object(runner, "_load_generator", return_value=DummyGenerator()),
+                patch.object(runner, "_build_face_detector", return_value=DummyDetector()),
+                patch.object(runner, "build_recognizers", side_effect=AssertionError("recognizers must not load")),
+                patch.object(runner, "describe_recognizer_assets", side_effect=AssertionError("recognizers must not describe")),
+            ):
+                result = runner.run_eval_from_config(config)
+
+            self.assertTrue(result["privacy_skipped"])
+            self.assertEqual(result["skip_reason"], "privacy_guard_failed")
+            self.assertFalse(result["privacy_guard_pass"])
+            self.assertEqual(result["metrics"]["privacy"], {})
+            self.assertTrue(Path(config["out_json"]).is_file())
+            self.assertTrue(Path(config["per_sample_jsonl"]).is_file())
+            persisted = json.loads(Path(config["out_json"]).read_text(encoding="utf-8"))
+            self.assertTrue(persisted["privacy_skipped"])
+            self.assertEqual(persisted["metrics"]["privacy"], {})
+
     def test_privacy_summary_adds_roc_metrics_from_clean_same_and_impostor_scores(self) -> None:
         rows = []
         for same, impostor in [(0.9, 0.1), (0.8, 0.4), (0.4, 0.4)]:
@@ -544,6 +744,25 @@ class EvalContractTests(unittest.TestCase):
         _run_privacy_pass({}, loader, generated, [DummyRecognizer()], {}, store, torch.device("cpu"))
         self.assertEqual(len(store["dummy"]["source"]), 1)
         self.assertEqual(len(store["dummy"]["generated"]["clean"]), 1)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for privacy cache tests")
+    def test_privacy_pass_reports_non_single_face_as_protocol_blocker(self) -> None:
+        import torch
+
+        from safa.evaluation.runner import PrivacyProtocolError
+
+        class BadRecognizer:
+            name = "arcface"
+
+            def embed(self, images):
+                raise RuntimeError("Recognizer arcface expected exactly one face, detected 2")
+
+        loader = [{"image": torch.zeros(1, 3, 4, 4)}]
+        generated = [torch.ones(1, 3, 4, 4)]
+        store = {"arcface": {"source": [], "generated": {"clean": []}}}
+
+        with self.assertRaisesRegex(PrivacyProtocolError, "Privacy protocol blocker.*source.*expected exactly one face"):
+            _run_privacy_pass({}, loader, generated, [BadRecognizer()], {}, store, torch.device("cpu"))
 
     @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for privacy cache tests")
     def test_privacy_pass_rejects_generated_cache_mismatch(self) -> None:
