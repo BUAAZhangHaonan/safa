@@ -1,0 +1,8 @@
+seed: 1337
+device: cuda:0
+num_workers: 8
+batch_size: 128
+image_size: 224
+index: data/index/train_balanced_medium.jsonl
+checkpoint: artifacts/checkpoints/e0_medium_v1/best.pt
+out_dir: artifacts/e0_features/train_balanced_medium_e0_medium_v1
