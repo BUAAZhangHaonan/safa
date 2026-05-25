@@ -4,6 +4,9 @@ from pathlib import Path
 from dataclasses import dataclass
 import math
 import json
+import os
+import subprocess
+import sys
 from contextlib import nullcontext
 from safa.data.feature_dataset import FeatureAlignedAffectNet
 from safa.evaluation.metrics import face_count_rates
@@ -30,6 +33,8 @@ from safa.utils.seed import set_seed
 _init_distributed = init_distributed
 
 _SAFA_PACKAGE_DIR = Path(__file__).resolve().parents[1]
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_QUALITY_DISTRIBUTION_MAX_SAMPLES = 3969
 DEFAULT_NO_IDENTITY_SOURCE_PATHS = (Path(__file__).resolve().parent, _SAFA_PACKAGE_DIR / "models")
 
 
@@ -1375,6 +1380,85 @@ def _evaluate_generation_quality(**kwargs):
     return evaluate_generation_quality(**kwargs)
 
 
+def _evaluate_generation_quality_subprocess(
+    *,
+    real_index: Path | None,
+    generated_dir: Path,
+    output: Path,
+    iqa_method: str,
+    metrics: tuple[str, ...],
+    max_generated: int | None,
+    max_real: int | None,
+    subset_seed: int,
+    device: str,
+    cuda_visible_devices: str | None,
+) -> dict:
+    script_path = _REPO_ROOT / "scripts" / "eval_generation_quality.py"
+    if output.exists():
+        if output.is_dir():
+            raise IsADirectoryError(f"quality_eval distribution output path is a directory: {output}")
+        output.unlink()
+    command = [
+        sys.executable,
+        str(script_path),
+        "--generated-dir",
+        str(generated_dir),
+        "--output",
+        str(output),
+        "--iqa-method",
+        iqa_method,
+        "--seed",
+        str(int(subset_seed)),
+        "--device",
+        str(device),
+        "--metrics",
+        *[str(name) for name in metrics],
+    ]
+    if real_index is not None:
+        command.extend(["--real-index", str(real_index)])
+    if max_generated is not None:
+        command.extend(["--max-generated", str(int(max_generated))])
+    if max_real is not None:
+        command.extend(["--max-real", str(int(max_real))])
+
+    env = os.environ.copy()
+    if cuda_visible_devices is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(cuda_visible_devices)
+    for name in (
+        "RANK",
+        "WORLD_SIZE",
+        "LOCAL_RANK",
+        "LOCAL_WORLD_SIZE",
+        "GROUP_RANK",
+        "ROLE_RANK",
+        "ROLE_WORLD_SIZE",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+    ):
+        env.pop(name, None)
+
+    completed = subprocess.run(
+        command,
+        cwd=str(_REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        details = "\n".join(part for part in (completed.stderr.strip(), completed.stdout.strip()) if part)
+        suffix = f": {details}" if details else ""
+        raise RuntimeError(f"quality_eval distribution subprocess failed with exit code {completed.returncode}{suffix}")
+    if not output.is_file():
+        raise FileNotFoundError(f"quality_eval distribution subprocess did not write JSON: {output}")
+    try:
+        payload = json.loads(output.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"quality_eval distribution subprocess wrote invalid JSON: {output}: {exc.msg}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"quality_eval distribution subprocess JSON must be an object: {output}")
+    return payload
+
+
 def _run_quality_eval_hook(
     config: dict,
     stage_name: str,
@@ -1418,6 +1502,10 @@ def _run_quality_eval_hook(
     iqa_method = str(payload.get("iqa_method", "niqe"))
     subset_seed = int(payload.get("subset_seed", sampling_seed))
     quality_device = str(payload.get("device", device))
+    distribution_device = str(payload.get("distribution_device", payload.get("device", "auto")))
+    distribution_cuda_visible_devices = payload.get("distribution_cuda_visible_devices")
+    if distribution_cuda_visible_devices is not None:
+        distribution_cuda_visible_devices = str(distribution_cuda_visible_devices)
     variants = _quality_eval_variants(payload, stage_name)
     metrics: dict[str, float] = {}
     generation_max_samples = max(group.max_samples for group in groups)
@@ -1450,17 +1538,27 @@ def _run_quality_eval_hook(
                 if _quality_eval_needs_real_index(group.metrics)
                 else None
             )
-            result = _evaluate_generation_quality(
-                real_index=real_index,
-                generated_dir=generated_dir,
-                output=epoch_dir / f"{stage_name}_epoch_{epoch_number:04d}_{model_name}_{group.name}.json",
-                iqa_method=iqa_method,
-                metrics=group.metrics,
-                max_generated=min(group.max_samples, generated_count),
-                max_real=group.max_samples if real_index is not None else None,
-                subset_seed=subset_seed,
-                device=quality_device,
-            )
+            eval_kwargs = {
+                "real_index": real_index,
+                "generated_dir": generated_dir,
+                "output": epoch_dir / f"{stage_name}_epoch_{epoch_number:04d}_{model_name}_{group.name}.json",
+                "iqa_method": iqa_method,
+                "metrics": group.metrics,
+                "max_generated": min(group.max_samples, generated_count),
+                "max_real": group.max_samples if real_index is not None else None,
+                "subset_seed": subset_seed,
+            }
+            if _quality_eval_needs_real_index(group.metrics):
+                result = _evaluate_generation_quality_subprocess(
+                    **eval_kwargs,
+                    device=distribution_device,
+                    cuda_visible_devices=distribution_cuda_visible_devices,
+                )
+            else:
+                result = _evaluate_generation_quality(
+                    **eval_kwargs,
+                    device=quality_device,
+                )
             metrics.update(_quality_payload_to_metrics(result, model_name, group.metrics))
     return metrics
 
@@ -1490,11 +1588,17 @@ def _quality_eval_due_groups(payload: dict, stage_name: str, epoch_number: int) 
     distribution_metrics = tuple(name for name in metric_names if name in ("fid", "kid"))
     if distribution_metrics:
         interval = _require_positive_int(payload, "distribution_interval_epochs", context)
-        max_samples = _require_positive_int(payload, "distribution_max_samples", context)
+        max_samples = _quality_eval_distribution_max_samples(payload, context)
         _require_field(payload, "real_index", context)
         if epoch_number % interval == 0:
             groups.append(_QualityEvalGroup("distribution", distribution_metrics, max_samples))
     return groups
+
+
+def _quality_eval_distribution_max_samples(payload: dict, context: str) -> int:
+    if "distribution_max_samples" not in payload:
+        return DEFAULT_QUALITY_DISTRIBUTION_MAX_SAMPLES
+    return _require_positive_int(payload, "distribution_max_samples", context)
 
 
 def _quality_eval_interval_epochs(payload: dict, stage_name: str) -> int:

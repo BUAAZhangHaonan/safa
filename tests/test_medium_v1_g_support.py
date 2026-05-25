@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -150,7 +151,7 @@ class MediumV1GSupportTests(unittest.TestCase):
             self.assertEqual(metrics["quality_raw_niqe"], 4.25)
             self.assertNotIn("quality_raw_fid", metrics)
 
-    def test_quality_eval_hook_honors_niqe_and_distribution_schedules_and_limits(self) -> None:
+    def test_quality_eval_hook_runs_distribution_metrics_outside_training_process(self) -> None:
         from safa.training import g_loop
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -167,6 +168,8 @@ class MediumV1GSupportTests(unittest.TestCase):
                             "metrics": ["niqe", "fid", "kid"],
                             "real_index": "data/index/val_single_face.jsonl",
                             "output_dir": str(quality_dir),
+                            "distribution_cuda_visible_devices": "0",
+                            "distribution_device": "cuda:0",
                             "model": "raw",
                         }
                     }
@@ -177,6 +180,7 @@ class MediumV1GSupportTests(unittest.TestCase):
                 load_calls: list[int] = []
                 generation_calls: list[dict] = []
                 eval_calls: list[dict] = []
+                external_eval_calls: list[dict] = []
 
                 def fake_loader(runner_config: dict, max_samples: int):
                     load_calls.append(max_samples)
@@ -192,13 +196,17 @@ class MediumV1GSupportTests(unittest.TestCase):
                     names = tuple(kwargs["metrics"])
                     if names == ("niqe",):
                         return {"iqa": {"method": "niqe", "mean": 3.0, "std": 0.0}}
-                    if names == ("fid", "kid"):
-                        return {"fid": 12.0, "kid_mean": 0.2, "kid_std": 0.01, "num_real": 5, "num_generated": 5}
-                    raise AssertionError(names)
+                    raise AssertionError(f"in-process distribution quality eval is forbidden: {names}")
+
+                def fake_external_quality_eval(**kwargs):
+                    external_eval_calls.append(kwargs)
+                    return {"fid": 12.0, "kid_mean": 0.2, "kid_std": 0.01, "num_real": 5, "num_generated": 5}
 
                 with patch.object(g_loop, "_build_quality_eval_loader", side_effect=fake_loader), patch.object(
                     g_loop, "_generate_quality_eval_images", side_effect=fake_generate
-                ), patch.object(g_loop, "_evaluate_generation_quality", side_effect=fake_quality_eval):
+                ), patch.object(g_loop, "_evaluate_generation_quality", side_effect=fake_quality_eval), patch.object(
+                    g_loop, "_evaluate_generation_quality_subprocess", side_effect=fake_external_quality_eval
+                ):
                     metrics = g_loop._run_quality_eval_hook(
                         config,
                         "stage1",
@@ -211,30 +219,153 @@ class MediumV1GSupportTests(unittest.TestCase):
                         use_amp=False,
                         ema_config={"enabled": False},
                     )
-                return metrics, load_calls, generation_calls, eval_calls
+                return metrics, load_calls, generation_calls, eval_calls, external_eval_calls
 
-            metrics, load_calls, generation_calls, eval_calls = run_epoch(0)
+            metrics, load_calls, generation_calls, eval_calls, external_eval_calls = run_epoch(0)
             self.assertEqual(load_calls, [2])
             self.assertEqual(generation_calls[0]["max_samples"], 2)
             self.assertEqual([call["metrics"] for call in eval_calls], [("niqe",)])
+            self.assertEqual(external_eval_calls, [])
             self.assertEqual(eval_calls[0]["max_generated"], 2)
             self.assertIsNone(eval_calls[0]["real_index"])
             self.assertEqual(metrics, {"quality_raw_niqe": 3.0})
 
-            metrics, load_calls, generation_calls, eval_calls = run_epoch(19)
+            metrics, load_calls, generation_calls, eval_calls, external_eval_calls = run_epoch(19)
             self.assertEqual(load_calls, [5])
             self.assertEqual(len(generation_calls), 1)
             self.assertEqual(generation_calls[0]["max_samples"], 5)
-            self.assertEqual([call["metrics"] for call in eval_calls], [("niqe",), ("fid", "kid")])
+            self.assertEqual([call["metrics"] for call in eval_calls], [("niqe",)])
+            self.assertEqual([call["metrics"] for call in external_eval_calls], [("fid", "kid")])
             self.assertEqual(eval_calls[0]["max_generated"], 2)
             self.assertIsNone(eval_calls[0]["real_index"])
-            self.assertEqual(eval_calls[1]["max_generated"], 5)
-            self.assertEqual(eval_calls[1]["max_real"], 5)
-            self.assertEqual(str(eval_calls[1]["real_index"]), "data/index/val_single_face.jsonl")
-            self.assertTrue(str(eval_calls[1]["generated_dir"]).endswith("quality/epoch_0020/generated_images"))
+            self.assertEqual(external_eval_calls[0]["max_generated"], 5)
+            self.assertEqual(external_eval_calls[0]["max_real"], 5)
+            self.assertEqual(str(external_eval_calls[0]["real_index"]), "data/index/val_single_face.jsonl")
+            self.assertEqual(external_eval_calls[0]["cuda_visible_devices"], "0")
+            self.assertEqual(external_eval_calls[0]["device"], "cuda:0")
+            self.assertTrue(str(external_eval_calls[0]["generated_dir"]).endswith("quality/epoch_0020/generated_images"))
             self.assertEqual(metrics["quality_raw_niqe"], 3.0)
             self.assertEqual(metrics["quality_raw_fid"], 12.0)
             self.assertEqual(metrics["quality_raw_kid_mean"], 0.2)
+
+    def test_quality_eval_distribution_subprocess_builds_gpu_command_and_reads_json(self) -> None:
+        from safa.training import g_loop
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "epoch_0020" / "stage1_epoch_0020_raw_distribution.json"
+            generated_dir = root / "epoch_0020" / "generated_images"
+            real_index = root / "real.jsonl"
+            generated_dir.mkdir(parents=True)
+            real_index.write_text("{}", encoding="utf-8")
+            calls: list[dict] = []
+
+            def fake_run(command, *, cwd, env, text, capture_output):
+                calls.append({"command": command, "cwd": cwd, "env": env, "text": text, "capture_output": capture_output})
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(
+                    json.dumps({"fid": 10.0, "kid_mean": 0.1, "kid_std": 0.01, "num_real": 5, "num_generated": 5}),
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch.object(g_loop.subprocess, "run", side_effect=fake_run):
+                payload = g_loop._evaluate_generation_quality_subprocess(
+                    real_index=real_index,
+                    generated_dir=generated_dir,
+                    output=output,
+                    iqa_method="niqe",
+                    metrics=("fid", "kid"),
+                    max_generated=5,
+                    max_real=5,
+                    subset_seed=123,
+                    device="cuda:0",
+                    cuda_visible_devices="0",
+                )
+
+            self.assertEqual(payload["fid"], 10.0)
+            self.assertEqual(len(calls), 1)
+            call = calls[0]
+            self.assertEqual(call["env"]["CUDA_VISIBLE_DEVICES"], "0")
+            self.assertTrue(call["text"])
+            self.assertTrue(call["capture_output"])
+            command = call["command"]
+            self.assertTrue(str(command[1]).endswith("scripts/eval_generation_quality.py"))
+            self.assertIn("--real-index", command)
+            self.assertIn(str(real_index), command)
+            self.assertIn("--generated-dir", command)
+            self.assertIn(str(generated_dir), command)
+            self.assertIn("--output", command)
+            self.assertIn(str(output), command)
+            self.assertIn("--metrics", command)
+            self.assertIn("fid", command)
+            self.assertIn("kid", command)
+            self.assertIn("--max-generated", command)
+            self.assertIn("5", command)
+            self.assertIn("--max-real", command)
+            self.assertIn("--seed", command)
+            self.assertIn("123", command)
+            self.assertIn("--device", command)
+            self.assertIn("cuda:0", command)
+
+    def test_quality_eval_distribution_subprocess_fails_without_json(self) -> None:
+        from safa.training import g_loop
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "missing.json"
+            generated_dir = root / "generated_images"
+            real_index = root / "real.jsonl"
+            generated_dir.mkdir()
+            real_index.write_text("{}", encoding="utf-8")
+            output.write_text('{"fid": 999.0}', encoding="utf-8")
+
+            def fake_run(command, *, cwd, env, text, capture_output):
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch.object(g_loop.subprocess, "run", side_effect=fake_run):
+                with self.assertRaisesRegex(FileNotFoundError, "did not write JSON"):
+                    g_loop._evaluate_generation_quality_subprocess(
+                        real_index=real_index,
+                        generated_dir=generated_dir,
+                        output=output,
+                        iqa_method="niqe",
+                        metrics=("fid", "kid"),
+                        max_generated=5,
+                        max_real=5,
+                        subset_seed=123,
+                        device="cuda:0",
+                        cuda_visible_devices="0",
+                    )
+
+    def test_quality_eval_distribution_subprocess_fails_on_nonzero_exit(self) -> None:
+        from safa.training import g_loop
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "quality.json"
+            generated_dir = root / "generated_images"
+            real_index = root / "real.jsonl"
+            generated_dir.mkdir()
+            real_index.write_text("{}", encoding="utf-8")
+
+            def fake_run(command, *, cwd, env, text, capture_output):
+                return SimpleNamespace(returncode=7, stdout="stdout text", stderr="stderr text")
+
+            with patch.object(g_loop.subprocess, "run", side_effect=fake_run):
+                with self.assertRaisesRegex(RuntimeError, "failed with exit code 7"):
+                    g_loop._evaluate_generation_quality_subprocess(
+                        real_index=real_index,
+                        generated_dir=generated_dir,
+                        output=output,
+                        iqa_method="niqe",
+                        metrics=("fid", "kid"),
+                        max_generated=5,
+                        max_real=5,
+                        subset_seed=123,
+                        device="cuda:0",
+                        cuda_visible_devices="0",
+                    )
 
     def test_quality_eval_enabled_requires_new_schedule_fields(self) -> None:
         from safa.training import g_loop
@@ -298,6 +429,7 @@ class MediumV1GSupportTests(unittest.TestCase):
             Path("configs/medium_v1/train_g_medium_v1_stage2_m0.yaml"),
             Path("configs/medium_v1/train_g_medium_v1_stage2_m1_uw.yaml"),
             Path("configs/medium_v1/train_g_medium_v1_stage1_long200_v3.yaml"),
+            Path("configs/medium_v1/train_g_medium_v1_stage1_long200_v4.yaml"),
         )
 
         for path in config_paths:
@@ -375,6 +507,29 @@ class MediumV1GSupportTests(unittest.TestCase):
         self.assertEqual(quality_eval["distribution_max_samples"], 0)
         self.assertEqual(quality_eval["output_dir"], "artifacts/eval/g_medium_v1_stage1_long200_v3/quality")
         self.assertNotIn("real_index", quality_eval)
+        self.assertNotIn("generated_dir", quality_eval)
+        g_loop._validate_train_g_config(config)
+
+    def test_medium_v1_stage1_long200_v4_resumes_v3_with_external_distribution_quality(self) -> None:
+        from safa.training import g_loop
+
+        path = Path("configs/medium_v1/train_g_medium_v1_stage1_long200_v4.yaml")
+        config = yaml.safe_load(path.read_text(encoding="utf-8"))
+        quality_eval = config["stages"]["stage1"]["quality_eval"]
+
+        self.assertEqual(config["out_dir"], "artifacts/checkpoints/g_medium_v1_stage1_long200_v4")
+        self.assertEqual(config["resume_from"], "artifacts/checkpoints/g_medium_v1_stage1_long200_v3/last.pt")
+        self.assertEqual(config["stages"]["stage1"]["epochs"], 200)
+        self.assertEqual(config["stages"]["stage2"]["epochs"], 0)
+        self.assertEqual(quality_eval["metrics"], ["niqe", "fid", "kid"])
+        self.assertEqual(quality_eval["niqe_interval_epochs"], 1)
+        self.assertEqual(quality_eval["distribution_interval_epochs"], 20)
+        self.assertEqual(quality_eval["niqe_max_samples"], 512)
+        self.assertEqual(quality_eval["distribution_max_samples"], 3969)
+        self.assertEqual(quality_eval["distribution_cuda_visible_devices"], "0")
+        self.assertEqual(quality_eval["distribution_device"], "cuda:0")
+        self.assertEqual(quality_eval["real_index"], "data/index/val_single_face.jsonl")
+        self.assertEqual(quality_eval["output_dir"], "artifacts/eval/g_medium_v1_stage1_long200_v4/quality")
         self.assertNotIn("generated_dir", quality_eval)
         g_loop._validate_train_g_config(config)
 

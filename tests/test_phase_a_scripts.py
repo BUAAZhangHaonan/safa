@@ -174,6 +174,8 @@ def test_quality_eval_uses_unpaired_real_and_generated_sets(tmp_path: Path, monk
             str(output),
             "--iqa-method",
             "niqe",
+            "--device",
+            "cpu",
         ]
     )
 
@@ -212,6 +214,7 @@ def test_quality_eval_niqe_only_does_not_create_fid_or_kid(tmp_path: Path, monke
         output=output,
         iqa_method="niqe",
         metrics=["niqe"],
+        device="cpu",
     )
 
     assert payload["metrics"] == ["niqe"]
@@ -366,6 +369,85 @@ def test_quality_eval_auto_device_moves_torchmetrics_to_cuda_when_available(
     assert payload["fid"] == pytest.approx(2.0)
     assert fake_fid.to_devices == ["cuda"]
     assert fake_fid.update_devices == ["cuda", "cuda"]
+
+
+def test_quality_eval_seed_alias_makes_kid_compute_deterministic_and_honors_limits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_script("eval_generation_quality")
+    real_dir = tmp_path / "real"
+    generated_dir = tmp_path / "generated"
+    real_dir.mkdir()
+    generated_dir.mkdir()
+    real_paths = []
+    for index in range(4):
+        real_path = real_dir / f"real_{index}.png"
+        generated_path = generated_dir / f"generated_{index}.png"
+        _write_png(real_path, (index, 0, 0))
+        _write_png(generated_path, (0, index, 0))
+        real_paths.append(real_path)
+    real_index = tmp_path / "real.jsonl"
+    _write_jsonl(
+        real_index,
+        [{"sample_id": f"real-{index}", "image_path": str(path), "label": index} for index, path in enumerate(real_paths)],
+    )
+
+    seed_calls: list[tuple[int, str]] = []
+
+    def fake_seed_metric_randomness(seed, device) -> None:
+        seed_calls.append((seed, str(device)))
+
+    class FakeKid:
+        def __init__(self) -> None:
+            self.real = 0
+            self.generated = 0
+
+        def update(self, images, real: bool) -> None:
+            if real:
+                self.real += 1
+            else:
+                self.generated += 1
+
+        def compute(self):
+            import torch
+
+            assert seed_calls == [(77, "cpu")]
+            assert self.real == 2
+            assert self.generated == 3
+            return torch.tensor(0.125), torch.tensor(0.025)
+
+    monkeypatch.setattr(module, "create_kid_metric", FakeKid)
+    monkeypatch.setattr(module, "seed_metric_randomness", fake_seed_metric_randomness)
+
+    output = tmp_path / "quality.json"
+    result = module.main(
+        [
+            "--real-index",
+            str(real_index),
+            "--generated-dir",
+            str(generated_dir),
+            "--output",
+            str(output),
+            "--metrics",
+            "kid",
+            "--max-real",
+            "2",
+            "--max-generated",
+            "3",
+            "--seed",
+            "77",
+            "--device",
+            "cpu",
+        ]
+    )
+
+    assert result == 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["num_real"] == 2
+    assert payload["num_generated"] == 3
+    assert payload["kid_mean"] == pytest.approx(0.125)
+    assert payload["kid_std"] == pytest.approx(0.025)
 
 
 def test_quality_eval_rejects_empty_generated_dir_before_creating_metrics(

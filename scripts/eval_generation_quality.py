@@ -86,18 +86,31 @@ def quality_eval_device(device: str):
     requested = str(device)
     if requested == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return torch.device(requested)
+    selected = torch.device(requested)
+    if selected.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"CUDA device requested but CUDA is not available: {requested}")
+        if selected.index is not None and selected.index >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"CUDA device index {selected.index} is unavailable; visible CUDA device count is {torch.cuda.device_count()}"
+            )
+    return selected
 
 
 def prepare_metric_for_device(metric, device):
     if metric is None:
         return None, None
     if hasattr(metric, "to"):
-        return metric.to(device), device
+        try:
+            return metric.to(device), device
+        except Exception as exc:
+            raise RuntimeError(f"failed to move quality metric to device {device}") from exc
     try:
         import torch
     except ImportError as exc:
         raise RuntimeError("torch is required for quality evaluation") from exc
+    if torch.device(device).type != "cpu":
+        raise RuntimeError(f"quality metric {type(metric).__name__} does not support .to(device); cannot use {device}")
     return metric, torch.device("cpu")
 
 
@@ -309,6 +322,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-generated", type=int, default=None)
     parser.add_argument("--max-real", type=int, default=None)
     parser.add_argument("--subset-seed", type=int, default=1337)
+    parser.add_argument("--seed", type=int, dest="subset_seed")
     parser.add_argument("--device", default="auto")
     parser.add_argument(
         "--metrics",
