@@ -1,0 +1,69 @@
+seed: 1337
+sampling_seed: 1337
+device: cuda:0
+num_workers: 8
+batch_size: 32
+learning_rate: 0.0003
+weight_decay: 0.0
+image_size: 224
+embedding_dim: 512
+train_index: data/index/train_balanced_medium.jsonl
+train_features: artifacts/e0_features/train_balanced_medium_e0_medium_v1
+e0_checkpoint: artifacts/checkpoints/e0_medium_v1/best.pt
+out_dir: artifacts/checkpoints/g_medium_v1_stage1_long200
+resume_from: artifacts/checkpoints/g_medium_v1_stage1_m0/best_single_face.pt
+allow_stage2_without_stage1_gate: true
+loss_weighting:
+  type: fixed
+  flow_weight: 1.0
+  cycle_weight: 0.01
+ema:
+  enabled: false
+  decay: 0.999
+  evaluate_raw: true
+  evaluate_ema: false
+  save_ema_checkpoint: false
+best_model: raw
+distributed:
+  backend: gloo
+generator:
+  model_type: conditional_flow_matching
+  base_channels: 32
+  channel_multipliers: [1, 2, 4, 4]
+  time_embedding_dim: 128
+  condition_dim: 512
+  sample_steps: 32
+  train_cycle_steps: 16
+  cycle_steps_schedule: []
+  sampler: heun
+grad_clip_norm: 1.0
+stages:
+  stage1:
+    epochs: 200
+    require_face_detection_gate: true
+    face_detection_threshold: 1.0
+    stable_epochs: 3
+    quality_eval:
+      enabled: true
+      interval_epochs: 1
+      metrics: [niqe]
+      real_index: data/index/val_single_face.jsonl
+      generated_dir: artifacts/eval/g_medium_v1_stage1_long200/raw_generated
+      output_dir: artifacts/eval/g_medium_v1_stage1_long200/quality
+      model: raw
+  stage2:
+    epochs: 0
+    lambda_initial: 0.01
+    lambda_max: 0.01
+    lambda_growth: 0
+    gradient_conflict:
+      enabled: false
+validation:
+  enabled: true
+  index: data/index/val_single_face.jsonl
+  features: artifacts/e0_features/val_single_face_e0_medium_v1
+  max_samples: 512
+  batch_size: 32
+  face_detection:
+    enabled: true
+    model_name: buffalo_l
