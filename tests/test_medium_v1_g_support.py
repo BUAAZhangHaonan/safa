@@ -297,6 +297,7 @@ class MediumV1GSupportTests(unittest.TestCase):
             Path("configs/medium_v1/train_g_medium_v1_stage1.yaml"),
             Path("configs/medium_v1/train_g_medium_v1_stage2_m0.yaml"),
             Path("configs/medium_v1/train_g_medium_v1_stage2_m1_uw.yaml"),
+            Path("configs/medium_v1/train_g_medium_v1_stage1_long200_v3.yaml"),
         )
 
         for path in config_paths:
@@ -346,6 +347,34 @@ class MediumV1GSupportTests(unittest.TestCase):
         self.assertEqual(quality_eval["distribution_interval_epochs"], 20)
         self.assertEqual(quality_eval["niqe_max_samples"], 512)
         self.assertEqual(quality_eval["distribution_max_samples"], 3969)
+        self.assertNotIn("generated_dir", quality_eval)
+        g_loop._validate_train_g_config(config)
+
+    def test_medium_v1_stage1_long200_v3_resumes_v2_with_niqe_only_training_quality(self) -> None:
+        from safa.training import g_loop
+
+        path = Path("configs/medium_v1/train_g_medium_v1_stage1_long200_v3.yaml")
+        config = yaml.safe_load(path.read_text(encoding="utf-8"))
+        quality_eval = config["stages"]["stage1"]["quality_eval"]
+
+        self.assertEqual(config["out_dir"], "artifacts/checkpoints/g_medium_v1_stage1_long200_v3")
+        self.assertEqual(config["resume_from"], "artifacts/checkpoints/g_medium_v1_stage1_long200_v2/last.pt")
+        self.assertEqual(config["batch_size"], 32)
+        self.assertEqual(config["validation"]["batch_size"], 32)
+        self.assertEqual(config["train_index"], "data/index/train_balanced_medium.jsonl")
+        self.assertEqual(config["train_features"], "artifacts/e0_features/train_balanced_medium_e0_medium_v1")
+        self.assertEqual(config["validation"]["features"], "artifacts/e0_features/val_single_face_e0_medium_v1")
+        self.assertEqual(config["stages"]["stage1"]["epochs"], 200)
+        self.assertEqual(config["stages"]["stage2"]["epochs"], 0)
+        self.assertEqual(quality_eval["metrics"], ["niqe"])
+        self.assertNotIn("fid", quality_eval["metrics"])
+        self.assertNotIn("kid", quality_eval["metrics"])
+        self.assertEqual(quality_eval["niqe_interval_epochs"], 1)
+        self.assertEqual(quality_eval["distribution_interval_epochs"], 0)
+        self.assertEqual(quality_eval["niqe_max_samples"], 512)
+        self.assertEqual(quality_eval["distribution_max_samples"], 0)
+        self.assertEqual(quality_eval["output_dir"], "artifacts/eval/g_medium_v1_stage1_long200_v3/quality")
+        self.assertNotIn("real_index", quality_eval)
         self.assertNotIn("generated_dir", quality_eval)
         g_loop._validate_train_g_config(config)
 
