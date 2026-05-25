@@ -420,6 +420,148 @@ class MediumV1GSupportTests(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 load_medium_v1_history(Path(tmp) / "missing.json")
 
+    def test_stage1_long200_plot_timeseries_reads_latest_run_and_quality_jsons(self) -> None:
+        from scripts.plot_medium_v1_curves import build_stage1_long200_timeseries
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            history_path = root / "history.json"
+            last_metrics_path = root / "last_metrics.json"
+            quality_dir = root / "quality"
+            history_path.write_text(
+                json.dumps(
+                    {
+                        "history": [
+                            {"stage": "stage1", "stage_epoch": 0, "loss": 9.0, "flow_matching_mse": 9.0},
+                            {"stage": "stage1", "stage_epoch": 1, "loss": 8.0, "flow_matching_mse": 8.0},
+                            {
+                                "stage": "stage1",
+                                "stage_epoch": 0,
+                                "loss": 0.3,
+                                "flow_matching_mse": 0.3,
+                                "grad_norm": 0.7,
+                                "validation_raw_latent_cosine_mean": 0.1,
+                                "validation_raw_source_prediction_preserved": 0.2,
+                                "validation_raw_face_detect_ge1_rate": 0.9,
+                                "validation_raw_single_face_eq1_rate": 0.8,
+                                "validation_raw_zero_face_rate": 0.1,
+                                "validation_raw_multi_face_rate": 0.0,
+                            },
+                            {
+                                "stage": "stage1",
+                                "stage_epoch": 1,
+                                "loss": 0.2,
+                                "flow_matching_mse": 0.2,
+                                "grad_norm": 0.6,
+                                "validation_raw_latent_cosine_mean": 0.3,
+                                "validation_raw_source_prediction_preserved": 0.4,
+                                "validation_raw_face_detect_ge1_rate": 1.0,
+                                "validation_raw_single_face_eq1_rate": 0.9,
+                                "validation_raw_zero_face_rate": 0.0,
+                                "validation_raw_multi_face_rate": 0.1,
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            last_metrics_path.write_text(
+                json.dumps(
+                    {
+                        "stage": "stage1",
+                        "stage_epoch": 2,
+                        "loss": 0.1,
+                        "flow_matching_mse": 0.1,
+                        "grad_norm": 0.5,
+                        "validation_raw_latent_cosine_mean": 0.5,
+                        "validation_raw_source_prediction_preserved": 0.6,
+                        "validation_raw_face_detect_ge1_rate": 1.0,
+                        "validation_raw_single_face_eq1_rate": 1.0,
+                        "validation_raw_zero_face_rate": 0.0,
+                        "validation_raw_multi_face_rate": 0.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (quality_dir / "epoch_0001").mkdir(parents=True)
+            (quality_dir / "epoch_0001" / "stage1_epoch_0001_raw_niqe.json").write_text(
+                json.dumps({"iqa": {"method": "niqe", "mean": 4.0, "std": 0.1}, "metrics": ["niqe"]}),
+                encoding="utf-8",
+            )
+            (quality_dir / "epoch_0002").mkdir()
+            (quality_dir / "epoch_0002" / "stage1_epoch_0002_raw_distribution.json").write_text(
+                json.dumps({"fid": 12.0, "kid_mean": 0.02, "kid_std": 0.003, "metrics": ["fid", "kid"]}),
+                encoding="utf-8",
+            )
+
+            payload = build_stage1_long200_timeseries(history_path, last_metrics_path, quality_dir, run_name="unit_run")
+
+        rows = payload["epochs"]
+        self.assertEqual(payload["run"], "unit_run")
+        self.assertEqual([row["epoch"] for row in rows], [1, 2, 3])
+        self.assertEqual([row["loss"] for row in rows], [0.3, 0.2, 0.1])
+        self.assertEqual(rows[0]["niqe"], 4.0)
+        self.assertIsNone(rows[0]["fid"])
+        self.assertEqual(rows[1]["fid"], 12.0)
+        self.assertEqual(rows[1]["kid_mean"], 0.02)
+        self.assertIsNone(rows[2]["niqe"])
+
+    def test_stage1_long200_plot_writes_required_outputs(self) -> None:
+        from scripts.plot_medium_v1_curves import plot_stage1_long200_curves
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            history_path = root / "history.json"
+            quality_dir = root / "quality" / "epoch_0001"
+            out_dir = root / "plots"
+            history_path.write_text(
+                json.dumps(
+                    {
+                        "history": [
+                            {
+                                "stage": "stage1",
+                                "stage_epoch": 0,
+                                "loss": 0.3,
+                                "flow_matching_mse": 0.2,
+                                "grad_norm": 0.7,
+                                "validation_raw_latent_cosine_mean": 0.1,
+                                "validation_raw_source_prediction_preserved": 0.2,
+                                "validation_raw_face_detect_ge1_rate": 0.9,
+                                "validation_raw_single_face_eq1_rate": 0.8,
+                                "validation_raw_zero_face_rate": 0.1,
+                                "validation_raw_multi_face_rate": 0.0,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            quality_dir.mkdir(parents=True)
+            (quality_dir / "stage1_epoch_0001_raw_niqe.json").write_text(
+                json.dumps({"iqa": {"method": "niqe", "mean": 4.0}, "metrics": ["niqe"]}),
+                encoding="utf-8",
+            )
+
+            outputs = plot_stage1_long200_curves(
+                history_path=history_path,
+                last_metrics_path=None,
+                quality_dir=root / "quality",
+                out_dir=out_dir,
+                output_prefix="stage1_long200_v4",
+            )
+
+            expected = {
+                out_dir / "stage1_long200_v4_quality_curves.png",
+                out_dir / "stage1_long200_v4_face_curves.png",
+                out_dir / "stage1_long200_v4_training_curves.png",
+                out_dir / "stage1_long200_v4_metrics_timeseries.json",
+            }
+            self.assertEqual(set(outputs), expected)
+            for path in expected:
+                self.assertTrue(path.is_file(), str(path))
+            payload = json.loads((out_dir / "stage1_long200_v4_metrics_timeseries.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["epochs"][0]["niqe"], 4.0)
+
     def test_medium_v1_g_configs_use_e0_medium_cache_and_checkpoint(self) -> None:
         expected_train_features = "artifacts/e0_features/train_balanced_medium_e0_medium_v1"
         expected_validation_features = "artifacts/e0_features/val_single_face_e0_medium_v1"
