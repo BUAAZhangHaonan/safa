@@ -85,7 +85,8 @@ class MediumV1GSupportTests(unittest.TestCase):
                 "stage1": {
                     "quality_eval": {
                         "enabled": True,
-                        "interval": 2,
+                        "interval_epochs": 2,
+                        "metrics": ["niqe"],
                         "real_index": "data/index/val_single_face.jsonl",
                         "generated_dir": "artifacts/eval/medium_v1/raw/generated",
                         "output_dir": "artifacts/eval/medium_v1/quality",
@@ -100,9 +101,6 @@ class MediumV1GSupportTests(unittest.TestCase):
         def fake_quality_eval(**kwargs):
             calls.append(kwargs)
             return {
-                "fid": 11.0,
-                "kid_mean": 0.01,
-                "kid_std": 0.002,
                 "iqa": {"method": "niqe", "mean": 4.25, "std": 0.5},
             }
 
@@ -110,9 +108,10 @@ class MediumV1GSupportTests(unittest.TestCase):
             metrics = g_loop._run_quality_eval_hook(config, "stage1", 1)
 
         self.assertEqual(len(calls), 1)
-        self.assertEqual(metrics["quality_raw_fid"], 11.0)
-        self.assertEqual(metrics["quality_raw_kid_mean"], 0.01)
         self.assertEqual(metrics["quality_raw_niqe"], 4.25)
+        self.assertNotIn("quality_raw_fid", metrics)
+        self.assertNotIn("quality_raw_kid_mean", metrics)
+        self.assertEqual(calls[0]["metrics"], ("niqe",))
         self.assertTrue(str(calls[0]["output"]).endswith("stage1_epoch_0002_raw.json"))
 
     @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for loss weighting integration tests")
@@ -172,6 +171,27 @@ class MediumV1GSupportTests(unittest.TestCase):
                 self.assertEqual(config["train_features"], expected_train_features)
                 self.assertEqual(config["validation"]["features"], expected_validation_features)
                 self.assertEqual(config["e0_checkpoint"], expected_e0_checkpoint)
+
+    def test_medium_v1_stage1_configs_enable_niqe_only_epoch_quality(self) -> None:
+        from safa.training import g_loop
+
+        config_paths = (
+            Path("configs/medium_v1/train_g_medium_v1_stage1.yaml"),
+            Path("configs/medium_v1/train_g_medium_v1_stage1_continue_best_sf.yaml"),
+        )
+
+        for path in config_paths:
+            with self.subTest(path=str(path)):
+                config = yaml.safe_load(path.read_text(encoding="utf-8"))
+                self.assertEqual(config["stages"]["stage1"]["epochs"], 200)
+                quality_eval = config["stages"]["stage1"]["quality_eval"]
+
+                self.assertIs(quality_eval["enabled"], True)
+                self.assertEqual(quality_eval["interval_epochs"], 1)
+                self.assertEqual(quality_eval["metrics"], ["niqe"])
+                self.assertNotIn("fid", quality_eval["metrics"])
+                self.assertNotIn("kid", quality_eval["metrics"])
+                g_loop._validate_train_g_config(config)
 
     def test_medium_v1_stage2_m0_and_m1_configs_only_differ_in_loss_weighting_and_out_dir(self) -> None:
         from safa.training import g_loop

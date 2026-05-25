@@ -6,10 +6,13 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 
 DEFAULT_IQA_METHOD = "niqe"
+DEFAULT_METRICS = ("fid", "kid", "niqe")
+SUPPORTED_METRICS = frozenset(DEFAULT_METRICS)
+REAL_IMAGE_METRICS = frozenset(("fid", "kid"))
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
 
@@ -134,24 +137,47 @@ def mean_std(values: list[float]) -> dict[str, float]:
     return {"mean": float(mean), "std": float(math.sqrt(variance))}
 
 
+def normalize_metrics(metrics: Iterable[str] | None) -> tuple[str, ...]:
+    values = DEFAULT_METRICS if metrics is None else tuple(metrics)
+    if not values:
+        raise ValueError("metrics must be a non-empty list")
+    parsed = []
+    for value in values:
+        name = str(value).lower()
+        if name not in SUPPORTED_METRICS:
+            raise ValueError(f"unsupported quality metric: {value!r}")
+        if name in parsed:
+            raise ValueError(f"duplicate quality metric: {name!r}")
+        parsed.append(name)
+    return tuple(parsed)
+
+
 def evaluate_generation_quality(
     *,
-    real_index: Path,
+    real_index: Path | None,
     generated_dir: Path,
     output: Path,
     iqa_method: str = DEFAULT_IQA_METHOD,
+    metrics: Iterable[str] | None = None,
 ) -> dict[str, Any]:
-    real_paths = real_image_paths(real_index)
+    metric_names = normalize_metrics(metrics)
     generated_paths = generated_image_paths(generated_dir)
+    needs_real_images = any(name in REAL_IMAGE_METRICS for name in metric_names)
+    if needs_real_images:
+        if real_index is None:
+            raise ValueError("real-index is required when FID or KID metrics are enabled")
+        real_paths = real_image_paths(real_index)
+    else:
+        real_paths = []
 
-    fid = create_fid_metric()
-    kid = create_kid_metric()
-    iqa = create_iqa_metric(iqa_method)
-    if hasattr(fid, "eval"):
+    fid = create_fid_metric() if "fid" in metric_names else None
+    kid = create_kid_metric() if "kid" in metric_names else None
+    iqa = create_iqa_metric(iqa_method) if "niqe" in metric_names else None
+    if fid is not None and hasattr(fid, "eval"):
         fid.eval()
-    if hasattr(kid, "eval"):
+    if kid is not None and hasattr(kid, "eval"):
         kid.eval()
-    if hasattr(iqa, "eval"):
+    if iqa is not None and hasattr(iqa, "eval"):
         iqa.eval()
 
     iqa_values: list[float] = []
@@ -163,29 +189,39 @@ def evaluate_generation_quality(
     with torch.no_grad():
         for path in real_paths:
             image = load_image_uint8(path)
-            fid.update(image, real=True)
-            kid.update(image, real=True)
+            if fid is not None:
+                fid.update(image, real=True)
+            if kid is not None:
+                kid.update(image, real=True)
 
         for path in generated_paths:
             image = load_image_uint8(path)
-            fid.update(image, real=False)
-            kid.update(image, real=False)
-            iqa_values.extend(metric_values(iqa(image.float().div(255.0))))
+            if fid is not None:
+                fid.update(image, real=False)
+            if kid is not None:
+                kid.update(image, real=False)
+            if iqa is not None:
+                iqa_values.extend(metric_values(iqa(image.float().div(255.0))))
 
-        kid_mean, kid_std = kid.compute()
-        iqa_summary = mean_std(iqa_values)
         payload = {
-            "num_real": len(real_paths),
+            "metrics": list(metric_names),
             "num_generated": len(generated_paths),
-            "fid": metric_scalar(fid.compute()),
-            "kid_mean": metric_scalar(kid_mean),
-            "kid_std": metric_scalar(kid_std),
-            "iqa": {
+        }
+        if needs_real_images:
+            payload["num_real"] = len(real_paths)
+        if fid is not None:
+            payload["fid"] = metric_scalar(fid.compute())
+        if kid is not None:
+            kid_mean, kid_std = kid.compute()
+            payload["kid_mean"] = metric_scalar(kid_mean)
+            payload["kid_std"] = metric_scalar(kid_std)
+        if iqa is not None:
+            iqa_summary = mean_std(iqa_values)
+            payload["iqa"] = {
                 "method": iqa_method,
                 "mean": iqa_summary["mean"],
                 "std": iqa_summary["std"],
-            },
-        }
+            }
 
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -194,11 +230,18 @@ def evaluate_generation_quality(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate generated image quality with FID, KID, and a real pyIQA metric."
+        description="Evaluate generated image quality with FID, KID, and NIQE."
     )
     parser.add_argument("--real-index", required=True, type=Path)
     parser.add_argument("--generated-dir", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--metrics",
+        nargs="+",
+        default=list(DEFAULT_METRICS),
+        choices=sorted(SUPPORTED_METRICS),
+        help="Quality metrics to run. Default: fid kid niqe.",
+    )
     parser.add_argument(
         "--iqa-method",
         default=DEFAULT_IQA_METHOD,
@@ -215,6 +258,7 @@ def main(argv: list[str] | None = None) -> int:
             generated_dir=args.generated_dir,
             output=args.output,
             iqa_method=args.iqa_method,
+            metrics=args.metrics,
         )
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)

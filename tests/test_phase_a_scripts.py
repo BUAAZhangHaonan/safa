@@ -187,6 +187,42 @@ def test_quality_eval_uses_unpaired_real_and_generated_sets(tmp_path: Path, monk
     assert payload["iqa"] == {"method": "niqe", "mean": 2.0, "std": pytest.approx(0.816496580927726)}
 
 
+def test_quality_eval_niqe_only_does_not_create_fid_or_kid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_script("eval_generation_quality")
+    generated_dir = tmp_path / "generated"
+    generated_dir.mkdir()
+    _write_png(generated_dir / "generated.png", (0, 255, 0))
+
+    class FakeIqa:
+        def __call__(self, images):
+            import torch
+
+            assert str(images.dtype) == "torch.float32"
+            assert images.shape[0] == 1
+            return torch.tensor([3.5])
+
+    monkeypatch.setattr(module, "create_fid_metric", lambda: pytest.fail("FID metric should not be created"))
+    monkeypatch.setattr(module, "create_kid_metric", lambda: pytest.fail("KID metric should not be created"))
+    monkeypatch.setattr(module, "create_iqa_metric", lambda method: FakeIqa())
+
+    output = tmp_path / "quality.json"
+    payload = module.evaluate_generation_quality(
+        real_index=None,
+        generated_dir=generated_dir,
+        output=output,
+        iqa_method="niqe",
+        metrics=["niqe"],
+    )
+
+    assert payload["metrics"] == ["niqe"]
+    assert payload["num_generated"] == 1
+    assert "num_real" not in payload
+    assert "fid" not in payload
+    assert "kid_mean" not in payload
+    assert "kid_std" not in payload
+    assert payload["iqa"] == {"method": "niqe", "mean": 3.5, "std": 0.0}
+
+
 def test_quality_eval_rejects_empty_generated_dir_before_creating_metrics(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -213,6 +249,8 @@ def test_quality_eval_rejects_empty_generated_dir_before_creating_metrics(
             str(generated_dir),
             "--output",
             str(output),
+            "--metrics",
+            "niqe",
         ]
     )
 

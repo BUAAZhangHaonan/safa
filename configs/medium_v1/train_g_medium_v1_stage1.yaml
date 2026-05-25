@@ -40,13 +40,14 @@ generator:
 grad_clip_norm: 1.0
 stages:
   stage1:
-    epochs: 80
+    epochs: 200
     require_face_detection_gate: true
     face_detection_threshold: 0.95
     stable_epochs: 3
     quality_eval:
-      enabled: false
-      interval: 10
+      enabled: true
+      interval_epochs: 1
+      metrics: [niqe]
       real_index: data/index/val_single_face.jsonl
       generated_dir: artifacts/eval/g_medium_v1_stage1/raw_generated
       output_dir: artifacts/eval/g_medium_v1_stage1/quality

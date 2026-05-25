@@ -616,8 +616,9 @@ def train_g_from_config(config: dict) -> dict:
                 stage_best_path = out_dir / f"best_{stage_name}.pt"
                 if _is_better(metrics, history[:-1], best_model=best_model):
                     _save_generator(stage_best_path, unwrap_model(training_module).generator, generator_config, config, metrics, history, **checkpoint_kwargs)
-                    if stage_name == "stage1":
-                        _save_generator(out_dir / "best_single_face.pt", unwrap_model(training_module).generator, generator_config, config, metrics, history, **checkpoint_kwargs)
+                if stage_name == "stage1":
+                    for filename in _stage1_single_face_checkpoint_filenames_to_save(metrics, history[:-1]):
+                        _save_generator(out_dir / filename, unwrap_model(training_module).generator, generator_config, config, metrics, history, **checkpoint_kwargs)
                 if _is_better_overall(metrics, history[:-1], best_model=best_model):
                     _save_generator(best_checkpoint, unwrap_model(training_module).generator, generator_config, config, metrics, history, **checkpoint_kwargs)
                 if stage_name == "stage2":
@@ -1341,11 +1342,12 @@ def _run_quality_eval_hook(config: dict, stage_name: str, stage_epoch: int) -> d
         raise ValueError(f"stages.{stage_name}.quality_eval.enabled must be true or false")
     if not enabled:
         return {}
-    interval = _require_positive_int(payload, "interval", f"stages.{stage_name}.quality_eval")
+    interval = _quality_eval_interval_epochs(payload, stage_name)
     epoch_number = int(stage_epoch) + 1
     if epoch_number % interval != 0:
         return {}
-    real_index = Path(str(_require_field(payload, "real_index", f"stages.{stage_name}.quality_eval")))
+    metric_names = _quality_eval_metric_names(payload, stage_name)
+    real_index = Path(str(_require_field(payload, "real_index", f"stages.{stage_name}.quality_eval"))) if _quality_eval_needs_real_index(metric_names) else None
     output_dir = Path(str(_require_field(payload, "output_dir", f"stages.{stage_name}.quality_eval")))
     iqa_method = str(payload.get("iqa_method", "niqe"))
     variants = _quality_eval_variants(payload, stage_name)
@@ -1356,9 +1358,39 @@ def _run_quality_eval_hook(config: dict, stage_name: str, stage_epoch: int) -> d
             generated_dir=generated_dir,
             output=output_path if output_path is not None else output_dir / f"{stage_name}_epoch_{epoch_number:04d}_{model_name}.json",
             iqa_method=iqa_method,
+            metrics=metric_names,
         )
-        metrics.update(_quality_payload_to_metrics(result, model_name))
+        metrics.update(_quality_payload_to_metrics(result, model_name, metric_names))
     return metrics
+
+
+def _quality_eval_interval_epochs(payload: dict, stage_name: str) -> int:
+    context = f"stages.{stage_name}.quality_eval"
+    if "interval_epochs" in payload:
+        return _require_positive_int(payload, "interval_epochs", context)
+    return _require_positive_int(payload, "interval", context)
+
+
+def _quality_eval_metric_names(payload: dict, stage_name: str) -> tuple[str, ...]:
+    value = payload.get("metrics", ("fid", "kid", "niqe"))
+    context = f"stages.{stage_name}.quality_eval.metrics"
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        raise ValueError(f"{context} must be a non-empty list")
+    if not value:
+        raise ValueError(f"{context} must be a non-empty list")
+    parsed = []
+    for item in value:
+        name = str(item).lower()
+        if name not in ("fid", "kid", "niqe"):
+            raise ValueError(f"{context} contains unsupported metric {item!r}")
+        if name in parsed:
+            raise ValueError(f"{context} contains duplicate metric {name!r}")
+        parsed.append(name)
+    return tuple(parsed)
+
+
+def _quality_eval_needs_real_index(metric_names: tuple[str, ...]) -> bool:
+    return any(name in ("fid", "kid") for name in metric_names)
 
 
 def _quality_eval_variants(payload: dict, stage_name: str) -> list[tuple[str, Path, Path | None]]:
@@ -1384,23 +1416,22 @@ def _quality_eval_variants(payload: dict, stage_name: str) -> list[tuple[str, Pa
     return [(model_name, generated_dir, output)]
 
 
-def _quality_payload_to_metrics(payload: dict, model_name: str) -> dict[str, float]:
-    fid = _finite_quality_value(payload, "fid")
-    kid_mean = _finite_quality_value(payload, "kid_mean")
-    kid_std = _finite_quality_value(payload, "kid_std")
-    iqa = payload.get("iqa")
-    if not isinstance(iqa, dict):
-        raise ValueError("quality_eval payload missing iqa metrics")
-    method = str(iqa.get("method", ""))
-    if method.lower() != "niqe":
-        raise ValueError(f"quality_eval iqa.method must be niqe for medium_v1 checkpoints, got {method!r}")
-    niqe = _finite_quality_value(iqa, "mean")
-    return {
-        f"quality_{model_name}_fid": fid,
-        f"quality_{model_name}_kid_mean": kid_mean,
-        f"quality_{model_name}_kid_std": kid_std,
-        f"quality_{model_name}_niqe": niqe,
-    }
+def _quality_payload_to_metrics(payload: dict, model_name: str, metric_names: tuple[str, ...] = ("fid", "kid", "niqe")) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    if "fid" in metric_names:
+        metrics[f"quality_{model_name}_fid"] = _finite_quality_value(payload, "fid")
+    if "kid" in metric_names:
+        metrics[f"quality_{model_name}_kid_mean"] = _finite_quality_value(payload, "kid_mean")
+        metrics[f"quality_{model_name}_kid_std"] = _finite_quality_value(payload, "kid_std")
+    if "niqe" in metric_names:
+        iqa = payload.get("iqa")
+        if not isinstance(iqa, dict):
+            raise ValueError("quality_eval payload missing iqa metrics")
+        method = str(iqa.get("method", ""))
+        if method.lower() != "niqe":
+            raise ValueError(f"quality_eval iqa.method must be niqe for medium_v1 checkpoints, got {method!r}")
+        metrics[f"quality_{model_name}_niqe"] = _finite_quality_value(iqa, "mean")
+    return metrics
 
 
 def _finite_quality_value(payload: dict, field: str) -> float:
@@ -1482,6 +1513,45 @@ def _stage2_checkpoint_filenames_to_save(metrics: dict, previous: list[dict]) ->
         if _has_quality_metrics(metrics, model_name) and _is_better_quality_for_model(metrics, previous, model_name):
             filenames.append(f"best_{model_name}_quality.pt")
     return filenames
+
+
+def _stage1_single_face_checkpoint_filenames_to_save(metrics: dict, previous: list[dict]) -> list[str]:
+    if metrics.get("stage") != "stage1":
+        return []
+    if not _is_better_single_face_stage1(metrics, previous):
+        return []
+    epoch_number = _stage_epoch_index(metrics, "stage1 single-face checkpoint metrics") + 1
+    return ["best_single_face.pt", f"best_single_face_epoch_{epoch_number:04d}.pt"]
+
+
+def _is_better_single_face_stage1(metrics: dict, previous: list[dict]) -> bool:
+    if metrics.get("stage") != "stage1":
+        return False
+    current_score = _stage1_single_face_score(metrics)
+    candidates = [item for item in previous if item.get("stage") == "stage1"]
+    if not candidates:
+        return True
+    best = max(candidates, key=_stage1_single_face_score)
+    return current_score > _stage1_single_face_score(best)
+
+
+def _stage1_single_face_score(item: dict) -> tuple[float, float, float, float, float, float, int]:
+    context = "stage1 single-face checkpoint metrics"
+    single_face = _finite_metric_value(item, "validation_raw_single_face_eq1_rate", context)
+    multi_face = _finite_metric_value(item, "validation_raw_multi_face_rate", context)
+    zero_face = _finite_metric_value(item, "validation_raw_zero_face_rate", context)
+    face_detect_ge1 = _finite_metric_value(item, "validation_raw_face_detect_ge1_rate", context)
+    loss = _finite_metric_value(item, "loss", context)
+    epoch = _stage_epoch_index(item, context)
+    multi_face_is_zero = 1.0 if multi_face == 0.0 else 0.0
+    return (multi_face_is_zero, single_face, -multi_face, -zero_face, face_detect_ge1, -loss, -epoch)
+
+
+def _stage_epoch_index(item: dict, context: str) -> int:
+    epoch = _finite_metric_value(item, "stage_epoch", context)
+    if epoch < 0 or int(epoch) != epoch:
+        raise ValueError(f"{context}.stage_epoch must be a non-negative integer, got {epoch!r}")
+    return int(epoch)
 
 
 def _has_utility_metrics(item: dict, model_name: str) -> bool:

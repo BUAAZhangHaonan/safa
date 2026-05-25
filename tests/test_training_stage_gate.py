@@ -625,6 +625,85 @@ class StageGateTests(unittest.TestCase):
         self.assertFalse(_is_better(current, [previous], best_model="ema"))
         self.assertTrue(_is_better(current, [previous], best_model="raw"))
 
+    def test_stage1_single_face_checkpoint_prefers_zero_multi_face_over_composite(self) -> None:
+        from safa.training.g_loop import _is_better_single_face_stage1
+
+        previous = {
+            "stage": "stage1",
+            "stage_epoch": 0,
+            "loss": 1.0,
+            "validation_raw_single_face_eq1_rate": 0.80,
+            "validation_raw_multi_face_rate": 0.0,
+            "validation_raw_zero_face_rate": 0.20,
+            "validation_raw_face_detect_ge1_rate": 0.80,
+            "validation_raw_latent_cosine_mean": 0.70,
+            "validation_single_face_eq1_rate": 0.80,
+            "validation_latent_cosine_mean": 0.70,
+        }
+        current = {
+            "stage": "stage1",
+            "stage_epoch": 1,
+            "loss": 0.1,
+            "validation_raw_single_face_eq1_rate": 0.95,
+            "validation_raw_multi_face_rate": 0.05,
+            "validation_raw_zero_face_rate": 0.0,
+            "validation_raw_face_detect_ge1_rate": 1.0,
+            "validation_raw_latent_cosine_mean": 0.99,
+            "validation_single_face_eq1_rate": 0.95,
+            "validation_latent_cosine_mean": 0.99,
+        }
+
+        self.assertFalse(_is_better_single_face_stage1(current, [previous]))
+
+    def test_stage1_single_face_checkpoint_uses_pure_quality_tie_breaks(self) -> None:
+        from safa.training.g_loop import _is_better_single_face_stage1
+
+        baseline = {
+            "stage": "stage1",
+            "stage_epoch": 0,
+            "loss": 1.0,
+            "validation_raw_single_face_eq1_rate": 0.90,
+            "validation_raw_multi_face_rate": 0.0,
+            "validation_raw_zero_face_rate": 0.10,
+            "validation_raw_face_detect_ge1_rate": 0.85,
+            "validation_raw_latent_cosine_mean": 0.90,
+            "validation_single_face_eq1_rate": 0.90,
+            "validation_latent_cosine_mean": 0.90,
+        }
+
+        lower_zero = dict(baseline, stage_epoch=1, loss=5.0, validation_raw_zero_face_rate=0.05)
+        higher_ge1 = dict(baseline, stage_epoch=1, loss=5.0, validation_raw_face_detect_ge1_rate=0.95)
+        lower_loss = dict(baseline, stage_epoch=1, loss=0.5)
+        later_epoch = dict(baseline, stage_epoch=1)
+
+        self.assertTrue(_is_better_single_face_stage1(lower_zero, [baseline]))
+        self.assertTrue(_is_better_single_face_stage1(higher_ge1, [baseline]))
+        self.assertTrue(_is_better_single_face_stage1(lower_loss, [baseline]))
+        self.assertFalse(_is_better_single_face_stage1(later_epoch, [baseline]))
+
+    def test_stage1_single_face_checkpoint_saves_epoch_named_new_best_only(self) -> None:
+        from safa.training.g_loop import _stage1_single_face_checkpoint_filenames_to_save
+
+        previous = {
+            "stage": "stage1",
+            "stage_epoch": 5,
+            "loss": 1.0,
+            "validation_raw_single_face_eq1_rate": 0.80,
+            "validation_raw_multi_face_rate": 0.0,
+            "validation_raw_zero_face_rate": 0.20,
+            "validation_raw_face_detect_ge1_rate": 0.80,
+            "validation_raw_latent_cosine_mean": 0.70,
+            "validation_single_face_eq1_rate": 0.80,
+            "validation_latent_cosine_mean": 0.70,
+        }
+        current = dict(previous, stage_epoch=6, validation_raw_single_face_eq1_rate=0.90)
+
+        self.assertEqual(
+            _stage1_single_face_checkpoint_filenames_to_save(current, [previous]),
+            ["best_single_face.pt", "best_single_face_epoch_0007.pt"],
+        )
+        self.assertEqual(_stage1_single_face_checkpoint_filenames_to_save(previous, [current]), [])
+
     def test_checkpoint_writer_persists_ema_payload_fields(self) -> None:
         import tempfile
         from pathlib import Path
