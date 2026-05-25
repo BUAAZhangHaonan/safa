@@ -284,8 +284,10 @@ def _validate_stage1_quality_presence(
     distribution_interval_epochs: int,
     allow_missing_quality: bool,
 ) -> None:
-    if allow_missing_quality or not quality_dir.is_dir():
+    if allow_missing_quality:
         return
+    if not quality_dir.is_dir():
+        raise FileNotFoundError(f"required Stage1 quality directory is missing: {quality_dir}")
     if distribution_interval_epochs <= 0:
         raise ValueError(f"distribution_interval_epochs must be positive, got {distribution_interval_epochs!r}")
     for index, row in enumerate(history, start=1):

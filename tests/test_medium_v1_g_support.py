@@ -621,6 +621,21 @@ class MediumV1GSupportTests(unittest.TestCase):
             payload = build_stage1_long200_timeseries(history_path, None, quality_dir, allow_missing_quality=True)
             self.assertIsNone(payload["epochs"][0]["niqe"])
 
+    def test_stage1_long200_plot_strict_mode_rejects_missing_quality_dir(self) -> None:
+        from scripts.plot_medium_v1_curves import build_stage1_long200_timeseries
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            history_path = root / "history.json"
+            quality_dir = root / "missing_quality"
+            history_path.write_text(json.dumps({"history": [{"stage": "stage1", "stage_epoch": 0, "loss": 1.0}]}), encoding="utf-8")
+
+            with self.assertRaisesRegex(FileNotFoundError, "required Stage1 quality directory is missing"):
+                build_stage1_long200_timeseries(history_path, None, quality_dir)
+
+            payload = build_stage1_long200_timeseries(history_path, None, quality_dir, allow_missing_quality=True)
+            self.assertIsNone(payload["epochs"][0]["niqe"])
+
     def test_stage1_long200_plot_strict_mode_rejects_missing_distribution_json_on_interval(self) -> None:
         from scripts.plot_medium_v1_curves import build_stage1_long200_timeseries
 
@@ -665,7 +680,9 @@ class MediumV1GSupportTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            payload = build_stage1_long200_timeseries(history_path, None, root / "missing_quality")
+            payload = build_stage1_long200_timeseries(
+                history_path, None, root / "missing_quality", allow_missing_quality=True
+            )
 
         row = payload["epochs"][0]
         self.assertEqual(row["niqe"], 3.0)
