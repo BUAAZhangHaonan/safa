@@ -10,8 +10,8 @@ embedding_dim: 512
 train_index: data/index/train_balanced_medium.jsonl
 train_features: artifacts/e0_features/train_balanced_medium_e0_medium_v1
 e0_checkpoint: artifacts/checkpoints/e0_medium_v1/best.pt
-out_dir: artifacts/checkpoints/g_medium_v1_stage1_long200
-resume_from: artifacts/checkpoints/g_medium_v1_stage1_m0/best_single_face.pt
+out_dir: artifacts/checkpoints/g_medium_v1_stage1_long200_v2
+resume_from: artifacts/checkpoints/g_medium_v1_stage1_long200/last.pt
 allow_stage2_without_stage1_gate: true
 loss_weighting:
   type: fixed
@@ -45,11 +45,13 @@ stages:
     stable_epochs: 3
     quality_eval:
       enabled: true
-      interval_epochs: 1
-      metrics: [niqe]
+      niqe_interval_epochs: 1
+      distribution_interval_epochs: 20
+      niqe_max_samples: 512
+      distribution_max_samples: 3969
+      metrics: [niqe, fid, kid]
       real_index: data/index/val_single_face.jsonl
-      generated_dir: artifacts/eval/g_medium_v1_stage1_m0_single_face/generated_images
-      output_dir: artifacts/eval/g_medium_v1_stage1_long200/quality
+      output_dir: artifacts/eval/g_medium_v1_stage1_long200_v2/quality
       model: raw
   stage2:
     epochs: 0

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import sys
@@ -47,6 +48,23 @@ def real_image_paths(real_index: Path) -> list[Path]:
     return paths
 
 
+def limited_paths(paths: list[Path], *, max_count: int | None, seed: int | None) -> list[Path]:
+    if max_count is None:
+        return list(paths)
+    if isinstance(max_count, bool) or int(max_count) <= 0:
+        raise ValueError(f"max_count must be a positive integer, got {max_count!r}")
+    limit = int(max_count)
+    if limit >= len(paths):
+        return list(paths)
+    if seed is None:
+        return list(paths[:limit])
+    seed_text = str(int(seed))
+    return sorted(
+        paths,
+        key=lambda path: hashlib.sha256(f"{seed_text}\0{path.as_posix()}".encode("utf-8")).hexdigest(),
+    )[:limit]
+
+
 def generated_image_paths(generated_dir: Path) -> list[Path]:
     if not generated_dir.is_dir():
         raise NotADirectoryError(f"generated-dir is not a directory: {generated_dir}")
@@ -58,6 +76,49 @@ def generated_image_paths(generated_dir: Path) -> list[Path]:
     if not paths:
         raise ValueError("generated-dir contains no supported images")
     return paths
+
+
+def quality_eval_device(device: str):
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError("torch is required for quality evaluation") from exc
+    requested = str(device)
+    if requested == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(requested)
+
+
+def prepare_metric_for_device(metric, device):
+    if metric is None:
+        return None, None
+    if hasattr(metric, "to"):
+        return metric.to(device), device
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError("torch is required for quality evaluation") from exc
+    return metric, torch.device("cpu")
+
+
+def image_to_device(image, device):
+    if device is None:
+        return image
+    if hasattr(image, "to"):
+        return image.to(device, non_blocking=True)
+    return image
+
+
+def seed_metric_randomness(seed: int | None, device) -> None:
+    if seed is None:
+        return
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError("torch is required for quality evaluation") from exc
+    torch.manual_seed(int(seed))
+    if getattr(device, "type", None) == "cuda":
+        torch.cuda.manual_seed_all(int(seed))
 
 
 def load_image_uint8(path: Path):
@@ -159,20 +220,28 @@ def evaluate_generation_quality(
     output: Path,
     iqa_method: str = DEFAULT_IQA_METHOD,
     metrics: Iterable[str] | None = None,
+    max_generated: int | None = None,
+    max_real: int | None = None,
+    subset_seed: int | None = 1337,
+    device: str = "auto",
 ) -> dict[str, Any]:
     metric_names = normalize_metrics(metrics)
-    generated_paths = generated_image_paths(generated_dir)
+    generated_paths = limited_paths(generated_image_paths(generated_dir), max_count=max_generated, seed=subset_seed)
     needs_real_images = any(name in REAL_IMAGE_METRICS for name in metric_names)
     if needs_real_images:
         if real_index is None:
             raise ValueError("real-index is required when FID or KID metrics are enabled")
-        real_paths = real_image_paths(real_index)
+        real_paths = limited_paths(real_image_paths(real_index), max_count=max_real, seed=subset_seed)
     else:
         real_paths = []
 
+    selected_device = quality_eval_device(device)
     fid = create_fid_metric() if "fid" in metric_names else None
     kid = create_kid_metric() if "kid" in metric_names else None
     iqa = create_iqa_metric(iqa_method) if "niqe" in metric_names else None
+    fid, fid_device = prepare_metric_for_device(fid, selected_device)
+    kid, kid_device = prepare_metric_for_device(kid, selected_device)
+    iqa, iqa_device = prepare_metric_for_device(iqa, selected_device)
     if fid is not None and hasattr(fid, "eval"):
         fid.eval()
     if kid is not None and hasattr(kid, "eval"):
@@ -190,18 +259,19 @@ def evaluate_generation_quality(
         for path in real_paths:
             image = load_image_uint8(path)
             if fid is not None:
-                fid.update(image, real=True)
+                fid.update(image_to_device(image, fid_device), real=True)
             if kid is not None:
-                kid.update(image, real=True)
+                kid.update(image_to_device(image, kid_device), real=True)
 
         for path in generated_paths:
             image = load_image_uint8(path)
             if fid is not None:
-                fid.update(image, real=False)
+                fid.update(image_to_device(image, fid_device), real=False)
             if kid is not None:
-                kid.update(image, real=False)
+                kid.update(image_to_device(image, kid_device), real=False)
             if iqa is not None:
-                iqa_values.extend(metric_values(iqa(image.float().div(255.0))))
+                iqa_image = image_to_device(image, iqa_device)
+                iqa_values.extend(metric_values(iqa(iqa_image.float().div(255.0))))
 
         payload = {
             "metrics": list(metric_names),
@@ -212,6 +282,7 @@ def evaluate_generation_quality(
         if fid is not None:
             payload["fid"] = metric_scalar(fid.compute())
         if kid is not None:
+            seed_metric_randomness(subset_seed, kid_device)
             kid_mean, kid_std = kid.compute()
             payload["kid_mean"] = metric_scalar(kid_mean)
             payload["kid_std"] = metric_scalar(kid_std)
@@ -232,9 +303,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Evaluate generated image quality with FID, KID, and NIQE."
     )
-    parser.add_argument("--real-index", required=True, type=Path)
+    parser.add_argument("--real-index", type=Path)
     parser.add_argument("--generated-dir", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--max-generated", type=int, default=None)
+    parser.add_argument("--max-real", type=int, default=None)
+    parser.add_argument("--subset-seed", type=int, default=1337)
+    parser.add_argument("--device", default="auto")
     parser.add_argument(
         "--metrics",
         nargs="+",
@@ -259,6 +334,10 @@ def main(argv: list[str] | None = None) -> int:
             output=args.output,
             iqa_method=args.iqa_method,
             metrics=args.metrics,
+            max_generated=args.max_generated,
+            max_real=args.max_real,
+            subset_seed=args.subset_seed,
+            device=args.device,
         )
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)

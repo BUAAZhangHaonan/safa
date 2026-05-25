@@ -49,6 +49,13 @@ class _LossWeightingRuntime:
     log_var_weight_decay: float | None = None
 
 
+@dataclass(frozen=True)
+class _QualityEvalGroup:
+    name: str
+    metrics: tuple[str, ...]
+    max_samples: int
+
+
 class _GeneratorTrainingStep:
     def __new__(
         cls,
@@ -586,7 +593,20 @@ def train_g_from_config(config: dict) -> dict:
                     ema_config=ema_config,
                 )
                 _attach_validation_metrics(metrics, raw_validation_metrics, ema_validation_metrics)
-                metrics.update(_run_quality_eval_hook(config, stage_name, stage_epoch))
+                metrics.update(
+                    _run_quality_eval_hook(
+                        config,
+                        stage_name,
+                        stage_epoch,
+                        generator=unwrap_model(training_module).generator,
+                        ema=ema,
+                        device=device,
+                        generator_config=generator_config,
+                        sampling_seed=sampling_seed,
+                        use_amp=use_amp,
+                        ema_config=ema_config,
+                    )
+                )
                 if stage_name == "stage1" and raw_validation_metrics is not None and raw_validation_metrics.get("face_detection_rate") is not None:
                     baseline_detection_rate = raw_validation_metrics["face_detection_rate"]
                     threshold = float(stages["stage1"]["face_detection_threshold"])
@@ -947,6 +967,7 @@ def _validate_train_g_config(config: dict) -> None:
     _validate_stage1_gate_config(stages["stage1"])
     _stage2_gradient_conflict_config(stages)
     _validate_validation_block(config)
+    _validate_quality_eval_configs(config, stages)
     if int(_require_field(stages["stage2"], "epochs", "stages.stage2")) > 0:
         _validate_stage2_validation_config(config)
 
@@ -1056,6 +1077,35 @@ def _validate_stage2_validation_config(config: dict) -> None:
     if not _require_bool(detection, "enabled", "validation.face_detection"):
         raise ValueError("validation.face_detection.enabled must be true when Stage 2 epochs > 0")
     _require_field(detection, "model_name", "validation.face_detection")
+
+
+def _validate_quality_eval_configs(config: dict, stages: dict) -> None:
+    for stage_name, stage in stages.items():
+        if not isinstance(stage, dict):
+            continue
+        payload = stage.get("quality_eval")
+        if payload is None:
+            continue
+        if not isinstance(payload, dict):
+            raise ValueError(f"stages.{stage_name}.quality_eval must be a mapping")
+        enabled = payload.get("enabled", False)
+        if not isinstance(enabled, bool):
+            raise ValueError(f"stages.{stage_name}.quality_eval.enabled must be true or false")
+        if not enabled:
+            continue
+        _require_field(payload, "output_dir", f"stages.{stage_name}.quality_eval")
+        _quality_eval_variants(payload, stage_name)
+        groups = _quality_eval_due_groups(payload, stage_name, 1)
+        metric_names = _quality_eval_metric_names(payload, stage_name)
+        if not groups and all(name != "niqe" for name in metric_names):
+            _quality_eval_due_groups(payload, stage_name, _require_positive_int(payload, "distribution_interval_epochs", f"stages.{stage_name}.quality_eval"))
+        if _quality_eval_needs_real_index(metric_names):
+            _require_field(payload, "real_index", f"stages.{stage_name}.quality_eval")
+        validation = _validate_validation_block(config)
+        if not _require_bool(validation, "enabled", "validation"):
+            raise ValueError("validation.enabled must be true when quality_eval is enabled")
+        for field in ("index", "features", "batch_size"):
+            _require_field(validation, field, "validation")
 
 
 def _generator_config_from_train_config(config: dict) -> FlowGeneratorConfig:
@@ -1325,7 +1375,19 @@ def _evaluate_generation_quality(**kwargs):
     return evaluate_generation_quality(**kwargs)
 
 
-def _run_quality_eval_hook(config: dict, stage_name: str, stage_epoch: int) -> dict[str, float]:
+def _run_quality_eval_hook(
+    config: dict,
+    stage_name: str,
+    stage_epoch: int,
+    *,
+    generator=None,
+    ema: ExponentialMovingAverage | None = None,
+    device=None,
+    generator_config: FlowGeneratorConfig | None = None,
+    sampling_seed: int | None = None,
+    use_amp: bool = False,
+    ema_config: dict | None = None,
+) -> dict[str, float]:
     stages = config.get("stages")
     if not isinstance(stages, dict):
         return {}
@@ -1342,26 +1404,97 @@ def _run_quality_eval_hook(config: dict, stage_name: str, stage_epoch: int) -> d
         raise ValueError(f"stages.{stage_name}.quality_eval.enabled must be true or false")
     if not enabled:
         return {}
-    interval = _quality_eval_interval_epochs(payload, stage_name)
     epoch_number = int(stage_epoch) + 1
-    if epoch_number % interval != 0:
+    groups = _quality_eval_due_groups(payload, stage_name, epoch_number)
+    if not groups:
         return {}
-    metric_names = _quality_eval_metric_names(payload, stage_name)
-    real_index = Path(str(_require_field(payload, "real_index", f"stages.{stage_name}.quality_eval"))) if _quality_eval_needs_real_index(metric_names) else None
+    _require_quality_eval_runtime(
+        generator=generator,
+        device=device,
+        generator_config=generator_config,
+        sampling_seed=sampling_seed,
+    )
     output_dir = Path(str(_require_field(payload, "output_dir", f"stages.{stage_name}.quality_eval")))
     iqa_method = str(payload.get("iqa_method", "niqe"))
+    subset_seed = int(payload.get("subset_seed", sampling_seed))
+    quality_device = str(payload.get("device", device))
     variants = _quality_eval_variants(payload, stage_name)
     metrics: dict[str, float] = {}
-    for model_name, generated_dir, output_path in variants:
-        result = _evaluate_generation_quality(
-            real_index=real_index,
-            generated_dir=generated_dir,
-            output=output_path if output_path is not None else output_dir / f"{stage_name}_epoch_{epoch_number:04d}_{model_name}.json",
-            iqa_method=iqa_method,
-            metrics=metric_names,
+    generation_max_samples = max(group.max_samples for group in groups)
+    loader = _build_quality_eval_loader(config, generation_max_samples)
+    multiple_variants = len(variants) > 1
+    for model_name in variants:
+        current_generator = _quality_eval_current_generator(
+            model_name,
+            generator=generator,
+            ema=ema,
+            device=device,
+            generator_config=generator_config,
+            ema_config=ema_config,
         )
-        metrics.update(_quality_payload_to_metrics(result, model_name, metric_names))
+        epoch_dir = _quality_eval_epoch_dir(output_dir, epoch_number, model_name, multiple_variants)
+        generated_dir = epoch_dir / "generated_images"
+        generated_count = _generate_quality_eval_images(
+            generator=current_generator,
+            loader=loader,
+            generated_dir=generated_dir,
+            device=device,
+            generator_config=generator_config,
+            sampling_seed=int(sampling_seed),
+            max_samples=generation_max_samples,
+            use_amp=use_amp,
+        )
+        for group in groups:
+            real_index = (
+                Path(str(_require_field(payload, "real_index", f"stages.{stage_name}.quality_eval")))
+                if _quality_eval_needs_real_index(group.metrics)
+                else None
+            )
+            result = _evaluate_generation_quality(
+                real_index=real_index,
+                generated_dir=generated_dir,
+                output=epoch_dir / f"{stage_name}_epoch_{epoch_number:04d}_{model_name}_{group.name}.json",
+                iqa_method=iqa_method,
+                metrics=group.metrics,
+                max_generated=min(group.max_samples, generated_count),
+                max_real=group.max_samples if real_index is not None else None,
+                subset_seed=subset_seed,
+                device=quality_device,
+            )
+            metrics.update(_quality_payload_to_metrics(result, model_name, group.metrics))
     return metrics
+
+
+def _require_quality_eval_runtime(*, generator, device, generator_config, sampling_seed) -> None:
+    if generator is None:
+        raise RuntimeError("quality_eval requires the current generator instance")
+    if device is None:
+        raise RuntimeError("quality_eval requires the current training device")
+    if generator_config is None:
+        raise RuntimeError("quality_eval requires the current generator config")
+    if sampling_seed is None:
+        raise RuntimeError("quality_eval requires the sampling seed")
+
+
+def _quality_eval_due_groups(payload: dict, stage_name: str, epoch_number: int) -> list[_QualityEvalGroup]:
+    if epoch_number <= 0:
+        raise ValueError(f"quality_eval epoch_number must be positive, got {epoch_number!r}")
+    context = f"stages.{stage_name}.quality_eval"
+    metric_names = _quality_eval_metric_names(payload, stage_name)
+    groups: list[_QualityEvalGroup] = []
+    if "niqe" in metric_names:
+        interval = _require_positive_int(payload, "niqe_interval_epochs", context)
+        max_samples = _require_positive_int(payload, "niqe_max_samples", context)
+        if epoch_number % interval == 0:
+            groups.append(_QualityEvalGroup("niqe", ("niqe",), max_samples))
+    distribution_metrics = tuple(name for name in metric_names if name in ("fid", "kid"))
+    if distribution_metrics:
+        interval = _require_positive_int(payload, "distribution_interval_epochs", context)
+        max_samples = _require_positive_int(payload, "distribution_max_samples", context)
+        _require_field(payload, "real_index", context)
+        if epoch_number % interval == 0:
+            groups.append(_QualityEvalGroup("distribution", distribution_metrics, max_samples))
+    return groups
 
 
 def _quality_eval_interval_epochs(payload: dict, stage_name: str) -> int:
@@ -1372,8 +1505,9 @@ def _quality_eval_interval_epochs(payload: dict, stage_name: str) -> int:
 
 
 def _quality_eval_metric_names(payload: dict, stage_name: str) -> tuple[str, ...]:
-    value = payload.get("metrics", ("fid", "kid", "niqe"))
-    context = f"stages.{stage_name}.quality_eval.metrics"
+    payload_context = f"stages.{stage_name}.quality_eval"
+    value = _require_field(payload, "metrics", payload_context)
+    context = f"{payload_context}.metrics"
     if isinstance(value, str) or not isinstance(value, (list, tuple)):
         raise ValueError(f"{context} must be a non-empty list")
     if not value:
@@ -1393,7 +1527,7 @@ def _quality_eval_needs_real_index(metric_names: tuple[str, ...]) -> bool:
     return any(name in ("fid", "kid") for name in metric_names)
 
 
-def _quality_eval_variants(payload: dict, stage_name: str) -> list[tuple[str, Path, Path | None]]:
+def _quality_eval_variants(payload: dict, stage_name: str) -> list[str]:
     variants = payload.get("variants")
     if variants is not None:
         if not isinstance(variants, dict) or not variants:
@@ -1404,16 +1538,124 @@ def _quality_eval_variants(payload: dict, stage_name: str) -> list[tuple[str, Pa
                 raise ValueError(f"stages.{stage_name}.quality_eval variant must be raw or ema, got {model_name!r}")
             if not isinstance(variant_payload, dict):
                 raise ValueError(f"stages.{stage_name}.quality_eval.variants.{model_name} must be a mapping")
-            generated_dir = Path(str(_require_field(variant_payload, "generated_dir", f"stages.{stage_name}.quality_eval.variants.{model_name}")))
-            output = Path(str(variant_payload["output"])) if "output" in variant_payload else None
-            parsed.append((str(model_name), generated_dir, output))
+            parsed.append(str(model_name))
         return parsed
     model_name = str(payload.get("model", "raw"))
     if model_name not in ("raw", "ema"):
         raise ValueError(f"stages.{stage_name}.quality_eval.model must be raw or ema, got {model_name!r}")
-    generated_dir = Path(str(_require_field(payload, "generated_dir", f"stages.{stage_name}.quality_eval")))
-    output = Path(str(payload["output"])) if "output" in payload else None
-    return [(model_name, generated_dir, output)]
+    return [model_name]
+
+
+def _quality_eval_epoch_dir(output_dir: Path, epoch_number: int, model_name: str, multiple_variants: bool) -> Path:
+    root = output_dir / f"epoch_{epoch_number:04d}"
+    return root / model_name if multiple_variants else root
+
+
+def _quality_eval_current_generator(
+    model_name: str,
+    *,
+    generator,
+    ema: ExponentialMovingAverage | None,
+    device,
+    generator_config: FlowGeneratorConfig,
+    ema_config: dict | None,
+):
+    if model_name == "raw":
+        return generator
+    if model_name != "ema":
+        raise ValueError(f"quality_eval model must be raw or ema, got {model_name!r}")
+    if ema is None or not (ema_config or {}).get("enabled", False):
+        raise RuntimeError("quality_eval requested EMA images but EMA is not enabled")
+    ema_generator = build_generator(generator_config.to_dict()).to(device)
+    ema.copy_to(ema_generator)
+    return ema_generator
+
+
+def _build_quality_eval_loader(config: dict, max_samples: int):
+    from torch.utils.data import DataLoader, Subset
+
+    validation = _require_mapping(config, "validation", "train_g config")
+    if not _require_bool(validation, "enabled", "validation"):
+        raise ValueError("validation.enabled must be true when quality_eval is enabled")
+    for field in ("index", "features", "batch_size"):
+        _require_field(validation, field, "validation")
+    max_samples = int(max_samples)
+    if max_samples <= 0:
+        raise ValueError(f"quality_eval max_samples must be positive, got {max_samples!r}")
+    val_set = FeatureAlignedAffectNet(
+        validation["index"],
+        validation["features"],
+        config["e0_checkpoint"],
+        transform=generator_image_transform(int(config["image_size"])),
+    )
+    val_set = Subset(val_set, list(range(min(max_samples, len(val_set)))))
+    if len(val_set) == 0:
+        raise ValueError("quality_eval validation dataset contains no samples")
+    num_workers = int(config["num_workers"])
+    loader_kwargs = {
+        "batch_size": int(validation["batch_size"]),
+        "shuffle": False,
+        "num_workers": num_workers,
+        "pin_memory": True,
+    }
+    if num_workers > 0:
+        loader_kwargs.update({"persistent_workers": True, "prefetch_factor": 4})
+    return DataLoader(val_set, **loader_kwargs)
+
+
+def _generate_quality_eval_images(
+    *,
+    generator,
+    loader,
+    generated_dir: Path,
+    device,
+    generator_config: FlowGeneratorConfig,
+    sampling_seed: int,
+    max_samples: int,
+    use_amp: bool,
+) -> int:
+    import torch
+    from safa.evaluation.runner import _save_generated_image_for_eval
+
+    if generated_dir.exists():
+        raise FileExistsError(f"quality_eval generated image directory already exists: {generated_dir}")
+    generated_dir.parent.mkdir(parents=True, exist_ok=True)
+    max_samples = int(max_samples)
+    if max_samples <= 0:
+        raise ValueError(f"quality_eval max_samples must be positive, got {max_samples!r}")
+    was_training = bool(getattr(generator, "training", False))
+    generator.eval()
+    count = 0
+    amp_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if use_amp else nullcontext()
+    try:
+        with torch.no_grad(), amp_ctx:
+            for batch in loader:
+                if count >= max_samples:
+                    break
+                z = batch["z"].to(device, non_blocking=True)
+                sample_ids = list(batch["sample_id"])
+                remaining = max_samples - count
+                if int(z.shape[0]) > remaining:
+                    z = z[:remaining]
+                    sample_ids = sample_ids[:remaining]
+                x_init = make_x_init_for_sample_ids(sample_ids, sampling_seed, generator_config.image_size, z.device, z.dtype)
+                generated = generator.sample(z, steps=generator_config.sample_steps, x_init=x_init)
+                assert_finite_tensor("quality_eval_generated_image", generated)
+                for index, sample_id in enumerate(sample_ids):
+                    _save_generated_image_for_eval(
+                        generated[index],
+                        generated_dir,
+                        global_index=count + index,
+                        sample_id=sample_id,
+                        row={},
+                    )
+                count += len(sample_ids)
+    finally:
+        if was_training:
+            generator.train()
+    if count <= 0:
+        raise RuntimeError("quality_eval generated zero images")
+    return count
 
 
 def _quality_payload_to_metrics(payload: dict, model_name: str, metric_names: tuple[str, ...] = ("fid", "kid", "niqe")) -> dict[str, float]:

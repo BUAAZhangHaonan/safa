@@ -46,10 +46,9 @@ stages:
     stable_epochs: 3
     quality_eval:
       enabled: true
-      interval_epochs: 1
+      niqe_interval_epochs: 1
+      niqe_max_samples: 512
       metrics: [niqe]
-      real_index: data/index/val_single_face.jsonl
-      generated_dir: artifacts/eval/g_medium_v1_stage1/raw_generated
       output_dir: artifacts/eval/g_medium_v1_stage1/quality
       model: raw
   stage2:

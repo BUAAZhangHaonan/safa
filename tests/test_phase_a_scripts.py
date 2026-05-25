@@ -223,6 +223,151 @@ def test_quality_eval_niqe_only_does_not_create_fid_or_kid(tmp_path: Path, monke
     assert payload["iqa"] == {"method": "niqe", "mean": 3.5, "std": 0.0}
 
 
+def test_quality_eval_limits_real_and_generated_sets_deterministically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_script("eval_generation_quality")
+    real_dir = tmp_path / "real"
+    generated_dir = tmp_path / "generated"
+    real_dir.mkdir()
+    generated_dir.mkdir()
+
+    real_paths = []
+    for index in range(5):
+        real_path = real_dir / f"real_{index}.png"
+        generated_path = generated_dir / f"generated_{index}.png"
+        _write_png(real_path, (index, 0, 0))
+        _write_png(generated_path, (0, index, 0))
+        real_paths.append(real_path)
+
+    real_index = tmp_path / "real.jsonl"
+    _write_jsonl(
+        real_index,
+        [{"sample_id": f"real-{index}", "image_path": str(path), "label": index} for index, path in enumerate(real_paths)],
+    )
+
+    seen: list[str] = []
+
+    def fake_load(path: Path):
+        import torch
+
+        seen.append(path.name)
+        return torch.zeros(1, 3, 8, 8, dtype=torch.uint8)
+
+    class FakeFid:
+        def __init__(self) -> None:
+            self.real = 0
+            self.generated = 0
+
+        def update(self, images, real: bool) -> None:
+            if real:
+                self.real += 1
+            else:
+                self.generated += 1
+
+        def compute(self):
+            import torch
+
+            assert self.real == 2
+            assert self.generated == 3
+            return torch.tensor(1.0)
+
+    monkeypatch.setattr(module, "load_image_uint8", fake_load)
+    monkeypatch.setattr(module, "create_fid_metric", FakeFid)
+
+    output = tmp_path / "quality.json"
+    payload = module.evaluate_generation_quality(
+        real_index=real_index,
+        generated_dir=generated_dir,
+        output=output,
+        metrics=["fid"],
+        max_real=2,
+        max_generated=3,
+        subset_seed=11,
+        device="cpu",
+    )
+    first_seen = list(seen)
+    seen.clear()
+    module.evaluate_generation_quality(
+        real_index=real_index,
+        generated_dir=generated_dir,
+        output=tmp_path / "quality_again.json",
+        metrics=["fid"],
+        max_real=2,
+        max_generated=3,
+        subset_seed=11,
+        device="cpu",
+    )
+
+    assert payload["num_real"] == 2
+    assert payload["num_generated"] == 3
+    assert seen == first_seen
+    assert len(first_seen) == 5
+
+
+def test_quality_eval_auto_device_moves_torchmetrics_to_cuda_when_available(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_script("eval_generation_quality")
+    real_dir = tmp_path / "real"
+    generated_dir = tmp_path / "generated"
+    real_dir.mkdir()
+    generated_dir.mkdir()
+    real_path = real_dir / "real.png"
+    generated_path = generated_dir / "generated.png"
+    _write_png(real_path, (255, 0, 0))
+    _write_png(generated_path, (0, 255, 0))
+    real_index = tmp_path / "real.jsonl"
+    _write_jsonl(real_index, [{"sample_id": "real-0", "image_path": str(real_path), "label": 0}])
+
+    class FakeTensor:
+        def __init__(self, device_label: str = "cpu") -> None:
+            self.device_label = device_label
+
+        def to(self, device, non_blocking: bool = False):
+            return FakeTensor(str(device))
+
+    class FakeFid:
+        def __init__(self) -> None:
+            self.to_devices: list[str] = []
+            self.update_devices: list[str] = []
+
+        def to(self, device):
+            self.to_devices.append(str(device))
+            return self
+
+        def update(self, images, real: bool) -> None:
+            self.update_devices.append(images.device_label)
+
+        def compute(self):
+            import torch
+
+            return torch.tensor(2.0)
+
+    import torch
+
+    fake_fid = FakeFid()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "manual_seed_all", lambda seed: None)
+    monkeypatch.setattr(module, "load_image_uint8", lambda path: FakeTensor())
+    monkeypatch.setattr(module, "create_fid_metric", lambda: fake_fid)
+
+    payload = module.evaluate_generation_quality(
+        real_index=real_index,
+        generated_dir=generated_dir,
+        output=tmp_path / "quality.json",
+        metrics=["fid"],
+        device="auto",
+        subset_seed=123,
+    )
+
+    assert payload["fid"] == pytest.approx(2.0)
+    assert fake_fid.to_devices == ["cuda"]
+    assert fake_fid.update_devices == ["cuda", "cuda"]
+
+
 def test_quality_eval_rejects_empty_generated_dir_before_creating_metrics(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

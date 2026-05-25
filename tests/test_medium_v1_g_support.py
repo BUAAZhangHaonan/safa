@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -77,42 +78,177 @@ class MediumV1GSupportTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "calibration_batches"):
             _finalize_uncertainty_calibration(flow_sum=1.0, cycle_sum=1.0, batches=0)
 
-    def test_quality_eval_hook_can_be_monkeypatched_and_writes_epoch_metrics(self) -> None:
+    def test_quality_eval_hook_generates_epoch_images_instead_of_reusing_generated_dir(self) -> None:
         from safa.training import g_loop
 
-        config = {
-            "stages": {
-                "stage1": {
-                    "quality_eval": {
-                        "enabled": True,
-                        "interval_epochs": 2,
-                        "metrics": ["niqe"],
-                        "real_index": "data/index/val_single_face.jsonl",
-                        "generated_dir": "artifacts/eval/medium_v1/raw/generated",
-                        "output_dir": "artifacts/eval/medium_v1/quality",
-                        "model": "raw",
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stale_generated = root / "old_eval" / "generated_images"
+            quality_dir = root / "quality"
+            config = {
+                "stages": {
+                    "stage1": {
+                        "quality_eval": {
+                            "enabled": True,
+                            "niqe_interval_epochs": 1,
+                            "niqe_max_samples": 2,
+                            "metrics": ["niqe"],
+                            "generated_dir": str(stale_generated),
+                            "output_dir": str(quality_dir),
+                            "model": "raw",
+                        }
                     }
                 }
             }
-        }
 
-        calls: list[dict] = []
+            load_calls: list[int] = []
+            generation_calls: list[dict] = []
+            eval_calls: list[dict] = []
 
-        def fake_quality_eval(**kwargs):
-            calls.append(kwargs)
-            return {
-                "iqa": {"method": "niqe", "mean": 4.25, "std": 0.5},
+            def fake_loader(runner_config: dict, max_samples: int):
+                load_calls.append(max_samples)
+                return object()
+
+            def fake_generate(**kwargs):
+                generation_calls.append(kwargs)
+                Path(kwargs["generated_dir"]).mkdir(parents=True)
+                return int(kwargs["max_samples"])
+
+            def fake_quality_eval(**kwargs):
+                eval_calls.append(kwargs)
+                return {"iqa": {"method": "niqe", "mean": 4.25, "std": 0.5}, "num_generated": 2}
+
+            generator = object()
+
+            with patch.object(g_loop, "_build_quality_eval_loader", side_effect=fake_loader), patch.object(
+                g_loop, "_generate_quality_eval_images", side_effect=fake_generate
+            ), patch.object(g_loop, "_evaluate_generation_quality", side_effect=fake_quality_eval):
+                metrics = g_loop._run_quality_eval_hook(
+                    config,
+                    "stage1",
+                    0,
+                    generator=generator,
+                    ema=None,
+                    device="cpu",
+                    generator_config=SimpleNamespace(image_size=4, sample_steps=1),
+                    sampling_seed=1337,
+                    use_amp=False,
+                    ema_config={"enabled": False},
+                )
+
+            expected_generated = quality_dir / "epoch_0001" / "generated_images"
+            self.assertEqual(load_calls, [2])
+            self.assertEqual(len(generation_calls), 1)
+            self.assertIs(generation_calls[0]["generator"], generator)
+            self.assertEqual(generation_calls[0]["generated_dir"], expected_generated)
+            self.assertNotEqual(generation_calls[0]["generated_dir"], stale_generated)
+            self.assertEqual(len(eval_calls), 1)
+            self.assertEqual(eval_calls[0]["generated_dir"], expected_generated)
+            self.assertEqual(eval_calls[0]["metrics"], ("niqe",))
+            self.assertEqual(eval_calls[0]["max_generated"], 2)
+            self.assertTrue(str(eval_calls[0]["output"]).endswith("stage1_epoch_0001_raw_niqe.json"))
+            self.assertEqual(metrics["quality_raw_niqe"], 4.25)
+            self.assertNotIn("quality_raw_fid", metrics)
+
+    def test_quality_eval_hook_honors_niqe_and_distribution_schedules_and_limits(self) -> None:
+        from safa.training import g_loop
+
+        with tempfile.TemporaryDirectory() as tmp:
+            quality_dir = Path(tmp) / "quality"
+            config = {
+                "stages": {
+                    "stage1": {
+                        "quality_eval": {
+                            "enabled": True,
+                            "niqe_interval_epochs": 1,
+                            "distribution_interval_epochs": 20,
+                            "niqe_max_samples": 2,
+                            "distribution_max_samples": 5,
+                            "metrics": ["niqe", "fid", "kid"],
+                            "real_index": "data/index/val_single_face.jsonl",
+                            "output_dir": str(quality_dir),
+                            "model": "raw",
+                        }
+                    }
+                }
             }
 
-        with patch.object(g_loop, "_evaluate_generation_quality", side_effect=fake_quality_eval):
-            metrics = g_loop._run_quality_eval_hook(config, "stage1", 1)
+            def run_epoch(stage_epoch: int):
+                load_calls: list[int] = []
+                generation_calls: list[dict] = []
+                eval_calls: list[dict] = []
 
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(metrics["quality_raw_niqe"], 4.25)
-        self.assertNotIn("quality_raw_fid", metrics)
-        self.assertNotIn("quality_raw_kid_mean", metrics)
-        self.assertEqual(calls[0]["metrics"], ("niqe",))
-        self.assertTrue(str(calls[0]["output"]).endswith("stage1_epoch_0002_raw.json"))
+                def fake_loader(runner_config: dict, max_samples: int):
+                    load_calls.append(max_samples)
+                    return object()
+
+                def fake_generate(**kwargs):
+                    generation_calls.append(kwargs)
+                    Path(kwargs["generated_dir"]).mkdir(parents=True)
+                    return int(kwargs["max_samples"])
+
+                def fake_quality_eval(**kwargs):
+                    eval_calls.append(kwargs)
+                    names = tuple(kwargs["metrics"])
+                    if names == ("niqe",):
+                        return {"iqa": {"method": "niqe", "mean": 3.0, "std": 0.0}}
+                    if names == ("fid", "kid"):
+                        return {"fid": 12.0, "kid_mean": 0.2, "kid_std": 0.01, "num_real": 5, "num_generated": 5}
+                    raise AssertionError(names)
+
+                with patch.object(g_loop, "_build_quality_eval_loader", side_effect=fake_loader), patch.object(
+                    g_loop, "_generate_quality_eval_images", side_effect=fake_generate
+                ), patch.object(g_loop, "_evaluate_generation_quality", side_effect=fake_quality_eval):
+                    metrics = g_loop._run_quality_eval_hook(
+                        config,
+                        "stage1",
+                        stage_epoch,
+                        generator=object(),
+                        ema=None,
+                        device="cpu",
+                        generator_config=SimpleNamespace(image_size=4, sample_steps=1),
+                        sampling_seed=1337,
+                        use_amp=False,
+                        ema_config={"enabled": False},
+                    )
+                return metrics, load_calls, generation_calls, eval_calls
+
+            metrics, load_calls, generation_calls, eval_calls = run_epoch(0)
+            self.assertEqual(load_calls, [2])
+            self.assertEqual(generation_calls[0]["max_samples"], 2)
+            self.assertEqual([call["metrics"] for call in eval_calls], [("niqe",)])
+            self.assertEqual(eval_calls[0]["max_generated"], 2)
+            self.assertIsNone(eval_calls[0]["real_index"])
+            self.assertEqual(metrics, {"quality_raw_niqe": 3.0})
+
+            metrics, load_calls, generation_calls, eval_calls = run_epoch(19)
+            self.assertEqual(load_calls, [5])
+            self.assertEqual(len(generation_calls), 1)
+            self.assertEqual(generation_calls[0]["max_samples"], 5)
+            self.assertEqual([call["metrics"] for call in eval_calls], [("niqe",), ("fid", "kid")])
+            self.assertEqual(eval_calls[0]["max_generated"], 2)
+            self.assertIsNone(eval_calls[0]["real_index"])
+            self.assertEqual(eval_calls[1]["max_generated"], 5)
+            self.assertEqual(eval_calls[1]["max_real"], 5)
+            self.assertEqual(str(eval_calls[1]["real_index"]), "data/index/val_single_face.jsonl")
+            self.assertTrue(str(eval_calls[1]["generated_dir"]).endswith("quality/epoch_0020/generated_images"))
+            self.assertEqual(metrics["quality_raw_niqe"], 3.0)
+            self.assertEqual(metrics["quality_raw_fid"], 12.0)
+            self.assertEqual(metrics["quality_raw_kid_mean"], 0.2)
+
+    def test_quality_eval_enabled_requires_new_schedule_fields(self) -> None:
+        from safa.training import g_loop
+
+        payload = {
+            "enabled": True,
+            "metrics": ["niqe"],
+            "niqe_max_samples": 2,
+            "output_dir": "artifacts/eval/example/quality",
+            "model": "raw",
+        }
+
+        with self.assertRaisesRegex(ValueError, "niqe_interval_epochs"):
+            g_loop._quality_eval_due_groups(payload, "stage1", 1)
 
     @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for loss weighting integration tests")
     def test_generator_training_step_fixed_loss_weighting_uses_config_weights(self) -> None:
@@ -187,11 +323,31 @@ class MediumV1GSupportTests(unittest.TestCase):
                 quality_eval = config["stages"]["stage1"]["quality_eval"]
 
                 self.assertIs(quality_eval["enabled"], True)
-                self.assertEqual(quality_eval["interval_epochs"], 1)
+                self.assertEqual(quality_eval["niqe_interval_epochs"], 1)
+                self.assertEqual(quality_eval["niqe_max_samples"], 512)
                 self.assertEqual(quality_eval["metrics"], ["niqe"])
                 self.assertNotIn("fid", quality_eval["metrics"])
                 self.assertNotIn("kid", quality_eval["metrics"])
                 g_loop._validate_train_g_config(config)
+
+    def test_medium_v1_stage1_long200_restart_config_uses_current_quality_schedule(self) -> None:
+        from safa.training import g_loop
+
+        path = Path("configs/medium_v1/train_g_medium_v1_stage1_long200.yaml")
+        config = yaml.safe_load(path.read_text(encoding="utf-8"))
+        quality_eval = config["stages"]["stage1"]["quality_eval"]
+
+        self.assertEqual(config["out_dir"], "artifacts/checkpoints/g_medium_v1_stage1_long200_v2")
+        self.assertEqual(config["resume_from"], "artifacts/checkpoints/g_medium_v1_stage1_long200/last.pt")
+        self.assertEqual(config["stages"]["stage1"]["epochs"], 200)
+        self.assertEqual(config["stages"]["stage2"]["epochs"], 0)
+        self.assertEqual(quality_eval["metrics"], ["niqe", "fid", "kid"])
+        self.assertEqual(quality_eval["niqe_interval_epochs"], 1)
+        self.assertEqual(quality_eval["distribution_interval_epochs"], 20)
+        self.assertEqual(quality_eval["niqe_max_samples"], 512)
+        self.assertEqual(quality_eval["distribution_max_samples"], 3969)
+        self.assertNotIn("generated_dir", quality_eval)
+        g_loop._validate_train_g_config(config)
 
     def test_medium_v1_stage2_m0_and_m1_configs_only_differ_in_loss_weighting_and_out_dir(self) -> None:
         from safa.training import g_loop
