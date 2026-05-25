@@ -12,6 +12,7 @@ from safa.models.e0 import assert_e0_frozen, freeze_e0, load_e0_checkpoint
 from safa.models.generator import FlowGeneratorConfig, build_generator
 from safa.training.audit import audit_no_identity_supervision
 from safa.training.losses import cosine_cycle_loss, normalize_for_e0
+from safa.training.multitask_loss import UncertaintyWeightedLoss
 from safa.training.transforms import generator_image_transform
 from safa.utils.device import assert_finite_tensor
 from safa.utils.distributed import (
@@ -38,8 +39,25 @@ class _GradientConflictConfig:
     interval: int | None = None
 
 
+@dataclass(frozen=True)
+class _LossWeightingRuntime:
+    type: str
+    flow_weight: float = 1.0
+    cycle_weight: float = 0.0
+    calibration_batches: int | None = None
+    log_var_lr: float | None = None
+    log_var_weight_decay: float | None = None
+
+
 class _GeneratorTrainingStep:
-    def __new__(cls, generator, e0, generator_config: FlowGeneratorConfig, sampling_seed: int):
+    def __new__(
+        cls,
+        generator,
+        e0,
+        generator_config: FlowGeneratorConfig,
+        sampling_seed: int,
+        loss_weighting: _LossWeightingRuntime | None = None,
+    ):
         from torch import nn
         schedule = generator_config.cycle_steps_schedule
 
@@ -50,17 +68,52 @@ class _GeneratorTrainingStep:
                 self.e0 = e0
                 self.generator_config = generator_config
                 self.sampling_seed = int(sampling_seed)
+                self.loss_weighting = loss_weighting if loss_weighting is not None else _LossWeightingRuntime(type="legacy")
+                self.uncertainty_loss = UncertaintyWeightedLoss(["flow", "cycle"]) if self.loss_weighting.type == "uncertainty" else None
                 self._schedule = schedule
                 self._batch_idx = 0
+                self.last_loss_metrics: dict[str, float | str] = {}
+                import torch
+
+                self.register_buffer("_flow_loss_initial", torch.tensor(float("nan"), dtype=torch.float64), persistent=True)
+                self.register_buffer("_cycle_loss_initial", torch.tensor(float("nan"), dtype=torch.float64), persistent=True)
 
             def reset_batch_idx(self):
                 self._batch_idx = 0
+
+            def configure_uncertainty_scales(self, *, flow_loss_initial: float, cycle_loss_initial: float) -> None:
+                if self.loss_weighting.type != "uncertainty":
+                    raise RuntimeError("configure_uncertainty_scales requires loss_weighting.type == 'uncertainty'")
+                _ensure_positive_finite_scale("flow_loss_initial", flow_loss_initial)
+                _ensure_positive_finite_scale("cycle_loss_initial", cycle_loss_initial)
+                self._flow_loss_initial.fill_(float(flow_loss_initial))
+                self._cycle_loss_initial.fill_(float(cycle_loss_initial))
+
+            def loss_weighting_checkpoint_state(self) -> dict:
+                state = {
+                    "type": self.loss_weighting.type,
+                    "flow_weight": self.loss_weighting.flow_weight,
+                    "cycle_weight": self.loss_weighting.cycle_weight,
+                }
+                if self.loss_weighting.type == "uncertainty":
+                    if self.uncertainty_loss is None:
+                        raise RuntimeError("uncertainty loss state requested before uncertainty_loss is initialized")
+                    state.update(
+                        {
+                            "task_names": list(self.uncertainty_loss.task_names),
+                            "initial_scales": {
+                                "flow": float(self._flow_loss_initial.detach().cpu()),
+                                "cycle": float(self._cycle_loss_initial.detach().cpu()),
+                            },
+                            "state_dict": self.uncertainty_loss.state_dict(),
+                        }
+                    )
+                return state
 
             def forward(self, images, z, sample_ids, use_cycle: bool, lambda_cycle: float):
                 import torch
                 flow_loss, flow_metrics = self.generator.flow_matching_loss(images, z)
                 cycle_loss = flow_loss.new_tensor(0.0)
-                loss = flow_loss
                 if use_cycle:
                     if self._schedule:
                         cycle_steps = self._schedule[self._batch_idx % len(self._schedule)]
@@ -84,11 +137,122 @@ class _GeneratorTrainingStep:
                     self.e0.eval()
                     e0_out = self.e0(normalize_for_e0(generated))
                     cycle_loss = cosine_cycle_loss(e0_out["embedding"], z)
-                    loss = flow_loss + float(lambda_cycle) * cycle_loss
                     self._batch_idx += 1
+                loss, loss_metrics = self._combine_losses(flow_loss, cycle_loss, use_cycle=use_cycle, lambda_cycle=lambda_cycle)
+                self.last_loss_metrics = loss_metrics
                 return loss, flow_metrics["flow_matching_mse"].detach(), cycle_loss.detach(), flow_loss, cycle_loss
 
+            def _combine_losses(self, flow_loss, cycle_loss, *, use_cycle: bool, lambda_cycle: float):
+                metrics = {
+                    "flow_loss_raw": float(flow_loss.detach().cpu()),
+                    "cycle_loss_raw": float(cycle_loss.detach().cpu()),
+                    "loss_weighting_type": self.loss_weighting.type,
+                }
+                if self.loss_weighting.type == "legacy":
+                    cycle_weight = float(lambda_cycle) if use_cycle else 0.0
+                    loss = flow_loss + cycle_weight * cycle_loss
+                    metrics.update(
+                        {
+                            "flow_loss_normalized": metrics["flow_loss_raw"],
+                            "cycle_loss_normalized": metrics["cycle_loss_raw"],
+                            "loss_weighting_flow_weight": 1.0,
+                            "loss_weighting_cycle_weight": cycle_weight,
+                        }
+                    )
+                    return loss, metrics
+                if self.loss_weighting.type == "fixed":
+                    flow_weight = float(self.loss_weighting.flow_weight)
+                    cycle_weight = float(self.loss_weighting.cycle_weight)
+                    loss = flow_weight * flow_loss + cycle_weight * cycle_loss
+                    metrics.update(
+                        {
+                            "flow_loss_normalized": metrics["flow_loss_raw"],
+                            "cycle_loss_normalized": metrics["cycle_loss_raw"],
+                            "loss_weighting_flow_weight": flow_weight,
+                            "loss_weighting_cycle_weight": cycle_weight,
+                        }
+                    )
+                    return loss, metrics
+                if self.loss_weighting.type != "uncertainty":
+                    raise RuntimeError(f"Unsupported loss_weighting.type {self.loss_weighting.type!r}")
+                if not use_cycle:
+                    raise RuntimeError("loss_weighting.type='uncertainty' requires cycle loss and can only run on Stage 2 batches")
+                if self.uncertainty_loss is None:
+                    raise RuntimeError("uncertainty_loss is not initialized")
+                flow_scale = float(self._flow_loss_initial.detach().cpu())
+                cycle_scale = float(self._cycle_loss_initial.detach().cpu())
+                _ensure_positive_finite_scale("flow_loss_initial", flow_scale)
+                _ensure_positive_finite_scale("cycle_loss_initial", cycle_scale)
+                normalized = {"flow": flow_loss / flow_scale, "cycle": cycle_loss / cycle_scale}
+                loss, uw_metrics = self.uncertainty_loss(normalized)
+                metrics.update(uw_metrics)
+                metrics.update(
+                    {
+                        "flow_loss_initial": flow_scale,
+                        "cycle_loss_initial": cycle_scale,
+                        "flow_loss_normalized": metrics["loss_weighting_uw_flow_normalized"],
+                        "cycle_loss_normalized": metrics["loss_weighting_uw_cycle_normalized"],
+                        "loss_weighting_flow_weight": 0.5 * metrics["loss_weighting_uw_flow_precision"] / flow_scale,
+                        "loss_weighting_cycle_weight": 0.5 * metrics["loss_weighting_uw_cycle_precision"] / cycle_scale,
+                    }
+                )
+                return loss, metrics
+
         return _Module()
+
+
+def _ensure_positive_finite_scale(name: str, value: float) -> None:
+    if not math.isfinite(float(value)) or float(value) <= 0.0:
+        raise RuntimeError(f"{name} must be positive and finite, got {value!r}")
+
+
+def _finalize_uncertainty_calibration(*, flow_sum: float, cycle_sum: float, batches: int) -> dict[str, float]:
+    if batches <= 0:
+        raise RuntimeError(f"calibration_batches produced no batches: {batches}")
+    flow_loss_initial = float(flow_sum) / float(batches)
+    cycle_loss_initial = float(cycle_sum) / float(batches)
+    _ensure_positive_finite_scale("flow_loss_initial", flow_loss_initial)
+    _ensure_positive_finite_scale("cycle_loss_initial", cycle_loss_initial)
+    return {"flow_loss_initial": flow_loss_initial, "cycle_loss_initial": cycle_loss_initial}
+
+
+def _loss_weighting_runtime_from_config(config: dict) -> _LossWeightingRuntime:
+    payload = config.get("loss_weighting")
+    if payload is None:
+        return _LossWeightingRuntime(type="legacy")
+    if not isinstance(payload, dict):
+        raise ValueError("loss_weighting must be a mapping")
+    loss_type = _require_field(payload, "type", "loss_weighting")
+    if loss_type == "fixed":
+        flow_weight = _require_numeric(payload, "flow_weight", "loss_weighting")
+        cycle_weight = _require_numeric(payload, "cycle_weight", "loss_weighting")
+        if flow_weight < 0.0:
+            raise ValueError(f"loss_weighting.flow_weight must be non-negative, got {flow_weight!r}")
+        if cycle_weight < 0.0:
+            raise ValueError(f"loss_weighting.cycle_weight must be non-negative, got {cycle_weight!r}")
+        return _LossWeightingRuntime(type="fixed", flow_weight=flow_weight, cycle_weight=cycle_weight)
+    if loss_type == "uncertainty":
+        calibration_batches = _require_positive_int(payload, "calibration_batches", "loss_weighting")
+        log_var_lr = _require_numeric(payload, "log_var_lr", "loss_weighting")
+        log_var_weight_decay = _require_numeric(payload, "log_var_weight_decay", "loss_weighting")
+        if log_var_lr <= 0.0:
+            raise ValueError(f"loss_weighting.log_var_lr must be positive, got {log_var_lr!r}")
+        if log_var_weight_decay < 0.0:
+            raise ValueError(f"loss_weighting.log_var_weight_decay must be non-negative, got {log_var_weight_decay!r}")
+        return _LossWeightingRuntime(
+            type="uncertainty",
+            calibration_batches=calibration_batches,
+            log_var_lr=log_var_lr,
+            log_var_weight_decay=log_var_weight_decay,
+        )
+    raise ValueError(f"loss_weighting.type must be 'fixed' or 'uncertainty', got {loss_type!r}")
+
+
+def _require_positive_int(config: dict, field: str, context: str) -> int:
+    value = _require_field(config, field, context)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{context}.{field} must be a positive integer, got {value!r}")
+    return int(value)
 
 
 def _verify_e0_feature_cache_consistency(config: dict) -> None:
@@ -106,6 +270,93 @@ def _verify_e0_feature_cache_consistency(config: dict) -> None:
             f"Feature cache manifest expects: {manifest.encoder_checkpoint_sha256}. "
             f"Regenerate the feature cache with the current E0 checkpoint."
         )
+
+
+def _optimizer_param_groups(training_module, config: dict, loss_weighting: _LossWeightingRuntime) -> list[dict]:
+    groups = [
+        {
+            "params": training_module.generator.parameters(),
+            "lr": float(config["learning_rate"]),
+            "weight_decay": float(config["weight_decay"]),
+        }
+    ]
+    if loss_weighting.type == "uncertainty":
+        if training_module.uncertainty_loss is None:
+            raise RuntimeError("loss_weighting.type='uncertainty' requires uncertainty_loss parameters")
+        groups.append(
+            {
+                "params": training_module.uncertainty_loss.parameters(),
+                "lr": float(loss_weighting.log_var_lr),
+                "weight_decay": float(loss_weighting.log_var_weight_decay),
+            }
+        )
+    return groups
+
+
+def _stage2_lambda_schedule(stages: dict, loss_weighting: _LossWeightingRuntime) -> tuple[float, float, float]:
+    stage2 = stages["stage2"]
+    if loss_weighting.type == "legacy":
+        return (
+            float(_require_numeric(stage2, "lambda_initial", "stages.stage2")),
+            float(_require_numeric(stage2, "lambda_max", "stages.stage2")),
+            float(_require_numeric(stage2, "lambda_growth", "stages.stage2")),
+        )
+    if loss_weighting.type == "fixed":
+        cycle_weight = float(loss_weighting.cycle_weight)
+        return cycle_weight, cycle_weight, 0.0
+    return 0.0, 0.0, 0.0
+
+
+def _calibrate_uncertainty_loss(
+    training_module,
+    train_loader,
+    device,
+    *,
+    use_amp: bool,
+    calibration_batches: int,
+    distributed: DistributedContext,
+) -> None:
+    import torch
+
+    if calibration_batches <= 0:
+        raise RuntimeError(f"loss_weighting.calibration_batches must be positive, got {calibration_batches!r}")
+    was_training = training_module.training
+    training_module.eval()
+    training_module.reset_batch_idx()
+    training_module.configure_uncertainty_scales(flow_loss_initial=1.0, cycle_loss_initial=1.0)
+    flow_sum = 0.0
+    cycle_sum = 0.0
+    batches = 0
+    amp_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if use_amp else nullcontext()
+    with torch.no_grad():
+        for batch_index, batch in enumerate(train_loader):
+            if batch_index >= calibration_batches:
+                break
+            images = batch["image"].to(device, non_blocking=True)
+            z = batch["z"].to(device, non_blocking=True)
+            sample_ids = list(batch["sample_id"])
+            with amp_ctx:
+                _, _, _, flow_loss, cycle_loss = training_module(images, z, sample_ids, True, 0.0)
+            flow_value = float(flow_loss.detach().cpu())
+            cycle_value = float(cycle_loss.detach().cpu())
+            _ensure_positive_finite_scale("flow_loss_initial", flow_value)
+            _ensure_positive_finite_scale("cycle_loss_initial", cycle_value)
+            flow_sum += flow_value
+            cycle_sum += cycle_value
+            batches += 1
+    if distributed.enabled:
+        import torch.distributed as dist
+
+        values = torch.tensor([flow_sum, cycle_sum, float(batches)], device=device, dtype=torch.float64)
+        dist.all_reduce(values, op=dist.ReduceOp.SUM)
+        flow_sum = float(values[0].item())
+        cycle_sum = float(values[1].item())
+        batches = int(values[2].item())
+    scales = _finalize_uncertainty_calibration(flow_sum=flow_sum, cycle_sum=cycle_sum, batches=batches)
+    training_module.configure_uncertainty_scales(**scales)
+    training_module.reset_batch_idx()
+    if was_training:
+        training_module.train()
 
 
 def train_g_from_config(config: dict) -> dict:
@@ -141,6 +392,7 @@ def train_g_from_config(config: dict) -> dict:
     stages = _stage_config(config)
     ema_config = _ema_config(config)
     best_model = _best_model(config, ema_config)
+    loss_weighting_runtime = _loss_weighting_runtime_from_config(config)
     sampling_seed = sampling_base_seed_from_config(config)
     generator = build_generator(generator_config.to_dict()).to(device)
     resume_history = None
@@ -174,11 +426,7 @@ def train_g_from_config(config: dict) -> dict:
         ema = ExponentialMovingAverage(generator, decay=float(ema_config["decay"]))
         if resume_ema_state_dict is not None:
             ema.load_state_dict(resume_ema_state_dict)
-    training_module = _GeneratorTrainingStep(generator, e0, generator_config, sampling_seed).to(device)
-    if distributed.enabled:
-        training_module = DistributedDataParallel(training_module, device_ids=[distributed.local_rank], output_device=distributed.local_rank)
-    optimizer = torch.optim.AdamW(unwrap_model(training_module).generator.parameters(), lr=float(config["learning_rate"]), weight_decay=float(config["weight_decay"]))
-    assert_e0_frozen(e0, optimizer)
+    training_module = _GeneratorTrainingStep(generator, e0, generator_config, sampling_seed, loss_weighting_runtime).to(device)
     set_seed(int(config["seed"]) + distributed.rank)
 
     _verify_e0_feature_cache_consistency(config)
@@ -213,9 +461,22 @@ def train_g_from_config(config: dict) -> dict:
     validation_loader = _build_validation_loader(config) if distributed.is_main else None
     detector = _build_detector(config, str(device)) if distributed.is_main else None
     gradient_conflict_config = _stage2_gradient_conflict_config(stages)
-    lambda_cycle = float(stages["stage2"]["lambda_initial"])
-    lambda_max = float(stages["stage2"]["lambda_max"])
-    lambda_growth = float(stages["stage2"]["lambda_growth"])
+    if loss_weighting_runtime.type == "uncertainty":
+        _calibrate_uncertainty_loss(
+            training_module,
+            train_loader,
+            device,
+            use_amp=use_amp,
+            calibration_batches=int(loss_weighting_runtime.calibration_batches),
+            distributed=distributed,
+        )
+    if distributed.enabled:
+        training_module = DistributedDataParallel(training_module, device_ids=[distributed.local_rank], output_device=distributed.local_rank)
+    optimizer = torch.optim.AdamW(
+        _optimizer_param_groups(unwrap_model(training_module), config, loss_weighting_runtime),
+    )
+    assert_e0_frozen(e0, optimizer)
+    lambda_cycle, lambda_max, lambda_growth = _stage2_lambda_schedule(stages, loss_weighting_runtime)
     baseline_detection_rate = None
     best_checkpoint = out_dir / "best.pt"
     history: list[dict] = resume_history if resume_history is not None else []
@@ -259,6 +520,7 @@ def train_g_from_config(config: dict) -> dict:
                 "weighted_gradient_norm_cycle": 0.0,
                 "weighted_gradient_ratio_cycle_to_fm": 0.0,
                 "gradient_conflict_samples": [],
+                "extra_metric_sums": {},
             }
             seen = 0
             for batch_index, batch in enumerate(tqdm(train_loader, desc=f"train_g {stage_name} epoch={stage_epoch}", disable=not distributed.is_main)):
@@ -270,12 +532,17 @@ def train_g_from_config(config: dict) -> dict:
                 with amp_ctx:
                     loss, flow_mse, cycle, flow_loss, cycle_loss = training_module(images, z, sample_ids, stage_name == "stage2", lambda_cycle)
                 _assert_finite_training_scalars(loss, flow_mse, cycle)
+                batch_size = int(z.shape[0])
+                _accumulate_extra_loss_metrics(totals, unwrap_model(training_module).last_loss_metrics, batch_size)
                 if _should_record_gradient_conflict(stage_name, batch_index, gradient_conflict_config):
+                    gradient_cycle_weight = float(
+                        unwrap_model(training_module).last_loss_metrics.get("loss_weighting_cycle_weight", lambda_cycle)
+                    )
                     gradient_metrics = _compute_gradient_conflict_metrics(
                         flow_loss,
                         cycle_loss,
                         unwrap_model(training_module).generator.parameters(),
-                        lambda_cycle=lambda_cycle,
+                        lambda_cycle=gradient_cycle_weight,
                     )
                     totals["gradient_conflict_count"] += 1.0
                     totals["gradient_cosine_fm_cycle"] += gradient_metrics["gradient_cosine_fm_cycle"]
@@ -296,7 +563,6 @@ def train_g_from_config(config: dict) -> dict:
                 optimizer.step()
                 if ema is not None:
                     ema.update(unwrap_model(training_module).generator)
-                batch_size = int(z.shape[0])
                 seen += batch_size
                 totals["loss"] += float(loss.detach().cpu()) * batch_size
                 totals["flow_matching_mse"] += float(flow_mse.cpu()) * batch_size
@@ -306,7 +572,7 @@ def train_g_from_config(config: dict) -> dict:
             metrics = _reduce_epoch_metrics(totals, seen, device, distributed)
             should_break = False
             if distributed.is_main:
-                metrics.update({"stage": stage_name, "stage_epoch": stage_epoch, "lambda_cycle": lambda_cycle})
+                metrics.update({"stage": stage_name, "stage_epoch": stage_epoch, "lambda_cycle": lambda_cycle, "loss_weighting_type": loss_weighting_runtime.type})
                 raw_validation_metrics, ema_validation_metrics = _evaluate_validation_variants(
                     unwrap_model(training_module).generator,
                     ema,
@@ -320,6 +586,7 @@ def train_g_from_config(config: dict) -> dict:
                     ema_config=ema_config,
                 )
                 _attach_validation_metrics(metrics, raw_validation_metrics, ema_validation_metrics)
+                metrics.update(_run_quality_eval_hook(config, stage_name, stage_epoch))
                 if stage_name == "stage1" and raw_validation_metrics is not None and raw_validation_metrics.get("face_detection_rate") is not None:
                     baseline_detection_rate = raw_validation_metrics["face_detection_rate"]
                     threshold = float(stages["stage1"]["face_detection_threshold"])
@@ -342,14 +609,20 @@ def train_g_from_config(config: dict) -> dict:
                     "metrics_ema": ema_validation_metrics,
                     "ema_config": ema_config,
                     "best_model": best_model,
+                    "loss_weighting_state": unwrap_model(training_module).loss_weighting_checkpoint_state(),
                 }
                 _save_generator(out_dir / "last.pt", unwrap_model(training_module).generator, generator_config, config, metrics, history, **checkpoint_kwargs)
                 _write_json(out_dir / "last_metrics.json", metrics)
                 stage_best_path = out_dir / f"best_{stage_name}.pt"
                 if _is_better(metrics, history[:-1], best_model=best_model):
                     _save_generator(stage_best_path, unwrap_model(training_module).generator, generator_config, config, metrics, history, **checkpoint_kwargs)
+                    if stage_name == "stage1":
+                        _save_generator(out_dir / "best_single_face.pt", unwrap_model(training_module).generator, generator_config, config, metrics, history, **checkpoint_kwargs)
                 if _is_better_overall(metrics, history[:-1], best_model=best_model):
                     _save_generator(best_checkpoint, unwrap_model(training_module).generator, generator_config, config, metrics, history, **checkpoint_kwargs)
+                if stage_name == "stage2":
+                    for filename in _stage2_checkpoint_filenames_to_save(metrics, history[:-1]):
+                        _save_generator(out_dir / filename, unwrap_model(training_module).generator, generator_config, config, metrics, history, **checkpoint_kwargs)
                 should_break = stage_name == "stage1" and stage1_stable_hits >= int(stages["stage1"]["stable_epochs"])
             lambda_cycle, baseline_detection_rate, stage1_stable_hits, should_break = _sync_epoch_control(
                 lambda_cycle,
@@ -442,6 +715,7 @@ def _reduce_epoch_metrics(totals: dict, seen: int, device, distributed: Distribu
         "cycle": float(values[2].item() / total_seen),
         "grad_norm": float(values[3].item() / total_seen),
     }
+    metrics.update(_reduce_extra_epoch_metrics(totals.get("extra_metric_sums", {}), total_seen, device, distributed))
     gradient_conflict_count = float(values[5].item())
     if gradient_conflict_count > 0.0:
         gradient_samples = _gather_gradient_conflict_samples(totals.get("gradient_conflict_samples", []), distributed)
@@ -462,6 +736,36 @@ def _reduce_epoch_metrics(totals: dict, seen: int, device, distributed: Distribu
             }
         )
     return metrics
+
+
+def _accumulate_extra_loss_metrics(totals: dict, metrics: dict, batch_size: int) -> None:
+    extra = totals.setdefault("extra_metric_sums", {})
+    for key, value in metrics.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            raise RuntimeError(f"Loss metric {key} is not finite")
+        extra[key] = float(extra.get(key, 0.0)) + numeric * batch_size
+
+
+def _reduce_extra_epoch_metrics(extra_sums: dict, total_seen: float, device, distributed: DistributedContext) -> dict:
+    if not extra_sums:
+        return {}
+    import torch
+
+    names = sorted(extra_sums)
+    values = torch.tensor([float(extra_sums[name]) for name in names], device=device, dtype=torch.float64)
+    if distributed.enabled:
+        import torch.distributed as dist
+
+        dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    output = {}
+    for index, name in enumerate(names):
+        if not bool(torch.isfinite(values[index]).item()):
+            raise RuntimeError(f"Epoch metric {name} is not finite")
+        output[name] = float(values[index].item() / total_seen)
+    return output
 
 
 def _gather_gradient_conflict_samples(samples: list[dict], distributed: DistributedContext) -> list[dict]:
@@ -632,6 +936,13 @@ def _validate_train_g_config(config: dict) -> None:
     stages = _stage_config(config)
     ema_config = _ema_config(config)
     _best_model(config, ema_config)
+    loss_weighting = _loss_weighting_runtime_from_config(config)
+    if loss_weighting.type == "uncertainty":
+        if int(_require_field(stages["stage1"], "epochs", "stages.stage1")) != 0:
+            raise ValueError("loss_weighting.type='uncertainty' requires stages.stage1.epochs == 0")
+        if int(_require_field(stages["stage2"], "epochs", "stages.stage2")) <= 0:
+            raise ValueError("loss_weighting.type='uncertainty' requires stages.stage2.epochs > 0")
+    _stage2_lambda_schedule(stages, loss_weighting)
     _validate_stage1_gate_config(stages["stage1"])
     _stage2_gradient_conflict_config(stages)
     _validate_validation_block(config)
@@ -1007,6 +1318,106 @@ def _attach_validation_metrics(metrics: dict, raw_metrics: dict | None, ema_metr
         metrics.update({f"validation_ema_{key}": value for key, value in ema_metrics.items()})
 
 
+def _evaluate_generation_quality(**kwargs):
+    from scripts.eval_generation_quality import evaluate_generation_quality
+
+    return evaluate_generation_quality(**kwargs)
+
+
+def _run_quality_eval_hook(config: dict, stage_name: str, stage_epoch: int) -> dict[str, float]:
+    stages = config.get("stages")
+    if not isinstance(stages, dict):
+        return {}
+    stage = stages.get(stage_name)
+    if not isinstance(stage, dict):
+        return {}
+    payload = stage.get("quality_eval")
+    if payload is None:
+        return {}
+    if not isinstance(payload, dict):
+        raise ValueError(f"stages.{stage_name}.quality_eval must be a mapping")
+    enabled = payload.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError(f"stages.{stage_name}.quality_eval.enabled must be true or false")
+    if not enabled:
+        return {}
+    interval = _require_positive_int(payload, "interval", f"stages.{stage_name}.quality_eval")
+    epoch_number = int(stage_epoch) + 1
+    if epoch_number % interval != 0:
+        return {}
+    real_index = Path(str(_require_field(payload, "real_index", f"stages.{stage_name}.quality_eval")))
+    output_dir = Path(str(_require_field(payload, "output_dir", f"stages.{stage_name}.quality_eval")))
+    iqa_method = str(payload.get("iqa_method", "niqe"))
+    variants = _quality_eval_variants(payload, stage_name)
+    metrics: dict[str, float] = {}
+    for model_name, generated_dir, output_path in variants:
+        result = _evaluate_generation_quality(
+            real_index=real_index,
+            generated_dir=generated_dir,
+            output=output_path if output_path is not None else output_dir / f"{stage_name}_epoch_{epoch_number:04d}_{model_name}.json",
+            iqa_method=iqa_method,
+        )
+        metrics.update(_quality_payload_to_metrics(result, model_name))
+    return metrics
+
+
+def _quality_eval_variants(payload: dict, stage_name: str) -> list[tuple[str, Path, Path | None]]:
+    variants = payload.get("variants")
+    if variants is not None:
+        if not isinstance(variants, dict) or not variants:
+            raise ValueError(f"stages.{stage_name}.quality_eval.variants must be a non-empty mapping")
+        parsed = []
+        for model_name, variant_payload in variants.items():
+            if model_name not in ("raw", "ema"):
+                raise ValueError(f"stages.{stage_name}.quality_eval variant must be raw or ema, got {model_name!r}")
+            if not isinstance(variant_payload, dict):
+                raise ValueError(f"stages.{stage_name}.quality_eval.variants.{model_name} must be a mapping")
+            generated_dir = Path(str(_require_field(variant_payload, "generated_dir", f"stages.{stage_name}.quality_eval.variants.{model_name}")))
+            output = Path(str(variant_payload["output"])) if "output" in variant_payload else None
+            parsed.append((str(model_name), generated_dir, output))
+        return parsed
+    model_name = str(payload.get("model", "raw"))
+    if model_name not in ("raw", "ema"):
+        raise ValueError(f"stages.{stage_name}.quality_eval.model must be raw or ema, got {model_name!r}")
+    generated_dir = Path(str(_require_field(payload, "generated_dir", f"stages.{stage_name}.quality_eval")))
+    output = Path(str(payload["output"])) if "output" in payload else None
+    return [(model_name, generated_dir, output)]
+
+
+def _quality_payload_to_metrics(payload: dict, model_name: str) -> dict[str, float]:
+    fid = _finite_quality_value(payload, "fid")
+    kid_mean = _finite_quality_value(payload, "kid_mean")
+    kid_std = _finite_quality_value(payload, "kid_std")
+    iqa = payload.get("iqa")
+    if not isinstance(iqa, dict):
+        raise ValueError("quality_eval payload missing iqa metrics")
+    method = str(iqa.get("method", ""))
+    if method.lower() != "niqe":
+        raise ValueError(f"quality_eval iqa.method must be niqe for medium_v1 checkpoints, got {method!r}")
+    niqe = _finite_quality_value(iqa, "mean")
+    return {
+        f"quality_{model_name}_fid": fid,
+        f"quality_{model_name}_kid_mean": kid_mean,
+        f"quality_{model_name}_kid_std": kid_std,
+        f"quality_{model_name}_niqe": niqe,
+    }
+
+
+def _finite_quality_value(payload: dict, field: str) -> float:
+    if field not in payload:
+        raise ValueError(f"quality_eval payload missing {field}")
+    value = payload[field]
+    if isinstance(value, bool):
+        raise ValueError(f"quality_eval {field} must be numeric, got bool")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"quality_eval {field} must be numeric, got {value!r}") from exc
+    if not math.isfinite(numeric):
+        raise ValueError(f"quality_eval {field} must be finite, got {value!r}")
+    return numeric
+
+
 def _evaluate_validation(generator, e0, loader, detector, device, generator_config: FlowGeneratorConfig, *, sampling_seed: int, use_amp: bool = False) -> dict:
     if loader is None:
         return {}
@@ -1059,6 +1470,79 @@ def _composite_score(item: dict, best_model: str = "raw") -> float:
     cosine = item[_checkpoint_metric_field(item, "latent_cosine_mean", best_model)]
     single_face = item[_checkpoint_metric_field(item, "single_face_eq1_rate", best_model)]
     return cosine * single_face
+
+
+def _stage2_checkpoint_filenames_to_save(metrics: dict, previous: list[dict]) -> list[str]:
+    if metrics.get("stage") != "stage2":
+        return []
+    filenames = []
+    for model_name in ("raw", "ema"):
+        if _has_utility_metrics(metrics, model_name) and _is_better_utility_for_model(metrics, previous, model_name):
+            filenames.append(f"best_{model_name}_utility.pt")
+        if _has_quality_metrics(metrics, model_name) and _is_better_quality_for_model(metrics, previous, model_name):
+            filenames.append(f"best_{model_name}_quality.pt")
+    return filenames
+
+
+def _has_utility_metrics(item: dict, model_name: str) -> bool:
+    try:
+        _checkpoint_metric_field(item, "latent_cosine_mean", model_name)
+        _checkpoint_metric_field(item, "single_face_eq1_rate", model_name)
+    except KeyError:
+        return False
+    return True
+
+
+def _utility_score_for_model(item: dict, model_name: str) -> float:
+    cosine = _finite_metric_value(item, _checkpoint_metric_field(item, "latent_cosine_mean", model_name), "utility checkpoint metrics")
+    single_face = _finite_metric_value(item, _checkpoint_metric_field(item, "single_face_eq1_rate", model_name), "utility checkpoint metrics")
+    return cosine * single_face
+
+
+def _is_better_utility_for_model(metrics: dict, previous: list[dict], model_name: str) -> bool:
+    current_score = _utility_score_for_model(metrics, model_name)
+    candidates = [item for item in previous if item.get("stage") == "stage2" and _has_utility_metrics(item, model_name)]
+    if not candidates:
+        return True
+    best = max(candidates, key=lambda item: (_utility_score_for_model(item, model_name), -float(item["loss"])))
+    return (current_score, -float(metrics["loss"])) > (_utility_score_for_model(best, model_name), -float(best["loss"]))
+
+
+def _has_quality_metrics(item: dict, model_name: str) -> bool:
+    return all(f"quality_{model_name}_{field}" in item for field in ("fid", "kid_mean", "niqe"))
+
+
+def _quality_tuple_for_model(item: dict, model_name: str) -> tuple[float, float, float, float]:
+    context = f"quality {model_name} checkpoint metrics"
+    fid = _finite_metric_value(item, f"quality_{model_name}_fid", context)
+    kid = _finite_metric_value(item, f"quality_{model_name}_kid_mean", context)
+    niqe = _finite_metric_value(item, f"quality_{model_name}_niqe", context)
+    loss = _finite_metric_value(item, "loss", context)
+    return fid, kid, niqe, loss
+
+
+def _is_better_quality_for_model(metrics: dict, previous: list[dict], model_name: str) -> bool:
+    current = _quality_tuple_for_model(metrics, model_name)
+    candidates = [item for item in previous if item.get("stage") == "stage2" and _has_quality_metrics(item, model_name)]
+    if not candidates:
+        return True
+    best = min(candidates, key=lambda item: _quality_tuple_for_model(item, model_name))
+    return current < _quality_tuple_for_model(best, model_name)
+
+
+def _finite_metric_value(item: dict, field: str, context: str) -> float:
+    if field not in item:
+        raise ValueError(f"{context}.{field} is required")
+    value = item[field]
+    if isinstance(value, bool):
+        raise ValueError(f"{context}.{field} must be numeric, got bool")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{context}.{field} must be numeric, got {value!r}") from exc
+    if not math.isfinite(numeric):
+        raise ValueError(f"{context}.{field} must be finite, got {value!r}")
+    return numeric
 
 
 def _checkpoint_metric_field(item: dict, metric_name: str, best_model: str) -> str:
@@ -1146,6 +1630,7 @@ def _save_generator(
     metrics_ema: dict | None = None,
     ema_config: dict | None = None,
     best_model: str | None = None,
+    loss_weighting_state: dict | None = None,
 ) -> None:
     import torch
 
@@ -1164,6 +1649,8 @@ def _save_generator(
         "ema": ema_config,
         "best_model": best_model,
     }
+    if "loss_weighting" in train_config:
+        training_config["loss_weighting"] = train_config["loss_weighting"]
     if "resume_from_legacy_stage1_metrics" in train_config:
         training_config["resume_from_legacy_stage1_metrics"] = train_config["resume_from_legacy_stage1_metrics"]
     if "seed" in train_config and train_config["seed"] is not None:
@@ -1186,6 +1673,8 @@ def _save_generator(
         "history": history,
         "training_config": training_config,
     }
+    if loss_weighting_state is not None:
+        payload["loss_weighting_state"] = loss_weighting_state
     if ema_config["enabled"] and ema_config["save_ema_checkpoint"]:
         payload["ema_model_state_dict"] = ema_model_state_dict
     sampling_seed = optional_sampling_base_seed_from_config(train_config)
