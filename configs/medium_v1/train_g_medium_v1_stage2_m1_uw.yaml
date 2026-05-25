@@ -9,7 +9,7 @@ weight_decay: 0.0
 image_size: 224
 embedding_dim: 512
 train_index: data/index/train_balanced_medium.jsonl
-train_features: artifacts/e0_features/train_balanced_medium
+train_features: artifacts/e0_features/train_balanced_medium_e0_medium_v1
 e0_checkpoint: artifacts/checkpoints/e0_medium_v1/best.pt
 out_dir: artifacts/checkpoints/g_medium_v1_stage2_m1_uw
 resume_from: artifacts/checkpoints/g_medium_v1_stage1_m0/best_single_face.pt
@@ -62,7 +62,7 @@ stages:
 validation:
   enabled: true
   index: data/index/val_single_face.jsonl
-  features: artifacts/e0_features/val_single_face
+  features: artifacts/e0_features/val_single_face_e0_medium_v1
   max_samples: 512
   batch_size: 16
   face_detection:

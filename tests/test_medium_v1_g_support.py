@@ -154,6 +154,25 @@ class MediumV1GSupportTests(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 load_medium_v1_history(Path(tmp) / "missing.json")
 
+    def test_medium_v1_g_configs_use_e0_medium_cache_and_checkpoint(self) -> None:
+        expected_train_features = "artifacts/e0_features/train_balanced_medium_e0_medium_v1"
+        expected_validation_features = "artifacts/e0_features/val_single_face_e0_medium_v1"
+        expected_e0_checkpoint = "artifacts/checkpoints/e0_medium_v1/best.pt"
+        config_paths = (
+            Path("configs/medium_v1/train_g_medium_v1_stage1.yaml"),
+            Path("configs/medium_v1/train_g_medium_v1_stage2_m0.yaml"),
+            Path("configs/medium_v1/train_g_medium_v1_stage2_m1_uw.yaml"),
+        )
+
+        for path in config_paths:
+            with self.subTest(path=str(path)):
+                self.assertTrue(path.is_file())
+                config = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+                self.assertEqual(config["train_features"], expected_train_features)
+                self.assertEqual(config["validation"]["features"], expected_validation_features)
+                self.assertEqual(config["e0_checkpoint"], expected_e0_checkpoint)
+
     def test_medium_v1_stage2_m0_and_m1_configs_only_differ_in_loss_weighting_and_out_dir(self) -> None:
         from safa.training import g_loop
 
