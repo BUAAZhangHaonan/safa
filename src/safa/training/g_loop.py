@@ -34,7 +34,6 @@ _init_distributed = init_distributed
 
 _SAFA_PACKAGE_DIR = Path(__file__).resolve().parents[1]
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_QUALITY_DISTRIBUTION_MAX_SAMPLES = 3969
 DEFAULT_NO_IDENTITY_SOURCE_PATHS = (Path(__file__).resolve().parent, _SAFA_PACKAGE_DIR / "models")
 
 
@@ -169,12 +168,13 @@ class _GeneratorTrainingStep:
                             "cycle_loss_normalized": metrics["cycle_loss_raw"],
                             "loss_weighting_flow_weight": 1.0,
                             "loss_weighting_cycle_weight": cycle_weight,
+                            "effective_cycle_loss_weight": cycle_weight,
                         }
                     )
                     return loss, metrics
                 if self.loss_weighting.type == "fixed":
                     flow_weight = float(self.loss_weighting.flow_weight)
-                    cycle_weight = float(self.loss_weighting.cycle_weight)
+                    cycle_weight = float(self.loss_weighting.cycle_weight) if use_cycle else 0.0
                     loss = flow_weight * flow_loss + cycle_weight * cycle_loss
                     metrics.update(
                         {
@@ -182,6 +182,7 @@ class _GeneratorTrainingStep:
                             "cycle_loss_normalized": metrics["cycle_loss_raw"],
                             "loss_weighting_flow_weight": flow_weight,
                             "loss_weighting_cycle_weight": cycle_weight,
+                            "effective_cycle_loss_weight": cycle_weight,
                         }
                     )
                     return loss, metrics
@@ -206,6 +207,7 @@ class _GeneratorTrainingStep:
                         "cycle_loss_normalized": metrics["loss_weighting_uw_cycle_normalized"],
                         "loss_weighting_flow_weight": 0.5 * metrics["loss_weighting_uw_flow_precision"] / flow_scale,
                         "loss_weighting_cycle_weight": 0.5 * metrics["loss_weighting_uw_cycle_precision"] / cycle_scale,
+                        "effective_cycle_loss_weight": 0.5 * metrics["loss_weighting_uw_cycle_precision"] / cycle_scale,
                     }
                 )
                 return loss, metrics
@@ -584,7 +586,20 @@ def train_g_from_config(config: dict) -> dict:
             metrics = _reduce_epoch_metrics(totals, seen, device, distributed)
             should_break = False
             if distributed.is_main:
-                metrics.update({"stage": stage_name, "stage_epoch": stage_epoch, "lambda_cycle": lambda_cycle, "loss_weighting_type": loss_weighting_runtime.type})
+                effective_cycle_loss_weight = _finite_metric_value(metrics, "effective_cycle_loss_weight", "epoch metrics")
+                metrics.update(
+                    {
+                        "stage": stage_name,
+                        "stage_epoch": stage_epoch,
+                        "stage_epoch_0based": stage_epoch,
+                        "stage_epoch_1based": stage_epoch + 1,
+                        "lambda_cycle": effective_cycle_loss_weight,
+                        "effective_cycle_loss_weight": effective_cycle_loss_weight,
+                        "loss_weighting_type": loss_weighting_runtime.type,
+                    }
+                )
+                if loss_weighting_runtime.type == "uncertainty":
+                    metrics["lambda_cycle_legacy_schedule"] = lambda_cycle
                 raw_validation_metrics, ema_validation_metrics = _evaluate_validation_variants(
                     unwrap_model(training_module).generator,
                     ema,
@@ -612,8 +627,8 @@ def train_g_from_config(config: dict) -> dict:
                         ema_config=ema_config,
                     )
                 )
-                if stage_name == "stage1" and raw_validation_metrics is not None and raw_validation_metrics.get("face_detection_rate") is not None:
-                    baseline_detection_rate = raw_validation_metrics["face_detection_rate"]
+                if stage_name == "stage1" and raw_validation_metrics is not None and raw_validation_metrics.get("face_detect_ge1_rate") is not None:
+                    baseline_detection_rate = raw_validation_metrics["face_detect_ge1_rate"]
                     threshold = float(stages["stage1"]["face_detection_threshold"])
                     stable_epochs = int(stages["stage1"]["stable_epochs"])
                     if baseline_detection_rate >= threshold:
@@ -1093,9 +1108,7 @@ def _validate_quality_eval_configs(config: dict, stages: dict) -> None:
             continue
         if not isinstance(payload, dict):
             raise ValueError(f"stages.{stage_name}.quality_eval must be a mapping")
-        enabled = payload.get("enabled", False)
-        if not isinstance(enabled, bool):
-            raise ValueError(f"stages.{stage_name}.quality_eval.enabled must be true or false")
+        enabled = _quality_eval_enabled(payload, stage_name)
         if not enabled:
             continue
         _require_field(payload, "output_dir", f"stages.{stage_name}.quality_eval")
@@ -1283,7 +1296,7 @@ def _assert_stage1_gate_allows_stage2(stages: dict, stable_hits: int, detection_
     if stable_hits < stable_epochs:
         raise RuntimeError(
             "Stage 2 is blocked because Stage 1 face detection gate failed: "
-            f"face_detection_rate={detection_rate}, threshold={threshold}, "
+            f"face_detect_ge1_rate={detection_rate}, threshold={threshold}, "
             f"stable_hits={stable_hits}, required_stable_epochs={stable_epochs}"
         )
 
@@ -1392,6 +1405,7 @@ def _evaluate_generation_quality_subprocess(
     subset_seed: int,
     device: str,
     cuda_visible_devices: str | None,
+    timeout_seconds: int,
 ) -> dict:
     script_path = _REPO_ROOT / "scripts" / "eval_generation_quality.py"
     if output.exists():
@@ -1437,13 +1451,19 @@ def _evaluate_generation_quality_subprocess(
     ):
         env.pop(name, None)
 
-    completed = subprocess.run(
-        command,
-        cwd=str(_REPO_ROOT),
-        env=env,
-        text=True,
-        capture_output=True,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(_REPO_ROOT),
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=int(timeout_seconds),
+        )
+    except subprocess.TimeoutExpired as exc:
+        details = _subprocess_output_details(exc.stderr, exc.stdout)
+        suffix = f": {details}" if details else ""
+        raise RuntimeError(f"quality_eval distribution subprocess timed out after {int(timeout_seconds)} seconds{suffix}") from exc
     if completed.returncode != 0:
         details = "\n".join(part for part in (completed.stderr.strip(), completed.stdout.strip()) if part)
         suffix = f": {details}" if details else ""
@@ -1457,6 +1477,21 @@ def _evaluate_generation_quality_subprocess(
     if not isinstance(payload, dict):
         raise ValueError(f"quality_eval distribution subprocess JSON must be an object: {output}")
     return payload
+
+
+def _subprocess_output_details(stderr, stdout) -> str:
+    parts = []
+    for value in (stderr, stdout):
+        if value is None:
+            continue
+        if isinstance(value, bytes):
+            text = value.decode("utf-8", errors="replace")
+        else:
+            text = str(value)
+        text = text.strip()
+        if text:
+            parts.append(text)
+    return "\n".join(parts)
 
 
 def _run_quality_eval_hook(
@@ -1483,9 +1518,7 @@ def _run_quality_eval_hook(
         return {}
     if not isinstance(payload, dict):
         raise ValueError(f"stages.{stage_name}.quality_eval must be a mapping")
-    enabled = payload.get("enabled", False)
-    if not isinstance(enabled, bool):
-        raise ValueError(f"stages.{stage_name}.quality_eval.enabled must be true or false")
+    enabled = _quality_eval_enabled(payload, stage_name)
     if not enabled:
         return {}
     epoch_number = int(stage_epoch) + 1
@@ -1503,6 +1536,11 @@ def _run_quality_eval_hook(
     subset_seed = int(payload.get("subset_seed", sampling_seed))
     quality_device = str(payload.get("device", device))
     distribution_device = str(payload.get("distribution_device", payload.get("device", "auto")))
+    distribution_timeout_seconds = (
+        _quality_eval_distribution_timeout_seconds(payload, f"stages.{stage_name}.quality_eval")
+        if any(_quality_eval_needs_real_index(group.metrics) for group in groups)
+        else None
+    )
     distribution_cuda_visible_devices = payload.get("distribution_cuda_visible_devices")
     if distribution_cuda_visible_devices is not None:
         distribution_cuda_visible_devices = str(distribution_cuda_visible_devices)
@@ -1553,6 +1591,7 @@ def _run_quality_eval_hook(
                     **eval_kwargs,
                     device=distribution_device,
                     cuda_visible_devices=distribution_cuda_visible_devices,
+                    timeout_seconds=distribution_timeout_seconds,
                 )
             else:
                 result = _evaluate_generation_quality(
@@ -1589,6 +1628,7 @@ def _quality_eval_due_groups(payload: dict, stage_name: str, epoch_number: int) 
     if distribution_metrics:
         interval = _require_positive_int(payload, "distribution_interval_epochs", context)
         max_samples = _quality_eval_distribution_max_samples(payload, context)
+        _quality_eval_distribution_timeout_seconds(payload, context)
         _require_field(payload, "real_index", context)
         if epoch_number % interval == 0:
             groups.append(_QualityEvalGroup("distribution", distribution_metrics, max_samples))
@@ -1597,8 +1637,23 @@ def _quality_eval_due_groups(payload: dict, stage_name: str, epoch_number: int) 
 
 def _quality_eval_distribution_max_samples(payload: dict, context: str) -> int:
     if "distribution_max_samples" not in payload:
-        return DEFAULT_QUALITY_DISTRIBUTION_MAX_SAMPLES
+        raise ValueError(f"{context}.distribution_max_samples is required")
     return _require_positive_int(payload, "distribution_max_samples", context)
+
+
+def _quality_eval_distribution_timeout_seconds(payload: dict, context: str) -> int:
+    if "distribution_timeout_seconds" not in payload:
+        raise ValueError(f"{context}.distribution_timeout_seconds is required")
+    return _require_positive_int(payload, "distribution_timeout_seconds", context)
+
+
+def _quality_eval_enabled(payload: dict, stage_name: str) -> bool:
+    if "enabled" not in payload:
+        raise ValueError(f"stages.{stage_name}.quality_eval.enabled is required")
+    enabled = payload["enabled"]
+    if not isinstance(enabled, bool):
+        raise ValueError(f"stages.{stage_name}.quality_eval.enabled must be true or false")
+    return enabled
 
 
 def _quality_eval_interval_epochs(payload: dict, stage_name: str) -> int:
@@ -1776,7 +1831,11 @@ def _quality_payload_to_metrics(payload: dict, model_name: str, metric_names: tu
         method = str(iqa.get("method", ""))
         if method.lower() != "niqe":
             raise ValueError(f"quality_eval iqa.method must be niqe for medium_v1 checkpoints, got {method!r}")
-        metrics[f"quality_{model_name}_niqe"] = _finite_quality_value(iqa, "mean")
+        niqe_mean = _finite_quality_value(iqa, "mean")
+        metrics[f"quality_{model_name}_niqe_mean"] = niqe_mean
+        metrics[f"quality_{model_name}_niqe"] = niqe_mean
+        if "std" in iqa:
+            metrics[f"quality_{model_name}_niqe_std"] = _finite_quality_value(iqa, "std")
     return metrics
 
 

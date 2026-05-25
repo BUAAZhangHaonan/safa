@@ -165,6 +165,7 @@ class MediumV1GSupportTests(unittest.TestCase):
                             "distribution_interval_epochs": 20,
                             "niqe_max_samples": 2,
                             "distribution_max_samples": 5,
+                            "distribution_timeout_seconds": 600,
                             "metrics": ["niqe", "fid", "kid"],
                             "real_index": "data/index/val_single_face.jsonl",
                             "output_dir": str(quality_dir),
@@ -228,7 +229,9 @@ class MediumV1GSupportTests(unittest.TestCase):
             self.assertEqual(external_eval_calls, [])
             self.assertEqual(eval_calls[0]["max_generated"], 2)
             self.assertIsNone(eval_calls[0]["real_index"])
-            self.assertEqual(metrics, {"quality_raw_niqe": 3.0})
+            self.assertEqual(metrics["quality_raw_niqe"], 3.0)
+            self.assertEqual(metrics["quality_raw_niqe_mean"], 3.0)
+            self.assertEqual(metrics["quality_raw_niqe_std"], 0.0)
 
             metrics, load_calls, generation_calls, eval_calls, external_eval_calls = run_epoch(19)
             self.assertEqual(load_calls, [5])
@@ -243,6 +246,7 @@ class MediumV1GSupportTests(unittest.TestCase):
             self.assertEqual(str(external_eval_calls[0]["real_index"]), "data/index/val_single_face.jsonl")
             self.assertEqual(external_eval_calls[0]["cuda_visible_devices"], "0")
             self.assertEqual(external_eval_calls[0]["device"], "cuda:0")
+            self.assertEqual(external_eval_calls[0]["timeout_seconds"], 600)
             self.assertTrue(str(external_eval_calls[0]["generated_dir"]).endswith("quality/epoch_0020/generated_images"))
             self.assertEqual(metrics["quality_raw_niqe"], 3.0)
             self.assertEqual(metrics["quality_raw_fid"], 12.0)
@@ -260,8 +264,8 @@ class MediumV1GSupportTests(unittest.TestCase):
             real_index.write_text("{}", encoding="utf-8")
             calls: list[dict] = []
 
-            def fake_run(command, *, cwd, env, text, capture_output):
-                calls.append({"command": command, "cwd": cwd, "env": env, "text": text, "capture_output": capture_output})
+            def fake_run(command, *, cwd, env, text, capture_output, timeout):
+                calls.append({"command": command, "cwd": cwd, "env": env, "text": text, "capture_output": capture_output, "timeout": timeout})
                 output.parent.mkdir(parents=True, exist_ok=True)
                 output.write_text(
                     json.dumps({"fid": 10.0, "kid_mean": 0.1, "kid_std": 0.01, "num_real": 5, "num_generated": 5}),
@@ -281,6 +285,7 @@ class MediumV1GSupportTests(unittest.TestCase):
                     subset_seed=123,
                     device="cuda:0",
                     cuda_visible_devices="0",
+                    timeout_seconds=600,
                 )
 
             self.assertEqual(payload["fid"], 10.0)
@@ -289,6 +294,7 @@ class MediumV1GSupportTests(unittest.TestCase):
             self.assertEqual(call["env"]["CUDA_VISIBLE_DEVICES"], "0")
             self.assertTrue(call["text"])
             self.assertTrue(call["capture_output"])
+            self.assertEqual(call["timeout"], 600)
             command = call["command"]
             self.assertTrue(str(command[1]).endswith("scripts/eval_generation_quality.py"))
             self.assertIn("--real-index", command)
@@ -320,7 +326,7 @@ class MediumV1GSupportTests(unittest.TestCase):
             real_index.write_text("{}", encoding="utf-8")
             output.write_text('{"fid": 999.0}', encoding="utf-8")
 
-            def fake_run(command, *, cwd, env, text, capture_output):
+            def fake_run(command, *, cwd, env, text, capture_output, timeout):
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
 
             with patch.object(g_loop.subprocess, "run", side_effect=fake_run):
@@ -336,6 +342,7 @@ class MediumV1GSupportTests(unittest.TestCase):
                         subset_seed=123,
                         device="cuda:0",
                         cuda_visible_devices="0",
+                        timeout_seconds=600,
                     )
 
     def test_quality_eval_distribution_subprocess_fails_on_nonzero_exit(self) -> None:
@@ -349,7 +356,7 @@ class MediumV1GSupportTests(unittest.TestCase):
             generated_dir.mkdir()
             real_index.write_text("{}", encoding="utf-8")
 
-            def fake_run(command, *, cwd, env, text, capture_output):
+            def fake_run(command, *, cwd, env, text, capture_output, timeout):
                 return SimpleNamespace(returncode=7, stdout="stdout text", stderr="stderr text")
 
             with patch.object(g_loop.subprocess, "run", side_effect=fake_run):
@@ -365,6 +372,37 @@ class MediumV1GSupportTests(unittest.TestCase):
                         subset_seed=123,
                         device="cuda:0",
                         cuda_visible_devices="0",
+                        timeout_seconds=600,
+                    )
+
+    def test_quality_eval_distribution_subprocess_fails_on_timeout_with_output(self) -> None:
+        from safa.training import g_loop
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "quality.json"
+            generated_dir = root / "generated_images"
+            real_index = root / "real.jsonl"
+            generated_dir.mkdir()
+            real_index.write_text("{}", encoding="utf-8")
+
+            def fake_run(command, *, cwd, env, text, capture_output, timeout):
+                raise g_loop.subprocess.TimeoutExpired(command, timeout, output="stdout text", stderr="stderr text")
+
+            with patch.object(g_loop.subprocess, "run", side_effect=fake_run):
+                with self.assertRaisesRegex(RuntimeError, "(?s)timed out after 3 seconds.*stderr text.*stdout text"):
+                    g_loop._evaluate_generation_quality_subprocess(
+                        real_index=real_index,
+                        generated_dir=generated_dir,
+                        output=output,
+                        iqa_method="niqe",
+                        metrics=("fid", "kid"),
+                        max_generated=5,
+                        max_real=5,
+                        subset_seed=123,
+                        device="cuda:0",
+                        cuda_visible_devices="0",
+                        timeout_seconds=3,
                     )
 
     def test_quality_eval_enabled_requires_new_schedule_fields(self) -> None:
@@ -380,6 +418,54 @@ class MediumV1GSupportTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "niqe_interval_epochs"):
             g_loop._quality_eval_due_groups(payload, "stage1", 1)
+
+    def test_quality_eval_block_requires_explicit_enabled(self) -> None:
+        from safa.training import g_loop
+
+        config = {
+            "stages": {"stage1": {"quality_eval": {"metrics": ["niqe"]}}},
+            "validation": {"enabled": True, "index": "x", "features": "y", "batch_size": 1},
+        }
+
+        with self.assertRaisesRegex(ValueError, "quality_eval.enabled"):
+            g_loop._validate_quality_eval_configs(config, config["stages"])
+
+    def test_quality_eval_distribution_requires_explicit_timeout_and_max_samples(self) -> None:
+        from safa.training import g_loop
+
+        payload = {
+            "enabled": True,
+            "metrics": ["fid", "kid"],
+            "distribution_interval_epochs": 20,
+            "real_index": "data/index/val_single_face.jsonl",
+        }
+
+        with self.assertRaisesRegex(ValueError, "distribution_max_samples"):
+            g_loop._quality_eval_due_groups(payload, "stage1", 20)
+
+        payload["distribution_max_samples"] = 3969
+        with self.assertRaisesRegex(ValueError, "distribution_timeout_seconds"):
+            g_loop._quality_eval_due_groups(payload, "stage1", 20)
+
+    def test_quality_payload_to_metrics_writes_clear_raw_aliases(self) -> None:
+        from safa.training import g_loop
+
+        metrics = g_loop._quality_payload_to_metrics(
+            {
+                "fid": 10.0,
+                "kid_mean": 0.1,
+                "kid_std": 0.01,
+                "iqa": {"method": "niqe", "mean": 4.5, "std": 0.25},
+            },
+            "raw",
+            ("fid", "kid", "niqe"),
+        )
+
+        self.assertEqual(metrics["quality_raw_niqe_mean"], 4.5)
+        self.assertEqual(metrics["quality_raw_niqe_std"], 0.25)
+        self.assertEqual(metrics["quality_raw_niqe"], 4.5)
+        self.assertEqual(metrics["quality_raw_fid"], 10.0)
+        self.assertEqual(metrics["quality_raw_kid_mean"], 0.1)
 
     @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for loss weighting integration tests")
     def test_generator_training_step_fixed_loss_weighting_uses_config_weights(self) -> None:
@@ -412,6 +498,10 @@ class MediumV1GSupportTests(unittest.TestCase):
         self.assertAlmostEqual(float(cycle), 1.0, places=6)
         self.assertAlmostEqual(float(loss.detach()), 4.01, places=6)
         self.assertEqual(module.last_loss_metrics["loss_weighting_type"], "fixed")
+        self.assertEqual(module.last_loss_metrics["effective_cycle_loss_weight"], 0.01)
+
+        module(torch.zeros(1, 3, 4, 4), torch.tensor([[1.0, 0.0]]), ["sample"], False, 99.0)
+        self.assertEqual(module.last_loss_metrics["effective_cycle_loss_weight"], 0.0)
 
     def test_plot_script_missing_required_input_fails_fast(self) -> None:
         from scripts.plot_medium_v1_curves import load_medium_v1_history
@@ -489,8 +579,17 @@ class MediumV1GSupportTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (quality_dir / "epoch_0002").mkdir()
+            (quality_dir / "epoch_0002" / "stage1_epoch_0002_raw_niqe.json").write_text(
+                json.dumps({"iqa": {"method": "niqe", "mean": 3.5, "std": 0.2}, "metrics": ["niqe"]}),
+                encoding="utf-8",
+            )
             (quality_dir / "epoch_0002" / "stage1_epoch_0002_raw_distribution.json").write_text(
                 json.dumps({"fid": 12.0, "kid_mean": 0.02, "kid_std": 0.003, "metrics": ["fid", "kid"]}),
+                encoding="utf-8",
+            )
+            (quality_dir / "epoch_0003").mkdir()
+            (quality_dir / "epoch_0003" / "stage1_epoch_0003_raw_niqe.json").write_text(
+                json.dumps({"iqa": {"method": "niqe", "mean": 3.0, "std": 0.3}, "metrics": ["niqe"]}),
                 encoding="utf-8",
             )
 
@@ -504,7 +603,74 @@ class MediumV1GSupportTests(unittest.TestCase):
         self.assertIsNone(rows[0]["fid"])
         self.assertEqual(rows[1]["fid"], 12.0)
         self.assertEqual(rows[1]["kid_mean"], 0.02)
-        self.assertIsNone(rows[2]["niqe"])
+        self.assertEqual(rows[2]["niqe"], 3.0)
+
+    def test_stage1_long200_plot_strict_mode_rejects_missing_quality_jsons(self) -> None:
+        from scripts.plot_medium_v1_curves import build_stage1_long200_timeseries
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            history_path = root / "history.json"
+            quality_dir = root / "quality"
+            history_path.write_text(json.dumps({"history": [{"stage": "stage1", "stage_epoch": 0, "loss": 1.0}]}), encoding="utf-8")
+            (quality_dir / "epoch_0001").mkdir(parents=True)
+
+            with self.assertRaisesRegex(ValueError, "missing NIQE quality JSON"):
+                build_stage1_long200_timeseries(history_path, None, quality_dir)
+
+            payload = build_stage1_long200_timeseries(history_path, None, quality_dir, allow_missing_quality=True)
+            self.assertIsNone(payload["epochs"][0]["niqe"])
+
+    def test_stage1_long200_plot_strict_mode_rejects_missing_distribution_json_on_interval(self) -> None:
+        from scripts.plot_medium_v1_curves import build_stage1_long200_timeseries
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            history_path = root / "history.json"
+            quality_dir = root / "quality"
+            history_path.write_text(json.dumps({"history": [{"stage": "stage1", "stage_epoch": 19, "loss": 1.0}]}), encoding="utf-8")
+            (quality_dir / "epoch_0020").mkdir(parents=True)
+            (quality_dir / "epoch_0020" / "stage1_epoch_0020_raw_niqe.json").write_text(
+                json.dumps({"iqa": {"method": "niqe", "mean": 4.0}, "metrics": ["niqe"]}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "missing FID/KID distribution quality JSON"):
+                build_stage1_long200_timeseries(history_path, None, quality_dir)
+
+    def test_stage1_long200_plot_prefers_clear_quality_history_fields(self) -> None:
+        from scripts.plot_medium_v1_curves import build_stage1_long200_timeseries
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            history_path = root / "history.json"
+            history_path.write_text(
+                json.dumps(
+                    {
+                        "history": [
+                            {
+                                "stage": "stage1",
+                                "stage_epoch": 0,
+                                "loss": 1.0,
+                                "quality_raw_niqe_mean": 3.0,
+                                "quality_raw_niqe_std": 0.3,
+                                "quality_raw_niqe": 9.0,
+                                "quality_raw_fid": 12.0,
+                                "quality_raw_kid_mean": 0.02,
+                                "quality_raw_kid_std": 0.003,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            payload = build_stage1_long200_timeseries(history_path, None, root / "missing_quality")
+
+        row = payload["epochs"][0]
+        self.assertEqual(row["niqe"], 3.0)
+        self.assertEqual(row["niqe_std"], 0.3)
+        self.assertEqual(row["fid"], 12.0)
 
     def test_stage1_long200_plot_writes_required_outputs(self) -> None:
         from scripts.plot_medium_v1_curves import plot_stage1_long200_curves
@@ -621,6 +787,7 @@ class MediumV1GSupportTests(unittest.TestCase):
         self.assertEqual(quality_eval["distribution_interval_epochs"], 20)
         self.assertEqual(quality_eval["niqe_max_samples"], 512)
         self.assertEqual(quality_eval["distribution_max_samples"], 3969)
+        self.assertEqual(quality_eval["distribution_timeout_seconds"], 3600)
         self.assertNotIn("generated_dir", quality_eval)
         g_loop._validate_train_g_config(config)
 
@@ -668,6 +835,7 @@ class MediumV1GSupportTests(unittest.TestCase):
         self.assertEqual(quality_eval["distribution_interval_epochs"], 20)
         self.assertEqual(quality_eval["niqe_max_samples"], 512)
         self.assertEqual(quality_eval["distribution_max_samples"], 3969)
+        self.assertEqual(quality_eval["distribution_timeout_seconds"], 3600)
         self.assertEqual(quality_eval["distribution_cuda_visible_devices"], "0")
         self.assertEqual(quality_eval["distribution_device"], "cuda:0")
         self.assertEqual(quality_eval["real_index"], "data/index/val_single_face.jsonl")
@@ -694,6 +862,9 @@ class MediumV1GSupportTests(unittest.TestCase):
         self.assertEqual(m1["resume_from"], "artifacts/checkpoints/g_medium_v1_stage1_m0/best_single_face.pt")
         self.assertEqual(m0["loss_weighting"], {"type": "fixed", "flow_weight": 1.0, "cycle_weight": 0.01})
         self.assertEqual(m1["loss_weighting"]["type"], "uncertainty")
+        self.assertNotIn("lambda_initial", m1["stages"]["stage2"])
+        self.assertNotIn("lambda_max", m1["stages"]["stage2"])
+        self.assertNotIn("lambda_growth", m1["stages"]["stage2"])
 
         comparable_m0 = copy.deepcopy(m0)
         comparable_m1 = copy.deepcopy(m1)
@@ -701,6 +872,9 @@ class MediumV1GSupportTests(unittest.TestCase):
         comparable_m1.pop("out_dir")
         comparable_m0.pop("loss_weighting")
         comparable_m1.pop("loss_weighting")
+        for field in ("lambda_initial", "lambda_max", "lambda_growth"):
+            comparable_m0["stages"]["stage2"].pop(field, None)
+            comparable_m1["stages"]["stage2"].pop(field, None)
         self.assertEqual(comparable_m0, comparable_m1)
 
         g_loop._validate_train_g_config(stage1)

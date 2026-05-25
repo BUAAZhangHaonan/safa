@@ -2,36 +2,22 @@
 """SAFA multi-experiment comparison: one grid showing same samples across all models."""
 
 import argparse
+import math
 import os
 import sys
-
-import torch
-import torch.nn.functional as F
-import numpy as np
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 for _candidate in [_SCRIPT_DIR, os.path.join(_SCRIPT_DIR, "src")]:
     if _candidate not in sys.path:
         sys.path.insert(0, _candidate)
 
-from safa.models.generator import build_generator, require_generator_model_config
-from safa.models.e0 import load_e0_checkpoint, freeze_e0
-from safa.data.dataset import AffectNetRecords
-from safa.training.transforms import eval_transform
-from safa.utils.sampling import make_x_init_for_sample_ids, sampling_base_seed_from_config
-
 EMOTION_LABELS = [
     "neutral", "happy", "sad", "surprise",
     "fear", "disgust", "anger", "contempt",
 ]
 
-IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])
-IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225])
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 def parse_args():
@@ -48,12 +34,19 @@ def parse_args():
 
 
 def load_generator(path, device):
+    import torch
+    from safa.models.generator import build_generator, require_generator_model_config
+
     ckpt = torch.load(path, map_location=device, weights_only=False)
     g_config = require_generator_model_config(ckpt, path)
     model = build_generator(g_config).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    checkpoint_model = _checkpoint_model_from_checkpoint(ckpt, path)
+    state_key = "ema_model_state_dict" if checkpoint_model == "ema" else "model_state_dict"
+    if state_key not in ckpt or ckpt[state_key] is None:
+        raise ValueError(f"{path} is marked as {checkpoint_model} but missing {state_key}")
+    model.load_state_dict(ckpt[state_key])
     model.eval()
-    return model, ckpt.get("metrics", {}), ckpt.get("training_config"), _checkpoint_image_size(ckpt)
+    return model, ckpt.get("metrics", {}), ckpt.get("training_config"), _checkpoint_image_size(ckpt), checkpoint_model
 
 
 def denormalize_imagenet(tensor_chw):
@@ -64,17 +57,25 @@ def denormalize_imagenet(tensor_chw):
 
 
 def chw_to_numpy(tensor_chw):
+    import numpy as np
+
     return (tensor_chw.cpu().permute(1, 2, 0).clamp(0.0, 1.0).numpy() * 255).astype(np.uint8)
 
 
 def normalize_for_e0(images_bchw):
-    mean = IMAGENET_MEAN.view(1, 3, 1, 1).to(images_bchw.device)
-    std = IMAGENET_STD.view(1, 3, 1, 1).to(images_bchw.device)
+    import torch
+
+    mean = torch.tensor(IMAGENET_MEAN, device=images_bchw.device).view(1, 3, 1, 1)
+    std = torch.tensor(IMAGENET_STD, device=images_bchw.device).view(1, 3, 1, 1)
     return (images_bchw - mean) / std
 
 
 def process_sample(e0, generator, img_tensor, device, sample_steps, sample_id, sampling_seed, image_size):
     """Process one image through E0 -> G -> E0 pipeline."""
+    import torch
+    import torch.nn.functional as F
+    from safa.utils.sampling import make_x_init_for_sample_ids
+
     with torch.no_grad():
         e0_out = e0(img_tensor)
         z = e0_out["embedding"]
@@ -100,6 +101,17 @@ def process_sample(e0, generator, img_tensor, device, sample_steps, sample_id, s
 
 
 def main():
+    import numpy as np
+    import torch
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+    from safa.models.e0 import load_e0_checkpoint, freeze_e0
+    from safa.data.dataset import AffectNetRecords
+    from safa.training.transforms import eval_transform
+
     args = parse_args()
     device = torch.device(args.device)
 
@@ -134,16 +146,19 @@ def main():
     exp_metrics = {}
     training_configs = []
     image_sizes = []
+    checkpoint_models = {}
+    metric_summaries = {}
     for name, path in experiments:
         print(f"Loading G from {path} ...")
-        gen, metrics, training_config, image_size = load_generator(path, device)
+        gen, metrics, training_config, image_size, checkpoint_model = load_generator(path, device)
         generators[name] = gen
         exp_metrics[name] = metrics
+        checkpoint_models[name] = checkpoint_model
+        metric_summaries[name] = _checkpoint_metric_summary(metrics, checkpoint_model=checkpoint_model, checkpoint_label=name)
         training_configs.append(training_config)
         image_sizes.append(image_size)
-        cos = metrics.get("validation_latent_cosine_mean", -1)
-        fd = metrics.get("validation_face_detection_rate", -1)
-        print(f"  {name}: cosine={cos:.4f}, face_det={fd:.4f}")
+        summary = metric_summaries[name]
+        print(f"  {name}: model={checkpoint_model} cosine={summary['cosine']:.4f}, single_face={summary['single_face_eq1']:.4f}")
 
     image_size = _shared_image_size(image_sizes)
 
@@ -219,9 +234,10 @@ def main():
 
             if row_idx == 0:
                 m = exp_metrics[name]
-                cos_m = m.get("validation_latent_cosine_mean", -1)
-                fd_m = m.get("validation_face_detection_rate", -1)
-                ax.set_title(f"{name}\ncos={cos_m:.3f} fd={fd_m:.3f}",
+                summary = metric_summaries[name]
+                cos_m = summary["cosine"]
+                sf_m = summary["single_face_eq1"]
+                ax.set_title(f"{name}\ncos={cos_m:.3f} sf={sf_m:.3f}",
                             fontsize=9, fontweight="bold", pad=4)
 
             pred_emo = EMOTION_LABELS[r["pred_gen"]]
@@ -238,26 +254,27 @@ def main():
 
     # === Print summary table ===
     print(f"\n{'='*80}")
-    print(f"{'Experiment':<30s} {'Cosine':>8s} {'FaceDet':>8s} {'Label%':>8s} {'Composite':>10s}")
+    print(f"{'Experiment':<30s} {'Cosine':>8s} {'Single':>8s} {'Label%':>8s} {'Composite':>10s}")
     print(f"{'-'*80}")
 
     for name, _ in experiments:
         m = exp_metrics[name]
-        cos_m = m.get("validation_latent_cosine_mean", -1)
-        fd_m = m.get("validation_face_detection_rate", -1)
-        composite = cos_m * fd_m
+        summary = metric_summaries[name]
+        cos_m = summary["cosine"]
+        sf_m = summary["single_face_eq1"]
+        composite = cos_m * sf_m
         label_match = sum(1 for r in all_results[name] if r["pred_orig"] == r["pred_gen"])
         label_pct = 100.0 * label_match / num_samples
-        print(f"{name:<30s} {cos_m:>8.4f} {fd_m:>8.4f} {label_pct:>7.1f}% {composite:>10.4f}")
+        print(f"{name:<30s} {cos_m:>8.4f} {sf_m:>8.4f} {label_pct:>7.1f}% {composite:>10.4f}")
 
     print(f"{'='*80}")
 
     # === Metrics bar chart ===
     fig2, axes = plt.subplots(1, 3, figsize=(15, 5), dpi=120)
     names = [n for n, _ in experiments]
-    cosines = [exp_metrics[n].get("validation_latent_cosine_mean", 0) for n in names]
-    face_dets = [exp_metrics[n].get("validation_face_detection_rate", 0) for n in names]
-    composites = [c * f for c, f in zip(cosines, face_dets)]
+    cosines = [metric_summaries[n]["cosine"] for n in names]
+    single_faces = [metric_summaries[n]["single_face_eq1"] for n in names]
+    composites = [c * f for c, f in zip(cosines, single_faces)]
 
     x = np.arange(len(names))
     width = 0.6
@@ -270,16 +287,16 @@ def main():
     for i, v in enumerate(cosines):
         axes[0].text(i, v + 0.02, f"{v:.3f}", ha="center", fontsize=8)
 
-    axes[1].bar(x, face_dets, width, color="coral")
-    axes[1].set_title("Face Detection Rate", fontsize=11)
+    axes[1].bar(x, single_faces, width, color="coral")
+    axes[1].set_title("Single-Face Rate", fontsize=11)
     axes[1].set_xticks(x)
     axes[1].set_xticklabels(names, rotation=30, ha="right", fontsize=8)
     axes[1].set_ylim(0, 1.15)
-    for i, v in enumerate(face_dets):
+    for i, v in enumerate(single_faces):
         axes[1].text(i, v + 0.02, f"{v:.3f}", ha="center", fontsize=8)
 
     axes[2].bar(x, composites, width, color="seagreen")
-    axes[2].set_title("Composite Score (cos × fd)", fontsize=11)
+    axes[2].set_title("Composite Score (cos x single)", fontsize=11)
     axes[2].set_xticks(x)
     axes[2].set_xticklabels(names, rotation=30, ha="right", fontsize=8)
     axes[2].set_ylim(0, 1.05)
@@ -295,6 +312,8 @@ def main():
 
 
 def _sampling_seed(arg_seed: int | None, training_configs: list) -> int:
+    from safa.utils.sampling import sampling_base_seed_from_config
+
     if arg_seed is not None:
         return int(arg_seed)
     seeds = []
@@ -328,6 +347,74 @@ def _shared_image_size(image_sizes: list[int]) -> int:
     if len(unique) != 1:
         raise RuntimeError(f"Multi-checkpoint visualization requires one shared model_config.image_size, got {unique}")
     return unique[0]
+
+
+def _checkpoint_model_from_checkpoint(checkpoint: dict, path: str) -> str:
+    value = checkpoint.get("checkpoint_model")
+    if value is None and os.path.basename(str(path)).startswith("best_ema"):
+        value = "ema"
+    if value is None:
+        value = "raw"
+    value = str(value)
+    if value not in ("raw", "ema"):
+        raise ValueError(f"{path}: checkpoint_model must be raw or ema, got {value!r}")
+    return value
+
+
+def _checkpoint_metric_summary(metrics: dict, *, checkpoint_model: str, checkpoint_label: str) -> dict:
+    if checkpoint_model not in ("raw", "ema"):
+        raise ValueError(f"{checkpoint_label}: checkpoint_model must be raw or ema, got {checkpoint_model!r}")
+    if checkpoint_model == "ema":
+        cosine_field = "validation_ema_latent_cosine_mean"
+        single_field = "validation_ema_single_face_eq1_rate"
+        ge1_field = "validation_ema_face_detect_ge1_rate"
+        _require_metric(metrics, single_field, f"EMA checkpoint metrics require {single_field}: {checkpoint_label}")
+        return {
+            "cosine": _metric_value(metrics, cosine_field, checkpoint_label),
+            "single_face_eq1": _metric_value(metrics, single_field, checkpoint_label),
+            "face_detect_ge1": _metric_value(metrics, ge1_field, checkpoint_label),
+            "cosine_source": cosine_field,
+            "single_face_source": single_field,
+            "face_detect_ge1_source": ge1_field,
+        }
+    cosine_field = _first_metric_field(metrics, ("validation_raw_latent_cosine_mean", "validation_latent_cosine_mean"), checkpoint_label)
+    single_field = _first_metric_field(metrics, ("validation_raw_single_face_eq1_rate", "validation_single_face_eq1_rate"), checkpoint_label)
+    ge1_field = _first_metric_field(
+        metrics,
+        ("validation_raw_face_detect_ge1_rate", "validation_face_detect_ge1_rate", "validation_face_detection_rate"),
+        checkpoint_label,
+    )
+    return {
+        "cosine": _metric_value(metrics, cosine_field, checkpoint_label),
+        "single_face_eq1": _metric_value(metrics, single_field, checkpoint_label),
+        "face_detect_ge1": _metric_value(metrics, ge1_field, checkpoint_label),
+        "cosine_source": cosine_field,
+        "single_face_source": single_field,
+        "face_detect_ge1_source": ge1_field,
+    }
+
+
+def _first_metric_field(metrics: dict, fields: tuple[str, ...], checkpoint_label: str) -> str:
+    for field in fields:
+        if field in metrics:
+            return field
+    raise ValueError(f"{checkpoint_label}: missing metric field; expected one of {fields}")
+
+
+def _require_metric(metrics: dict, field: str, message: str) -> None:
+    if field not in metrics:
+        raise ValueError(message)
+
+
+def _metric_value(metrics: dict, field: str, checkpoint_label: str) -> float:
+    _require_metric(metrics, field, f"{checkpoint_label}: missing metric field {field}")
+    value = metrics[field]
+    if isinstance(value, bool):
+        raise ValueError(f"{checkpoint_label}.{field} must be numeric, got bool")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{checkpoint_label}.{field} must be finite, got {value!r}")
+    return number
 
 
 if __name__ == "__main__":

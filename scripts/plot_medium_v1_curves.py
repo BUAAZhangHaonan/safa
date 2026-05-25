@@ -268,12 +268,39 @@ def _stage1_timeseries_row(row: dict[str, Any], epoch: int, quality: dict[str, f
         ),
         "zero_face": _first_number(row, ("validation_raw_zero_face_rate", "validation_zero_face_rate"), "history"),
         "multi_face": _first_number(row, ("validation_raw_multi_face_rate", "validation_multi_face_rate"), "history"),
-        "niqe": quality.get("niqe", _first_number(row, ("quality_raw_niqe", "quality_niqe"), "history")),
-        "niqe_std": quality.get("niqe_std"),
+        "niqe": quality.get("niqe", _first_number(row, ("quality_raw_niqe_mean", "quality_raw_niqe", "quality_niqe_mean", "quality_niqe"), "history")),
+        "niqe_std": quality.get("niqe_std", _first_number(row, ("quality_raw_niqe_std", "quality_niqe_std"), "history")),
         "fid": quality.get("fid", _first_number(row, ("quality_raw_fid", "quality_fid"), "history")),
         "kid_mean": quality.get("kid_mean", _first_number(row, ("quality_raw_kid_mean", "quality_kid_mean"), "history")),
         "kid_std": quality.get("kid_std", _first_number(row, ("quality_raw_kid_std", "quality_kid_std"), "history")),
     }
+
+
+def _validate_stage1_quality_presence(
+    *,
+    quality_dir: Path,
+    quality: dict[int, dict[str, float]],
+    history: list[dict[str, Any]],
+    distribution_interval_epochs: int,
+    allow_missing_quality: bool,
+) -> None:
+    if allow_missing_quality or not quality_dir.is_dir():
+        return
+    if distribution_interval_epochs <= 0:
+        raise ValueError(f"distribution_interval_epochs must be positive, got {distribution_interval_epochs!r}")
+    for index, row in enumerate(history, start=1):
+        epoch = _epoch_number(row, index)
+        epoch_dir = quality_dir / f"epoch_{epoch:04d}"
+        quality_row = quality.get(epoch, {})
+        if "niqe" not in quality_row:
+            raise ValueError(f"missing NIQE quality JSON for completed epoch {epoch}: {epoch_dir}")
+        if epoch % distribution_interval_epochs == 0 and epoch_dir.is_dir():
+            missing_distribution = [field for field in ("fid", "kid_mean", "kid_std") if field not in quality_row]
+            if missing_distribution:
+                raise ValueError(
+                    "missing FID/KID distribution quality JSON "
+                    f"for completed distribution epoch {epoch}: {epoch_dir} missing={missing_distribution}"
+                )
 
 
 def build_stage1_long200_timeseries(
@@ -282,11 +309,20 @@ def build_stage1_long200_timeseries(
     quality_dir: Path,
     *,
     run_name: str = "stage1_long200_v4",
+    distribution_interval_epochs: int = 20,
+    allow_missing_quality: bool = False,
 ) -> dict[str, Any]:
     history = _load_stage1_history_source(history_path)
     history = _merge_last_metrics(history, _load_last_metrics(last_metrics_path))
     history = _latest_stage_epoch_segment(history)
     quality = load_stage1_quality_timeseries(quality_dir)
+    _validate_stage1_quality_presence(
+        quality_dir=quality_dir,
+        quality=quality,
+        history=history,
+        distribution_interval_epochs=distribution_interval_epochs,
+        allow_missing_quality=allow_missing_quality,
+    )
     epochs = [
         _stage1_timeseries_row(row, _epoch_number(row, index), quality.get(_epoch_number(row, index), {}))
         for index, row in enumerate(history, start=1)
@@ -397,12 +433,16 @@ def plot_stage1_long200_curves(
     quality_dir: Path,
     out_dir: Path,
     output_prefix: str = "stage1_long200_v4",
+    distribution_interval_epochs: int = 20,
+    allow_missing_quality: bool = False,
 ) -> list[Path]:
     payload = build_stage1_long200_timeseries(
         history_path,
         last_metrics_path,
         quality_dir,
         run_name=output_prefix,
+        distribution_interval_epochs=distribution_interval_epochs,
+        allow_missing_quality=allow_missing_quality,
     )
     rows = payload["epochs"]
     if not rows:
@@ -494,6 +534,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage1-last-metrics-json", type=Path)
     parser.add_argument("--stage1-quality-dir", type=Path)
     parser.add_argument("--stage1-output-prefix", default="stage1_long200_v4")
+    parser.add_argument("--stage1-distribution-interval-epochs", type=int, default=20)
+    parser.add_argument("--allow-missing-quality", action="store_true")
     parser.add_argument("--out-dir", required=True, type=Path)
     return parser.parse_args()
 
@@ -510,6 +552,8 @@ def main() -> int:
                 quality_dir=args.stage1_quality_dir,
                 out_dir=args.out_dir,
                 output_prefix=args.stage1_output_prefix,
+                distribution_interval_epochs=args.stage1_distribution_interval_epochs,
+                allow_missing_quality=args.allow_missing_quality,
             )
         else:
             if args.stage1_json is None or args.m0_json is None or args.m1_json is None:

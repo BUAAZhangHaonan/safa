@@ -88,6 +88,13 @@ no tracked `artifacts/e0_features` convention.
   fields.
 - Checkpoint composite selection uses `validation_latent_cosine_mean *
   validation_single_face_eq1_rate`, not the legacy any-face rate.
+- `face_detection_rate` remains a legacy alias for `face_detect_ge1_rate`.
+  New plots and checkpoint composites should use `single_face_eq1_rate`.
+- Stage metrics now write both `stage_epoch_0based` and
+  `stage_epoch_1based`; the old `stage_epoch` field remains 0-based.
+- Cycle-weight plots should read `effective_cycle_loss_weight`. The old
+  `lambda_cycle` key is kept for old readers and is not the clearest field for
+  uncertainty-weighted runs.
 - FID/KID/IQA dependencies are installed.
 - The quality script is implemented at `scripts/eval_generation_quality.py` for
   FID, KID, and pyIQA no-reference IQA.

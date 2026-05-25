@@ -49,6 +49,7 @@ stages:
       distribution_interval_epochs: 20
       niqe_max_samples: 512
       distribution_max_samples: 3969
+      distribution_timeout_seconds: 3600
       metrics: [niqe, fid, kid]
       real_index: data/index/val_single_face.jsonl
       output_dir: artifacts/eval/g_medium_v1_stage1_long200_v2/quality

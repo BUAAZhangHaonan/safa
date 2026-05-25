@@ -17,8 +17,10 @@ No code was changed for this decision. No new training was started.
 ## Evidence Used
 
 The Phase C ablation held monitor interval, best checkpoint selection, data,
-model scale, seed, Stage 2 length, and `lambda_cycle=0.01` fixed. The only
-changed variable was the cycle-step setting.
+model scale, seed, Stage 2 length, and `effective_cycle_loss_weight=0.01`
+fixed. Older artifacts may show the same value as `lambda_cycle`; new reports
+should read `effective_cycle_loss_weight`. The only changed variable was the
+cycle-step setting.
 
 | Run | Raw cosine | Raw single_face_eq1 | Conflict | Weighted cycle/FM |
 | --- | ---: | ---: | ---: | ---: |
@@ -40,7 +42,7 @@ were not reported.
 ## Why Not Add PCGrad Or GradNorm Now
 
 - The weighted cycle/FM ratio does not show cycle dominating flow matching after
-  `lambda_cycle=0.01` is applied.
+  `effective_cycle_loss_weight=0.01` is applied.
 - Fixed16 already gives a stable short-run baseline: final raw cosine `0.885797`,
   raw single_face_eq1 `1.0`, and final conflict `0.153846`.
 - The privacy guard has not passed, so adding a new multitask optimizer now would

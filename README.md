@@ -26,7 +26,10 @@ The first validation is intentionally small. It checks whether the full chain ru
 - `zero_face_rate` is the count == 0 rate.
 - `multi_face_rate` is the count > 1 rate.
 - Legacy `face_detection_rate` and eval `face_detection.detected.mean` remain ge1 metrics for old report compatibility.
-- New checkpoint composite uses `validation_latent_cosine_mean * validation_single_face_eq1_rate`. Old reports used `face_detection_rate`/ge1.
+- New checkpoint composite uses `validation_*_latent_cosine_mean * validation_*_single_face_eq1_rate`. Old reports used `face_detection_rate`/ge1.
+- `lambda_cycle` is a legacy compatibility field. Read `effective_cycle_loss_weight` for the actual cycle loss weight, especially for uncertainty-weighted runs.
+- `stage_epoch` remains the legacy 0-based epoch. New metrics also write `stage_epoch_0based` and `stage_epoch_1based`.
+- Quality metrics prefer explicit fields such as `quality_raw_niqe_mean`, `quality_raw_niqe_std`, `quality_raw_fid`, `quality_raw_kid_mean`, and `quality_raw_kid_std`; older names remain aliases only.
 
 ## Main Commands
 
