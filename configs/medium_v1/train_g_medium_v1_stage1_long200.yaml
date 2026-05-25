@@ -48,7 +48,7 @@ stages:
       interval_epochs: 1
       metrics: [niqe]
       real_index: data/index/val_single_face.jsonl
-      generated_dir: artifacts/eval/g_medium_v1_stage1_long200/raw_generated
+      generated_dir: artifacts/eval/g_medium_v1_stage1_m0_single_face/generated_images
       output_dir: artifacts/eval/g_medium_v1_stage1_long200/quality
       model: raw
   stage2:
