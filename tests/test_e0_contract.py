@@ -6,9 +6,75 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from safa.utils.config import load_yaml
+
 
 TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None and importlib.util.find_spec("torchvision") is not None
 TORCH_ONLY_AVAILABLE = importlib.util.find_spec("torch") is not None
+
+
+class E0MediumConfigTests(unittest.TestCase):
+    def test_medium_v1_train_config_explicitly_sets_required_plan_fields(self) -> None:
+        config = load_yaml("configs/medium_v1/train_e0_medium_v1.yaml")
+
+        expected = {
+            "seed": 1337,
+            "device": "cuda:0",
+            "num_workers": 8,
+            "image_size": 224,
+            "num_classes": 8,
+            "embedding_dim": 512,
+            "train_index": "data/index/train_balanced_medium.jsonl",
+            "val_index": "data/index/val_single_face.jsonl",
+            "out_dir": "artifacts/checkpoints/e0_medium_v1",
+            "epochs": 60,
+            "batch_size": 64,
+            "learning_rate": 0.0003,
+            "weight_decay": 0.0001,
+            "warmup_epochs": 5,
+            "early_stopping_patience": 15,
+            "augmentation": "strong",
+            "class_weight": False,
+            "label_smoothing": 0.1,
+            "imagenet_weights": "IMAGENET1K_V2",
+        }
+
+        for key, value in expected.items():
+            with self.subTest(key=key):
+                self.assertIn(key, config)
+                self.assertEqual(config[key], value)
+
+    def test_e0_train_config_rejects_missing_medium_required_fields(self) -> None:
+        from safa.training.e0_loop import require_e0_train_config
+
+        config = {
+            "seed": 1337,
+            "device": "cuda:0",
+            "num_workers": 8,
+            "image_size": 224,
+            "num_classes": 8,
+            "embedding_dim": 512,
+            "train_index": "data/index/train_balanced_medium.jsonl",
+            "val_index": "data/index/val_single_face.jsonl",
+            "out_dir": "artifacts/checkpoints/e0_medium_v1",
+            "epochs": 60,
+            "batch_size": 64,
+            "learning_rate": 0.0003,
+            "weight_decay": 0.0001,
+            "warmup_epochs": 5,
+            "early_stopping_patience": 15,
+            "augmentation": "strong",
+            "class_weight": False,
+            "label_smoothing": 0.1,
+            "imagenet_weights": "IMAGENET1K_V2",
+        }
+
+        for missing in ("warmup_epochs", "early_stopping_patience", "augmentation", "class_weight", "label_smoothing"):
+            incomplete = dict(config)
+            incomplete.pop(missing)
+            with self.subTest(missing=missing):
+                with self.assertRaisesRegex(KeyError, missing):
+                    require_e0_train_config(incomplete)
 
 
 @unittest.skipUnless(TORCH_AVAILABLE, "torch and torchvision are required for E0 contract tests")
@@ -39,6 +105,68 @@ class E0ContractTests(unittest.TestCase):
 
 @unittest.skipUnless(TORCH_ONLY_AVAILABLE, "torch is required for E0 training loop tests")
 class E0TrainingLoopTests(unittest.TestCase):
+    def test_evaluate_e0_reports_macro_metrics_confusion_matrix_and_norm_payload(self) -> None:
+        import torch
+        import torch.nn.functional as F
+
+        from safa.training.e0_loop import evaluate_e0
+
+        class FakeE0(torch.nn.Module):
+            num_classes = 4
+
+            def forward(self, images):
+                embeddings = F.normalize(
+                    torch.tensor(
+                        [
+                            [1.0, 0.0],
+                            [1.0, 1.0],
+                            [0.0, 1.0],
+                            [-1.0, 0.0],
+                        ],
+                        dtype=torch.float32,
+                    ),
+                    p=2,
+                    dim=1,
+                )
+                logits = torch.tensor(
+                    [
+                        [4.0, 0.0, 0.0, 0.0],
+                        [3.0, 1.0, 0.0, 0.0],
+                        [0.0, 5.0, 0.0, 0.0],
+                        [0.0, 0.0, 6.0, 0.0],
+                    ],
+                    dtype=torch.float32,
+                )
+                return {"embedding": embeddings, "logits": logits}
+
+        loader = [
+            {
+                "image": torch.zeros(4, 3, 4, 4),
+                "label": torch.tensor([0, 1, 1, 2]),
+            }
+        ]
+
+        metrics = evaluate_e0(FakeE0(), loader, torch.device("cpu"), num_classes=4)
+
+        self.assertAlmostEqual(metrics["accuracy"], 0.75)
+        self.assertAlmostEqual(metrics["balanced_accuracy"], (1.0 + 0.5 + 1.0) / 3.0)
+        self.assertAlmostEqual(metrics["macro_f1"], ((2.0 / 3.0) + (2.0 / 3.0) + 1.0) / 3.0)
+        self.assertEqual(
+            metrics["confusion_matrix"],
+            [
+                [1, 0, 0, 0],
+                [1, 1, 0, 0],
+                [0, 0, 1, 0],
+                [0, 0, 0, 0],
+            ],
+        )
+        self.assertEqual(set(metrics["per_class_accuracy"]), {"class_0", "class_1", "class_2", "class_3"})
+        self.assertEqual(metrics["per_class_accuracy"]["class_3"], None)
+        self.assertEqual(metrics["per_class_support"]["class_3"], 0)
+        self.assertEqual(metrics["per_class_accuracy_note"], "null means the class has zero validation samples")
+        self.assertTrue(metrics["embedding_norm_check"]["passed"])
+        self.assertLessEqual(metrics["embedding_norm_check"]["max_abs_deviation"], 1e-4)
+
     def test_train_e0_hard_fails_on_non_finite_loss(self) -> None:
         import torch
 
@@ -89,6 +217,11 @@ class E0TrainingLoopTests(unittest.TestCase):
             "learning_rate": 0.001,
             "weight_decay": 0.0,
             "epochs": 1,
+            "warmup_epochs": 0,
+            "early_stopping_patience": 0,
+            "augmentation": "default",
+            "class_weight": False,
+            "label_smoothing": 0.0,
         }
         distributed = DistributedContext(
             enabled=False,

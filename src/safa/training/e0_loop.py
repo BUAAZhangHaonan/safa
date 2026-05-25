@@ -19,6 +19,54 @@ from safa.utils.distributed import (
     unwrap_model,
 )
 from safa.utils.seed import set_seed
+from safa.utils.config import require_keys
+
+
+REQUIRED_E0_TRAIN_KEYS = (
+    "seed",
+    "device",
+    "num_workers",
+    "batch_size",
+    "epochs",
+    "learning_rate",
+    "weight_decay",
+    "num_classes",
+    "embedding_dim",
+    "image_size",
+    "imagenet_weights",
+    "train_index",
+    "val_index",
+    "out_dir",
+    "warmup_epochs",
+    "early_stopping_patience",
+    "augmentation",
+    "class_weight",
+    "label_smoothing",
+)
+
+
+def require_e0_train_config(config: dict) -> None:
+    require_keys(config, REQUIRED_E0_TRAIN_KEYS)
+    augmentation = str(config["augmentation"])
+    if augmentation not in {"default", "strong"}:
+        raise ValueError(f"augmentation must be 'default' or 'strong', got {augmentation!r}")
+    if not isinstance(config["class_weight"], bool):
+        raise ValueError("class_weight must be true or false")
+    epochs = int(config["epochs"])
+    warmup_epochs = int(config["warmup_epochs"])
+    early_stopping_patience = int(config["early_stopping_patience"])
+    if epochs <= 0:
+        raise ValueError(f"epochs must be positive, got {epochs}")
+    if warmup_epochs < 0:
+        raise ValueError(f"warmup_epochs must be non-negative, got {warmup_epochs}")
+    if warmup_epochs > epochs:
+        raise ValueError(f"warmup_epochs must be <= epochs, got {warmup_epochs} > {epochs}")
+    if early_stopping_patience < 0:
+        raise ValueError(f"early_stopping_patience must be non-negative, got {early_stopping_patience}")
+    if int(config["num_classes"]) <= 0:
+        raise ValueError(f"num_classes must be positive, got {config['num_classes']}")
+    if int(config["embedding_dim"]) <= 0:
+        raise ValueError(f"embedding_dim must be positive, got {config['embedding_dim']}")
 
 
 def train_e0_from_config(config: dict) -> dict:
@@ -28,6 +76,7 @@ def train_e0_from_config(config: dict) -> dict:
     from torch.nn.parallel import DistributedDataParallel
     from tqdm import tqdm
 
+    require_e0_train_config(config)
     set_seed(int(config["seed"]))
     torch.backends.cudnn.benchmark = True
     distributed = init_distributed(config)
@@ -41,7 +90,7 @@ def train_e0_from_config(config: dict) -> dict:
     barrier(distributed)
 
     # --- augmentation selection ---
-    augmentation = str(config.get("augmentation", "default"))
+    augmentation = str(config["augmentation"])
     if augmentation == "strong":
         t_transform = train_transform_strong(int(config["image_size"]))
     else:
@@ -98,7 +147,7 @@ def train_e0_from_config(config: dict) -> dict:
 
     # --- class weighting (effective number of samples) ---
     class_weights = None
-    if config.get("class_weight", False):
+    if config["class_weight"]:
         class_counts = Counter(record.label for record in train_set.records)
         num_classes = int(config["num_classes"])
         missing = [i for i in range(num_classes) if class_counts.get(i, 0) == 0]
@@ -113,19 +162,19 @@ def train_e0_from_config(config: dict) -> dict:
         class_weights = weights.float().to(device)
 
     # --- label smoothing ---
-    label_smoothing = float(config.get("label_smoothing", 0.0))
+    label_smoothing = float(config["label_smoothing"])
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
 
     # --- warmup + scheduler ---
     epochs = int(config["epochs"])
-    warmup_epochs = int(config.get("warmup_epochs", 0))
+    warmup_epochs = int(config["warmup_epochs"])
     base_lr = float(config["learning_rate"])
 
     # --- LR scheduler ---
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs - warmup_epochs), eta_min=1e-6)
 
     # --- early stopping ---
-    early_stopping_patience = int(config.get("early_stopping_patience", 0))
+    early_stopping_patience = int(config["early_stopping_patience"])
 
     majority = _majority_baseline(train_set.records, val_set.records)
     best_acc = -1.0
@@ -170,7 +219,7 @@ def train_e0_from_config(config: dict) -> dict:
 
         should_break = False
         if distributed.is_main:
-            metrics = evaluate_e0(unwrap_model(model), val_loader, device)
+            metrics = evaluate_e0(unwrap_model(model), val_loader, device, num_classes=model_config.num_classes)
             metrics.update(
                 {
                     "epoch": epoch,
@@ -223,23 +272,32 @@ def _assert_finite_e0_loss(loss, epoch: int, batch_idx: int) -> None:
     assert_finite_tensor("e0_loss", loss)
 
 
-def evaluate_e0(model, loader, device) -> dict:
+def evaluate_e0(model, loader, device, num_classes: int | None = None) -> dict:
     import torch
 
     model.eval()
     correct = 0
     total = 0
     logits_abs_sum = 0.0
-    # --- per-class accuracy tracking ---
     all_preds = []
     all_labels = []
+    all_norms = []
+    parsed_num_classes = int(num_classes if num_classes is not None else getattr(model, "num_classes"))
+    if parsed_num_classes <= 0:
+        raise ValueError(f"num_classes must be positive, got {parsed_num_classes}")
     with torch.no_grad():
         for batch in loader:
             images = batch["image"].to(device, non_blocking=True)
             labels = batch["label"].to(device, non_blocking=True)
             output = model(images)
             assert_finite_tensor("eval_e0_embedding", output["embedding"])
+            if output["logits"].shape[1] != parsed_num_classes:
+                raise RuntimeError(
+                    "E0 logits class dimension does not match num_classes: "
+                    f"logits={output['logits'].shape[1]} num_classes={parsed_num_classes}"
+                )
             norms = output["embedding"].float().norm(dim=1)
+            all_norms.append(norms.detach().cpu())
             if not torch.allclose(norms, torch.ones_like(norms), rtol=1e-4, atol=1e-4):
                 raise RuntimeError("E0 embeddings are not L2-normalized")
             predictions = output["logits"].argmax(dim=1)
@@ -254,21 +312,76 @@ def evaluate_e0(model, loader, device) -> dict:
     # --- compute per-class accuracy ---
     all_preds = torch.cat(all_preds)
     all_labels = torch.cat(all_labels)
+    invalid_labels = sorted(
+        int(value) for value in all_labels[(all_labels < 0) | (all_labels >= parsed_num_classes)].unique().tolist()
+    )
+    if invalid_labels:
+        raise ValueError(f"Validation labels out of range for num_classes={parsed_num_classes}: {invalid_labels}")
+    invalid_preds = sorted(
+        int(value) for value in all_preds[(all_preds < 0) | (all_preds >= parsed_num_classes)].unique().tolist()
+    )
+    if invalid_preds:
+        raise RuntimeError(f"E0 predictions out of range for num_classes={parsed_num_classes}: {invalid_preds}")
+    confusion = torch.zeros((parsed_num_classes, parsed_num_classes), dtype=torch.int64)
+    for label, pred in zip(all_labels.tolist(), all_preds.tolist()):
+        confusion[int(label), int(pred)] += 1
+
     per_class_acc = {}
-    for cls in sorted(all_labels.unique().tolist()):
-        cls = int(cls)
-        mask = all_labels == cls
-        cls_correct = int((all_preds[mask] == cls).sum().item())
-        cls_total = int(mask.sum().item())
-        acc = cls_correct / cls_total if cls_total > 0 else 0.0
-        per_class_acc[f"class_{cls}"] = acc
-        print(f"  class_{cls}: accuracy={acc:.4f} ({cls_correct}/{cls_total})")
+    per_class_support = {}
+    per_class_correct = {}
+    per_class_f1 = {}
+    recalls = []
+    f1_values = []
+    for cls in range(parsed_num_classes):
+        key = f"class_{cls}"
+        cls_correct = int(confusion[cls, cls].item())
+        cls_total = int(confusion[cls].sum().item())
+        cls_predicted = int(confusion[:, cls].sum().item())
+        per_class_support[key] = cls_total
+        per_class_correct[key] = cls_correct
+        if cls_total == 0:
+            per_class_acc[key] = None
+            per_class_f1[key] = None
+            print(f"  {key}: accuracy=undefined (0 validation samples)")
+            continue
+        recall = cls_correct / cls_total
+        precision = cls_correct / cls_predicted if cls_predicted > 0 else 0.0
+        f1 = 0.0 if precision + recall == 0.0 else 2.0 * precision * recall / (precision + recall)
+        per_class_acc[key] = recall
+        per_class_f1[key] = f1
+        recalls.append(recall)
+        f1_values.append(f1)
+        print(f"  {key}: accuracy={recall:.4f} ({cls_correct}/{cls_total})")
+
+    norm_values = torch.cat(all_norms)
+    norm_deviation = (norm_values - 1.0).abs()
+    embedding_norm_check = {
+        "passed": True,
+        "mean": float(norm_values.mean().item()),
+        "min": float(norm_values.min().item()),
+        "max": float(norm_values.max().item()),
+        "max_abs_deviation": float(norm_deviation.max().item()),
+        "rtol": 1e-4,
+        "atol": 1e-4,
+    }
 
     result = {
         "accuracy": correct / total,
+        "balanced_accuracy": sum(recalls) / len(recalls),
+        "macro_f1": sum(f1_values) / len(f1_values),
+        "confusion_matrix": [[int(value) for value in row] for row in confusion.tolist()],
+        "embedding_norm_check": embedding_norm_check,
         "num_samples": total,
         "mean_abs_logit": logits_abs_sum / total,
         "per_class_accuracy": per_class_acc,
+        "per_class_accuracy_note": "null means the class has zero validation samples",
+        "per_class_support": per_class_support,
+        "per_class_correct": per_class_correct,
+        "per_class_f1": per_class_f1,
+        "metric_averaging": {
+            "balanced_accuracy": "mean recall over classes with validation support",
+            "macro_f1": "mean F1 over classes with validation support",
+        },
     }
     return result
 
