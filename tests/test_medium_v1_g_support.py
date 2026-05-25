@@ -106,7 +106,7 @@ class MediumV1GSupportTests(unittest.TestCase):
             generation_calls: list[dict] = []
             eval_calls: list[dict] = []
 
-            def fake_loader(runner_config: dict, max_samples: int):
+            def fake_loader(runner_config: dict, max_samples: int, **kwargs):
                 load_calls.append(max_samples)
                 return object()
 
@@ -183,7 +183,7 @@ class MediumV1GSupportTests(unittest.TestCase):
                 eval_calls: list[dict] = []
                 external_eval_calls: list[dict] = []
 
-                def fake_loader(runner_config: dict, max_samples: int):
+                def fake_loader(runner_config: dict, max_samples: int, **kwargs):
                     load_calls.append(max_samples)
                     return object()
 
@@ -844,7 +844,7 @@ class MediumV1GSupportTests(unittest.TestCase):
         quality_eval = config["stages"]["stage1"]["quality_eval"]
 
         self.assertEqual(config["out_dir"], "artifacts/checkpoints/g_medium_v1_stage1_long200_v4")
-        self.assertEqual(config["resume_from"], "artifacts/checkpoints/g_medium_v1_stage1_long200_v3/last.pt")
+        self.assertEqual(config["resume_from"], "artifacts/checkpoints/g_medium_v1_stage1_long200_v4/last.pt")
         self.assertEqual(config["stages"]["stage1"]["epochs"], 200)
         self.assertEqual(config["stages"]["stage2"]["epochs"], 0)
         self.assertEqual(quality_eval["metrics"], ["niqe", "fid", "kid"])
@@ -855,6 +855,7 @@ class MediumV1GSupportTests(unittest.TestCase):
         self.assertEqual(quality_eval["distribution_timeout_seconds"], 3600)
         self.assertEqual(quality_eval["distribution_cuda_visible_devices"], "0")
         self.assertEqual(quality_eval["distribution_device"], "cuda:0")
+        self.assertEqual(quality_eval["quality_num_workers"], 2)
         self.assertEqual(quality_eval["real_index"], "data/index/val_single_face.jsonl")
         self.assertEqual(quality_eval["output_dir"], "artifacts/eval/g_medium_v1_stage1_long200_v4/quality")
         self.assertNotIn("generated_dir", quality_eval)

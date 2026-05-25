@@ -45,6 +45,7 @@ stages:
     stable_epochs: 3
     quality_eval:
       enabled: true
+      quality_num_workers: 2
       niqe_interval_epochs: 1
       distribution_interval_epochs: 0
       niqe_max_samples: 512

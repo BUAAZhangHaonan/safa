@@ -11,7 +11,7 @@ train_index: data/index/train_balanced_medium.jsonl
 train_features: artifacts/e0_features/train_balanced_medium_e0_medium_v1
 e0_checkpoint: artifacts/checkpoints/e0_medium_v1/best.pt
 out_dir: artifacts/checkpoints/g_medium_v1_stage1_long200_v4
-resume_from: artifacts/checkpoints/g_medium_v1_stage1_long200_v3/last.pt
+resume_from: artifacts/checkpoints/g_medium_v1_stage1_long200_v4/last.pt
 allow_stage2_without_stage1_gate: true
 loss_weighting:
   type: fixed
@@ -45,6 +45,7 @@ stages:
     stable_epochs: 3
     quality_eval:
       enabled: true
+      quality_num_workers: 2
       niqe_interval_epochs: 1
       distribution_interval_epochs: 20
       niqe_max_samples: 512

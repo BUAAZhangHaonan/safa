@@ -60,6 +60,12 @@ class _QualityEvalGroup:
     max_samples: int
 
 
+@dataclass(frozen=True)
+class _ResumeProgress:
+    stage: str
+    stage_epoch: int
+
+
 class _GeneratorTrainingStep:
     def __new__(
         cls,
@@ -410,8 +416,9 @@ def train_g_from_config(config: dict) -> dict:
     sampling_seed = sampling_base_seed_from_config(config)
     generator = build_generator(generator_config.to_dict()).to(device)
     resume_history = None
-    resume_stage_epoch = None
+    resume_progress = None
     resume_ema_state_dict = None
+    resume_optimizer_state_dict = None
     # Optional: absent resume_from starts a fresh generator run.
     if config.get("resume_from"):
         resume_path = Path(config["resume_from"])
@@ -421,16 +428,16 @@ def train_g_from_config(config: dict) -> dict:
         generator.load_state_dict(ckpt["model_state_dict"])
         if "history" in ckpt:
             resume_history = _resume_history_for_checkpoint_selection(ckpt["history"], str(resume_path), config, stages)
-        if "metrics" in ckpt and "stage_epoch" in ckpt["metrics"]:
-            resume_stage_epoch = ckpt["metrics"]["stage_epoch"]
+        resume_progress = _resume_stage_progress_from_metrics(ckpt.get("metrics"), str(resume_path))
         if "ema_model_state_dict" in ckpt:
             resume_ema_state_dict = ckpt["ema_model_state_dict"]
+        if "optimizer_state_dict" in ckpt:
+            resume_optimizer_state_dict = ckpt["optimizer_state_dict"]
         if distributed.is_main:
             restored = ["model_state_dict"]
             if resume_history is not None:
                 restored.append("history")
-            if resume_stage_epoch is not None:
-                restored.append("stage_epoch")
+            restored.append(f"progress={resume_progress.stage}:{resume_progress.stage_epoch}")
             if resume_ema_state_dict is not None:
                 restored.append("ema_model_state_dict")
             sep = ", ".join(restored)
@@ -489,6 +496,16 @@ def train_g_from_config(config: dict) -> dict:
     optimizer = torch.optim.AdamW(
         _optimizer_param_groups(unwrap_model(training_module), config, loss_weighting_runtime),
     )
+    optimizer_resumed = False
+    if config.get("resume_from"):
+        if resume_optimizer_state_dict is None:
+            if distributed.is_main:
+                print("Resume checkpoint has no optimizer_state_dict; optimizer_resumed: false")
+        else:
+            optimizer.load_state_dict(resume_optimizer_state_dict)
+            optimizer_resumed = True
+            if distributed.is_main:
+                print("Resumed optimizer state from checkpoint; optimizer_resumed: true")
     assert_e0_frozen(e0, optimizer)
     lambda_cycle, lambda_max, lambda_growth = _stage2_lambda_schedule(stages, loss_weighting_runtime)
     baseline_detection_rate = None
@@ -499,7 +516,7 @@ def train_g_from_config(config: dict) -> dict:
 
     total_epoch = 0
     for stage_name in ("stage1", "stage2"):
-        if stage_name == "stage2":
+        if _should_check_stage2_gate(stage_name, resume_progress):
             blocked = _stage2_blocked(
                 distributed,
                 device,
@@ -515,8 +532,10 @@ def train_g_from_config(config: dict) -> dict:
                 cleanup_distributed(distributed)
                 raise RuntimeError("Stage 2 is blocked by the Stage 1 face detection gate; see manifest.json on rank 0")
         epochs = int(stages[stage_name]["epochs"])
-        stage_epoch = -1
-        for stage_epoch in range(epochs):
+        start_stage_epoch = _resume_stage_start_epoch(stage_name, epochs, resume_progress)
+        stage_epoch = start_stage_epoch - 1
+        completed_stage_epochs = start_stage_epoch
+        for stage_epoch in range(start_stage_epoch, epochs):
             if train_sampler is not None:
                 train_sampler.set_epoch(total_epoch + stage_epoch)
             training_module.train()
@@ -598,6 +617,8 @@ def train_g_from_config(config: dict) -> dict:
                         "loss_weighting_type": loss_weighting_runtime.type,
                     }
                 )
+                if config.get("resume_from"):
+                    metrics["optimizer_resumed"] = optimizer_resumed
                 if loss_weighting_runtime.type == "uncertainty":
                     metrics["lambda_cycle_legacy_schedule"] = lambda_cycle
                 raw_validation_metrics, ema_validation_metrics = _evaluate_validation_variants(
@@ -650,6 +671,7 @@ def train_g_from_config(config: dict) -> dict:
                     "ema_config": ema_config,
                     "best_model": best_model,
                     "loss_weighting_state": unwrap_model(training_module).loss_weighting_checkpoint_state(),
+                    "optimizer_state_dict": optimizer.state_dict(),
                 }
                 _save_generator(out_dir / "last.pt", unwrap_model(training_module).generator, generator_config, config, metrics, history, **checkpoint_kwargs)
                 _write_json(out_dir / "last_metrics.json", metrics)
@@ -673,9 +695,10 @@ def train_g_from_config(config: dict) -> dict:
                 device,
                 distributed,
             )
+            completed_stage_epochs = stage_epoch + 1
             if should_break:
                 break
-        total_epoch += stage_epoch + 1
+        total_epoch += completed_stage_epochs
 
     manifest = {}
     if distributed.is_main:
@@ -1111,7 +1134,9 @@ def _validate_quality_eval_configs(config: dict, stages: dict) -> None:
         enabled = _quality_eval_enabled(payload, stage_name)
         if not enabled:
             continue
-        _require_field(payload, "output_dir", f"stages.{stage_name}.quality_eval")
+        context = f"stages.{stage_name}.quality_eval"
+        _require_field(payload, "output_dir", context)
+        _quality_eval_num_workers(payload, context)
         _quality_eval_variants(payload, stage_name)
         groups = _quality_eval_due_groups(payload, stage_name, 1)
         metric_names = _quality_eval_metric_names(payload, stage_name)
@@ -1181,6 +1206,50 @@ def _should_record_gradient_conflict(stage_name: str, batch_index: int, config: 
     if config.interval is None:
         raise RuntimeError("Stage 2 gradient conflict monitor is enabled without an interval")
     return batch_index % config.interval == 0
+
+
+def _resume_stage_progress_from_metrics(metrics: dict | None, checkpoint_path: str) -> _ResumeProgress:
+    context = f"resume_from checkpoint metrics: {checkpoint_path}"
+    if not isinstance(metrics, dict):
+        raise ValueError(f"{context} must be a mapping with stage and stage_epoch progress")
+    stage = _require_field(metrics, "stage", context)
+    if stage not in ("stage1", "stage2"):
+        raise ValueError(f"{context}.stage must be stage1 or stage2, got {stage!r}")
+    if "stage_epoch" in metrics:
+        field = "stage_epoch"
+    elif "stage_epoch_0based" in metrics:
+        field = "stage_epoch_0based"
+    else:
+        raise ValueError(f"{context} must include stage_epoch or stage_epoch_0based")
+    value = metrics[field]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{context}.{field} must be a non-negative integer, got {value!r}")
+    return _ResumeProgress(stage=str(stage), stage_epoch=int(value))
+
+
+def _resume_stage_start_epoch(stage_name: str, epochs: int, resume_progress: _ResumeProgress | None) -> int:
+    if resume_progress is None:
+        return 0
+    if stage_name not in ("stage1", "stage2"):
+        raise ValueError(f"stage_name must be stage1 or stage2, got {stage_name!r}")
+    if epochs < 0:
+        raise ValueError(f"{stage_name} epochs must be non-negative, got {epochs!r}")
+    stage_order = {"stage1": 0, "stage2": 1}
+    if stage_order[stage_name] < stage_order[resume_progress.stage]:
+        return epochs
+    if stage_name != resume_progress.stage:
+        return 0
+    start_epoch = resume_progress.stage_epoch + 1
+    if start_epoch > epochs:
+        raise ValueError(
+            f"resume_from checkpoint progress {resume_progress.stage} stage_epoch={resume_progress.stage_epoch} "
+            f"exceeds configured {stage_name}.epochs={epochs}"
+        )
+    return start_epoch
+
+
+def _should_check_stage2_gate(stage_name: str, resume_progress: _ResumeProgress | None) -> bool:
+    return stage_name == "stage2" and not (resume_progress is not None and resume_progress.stage == "stage2")
 
 
 def _resume_history_for_checkpoint_selection(history: list[dict], checkpoint_path: str, config: dict, stages: dict) -> list[dict]:
@@ -1547,7 +1616,12 @@ def _run_quality_eval_hook(
     variants = _quality_eval_variants(payload, stage_name)
     metrics: dict[str, float] = {}
     generation_max_samples = max(group.max_samples for group in groups)
-    loader = _build_quality_eval_loader(config, generation_max_samples)
+    loader = _build_quality_eval_loader(
+        config,
+        generation_max_samples,
+        quality_eval_config=payload,
+        quality_eval_context=f"stages.{stage_name}.quality_eval",
+    )
     multiple_variants = len(variants) > 1
     for model_name in variants:
         current_generator = _quality_eval_current_generator(
@@ -1647,6 +1721,15 @@ def _quality_eval_distribution_timeout_seconds(payload: dict, context: str) -> i
     return _require_positive_int(payload, "distribution_timeout_seconds", context)
 
 
+def _quality_eval_num_workers(payload: dict, context: str) -> int:
+    if "quality_num_workers" not in payload:
+        raise ValueError(f"{context}.quality_num_workers is required")
+    value = payload["quality_num_workers"]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{context}.quality_num_workers must be a non-negative integer, got {value!r}")
+    return int(value)
+
+
 def _quality_eval_enabled(payload: dict, stage_name: str) -> bool:
     if "enabled" not in payload:
         raise ValueError(f"stages.{stage_name}.quality_eval.enabled is required")
@@ -1730,7 +1813,7 @@ def _quality_eval_current_generator(
     return ema_generator
 
 
-def _build_quality_eval_loader(config: dict, max_samples: int):
+def _build_quality_eval_loader(config: dict, max_samples: int, *, quality_eval_config: dict, quality_eval_context: str):
     from torch.utils.data import DataLoader, Subset
 
     validation = _require_mapping(config, "validation", "train_g config")
@@ -1750,7 +1833,7 @@ def _build_quality_eval_loader(config: dict, max_samples: int):
     val_set = Subset(val_set, list(range(min(max_samples, len(val_set)))))
     if len(val_set) == 0:
         raise ValueError("quality_eval validation dataset contains no samples")
-    num_workers = int(config["num_workers"])
+    num_workers = _quality_eval_num_workers(quality_eval_config, quality_eval_context)
     loader_kwargs = {
         "batch_size": int(validation["batch_size"]),
         "shuffle": False,
@@ -1758,7 +1841,7 @@ def _build_quality_eval_loader(config: dict, max_samples: int):
         "pin_memory": True,
     }
     if num_workers > 0:
-        loader_kwargs.update({"persistent_workers": True, "prefetch_factor": 4})
+        loader_kwargs.update({"persistent_workers": False, "prefetch_factor": 4})
     return DataLoader(val_set, **loader_kwargs)
 
 
@@ -2106,6 +2189,7 @@ def _save_generator(
     ema_config: dict | None = None,
     best_model: str | None = None,
     loss_weighting_state: dict | None = None,
+    optimizer_state_dict: dict | None = None,
 ) -> None:
     import torch
 
@@ -2150,6 +2234,8 @@ def _save_generator(
     }
     if loss_weighting_state is not None:
         payload["loss_weighting_state"] = loss_weighting_state
+    if optimizer_state_dict is not None:
+        payload["optimizer_state_dict"] = optimizer_state_dict
     if ema_config["enabled"] and ema_config["save_ema_checkpoint"]:
         payload["ema_model_state_dict"] = ema_model_state_dict
     sampling_seed = optional_sampling_base_seed_from_config(train_config)

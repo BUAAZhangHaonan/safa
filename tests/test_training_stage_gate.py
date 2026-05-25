@@ -154,6 +154,64 @@ class StageGateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "validation"):
             g_loop._validate_train_g_config(config)
 
+
+    def test_quality_eval_loader_uses_explicit_non_persistent_workers(self) -> None:
+        import torch
+        from unittest import mock
+
+        from safa.training import g_loop
+
+        class DummyDataset(torch.utils.data.Dataset):
+            def __len__(self) -> int:
+                return 4
+
+            def __getitem__(self, index: int) -> dict:
+                return {"image": torch.zeros(3, 4, 4), "z": torch.zeros(2), "sample_id": f"sample-{index}"}
+
+        config = self._base_train_config()
+        config.update({"e0_checkpoint": "e0.pt", "image_size": 4, "num_workers": 8})
+        quality_eval = {"quality_num_workers": 2}
+
+        with mock.patch.object(g_loop, "FeatureAlignedAffectNet", return_value=DummyDataset()):
+            loader = g_loop._build_quality_eval_loader(
+                config,
+                3,
+                quality_eval_config=quality_eval,
+                quality_eval_context="stages.stage1.quality_eval",
+            )
+
+        self.assertEqual(loader.num_workers, 2)
+        self.assertFalse(loader.persistent_workers)
+
+    def test_resume_stage_progress_starts_after_completed_stage_epoch(self) -> None:
+        from safa.training.g_loop import _resume_stage_progress_from_metrics, _resume_stage_start_epoch
+
+        progress = _resume_stage_progress_from_metrics({"stage": "stage1", "stage_epoch": 51}, "last.pt")
+
+        self.assertEqual(_resume_stage_start_epoch("stage1", 200, progress), 52)
+        self.assertEqual(_resume_stage_start_epoch("stage2", 10, progress), 0)
+
+    def test_resume_stage_progress_supports_stage2_zero_based_field(self) -> None:
+        from safa.training.g_loop import _resume_stage_progress_from_metrics, _resume_stage_start_epoch
+
+        progress = _resume_stage_progress_from_metrics({"stage": "stage2", "stage_epoch_0based": 7}, "last.pt")
+
+        self.assertEqual(_resume_stage_start_epoch("stage1", 200, progress), 200)
+        self.assertEqual(_resume_stage_start_epoch("stage2", 20, progress), 8)
+
+    def test_resume_stage_progress_requires_checkpoint_progress_field(self) -> None:
+        from safa.training.g_loop import _resume_stage_progress_from_metrics
+
+        with self.assertRaisesRegex(ValueError, "stage_epoch"):
+            _resume_stage_progress_from_metrics({"stage": "stage1"}, "last.pt")
+
+    def test_stage2_resume_does_not_recheck_stage1_gate(self) -> None:
+        from safa.training.g_loop import _resume_stage_progress_from_metrics, _should_check_stage2_gate
+
+        progress = _resume_stage_progress_from_metrics({"stage": "stage2", "stage_epoch": 3}, "last.pt")
+
+        self.assertFalse(_should_check_stage2_gate("stage2", progress))
+
     def test_stage2_requires_explicit_ema_block(self) -> None:
         from safa.training import g_loop
 
