@@ -594,6 +594,95 @@ class MediumV1GSupportTests(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 load_medium_v1_history(Path(tmp) / "missing.json")
 
+    def test_medium_v1_stage2_single_metrics_object_is_rejected_for_curve_history(self) -> None:
+        from scripts.plot_medium_v1_curves import load_medium_v1_history_source
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "last_metrics.json"
+            path.write_text(json.dumps({"stage": "stage2", "stage_epoch": 2, "loss": 0.1}), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "single metrics object"):
+                load_medium_v1_history_source(path)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required to write checkpoint fixtures")
+    def test_medium_v1_stage2_checkpoint_source_writes_non_empty_timeseries(self) -> None:
+        import torch
+
+        from scripts.plot_medium_v1_curves import write_stage2_medium_v1_timeseries
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkpoint_dir = root / "checkpoint"
+            checkpoint_dir.mkdir()
+            torch.save(
+                {
+                    "stage": "stage2",
+                    "history": [
+                        {
+                            "stage": "stage2",
+                            "stage_epoch": 0,
+                            "loss": 0.2,
+                            "flow_loss_raw": 0.11,
+                            "cycle_loss_raw": 0.12,
+                            "flow_loss_normalized": 0.13,
+                            "cycle_loss_normalized": 0.14,
+                            "validation_raw_latent_cosine_mean": 0.9,
+                            "validation_raw_single_face_eq1_rate": 0.8,
+                        },
+                        {
+                            "stage": "stage2",
+                            "stage_epoch": 1,
+                            "loss": 0.1,
+                            "flow_loss_raw": 0.21,
+                            "cycle_loss_raw": 0.22,
+                            "flow_loss_normalized": 0.23,
+                            "cycle_loss_normalized": 0.24,
+                            "validation_raw_latent_cosine_mean": 0.95,
+                            "validation_raw_single_face_eq1_rate": 1.0,
+                        },
+                    ],
+                },
+                checkpoint_dir / "last.pt",
+            )
+
+            output = write_stage2_medium_v1_timeseries(checkpoint_dir, root / "stage2_m0_metrics_timeseries.json", run_name="m0")
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(payload["run"], "m0")
+            self.assertEqual(payload["sources"]["history"], str(checkpoint_dir / "last.pt"))
+            self.assertEqual([row["stage_epoch"] for row in payload["history"]], [0, 1])
+            self.assertEqual(payload["history"][1]["loss"], 0.1)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required to write checkpoint fixtures")
+    def test_medium_v1_stage2_checkpoint_history_rejects_missing_curve_field(self) -> None:
+        import torch
+
+        from scripts.plot_medium_v1_curves import load_medium_v1_history_source
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "last.pt"
+            torch.save(
+                {
+                    "stage": "stage2",
+                    "history": [
+                        {
+                            "stage": "stage2",
+                            "stage_epoch": 0,
+                            "loss": 0.2,
+                            "cycle_loss_raw": 0.12,
+                            "flow_loss_normalized": 0.13,
+                            "cycle_loss_normalized": 0.14,
+                            "validation_raw_latent_cosine_mean": 0.9,
+                            "validation_raw_single_face_eq1_rate": 0.8,
+                        }
+                    ],
+                },
+                path,
+            )
+
+            with self.assertRaisesRegex(ValueError, "missing required curve field 'flow_loss_raw'"):
+                load_medium_v1_history_source(path)
+
     def test_stage1_long200_plot_timeseries_reads_latest_run_and_quality_jsons(self) -> None:
         from scripts.plot_medium_v1_curves import build_stage1_long200_timeseries
 
