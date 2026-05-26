@@ -9,6 +9,15 @@ from pathlib import Path
 from typing import Any
 
 
+MEDIUM_V1_REQUIRED_CURVE_FIELDS = (
+    "loss",
+    "flow_loss_raw",
+    "cycle_loss_raw",
+    "flow_loss_normalized",
+    "cycle_loss_normalized",
+)
+
+
 def load_medium_v1_history(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         raise FileNotFoundError(f"required medium_v1 JSON is missing: {path}")
@@ -60,6 +69,74 @@ def _utility_series(history: list[dict[str, Any]], label: str, model: str = "raw
         xs.append(index)
         ys.append(cosine * single)
     return xs, ys
+
+
+def _validate_medium_v1_curve_history(history: list[dict[str, Any]], label: str) -> None:
+    for field in MEDIUM_V1_REQUIRED_CURVE_FIELDS:
+        _series(history, field, label)
+    _utility_series(history, label, "raw")
+
+
+def _resolve_medium_v1_history_source(path: Path) -> Path:
+    if path.is_dir():
+        checkpoint = path / "last.pt"
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f"required Stage2 checkpoint history is missing: {checkpoint}")
+        return checkpoint
+    return path
+
+
+def _load_checkpoint_history(path: Path, label: str) -> list[dict[str, Any]]:
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError("torch is required to read Stage2 checkpoint history") from exc
+    checkpoint = torch.load(path, map_location="cpu")
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"{path} must contain a checkpoint mapping")
+    history = checkpoint.get("history")
+    if not isinstance(history, list) or not history:
+        raise ValueError(f"{path} must contain a non-empty history list for {label}")
+    rows = []
+    for index, item in enumerate(history):
+        if not isinstance(item, dict):
+            raise ValueError(f"{path}: history[{index}] must be an object")
+        rows.append(dict(item))
+    return rows
+
+
+def load_medium_v1_history_source(path: Path) -> list[dict[str, Any]]:
+    source = _resolve_medium_v1_history_source(path)
+    if not source.is_file():
+        raise FileNotFoundError(f"required medium_v1 history source is missing: {source}")
+    if source.suffix == ".json":
+        payload = json.loads(source.read_text(encoding="utf-8"))
+        if isinstance(payload, dict) and "history" not in payload:
+            raise ValueError(f"{source} contains a single metrics object; provide a history JSON, .pt checkpoint, or checkpoint directory")
+        rows = load_medium_v1_history(source)
+    elif source.suffix == ".pt":
+        rows = _load_checkpoint_history(source, str(path))
+    else:
+        raise ValueError(f"{source} must be a JSON history file, .pt checkpoint, or checkpoint directory")
+    _validate_medium_v1_curve_history(rows, str(path))
+    return rows
+
+
+def build_stage2_medium_v1_timeseries(source_path: Path, *, run_name: str) -> dict[str, Any]:
+    resolved = _resolve_medium_v1_history_source(source_path)
+    history = load_medium_v1_history_source(source_path)
+    return {
+        "run": run_name,
+        "sources": {"history": str(resolved)},
+        "history": history,
+    }
+
+
+def write_stage2_medium_v1_timeseries(source_path: Path, output: Path, *, run_name: str) -> Path:
+    payload = build_stage2_medium_v1_timeseries(source_path, run_name=run_name)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False), encoding="utf-8")
+    return output
 
 
 def _plot_lines(curves: list[tuple[str, list[int], list[float]]], title: str, ylabel: str, output: Path) -> None:
@@ -476,9 +553,9 @@ def plot_stage1_long200_curves(
 
 def plot_medium_v1_curves(*, stage1_json: Path, m0_json: Path, m1_json: Path, out_dir: Path) -> list[Path]:
     histories = {
-        "stage1": load_medium_v1_history(stage1_json),
-        "m0": load_medium_v1_history(m0_json),
-        "m1_uw": load_medium_v1_history(m1_json),
+        "stage1": load_medium_v1_history_source(stage1_json),
+        "m0": load_medium_v1_history_source(m0_json),
+        "m1_uw": load_medium_v1_history_source(m1_json),
     }
     outputs = [
         out_dir / "medium_v1_loss.png",
@@ -487,7 +564,11 @@ def plot_medium_v1_curves(*, stage1_json: Path, m0_json: Path, m1_json: Path, ou
         out_dir / "medium_v1_flow_loss_normalized.png",
         out_dir / "medium_v1_cycle_loss_normalized.png",
         out_dir / "medium_v1_raw_utility.png",
+        out_dir / "stage2_m0_metrics_timeseries.json",
+        out_dir / "stage2_m1_uw_metrics_timeseries.json",
     ]
+    write_stage2_medium_v1_timeseries(m0_json, outputs[6], run_name="stage2_m0")
+    write_stage2_medium_v1_timeseries(m1_json, outputs[7], run_name="stage2_m1_uw")
     _plot_lines(
         [(name, *_series(history, "loss", name)) for name, history in histories.items()],
         "medium_v1 loss",
@@ -532,6 +613,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage1-json", type=Path)
     parser.add_argument("--m0-json", type=Path)
     parser.add_argument("--m1-json", type=Path)
+    parser.add_argument("--m0-history-source", type=Path, help="Stage2 M0 JSON history, .pt checkpoint, or checkpoint directory.")
+    parser.add_argument("--m1-history-source", type=Path, help="Stage2 M1-UW JSON history, .pt checkpoint, or checkpoint directory.")
     parser.add_argument("--stage1-history", type=Path, help="Stage1 checkpoint .pt or JSON containing history.")
     parser.add_argument("--stage1-last-metrics-json", type=Path)
     parser.add_argument("--stage1-quality-dir", type=Path)
@@ -558,12 +641,17 @@ def main() -> int:
                 allow_missing_quality=args.allow_missing_quality,
             )
         else:
-            if args.stage1_json is None or args.m0_json is None or args.m1_json is None:
-                raise ValueError("--stage1-json, --m0-json, and --m1-json are required for medium_v1 comparison plots")
+            m0_source = args.m0_history_source or args.m0_json
+            m1_source = args.m1_history_source or args.m1_json
+            if args.stage1_json is None or m0_source is None or m1_source is None:
+                raise ValueError(
+                    "--stage1-json and M0/M1 history sources are required for medium_v1 comparison plots; "
+                    "use --m0-history-source/--m1-history-source for Stage2 checkpoint inputs"
+                )
             outputs = plot_medium_v1_curves(
                 stage1_json=args.stage1_json,
-                m0_json=args.m0_json,
-                m1_json=args.m1_json,
+                m0_json=m0_source,
+                m1_json=m1_source,
                 out_dir=args.out_dir,
             )
     except Exception as exc:
