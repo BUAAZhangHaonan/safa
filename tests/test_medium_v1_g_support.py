@@ -1114,5 +1114,59 @@ class MediumV1GSupportTests(unittest.TestCase):
         self.assertEqual(g_loop._training_batch_config(m1, world_size=4).per_device_batch_size, 24)
 
 
+    def test_medium_v1_stage2_m0_and_m1_eval_configs_use_guarded_privacy_protocol(self) -> None:
+        from safa.cli.eval import REQUIRED_KEYS
+        from safa.utils.config import require_keys
+        from safa.evaluation import runner
+
+        cases = (
+            (
+                "m0",
+                Path("configs/medium_v1/eval_g_medium_v1_stage2_m0_single_face.yaml"),
+                "artifacts/checkpoints/g_medium_v1_stage2_m0/best_raw_utility.pt",
+                "artifacts/eval/g_medium_v1_stage2_m0_single_face",
+            ),
+            (
+                "m1",
+                Path("configs/medium_v1/eval_g_medium_v1_stage2_m1_uw_single_face.yaml"),
+                "artifacts/checkpoints/g_medium_v1_stage2_m1_uw/best_raw_utility.pt",
+                "artifacts/eval/g_medium_v1_stage2_m1_uw_single_face",
+            ),
+        )
+
+        for name, path, checkpoint, eval_dir in cases:
+            with self.subTest(name=name):
+                self.assertTrue(path.is_file())
+                config = yaml.safe_load(path.read_text(encoding="utf-8"))
+                require_keys(config, REQUIRED_KEYS)
+                runner._eval_monitor_configs(config)
+
+                self.assertEqual(config["index"], "data/index/val_single_face.jsonl")
+                self.assertEqual(config["features"], "artifacts/e0_features/val_single_face_e0_medium_v1")
+                self.assertEqual(config["e0_checkpoint"], "artifacts/checkpoints/e0_medium_v1/best.pt")
+                self.assertEqual(config["g_checkpoint"], checkpoint)
+                self.assertEqual(config["checkpoint_model"], "raw")
+                self.assertNotEqual(config["g_checkpoint"], "artifacts/checkpoints/g_medium_v1_stage2_m0/best.pt")
+                self.assertNotEqual(config["g_checkpoint"], "artifacts/checkpoints/g_medium_v1_stage2_m1_uw/best.pt")
+                self.assertEqual(runner._eval_checkpoint_model_source({"training_config": {"best_model": "ema"}}, config), "raw")
+
+                self.assertEqual(config["out_json"], f"{eval_dir}/result.json")
+                self.assertEqual(config["per_sample_jsonl"], f"{eval_dir}/per_sample.jsonl")
+                self.assertEqual(config["sample_dir"], f"{eval_dir}/samples")
+                self.assertEqual(config["generated_image_dir"], f"{eval_dir}/generated_images")
+
+                self.assertEqual(config["face_detection"]["single_face_eq1_threshold"], 0.98)
+                self.assertEqual(config["face_detection"]["latent_cosine_threshold"], 0.95)
+                self.assertIs(config["privacy"]["enabled"], True)
+                self.assertEqual(
+                    config["privacy"]["recognizers"],
+                    [
+                        {"name": "arcface", "type": "insightface", "model_name": "buffalo_l"},
+                        {"name": "facenet", "type": "torchscript", "checkpoint": "artifacts/privacy/facenet.pt", "embedding_dim": 512, "input_size": 160},
+                        {"name": "adaface", "type": "torchscript", "checkpoint": "artifacts/privacy/adaface.pt", "embedding_dim": 512, "input_size": 112},
+                    ],
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
