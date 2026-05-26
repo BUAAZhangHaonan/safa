@@ -10,6 +10,7 @@ class StageGateTests(unittest.TestCase):
         return {
             "embedding_dim": 2,
             "image_size": 4,
+            "batch_size": 2,
             "allow_stage2_without_stage1_gate": False,
             "ema": {
                 "enabled": False,
@@ -143,6 +144,58 @@ class StageGateTests(unittest.TestCase):
         from safa.training import g_loop
 
         g_loop._validate_train_g_config(self._base_train_config())
+
+    def test_explicit_global_and_per_device_batch_semantics_use_per_device_loader_batch(self) -> None:
+        import torch
+
+        from safa.training import g_loop
+
+        class DummyDataset(torch.utils.data.Dataset):
+            def __len__(self) -> int:
+                return 128
+
+            def __getitem__(self, index: int) -> dict:
+                return {"image": torch.zeros(3, 4, 4), "z": torch.zeros(2), "sample_id": f"sample-{index}"}
+
+        config = self._base_train_config()
+        config.pop("batch_size")
+        config["global_batch_size"] = 64
+        config["per_device_batch_size"] = 16
+        config["stages"]["stage2"]["gradient_conflict"] = {"enabled": True, "interval": 20, "max_samples": 8}
+
+        g_loop._validate_train_g_config(config)
+        batch_config = g_loop._training_batch_config(config, world_size=4)
+        loader = g_loop._build_train_loader(DummyDataset(), train_sampler=None, batch_config=batch_config, num_workers=1)
+
+        self.assertEqual(batch_config.global_batch_size, 64)
+        self.assertEqual(batch_config.per_device_batch_size, 16)
+        self.assertEqual(batch_config.world_size, 4)
+        self.assertEqual(batch_config.gradient_accumulation_steps, 1)
+        self.assertEqual(loader.batch_size, 16)
+
+    def test_global_and_per_device_batch_semantics_fail_when_accumulation_would_be_required(self) -> None:
+        from safa.training import g_loop
+
+        config = self._base_train_config()
+        config.pop("batch_size")
+        config["global_batch_size"] = 64
+        config["per_device_batch_size"] = 8
+
+        g_loop._validate_train_g_config(config)
+        with self.assertRaisesRegex(ValueError, "gradient accumulation.*not implemented"):
+            g_loop._training_batch_config(config, world_size=4)
+
+    def test_legacy_batch_size_remains_per_device_compatible(self) -> None:
+        from safa.training import g_loop
+
+        config = self._base_train_config()
+
+        g_loop._validate_train_g_config(config)
+        batch_config = g_loop._training_batch_config(config, world_size=4)
+
+        self.assertEqual(batch_config.per_device_batch_size, 2)
+        self.assertEqual(batch_config.global_batch_size, 8)
+        self.assertEqual(batch_config.world_size, 4)
 
     def test_training_config_requires_explicit_validation_block_even_without_stage2(self) -> None:
         from safa.training import g_loop

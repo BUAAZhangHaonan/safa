@@ -3,7 +3,8 @@ seed: 1337
 sampling_seed: 1337
 device: cuda:0
 num_workers: 8
-batch_size: 64
+global_batch_size: 64
+per_device_batch_size: 16
 learning_rate: 0.0003
 weight_decay: 0.0
 image_size: 224
@@ -71,7 +72,8 @@ validation:
   index: data/index/val_single_face.jsonl
   features: artifacts/e0_features/val_single_face_e0_medium_v1
   max_samples: 512
-  batch_size: 64
+  # Validation batch_size is per-device/eval batch; it does not change the training global batch.
+  batch_size: 16
   face_detection:
     enabled: true
     model_name: buffalo_l

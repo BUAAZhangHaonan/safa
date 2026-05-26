@@ -10,7 +10,6 @@ REQUIRED_KEYS = (
     "seed",
     "device",
     "num_workers",
-    "batch_size",
     "learning_rate",
     "weight_decay",
     "image_size",
@@ -33,6 +32,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     config = load_yaml(parse_args().config)
     require_keys(config, REQUIRED_KEYS)
+    if "batch_size" not in config and ("global_batch_size" not in config or "per_device_batch_size" not in config):
+        raise KeyError("Config must define either legacy batch_size or both global_batch_size and per_device_batch_size")
     print(train_g_from_config(config))
 
 

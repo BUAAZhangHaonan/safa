@@ -55,6 +55,14 @@ class _LossWeightingRuntime:
 
 
 @dataclass(frozen=True)
+class _BatchConfig:
+    global_batch_size: int
+    per_device_batch_size: int
+    world_size: int
+    gradient_accumulation_steps: int = 1
+
+
+@dataclass(frozen=True)
 class _QualityEvalGroup:
     name: str
     metrics: tuple[str, ...]
@@ -276,6 +284,69 @@ def _require_positive_int(config: dict, field: str, context: str) -> int:
     return int(value)
 
 
+def _requires_explicit_stage2_batch_semantics(config: dict) -> bool:
+    stages = config.get("stages")
+    if not isinstance(stages, dict) or not isinstance(stages.get("stage2"), dict):
+        return False
+    stage2_epochs = stages["stage2"].get("epochs", 0)
+    out_dir = Path(str(config.get("out_dir", ""))).name
+    return int(stage2_epochs) > 0 and out_dir in {"g_medium_v1_stage2_m0", "g_medium_v1_stage2_m1_uw"}
+
+
+def _training_batch_config(config: dict, *, world_size: int | None = None) -> _BatchConfig:
+    effective_world_size = 1 if world_size is None else int(world_size)
+    if effective_world_size < 1:
+        raise ValueError(f"world_size must be >= 1, got {world_size!r}")
+
+    has_global = "global_batch_size" in config
+    has_per_device = "per_device_batch_size" in config
+    has_legacy = "batch_size" in config
+    context = "train_g config"
+
+    if _requires_explicit_stage2_batch_semantics(config):
+        if has_legacy:
+            raise ValueError(
+                "medium_v1 Stage 2 M0/M1 configs must use explicit global_batch_size "
+                "and per_device_batch_size; remove legacy train_g config.batch_size"
+            )
+        if not has_global or not has_per_device:
+            raise ValueError("medium_v1 Stage 2 M0/M1 configs require explicit global_batch_size and per_device_batch_size")
+
+    if has_global or has_per_device:
+        if has_legacy:
+            raise ValueError("Do not set legacy batch_size with explicit global_batch_size/per_device_batch_size")
+        global_batch_size = _require_positive_int(config, "global_batch_size", context)
+        per_device_batch_size = _require_positive_int(config, "per_device_batch_size", context)
+        expected_global = per_device_batch_size * effective_world_size
+        if world_size is not None and global_batch_size != expected_global:
+            raise ValueError(
+                "global_batch_size must equal per_device_batch_size * world_size because gradient accumulation is not implemented; "
+                f"got global_batch_size={global_batch_size}, per_device_batch_size={per_device_batch_size}, "
+                f"world_size={effective_world_size}, expected_global_batch_size={expected_global}"
+            )
+        return _BatchConfig(
+            global_batch_size=global_batch_size,
+            per_device_batch_size=per_device_batch_size,
+            world_size=effective_world_size,
+        )
+
+    per_device_batch_size = _require_positive_int(config, "batch_size", context)
+    return _BatchConfig(
+        global_batch_size=per_device_batch_size * effective_world_size,
+        per_device_batch_size=per_device_batch_size,
+        world_size=effective_world_size,
+    )
+
+
+def _batch_metadata(batch_config: _BatchConfig) -> dict:
+    return {
+        "global_batch_size": batch_config.global_batch_size,
+        "per_device_batch_size": batch_config.per_device_batch_size,
+        "world_size": batch_config.world_size,
+        "gradient_accumulation_steps": batch_config.gradient_accumulation_steps,
+    }
+
+
 def _verify_e0_feature_cache_consistency(config: dict) -> None:
     from safa.data.feature_cache import load_manifest
     from safa.utils.hashing import sha256_file
@@ -443,9 +514,24 @@ def _restore_or_calibrate_uncertainty_loss(
     return "calibrated"
 
 
+def _build_train_loader(train_set, *, train_sampler, batch_config: _BatchConfig, num_workers: int):
+    from torch.utils.data import DataLoader
+
+    return DataLoader(
+        train_set,
+        batch_size=batch_config.per_device_batch_size,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4,
+    )
+
+
 def train_g_from_config(config: dict) -> dict:
     import torch
-    from torch.utils.data import DataLoader, DistributedSampler
+    from torch.utils.data import DistributedSampler
     from torch.nn.parallel import DistributedDataParallel
     from tqdm import tqdm
 
@@ -454,6 +540,12 @@ def train_g_from_config(config: dict) -> dict:
     audit_no_identity_supervision(config, DEFAULT_NO_IDENTITY_SOURCE_PATHS)
     _validate_train_g_config(config)
     distributed = init_distributed(config)
+    try:
+        batch_config = _training_batch_config(config, world_size=distributed.world_size)
+    except ValueError:
+        cleanup_distributed(distributed)
+        raise
+    batch_metadata = _batch_metadata(batch_config)
     device = distributed.device
     num_workers = int(config["num_workers"])
     if num_workers < 1:
@@ -538,16 +630,7 @@ def train_g_from_config(config: dict) -> dict:
         if distributed.enabled
         else None
     )
-    train_loader = DataLoader(
-        train_set,
-        batch_size=int(config["batch_size"]),
-        shuffle=train_sampler is None,
-        sampler=train_sampler,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=4,
-    )
+    train_loader = _build_train_loader(train_set, train_sampler=train_sampler, batch_config=batch_config, num_workers=num_workers)
     validation_loader = _build_validation_loader(config) if distributed.is_main else None
     detector = _build_detector(config, str(device)) if distributed.is_main else None
     gradient_conflict_config = _stage2_gradient_conflict_config(stages)
@@ -601,6 +684,7 @@ def train_g_from_config(config: dict) -> dict:
                 out_dir,
                 best_checkpoint,
                 history,
+                batch_metadata,
             )
             if blocked:
                 cleanup_distributed(distributed)
@@ -729,6 +813,7 @@ def train_g_from_config(config: dict) -> dict:
                         "loss_weighting_type": loss_weighting_runtime.type,
                     }
                 )
+                metrics.update(batch_metadata)
                 if config.get("resume_from"):
                     metrics["optimizer_resumed"] = optimizer_resumed
                 if loss_weighting_runtime.type == "uncertainty":
@@ -824,6 +909,7 @@ def train_g_from_config(config: dict) -> dict:
             "model_type": "conditional_flow_matching",
             "identity_supervision": False,
             "distributed": _distributed_manifest(distributed),
+            **batch_metadata,
             "sampling": {"base_seed": sampling_seed, "stable_x_init": True},
             "ema_config": ema_config,
             "best_model": best_model,
@@ -1070,6 +1156,7 @@ def _stage2_blocked(
     out_dir: Path,
     best_checkpoint: Path,
     history: list[dict],
+    batch_metadata: dict,
 ) -> bool:
     import torch
 
@@ -1096,6 +1183,7 @@ def _stage2_blocked(
                     "blocked": True,
                     "block_reason": str(exc),
                     "distributed": _distributed_manifest(distributed),
+                    **batch_metadata,
                 },
             )
             blocked = True
@@ -1130,15 +1218,15 @@ def _validate_train_g_config(config: dict) -> None:
             raise ValueError("loss_weighting.type='uncertainty' requires stages.stage2.epochs > 0")
     _stage2_lambda_schedule(stages, loss_weighting)
     _validate_stage1_gate_config(stages["stage1"])
+    batch_config = _training_batch_config(config)
     gradient_conflict = _stage2_gradient_conflict_config(stages)
     if gradient_conflict.enabled:
-        batch_size = _require_positive_int(config, "batch_size", "train_g config")
         if gradient_conflict.max_samples is None:
             raise ValueError("stages.stage2.gradient_conflict.max_samples is required when enabled")
-        if gradient_conflict.max_samples > batch_size:
+        if gradient_conflict.max_samples > batch_config.per_device_batch_size:
             raise ValueError(
-                "stages.stage2.gradient_conflict.max_samples must be less than or equal to train_g config.batch_size, "
-                f"got max_samples={gradient_conflict.max_samples} batch_size={batch_size}"
+                "stages.stage2.gradient_conflict.max_samples must be less than or equal to train_g config.per_device_batch_size, "
+                f"got max_samples={gradient_conflict.max_samples} per_device_batch_size={batch_config.per_device_batch_size}"
             )
     _validate_validation_block(config)
     _validate_quality_eval_configs(config, stages)
@@ -2413,6 +2501,11 @@ def _save_generator(
         "ema": ema_config,
         "best_model": best_model,
     }
+    for field in ("global_batch_size", "per_device_batch_size", "world_size", "gradient_accumulation_steps"):
+        if field in metrics:
+            training_config[field] = metrics[field]
+        elif field in train_config:
+            training_config[field] = train_config[field]
     if "loss_weighting" in train_config:
         training_config["loss_weighting"] = train_config["loss_weighting"]
     if "resume_from_legacy_stage1_metrics" in train_config:
