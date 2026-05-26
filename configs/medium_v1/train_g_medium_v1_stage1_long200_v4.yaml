@@ -42,7 +42,8 @@ stages:
     epochs: 200
     require_face_detection_gate: true
     face_detection_threshold: 1.0
-    stable_epochs: 3
+    # Keep the gate from ending the long200 continuation before epoch 200.
+    stable_epochs: 29
     quality_eval:
       enabled: true
       quality_num_workers: 2
