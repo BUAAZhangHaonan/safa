@@ -962,8 +962,10 @@ class MediumV1GSupportTests(unittest.TestCase):
         ):
             with self.subTest(name=name):
                 self.assertEqual(config["resume_from"], "artifacts/checkpoints/g_medium_v1_stage1_long200_v4/best_stage1.pt")
-                self.assertEqual(config["batch_size"], 64)
-                self.assertEqual(config["validation"]["batch_size"], 64)
+                self.assertNotIn("batch_size", config)
+                self.assertEqual(config["global_batch_size"], 64)
+                self.assertEqual(config["per_device_batch_size"], 16)
+                self.assertEqual(config["validation"]["batch_size"], 16)
                 self.assertEqual(config["stages"]["stage2"]["epochs"], 200)
                 self.assertEqual(config["generator"]["train_cycle_steps"], 16)
                 self.assertEqual(config["generator"]["cycle_steps_schedule"], [])
@@ -1006,6 +1008,10 @@ class MediumV1GSupportTests(unittest.TestCase):
 
         g_loop._validate_train_g_config(m0)
         g_loop._validate_train_g_config(m1)
+        self.assertEqual(g_loop._training_batch_config(m0, world_size=4).global_batch_size, 64)
+        self.assertEqual(g_loop._training_batch_config(m0, world_size=4).per_device_batch_size, 16)
+        self.assertEqual(g_loop._training_batch_config(m1, world_size=4).global_batch_size, 64)
+        self.assertEqual(g_loop._training_batch_config(m1, world_size=4).per_device_batch_size, 16)
 
 
 if __name__ == "__main__":
