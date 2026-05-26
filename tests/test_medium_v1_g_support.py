@@ -967,7 +967,7 @@ class MediumV1GSupportTests(unittest.TestCase):
                 self.assertEqual(config["stages"]["stage2"]["epochs"], 200)
                 self.assertEqual(config["generator"]["train_cycle_steps"], 16)
                 self.assertEqual(config["generator"]["cycle_steps_schedule"], [])
-                self.assertEqual(config["stages"]["stage2"]["gradient_conflict"], {"enabled": True, "interval": 20})
+                self.assertEqual(config["stages"]["stage2"]["gradient_conflict"], {"enabled": True, "interval": 20, "max_samples": 8})
 
                 quality_eval = config["stages"]["stage2"]["quality_eval"]
                 self.assertIs(quality_eval["enabled"], True)

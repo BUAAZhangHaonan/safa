@@ -41,6 +41,7 @@ DEFAULT_NO_IDENTITY_SOURCE_PATHS = (Path(__file__).resolve().parent, _SAFA_PACKA
 class _GradientConflictConfig:
     enabled: bool
     interval: int | None = None
+    max_samples: int | None = None
 
 
 @dataclass(frozen=True)
@@ -635,28 +636,66 @@ def train_g_from_config(config: dict) -> dict:
                 optimizer.zero_grad(set_to_none=True)
                 amp_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if use_amp else nullcontext()
                 sample_ids = list(batch["sample_id"])
-                with amp_ctx:
-                    loss, flow_mse, cycle, flow_loss, cycle_loss = training_module(images, z, sample_ids, stage_name == "stage2", lambda_cycle)
-                _assert_finite_training_scalars(loss, flow_mse, cycle)
                 batch_size = int(z.shape[0])
-                _accumulate_extra_loss_metrics(totals, unwrap_model(training_module).last_loss_metrics, batch_size)
                 if _should_record_gradient_conflict(stage_name, batch_index, gradient_conflict_config):
-                    gradient_cycle_weight = float(
-                        unwrap_model(training_module).last_loss_metrics.get("loss_weighting_cycle_weight", lambda_cycle)
+                    if gradient_conflict_config.max_samples is None:
+                        raise RuntimeError("Stage 2 gradient conflict monitor is enabled without max_samples")
+                    (
+                        gradient_images,
+                        gradient_z,
+                        gradient_sample_ids,
+                        gradient_sample_size,
+                        gradient_full_batch_size,
+                    ) = _slice_gradient_conflict_monitor_batch(
+                        images,
+                        z,
+                        sample_ids,
+                        max_samples=gradient_conflict_config.max_samples,
                     )
-                    gradient_metrics = _compute_gradient_conflict_metrics(
-                        flow_loss,
-                        cycle_loss,
-                        unwrap_model(training_module).generator.parameters(),
-                        lambda_cycle=gradient_cycle_weight,
-                    )
+                    training_state = unwrap_model(training_module)
+                    saved_batch_idx = training_state._batch_idx
+                    saved_loss_metrics = dict(training_state.last_loss_metrics)
+                    try:
+                        training_state._batch_idx = saved_batch_idx
+                        with amp_ctx:
+                            _, _, _, gradient_flow_loss, gradient_cycle_loss = training_state(
+                                gradient_images,
+                                gradient_z,
+                                gradient_sample_ids,
+                                True,
+                                lambda_cycle,
+                            )
+                        gradient_cycle_weight = float(
+                            training_state.last_loss_metrics.get("loss_weighting_cycle_weight", lambda_cycle)
+                        )
+                        gradient_metrics = _compute_gradient_conflict_metrics(
+                            gradient_flow_loss,
+                            gradient_cycle_loss,
+                            training_state.generator.parameters(),
+                            lambda_cycle=gradient_cycle_weight,
+                            sample_size=gradient_sample_size,
+                            full_batch_size=gradient_full_batch_size,
+                        )
+                    finally:
+                        training_state._batch_idx = saved_batch_idx
+                        training_state.last_loss_metrics = saved_loss_metrics
                     totals["gradient_conflict_count"] += 1.0
                     totals["gradient_cosine_fm_cycle"] += gradient_metrics["gradient_cosine_fm_cycle"]
                     totals["gradient_norm_fm"] += gradient_metrics["gradient_norm_fm"]
                     totals["gradient_norm_cycle"] += gradient_metrics["gradient_norm_cycle"]
                     totals["weighted_gradient_norm_cycle"] += gradient_metrics["weighted_gradient_norm_cycle"]
                     totals["weighted_gradient_ratio_cycle_to_fm"] += gradient_metrics["weighted_gradient_ratio_cycle_to_fm"]
+                    totals["gradient_conflict_sample_size"] = float(totals.get("gradient_conflict_sample_size", 0.0)) + float(
+                        gradient_metrics["gradient_conflict_sample_size"]
+                    )
+                    totals["gradient_conflict_full_batch_size"] = float(totals.get("gradient_conflict_full_batch_size", 0.0)) + float(
+                        gradient_metrics["gradient_conflict_full_batch_size"]
+                    )
                     totals["gradient_conflict_samples"].append(gradient_metrics)
+                with amp_ctx:
+                    loss, flow_mse, cycle, flow_loss, cycle_loss = training_module(images, z, sample_ids, stage_name == "stage2", lambda_cycle)
+                _assert_finite_training_scalars(loss, flow_mse, cycle)
+                _accumulate_extra_loss_metrics(totals, unwrap_model(training_module).last_loss_metrics, batch_size)
                 assert_finite_tensor("g_loss", loss)
                 loss.backward()
                 batch_grad_norm = 0.0
@@ -805,6 +844,10 @@ def _reduce_epoch_metrics(totals: dict, seen: int, device, distributed: Distribu
     if local_gradient_conflict_count > 0.0:
         weighted_gradient_norm_cycle = float(totals["weighted_gradient_norm_cycle"])
         weighted_gradient_ratio_cycle_to_fm = float(totals["weighted_gradient_ratio_cycle_to_fm"])
+        if "gradient_conflict_sample_size" not in totals:
+            raise RuntimeError("Gradient conflict monitor is missing gradient_conflict_sample_size")
+        if "gradient_conflict_full_batch_size" not in totals:
+            raise RuntimeError("Gradient conflict monitor is missing gradient_conflict_full_batch_size")
     values = torch.tensor(
         [
             float(totals["loss"]),
@@ -819,6 +862,8 @@ def _reduce_epoch_metrics(totals: dict, seen: int, device, distributed: Distribu
             float(totals.get("gradient_norm_cycle", 0.0)),
             weighted_gradient_norm_cycle,
             weighted_gradient_ratio_cycle_to_fm,
+            float(totals.get("gradient_conflict_sample_size", 0.0)),
+            float(totals.get("gradient_conflict_full_batch_size", 0.0)),
         ],
         device=device,
         dtype=torch.float64,
@@ -839,6 +884,8 @@ def _reduce_epoch_metrics(totals: dict, seen: int, device, distributed: Distribu
         "gradient_norm_cycle",
         "weighted_gradient_norm_cycle",
         "weighted_gradient_ratio_cycle_to_fm",
+        "gradient_conflict_sample_size",
+        "gradient_conflict_full_batch_size",
     )
     for index, name in enumerate(metric_names):
         if not bool(torch.isfinite(values[index]).item()):
@@ -868,6 +915,8 @@ def _reduce_epoch_metrics(totals: dict, seen: int, device, distributed: Distribu
                 "gradient_norm_cycle": float(values[8].item() / gradient_conflict_count),
                 "weighted_gradient_norm_cycle": float(values[9].item() / gradient_conflict_count),
                 "weighted_gradient_ratio_cycle_to_fm": float(values[10].item() / gradient_conflict_count),
+                "gradient_conflict_sample_size": float(values[11].item() / gradient_conflict_count),
+                "gradient_conflict_full_batch_size": float(values[12].item() / gradient_conflict_count),
                 "gradient_conflict_count": int(gradient_conflict_count),
                 **_summarize_gradient_conflict_samples(gradient_samples),
             }
@@ -1081,7 +1130,16 @@ def _validate_train_g_config(config: dict) -> None:
             raise ValueError("loss_weighting.type='uncertainty' requires stages.stage2.epochs > 0")
     _stage2_lambda_schedule(stages, loss_weighting)
     _validate_stage1_gate_config(stages["stage1"])
-    _stage2_gradient_conflict_config(stages)
+    gradient_conflict = _stage2_gradient_conflict_config(stages)
+    if gradient_conflict.enabled:
+        batch_size = _require_positive_int(config, "batch_size", "train_g config")
+        if gradient_conflict.max_samples is None:
+            raise ValueError("stages.stage2.gradient_conflict.max_samples is required when enabled")
+        if gradient_conflict.max_samples > batch_size:
+            raise ValueError(
+                "stages.stage2.gradient_conflict.max_samples must be less than or equal to train_g config.batch_size, "
+                f"got max_samples={gradient_conflict.max_samples} batch_size={batch_size}"
+            )
     _validate_validation_block(config)
     _validate_quality_eval_configs(config, stages)
     if int(_require_field(stages["stage2"], "epochs", "stages.stage2")) > 0:
@@ -1264,12 +1322,24 @@ def _stage2_gradient_conflict_config(stages: dict) -> _GradientConflictConfig:
         return _GradientConflictConfig(enabled=False)
     if "interval" not in payload:
         raise ValueError("stages.stage2.gradient_conflict.interval is required when enabled")
-    return _GradientConflictConfig(enabled=True, interval=_validate_gradient_conflict_interval(payload["interval"]))
+    if "max_samples" not in payload:
+        raise ValueError("stages.stage2.gradient_conflict.max_samples is required when enabled")
+    return _GradientConflictConfig(
+        enabled=True,
+        interval=_validate_gradient_conflict_interval(payload["interval"]),
+        max_samples=_validate_gradient_conflict_max_samples(payload["max_samples"]),
+    )
 
 
 def _validate_gradient_conflict_interval(value) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"stages.stage2.gradient_conflict.interval must be a positive integer, got {value!r}")
+    return int(value)
+
+
+def _validate_gradient_conflict_max_samples(value) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"stages.stage2.gradient_conflict.max_samples must be a positive integer, got {value!r}")
     return int(value)
 
 
@@ -1380,9 +1450,45 @@ def _resume_history_for_checkpoint_selection(history: list[dict], checkpoint_pat
     return []
 
 
-def _compute_gradient_conflict_metrics(flow_loss, cycle_loss, parameters, *, lambda_cycle: float) -> dict[str, float]:
+def _slice_gradient_conflict_monitor_batch(images, z, sample_ids: list[str], *, max_samples: int):
+    max_samples = _validate_gradient_conflict_max_samples(max_samples)
+    full_batch_size = int(z.shape[0])
+    if int(images.shape[0]) != full_batch_size:
+        raise ValueError(
+            "Gradient conflict monitor requires image and z batch sizes to match: "
+            f"images={int(images.shape[0])} z={full_batch_size}"
+        )
+    if len(sample_ids) != full_batch_size:
+        raise ValueError(
+            "Gradient conflict monitor requires sample_ids to match batch size: "
+            f"sample_ids={len(sample_ids)} batch={full_batch_size}"
+        )
+    if max_samples > full_batch_size:
+        raise ValueError(
+            "stages.stage2.gradient_conflict.max_samples must be less than or equal to the current batch size, "
+            f"got max_samples={max_samples} batch_size={full_batch_size}"
+        )
+    return images[:max_samples], z[:max_samples], list(sample_ids[:max_samples]), max_samples, full_batch_size
+
+
+def _compute_gradient_conflict_metrics(
+    flow_loss,
+    cycle_loss,
+    parameters,
+    *,
+    lambda_cycle: float,
+    sample_size: int,
+    full_batch_size: int,
+) -> dict[str, float]:
     import torch
 
+    sample_size = _validate_gradient_conflict_max_samples(sample_size)
+    full_batch_size = _validate_gradient_conflict_max_samples(full_batch_size)
+    if sample_size > full_batch_size:
+        raise RuntimeError(
+            "gradient_conflict_sample_size must be less than or equal to gradient_conflict_full_batch_size, "
+            f"got sample_size={sample_size} full_batch_size={full_batch_size}"
+        )
     if isinstance(lambda_cycle, bool):
         raise RuntimeError("lambda_cycle must be numeric, got bool")
     lambda_cycle = float(lambda_cycle)
@@ -1418,6 +1524,8 @@ def _compute_gradient_conflict_metrics(flow_loss, cycle_loss, parameters, *, lam
         "gradient_norm_cycle": float(cycle_norm.detach().cpu()),
         "weighted_gradient_norm_cycle": float(weighted_cycle_norm.detach().cpu()),
         "weighted_gradient_ratio_cycle_to_fm": float(weighted_ratio.detach().cpu()),
+        "gradient_conflict_sample_size": sample_size,
+        "gradient_conflict_full_batch_size": full_batch_size,
     }
 
 

@@ -354,11 +354,44 @@ class StageGateTests(unittest.TestCase):
 
         stages = {
             "stage1": {"epochs": 0},
-            "stage2": {"epochs": 1, "gradient_conflict": {"enabled": True, "interval": 0}},
+            "stage2": {"epochs": 1, "gradient_conflict": {"enabled": True, "interval": 0, "max_samples": 8}},
         }
 
         with self.assertRaisesRegex(ValueError, "interval"):
             _stage2_gradient_conflict_config(stages)
+
+    def test_stage2_gradient_conflict_config_requires_max_samples_when_enabled(self) -> None:
+        from safa.training.g_loop import _stage2_gradient_conflict_config
+
+        stages = {
+            "stage1": {"epochs": 0},
+            "stage2": {"epochs": 1, "gradient_conflict": {"enabled": True, "interval": 20}},
+        }
+
+        with self.assertRaisesRegex(ValueError, "max_samples"):
+            _stage2_gradient_conflict_config(stages)
+
+    def test_stage2_gradient_conflict_config_rejects_invalid_max_samples(self) -> None:
+        from safa.training.g_loop import _stage2_gradient_conflict_config
+
+        for value in (0, -1, True, 1.5):
+            stages = {
+                "stage1": {"epochs": 0},
+                "stage2": {"epochs": 1, "gradient_conflict": {"enabled": True, "interval": 20, "max_samples": value}},
+            }
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "max_samples"):
+                _stage2_gradient_conflict_config(stages)
+
+    def test_stage2_gradient_conflict_config_records_max_samples(self) -> None:
+        from safa.training.g_loop import _stage2_gradient_conflict_config
+
+        config = _stage2_gradient_conflict_config(
+            {"stage1": {"epochs": 0}, "stage2": {"epochs": 1, "gradient_conflict": {"enabled": True, "interval": 20, "max_samples": 8}}}
+        )
+
+        self.assertTrue(config.enabled)
+        self.assertEqual(config.interval, 20)
+        self.assertEqual(config.max_samples, 8)
 
     def test_stage2_gradient_conflict_config_is_not_required_without_stage2(self) -> None:
         from safa.training.g_loop import _stage2_gradient_conflict_config
@@ -366,6 +399,54 @@ class StageGateTests(unittest.TestCase):
         config = _stage2_gradient_conflict_config({"stage1": {"epochs": 1}, "stage2": {"epochs": 0}})
 
         self.assertFalse(config.enabled)
+
+    def test_stage2_gradient_conflict_monitor_batch_slices_without_changing_training_batch(self) -> None:
+        import torch
+
+        from safa.training.g_loop import _slice_gradient_conflict_monitor_batch
+
+        images = torch.arange(4 * 3 * 2 * 2, dtype=torch.float32).reshape(4, 3, 2, 2)
+        z = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+        sample_ids = ["a", "b", "c", "d"]
+
+        sampled_images, sampled_z, sampled_ids, sample_size, full_batch_size = _slice_gradient_conflict_monitor_batch(
+            images,
+            z,
+            sample_ids,
+            max_samples=2,
+        )
+
+        self.assertEqual(sample_size, 2)
+        self.assertEqual(full_batch_size, 4)
+        self.assertEqual(tuple(sampled_images.shape), (2, 3, 2, 2))
+        self.assertEqual(tuple(sampled_z.shape), (2, 2))
+        self.assertEqual(sampled_ids, ["a", "b"])
+        self.assertEqual(tuple(images.shape), (4, 3, 2, 2))
+        self.assertEqual(tuple(z.shape), (4, 2))
+        self.assertEqual(sample_ids, ["a", "b", "c", "d"])
+
+    def test_stage2_gradient_conflict_monitor_batch_rejects_max_samples_larger_than_batch(self) -> None:
+        import torch
+
+        from safa.training.g_loop import _slice_gradient_conflict_monitor_batch
+
+        with self.assertRaisesRegex(ValueError, "max_samples"):
+            _slice_gradient_conflict_monitor_batch(
+                torch.zeros(4, 3, 2, 2),
+                torch.zeros(4, 2),
+                ["a", "b", "c", "d"],
+                max_samples=5,
+            )
+
+    def test_stage2_gradient_conflict_validation_rejects_max_samples_larger_than_train_batch(self) -> None:
+        from safa.training import g_loop
+
+        config = self._base_train_config()
+        config["batch_size"] = 4
+        config["stages"]["stage2"]["gradient_conflict"] = {"enabled": True, "interval": 20, "max_samples": 5}
+
+        with self.assertRaisesRegex(ValueError, "max_samples"):
+            g_loop._validate_train_g_config(config)
 
     def test_stage2_gradient_conflict_metrics_compute_cosine_and_norms(self) -> None:
         import torch
@@ -376,13 +457,22 @@ class StageGateTests(unittest.TestCase):
         flow_loss = parameter[0] * 2.0
         cycle_loss = parameter[1] * 3.0
 
-        metrics = _compute_gradient_conflict_metrics(flow_loss, cycle_loss, [parameter], lambda_cycle=0.01)
+        metrics = _compute_gradient_conflict_metrics(
+            flow_loss,
+            cycle_loss,
+            [parameter],
+            lambda_cycle=0.01,
+            sample_size=2,
+            full_batch_size=4,
+        )
 
         self.assertAlmostEqual(metrics["gradient_cosine_fm_cycle"], 0.0, places=6)
         self.assertAlmostEqual(metrics["gradient_norm_fm"], 2.0, places=6)
         self.assertAlmostEqual(metrics["gradient_norm_cycle"], 3.0, places=6)
         self.assertAlmostEqual(metrics["weighted_gradient_norm_cycle"], 0.03, places=6)
         self.assertAlmostEqual(metrics["weighted_gradient_ratio_cycle_to_fm"], 0.015, places=6)
+        self.assertEqual(metrics["gradient_conflict_sample_size"], 2)
+        self.assertEqual(metrics["gradient_conflict_full_batch_size"], 4)
 
     def test_stage2_gradient_conflict_metrics_reject_zero_norm_gradient(self) -> None:
         import torch
@@ -394,7 +484,14 @@ class StageGateTests(unittest.TestCase):
         cycle_loss = parameter[1] * 3.0
 
         with self.assertRaisesRegex(RuntimeError, "zero norm"):
-            _compute_gradient_conflict_metrics(flow_loss, cycle_loss, [parameter], lambda_cycle=0.01)
+            _compute_gradient_conflict_metrics(
+                flow_loss,
+                cycle_loss,
+                [parameter],
+                lambda_cycle=0.01,
+                sample_size=2,
+                full_batch_size=4,
+            )
 
     def test_checkpoint_composite_uses_single_face_eq1_rate_not_legacy_ge1(self) -> None:
         from safa.training.g_loop import _composite_score
@@ -473,6 +570,8 @@ class StageGateTests(unittest.TestCase):
             "gradient_norm_cycle": 6.0,
             "weighted_gradient_norm_cycle": 0.06,
             "weighted_gradient_ratio_cycle_to_fm": 0.03,
+            "gradient_conflict_sample_size": 4.0,
+            "gradient_conflict_full_batch_size": 8.0,
             "gradient_conflict_samples": [
                 {
                     "gradient_cosine_fm_cycle": -0.5,
@@ -506,6 +605,8 @@ class StageGateTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["gradient_cosine_fm_cycle"], -0.25)
         self.assertAlmostEqual(metrics["gradient_norm_fm"], 2.0)
         self.assertAlmostEqual(metrics["gradient_norm_cycle"], 3.0)
+        self.assertAlmostEqual(metrics["gradient_conflict_sample_size"], 2.0)
+        self.assertAlmostEqual(metrics["gradient_conflict_full_batch_size"], 4.0)
 
     def test_epoch_metrics_include_gradient_quantiles_norm_ratio_and_conflict_fraction(self) -> None:
         import torch
@@ -524,6 +625,8 @@ class StageGateTests(unittest.TestCase):
             "gradient_norm_cycle": 12.0,
             "weighted_gradient_norm_cycle": 0.12,
             "weighted_gradient_ratio_cycle_to_fm": 0.06,
+            "gradient_conflict_sample_size": 6.0,
+            "gradient_conflict_full_batch_size": 12.0,
             "gradient_conflict_samples": [
                 {
                     "gradient_cosine_fm_cycle": -1.0,
@@ -584,6 +687,8 @@ class StageGateTests(unittest.TestCase):
             "gradient_norm_cycle": 6.0,
             "weighted_gradient_norm_cycle": 0.06,
             "weighted_gradient_ratio_cycle_to_fm": 0.03,
+            "gradient_conflict_sample_size": 4.0,
+            "gradient_conflict_full_batch_size": 8.0,
             "gradient_conflict_samples": [
                 {
                     "gradient_cosine_fm_cycle": -0.5,

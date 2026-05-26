@@ -52,6 +52,7 @@ stages:
     gradient_conflict:
       enabled: true
       interval: 50
+      max_samples: 8
 validation:
   enabled: true
   index: data/index/val.jsonl

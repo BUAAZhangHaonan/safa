@@ -49,6 +49,7 @@ stages:
     gradient_conflict:
       enabled: true
       interval: 20
+      max_samples: 8
     quality_eval:
       enabled: true
       metrics: [niqe, fid, kid]
