@@ -1,0 +1,47 @@
+# medium_v1 G Stage 2 M1 uncertainty-weighted single-face eval.
+# Privacy recognizers run only after the guard passes. If the guard fails,
+# eval writes privacy_skipped=true and does not emit TAR/EER/AUC metrics.
+seed: 1337
+sampling_seed: 1337
+device: cuda:0
+num_workers: 2
+batch_size: 16
+image_size: 224
+index: data/index/val_single_face.jsonl
+features: artifacts/e0_features/val_single_face_e0_medium_v1
+e0_checkpoint: artifacts/checkpoints/e0_medium_v1/best.pt
+g_checkpoint: artifacts/checkpoints/g_medium_v1_stage2_m1_uw/best_raw_utility.pt
+checkpoint_model: raw
+out_json: artifacts/eval/g_medium_v1_stage2_m1_uw_single_face/result.json
+per_sample_jsonl: artifacts/eval/g_medium_v1_stage2_m1_uw_single_face/per_sample.jsonl
+sample_dir: artifacts/eval/g_medium_v1_stage2_m1_uw_single_face/samples
+generated_image_dir: artifacts/eval/g_medium_v1_stage2_m1_uw_single_face/generated_images
+face_detection:
+  enabled: true
+  model_name: buffalo_l
+  threshold: 0.95
+  single_face_eq1_threshold: 0.98
+  latent_cosine_threshold: 0.95
+privacy:
+  enabled: true
+  recognizers:
+    - name: arcface
+      type: insightface
+      model_name: buffalo_l
+    - name: facenet
+      type: torchscript
+      checkpoint: artifacts/privacy/facenet.pt
+      embedding_dim: 512
+      input_size: 160
+    - name: adaface
+      type: torchscript
+      checkpoint: artifacts/privacy/adaface.pt
+      embedding_dim: 512
+      input_size: 112
+anti_steg:
+  enabled: true
+  jpeg_quality: 75
+  blur_radius: 1.5
+  downsample_scale: 0.5
+  crop_fraction: 0.9
+  noise_std: 0.01

@@ -604,11 +604,17 @@ class EvalContractTests(unittest.TestCase):
             self.assertEqual(result["skip_reason"], "privacy_guard_failed")
             self.assertFalse(result["privacy_guard_pass"])
             self.assertEqual(result["metrics"]["privacy"], {})
+            serialized_metrics = json.dumps(result["metrics"], sort_keys=True)
+            for forbidden in ("tar_at_far", "eer", "auc"):
+                self.assertNotIn(forbidden, serialized_metrics)
             self.assertTrue(Path(config["out_json"]).is_file())
             self.assertTrue(Path(config["per_sample_jsonl"]).is_file())
             persisted = json.loads(Path(config["out_json"]).read_text(encoding="utf-8"))
             self.assertTrue(persisted["privacy_skipped"])
             self.assertEqual(persisted["metrics"]["privacy"], {})
+            persisted_metrics = json.dumps(persisted["metrics"], sort_keys=True)
+            for forbidden in ("tar_at_far", "eer", "auc"):
+                self.assertNotIn(forbidden, persisted_metrics)
 
     def test_privacy_summary_adds_roc_metrics_from_clean_same_and_impostor_scores(self) -> None:
         rows = []
