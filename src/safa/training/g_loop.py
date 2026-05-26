@@ -379,6 +379,69 @@ def _calibrate_uncertainty_loss(
         training_module.train()
 
 
+def _restore_uncertainty_loss_checkpoint_state(training_module, state: dict, checkpoint_path: str) -> None:
+    context = f"loss_weighting_state in {checkpoint_path}"
+    if not isinstance(state, dict):
+        raise RuntimeError(f"{context} must be a mapping")
+    state_type = state.get("type")
+    if state_type != "uncertainty":
+        raise RuntimeError(f"{context}.type must be 'uncertainty', got {state_type!r}")
+    if getattr(training_module, "uncertainty_loss", None) is None:
+        raise RuntimeError("Cannot restore uncertainty loss state because uncertainty_loss is not initialized")
+    expected_tasks = list(training_module.uncertainty_loss.task_names)
+    task_names = state.get("task_names")
+    if task_names != expected_tasks:
+        raise RuntimeError(f"{context}.task_names must be {expected_tasks!r}, got {task_names!r}")
+    initial_scales = state.get("initial_scales")
+    if not isinstance(initial_scales, dict):
+        raise RuntimeError(f"{context}.initial_scales must be a mapping")
+    state_dict = state.get("state_dict")
+    if not isinstance(state_dict, dict):
+        raise RuntimeError(f"{context}.state_dict must be a mapping")
+    training_module.configure_uncertainty_scales(
+        flow_loss_initial=float(_require_field(initial_scales, "flow", context + ".initial_scales")),
+        cycle_loss_initial=float(_require_field(initial_scales, "cycle", context + ".initial_scales")),
+    )
+    try:
+        training_module.uncertainty_loss.load_state_dict(state_dict)
+    except RuntimeError as exc:
+        raise RuntimeError(f"{context}.state_dict is invalid: {exc}") from exc
+
+
+def _restore_or_calibrate_uncertainty_loss(
+    training_module,
+    train_loader,
+    device,
+    *,
+    use_amp: bool,
+    calibration_batches: int,
+    distributed: DistributedContext,
+    resume_progress: _ResumeProgress | None,
+    resume_loss_weighting_state: dict | None,
+    resume_path: str | None,
+) -> str:
+    if resume_loss_weighting_state is not None:
+        if not isinstance(resume_loss_weighting_state, dict):
+            raise RuntimeError(f"loss_weighting_state in {resume_path} must be a mapping")
+        if resume_loss_weighting_state.get("type") == "uncertainty":
+            _restore_uncertainty_loss_checkpoint_state(training_module, resume_loss_weighting_state, str(resume_path or "<fresh run>"))
+            return "restored"
+    if resume_progress is not None and resume_progress.stage == "stage2":
+        raise RuntimeError(
+            "Stage 2 uncertainty resume checkpoint is missing required UW loss_weighting_state; "
+            f"refusing to recalibrate UW scales: {resume_path}"
+        )
+    _calibrate_uncertainty_loss(
+        training_module,
+        train_loader,
+        device,
+        use_amp=use_amp,
+        calibration_batches=calibration_batches,
+        distributed=distributed,
+    )
+    return "calibrated"
+
+
 def train_g_from_config(config: dict) -> dict:
     import torch
     from torch.utils.data import DataLoader, DistributedSampler
@@ -419,6 +482,7 @@ def train_g_from_config(config: dict) -> dict:
     resume_progress = None
     resume_ema_state_dict = None
     resume_optimizer_state_dict = None
+    resume_loss_weighting_state = None
     # Optional: absent resume_from starts a fresh generator run.
     if config.get("resume_from"):
         resume_path = Path(config["resume_from"])
@@ -433,6 +497,8 @@ def train_g_from_config(config: dict) -> dict:
             resume_ema_state_dict = ckpt["ema_model_state_dict"]
         if "optimizer_state_dict" in ckpt:
             resume_optimizer_state_dict = ckpt["optimizer_state_dict"]
+        if "loss_weighting_state" in ckpt:
+            resume_loss_weighting_state = ckpt["loss_weighting_state"]
         if distributed.is_main:
             restored = ["model_state_dict"]
             if resume_history is not None:
@@ -440,6 +506,8 @@ def train_g_from_config(config: dict) -> dict:
             restored.append(f"progress={resume_progress.stage}:{resume_progress.stage_epoch}")
             if resume_ema_state_dict is not None:
                 restored.append("ema_model_state_dict")
+            if resume_loss_weighting_state is not None:
+                restored.append("loss_weighting_state")
             sep = ", ".join(restored)
             print(f"Resumed generator from {resume_path} (restored: {sep})")
     ema = None
@@ -483,14 +551,19 @@ def train_g_from_config(config: dict) -> dict:
     detector = _build_detector(config, str(device)) if distributed.is_main else None
     gradient_conflict_config = _stage2_gradient_conflict_config(stages)
     if loss_weighting_runtime.type == "uncertainty":
-        _calibrate_uncertainty_loss(
+        uw_state_action = _restore_or_calibrate_uncertainty_loss(
             training_module,
             train_loader,
             device,
             use_amp=use_amp,
             calibration_batches=int(loss_weighting_runtime.calibration_batches),
             distributed=distributed,
+            resume_progress=resume_progress,
+            resume_loss_weighting_state=resume_loss_weighting_state,
+            resume_path=str(config.get("resume_from")) if config.get("resume_from") else None,
         )
+        if distributed.is_main:
+            print(f"Uncertainty loss state: {uw_state_action}")
     if distributed.enabled:
         training_module = DistributedDataParallel(training_module, device_ids=[distributed.local_rank], output_device=distributed.local_rank)
     optimizer = torch.optim.AdamW(

@@ -3,7 +3,7 @@ seed: 1337
 sampling_seed: 1337
 device: cuda:0
 num_workers: 8
-batch_size: 16
+batch_size: 64
 learning_rate: 0.0003
 weight_decay: 0.0
 image_size: 224
@@ -12,7 +12,7 @@ train_index: data/index/train_balanced_medium.jsonl
 train_features: artifacts/e0_features/train_balanced_medium_e0_medium_v1
 e0_checkpoint: artifacts/checkpoints/e0_medium_v1/best.pt
 out_dir: artifacts/checkpoints/g_medium_v1_stage2_m1_uw
-resume_from: artifacts/checkpoints/g_medium_v1_stage1_m0/best_single_face.pt
+resume_from: artifacts/checkpoints/g_medium_v1_stage1_long200_v4/best_stage1.pt
 allow_stage2_without_stage1_gate: true
 resume_from_legacy_stage1_metrics: false
 loss_weighting:
@@ -45,23 +45,30 @@ stages:
     epochs: 0
     require_face_detection_gate: false
   stage2:
-    epochs: 80
+    epochs: 200
     gradient_conflict:
       enabled: true
-      interval: 50
+      interval: 20
     quality_eval:
-      enabled: false
-      interval: 10
+      enabled: true
+      metrics: [niqe, fid, kid]
+      niqe_interval_epochs: 1
+      niqe_max_samples: 512
+      distribution_interval_epochs: 20
+      distribution_max_samples: 3969
+      distribution_timeout_seconds: 3600
+      quality_num_workers: 2
       real_index: data/index/val_single_face.jsonl
-      generated_dir: artifacts/eval/g_medium_v1_stage2/raw_generated
-      output_dir: artifacts/eval/g_medium_v1_stage2/quality
+      distribution_cuda_visible_devices: "0"
+      distribution_device: cuda:0
+      output_dir: artifacts/eval/g_medium_v1_stage2_m1_uw/quality
       model: raw
 validation:
   enabled: true
   index: data/index/val_single_face.jsonl
   features: artifacts/e0_features/val_single_face_e0_medium_v1
   max_samples: 512
-  batch_size: 16
+  batch_size: 64
   face_detection:
     enabled: true
     model_name: buffalo_l

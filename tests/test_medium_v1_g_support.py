@@ -79,6 +79,90 @@ class MediumV1GSupportTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "calibration_batches"):
             _finalize_uncertainty_calibration(flow_sum=1.0, cycle_sum=1.0, batches=0)
 
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for uncertainty checkpoint tests")
+    def test_uncertainty_checkpoint_state_restore_restores_scales_and_trainable_state(self) -> None:
+        import torch
+        from torch import nn
+
+        from safa.models.generator import FlowGeneratorConfig
+        from safa.training.g_loop import (
+            _GeneratorTrainingStep,
+            _loss_weighting_runtime_from_config,
+            _restore_uncertainty_loss_checkpoint_state,
+        )
+
+        class DummyGenerator(nn.Module):
+            pass
+
+        class DummyE0(nn.Module):
+            pass
+
+        runtime = _loss_weighting_runtime_from_config(
+            {"loss_weighting": {"type": "uncertainty", "calibration_batches": 20, "log_var_lr": 0.0001, "log_var_weight_decay": 0.0}}
+        )
+        module = _GeneratorTrainingStep(DummyGenerator(), DummyE0(), FlowGeneratorConfig(embedding_dim=2, image_size=4), 1337, runtime)
+        module.configure_uncertainty_scales(flow_loss_initial=1.0, cycle_loss_initial=1.0)
+
+        _restore_uncertainty_loss_checkpoint_state(
+            module,
+            {
+                "type": "uncertainty",
+                "task_names": ["flow", "cycle"],
+                "initial_scales": {"flow": 2.5, "cycle": 3.5},
+                "state_dict": {"log_vars.flow": torch.tensor(0.25), "log_vars.cycle": torch.tensor(-0.5)},
+            },
+            "stage2_m1.pt",
+        )
+
+        self.assertAlmostEqual(float(module._flow_loss_initial.detach().cpu()), 2.5, places=6)
+        self.assertAlmostEqual(float(module._cycle_loss_initial.detach().cpu()), 3.5, places=6)
+        self.assertAlmostEqual(float(module.uncertainty_loss.log_vars["flow"].detach().cpu()), 0.25, places=6)
+        self.assertAlmostEqual(float(module.uncertainty_loss.log_vars["cycle"].detach().cpu()), -0.5, places=6)
+
+    def test_uncertainty_resume_from_stage1_without_uw_state_calibrates_once(self) -> None:
+        from safa.training import g_loop
+
+        calls: list[dict] = []
+
+        def fake_calibrate(*args, **kwargs):
+            calls.append(kwargs)
+
+        with patch.object(g_loop, "_calibrate_uncertainty_loss", side_effect=fake_calibrate):
+            action = g_loop._restore_or_calibrate_uncertainty_loss(
+                object(),
+                object(),
+                "cpu",
+                use_amp=False,
+                calibration_batches=20,
+                distributed=SimpleNamespace(enabled=False),
+                resume_progress=g_loop._ResumeProgress(stage="stage1", stage_epoch=199),
+                resume_loss_weighting_state={"type": "fixed", "flow_weight": 1.0, "cycle_weight": 0.01},
+                resume_path="stage1.pt",
+            )
+
+        self.assertEqual(action, "calibrated")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["calibration_batches"], 20)
+
+    def test_uncertainty_resume_from_stage2_without_state_fails_fast(self) -> None:
+        from safa.training import g_loop
+
+        with patch.object(g_loop, "_calibrate_uncertainty_loss") as calibrate:
+            with self.assertRaisesRegex(RuntimeError, "Stage 2.*loss_weighting_state"):
+                g_loop._restore_or_calibrate_uncertainty_loss(
+                    object(),
+                    object(),
+                    "cpu",
+                    use_amp=False,
+                    calibration_batches=20,
+                    distributed=SimpleNamespace(enabled=False),
+                    resume_progress=g_loop._ResumeProgress(stage="stage2", stage_epoch=12),
+                    resume_loss_weighting_state=None,
+                    resume_path="stage2_m1.pt",
+                )
+
+        calibrate.assert_not_called()
+
     def test_quality_eval_hook_generates_epoch_images_instead_of_reusing_generated_dir(self) -> None:
         from safa.training import g_loop
 
@@ -861,23 +945,46 @@ class MediumV1GSupportTests(unittest.TestCase):
         self.assertNotIn("generated_dir", quality_eval)
         g_loop._validate_train_g_config(config)
 
-    def test_medium_v1_stage2_m0_and_m1_configs_only_differ_in_loss_weighting_and_out_dir(self) -> None:
+    def test_medium_v1_stage2_m0_and_m1_configs_prepare_long_fixed16_runs(self) -> None:
         from safa.training import g_loop
 
         m0_path = Path("configs/medium_v1/train_g_medium_v1_stage2_m0.yaml")
         m1_path = Path("configs/medium_v1/train_g_medium_v1_stage2_m1_uw.yaml")
-        stage1_path = Path("configs/medium_v1/train_g_medium_v1_stage1.yaml")
-        self.assertTrue(stage1_path.is_file())
         self.assertTrue(m0_path.is_file())
         self.assertTrue(m1_path.is_file())
 
-        stage1 = yaml.safe_load(stage1_path.read_text(encoding="utf-8"))
         m0 = yaml.safe_load(m0_path.read_text(encoding="utf-8"))
         m1 = yaml.safe_load(m1_path.read_text(encoding="utf-8"))
 
-        self.assertEqual(stage1["out_dir"], "artifacts/checkpoints/g_medium_v1_stage1_m0")
-        self.assertEqual(m0["resume_from"], "artifacts/checkpoints/g_medium_v1_stage1_m0/best_single_face.pt")
-        self.assertEqual(m1["resume_from"], "artifacts/checkpoints/g_medium_v1_stage1_m0/best_single_face.pt")
+        for name, config, quality_output in (
+            ("m0", m0, "artifacts/eval/g_medium_v1_stage2_m0/quality"),
+            ("m1", m1, "artifacts/eval/g_medium_v1_stage2_m1_uw/quality"),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(config["resume_from"], "artifacts/checkpoints/g_medium_v1_stage1_long200_v4/best_stage1.pt")
+                self.assertEqual(config["batch_size"], 64)
+                self.assertEqual(config["validation"]["batch_size"], 64)
+                self.assertEqual(config["stages"]["stage2"]["epochs"], 200)
+                self.assertEqual(config["generator"]["train_cycle_steps"], 16)
+                self.assertEqual(config["generator"]["cycle_steps_schedule"], [])
+                self.assertEqual(config["stages"]["stage2"]["gradient_conflict"], {"enabled": True, "interval": 20})
+
+                quality_eval = config["stages"]["stage2"]["quality_eval"]
+                self.assertIs(quality_eval["enabled"], True)
+                self.assertEqual(quality_eval["metrics"], ["niqe", "fid", "kid"])
+                self.assertEqual(quality_eval["niqe_interval_epochs"], 1)
+                self.assertEqual(quality_eval["niqe_max_samples"], 512)
+                self.assertEqual(quality_eval["distribution_interval_epochs"], 20)
+                self.assertEqual(quality_eval["distribution_max_samples"], 3969)
+                self.assertEqual(quality_eval["distribution_timeout_seconds"], 3600)
+                self.assertEqual(quality_eval["quality_num_workers"], 2)
+                self.assertEqual(quality_eval["real_index"], "data/index/val_single_face.jsonl")
+                self.assertEqual(quality_eval["distribution_cuda_visible_devices"], "0")
+                self.assertEqual(quality_eval["distribution_device"], "cuda:0")
+                self.assertEqual(quality_eval["output_dir"], quality_output)
+                self.assertNotIn("interval", quality_eval)
+                self.assertNotIn("generated_dir", quality_eval)
+
         self.assertEqual(m0["loss_weighting"], {"type": "fixed", "flow_weight": 1.0, "cycle_weight": 0.01})
         self.assertEqual(m1["loss_weighting"]["type"], "uncertainty")
         self.assertNotIn("lambda_initial", m1["stages"]["stage2"])
@@ -890,12 +997,13 @@ class MediumV1GSupportTests(unittest.TestCase):
         comparable_m1.pop("out_dir")
         comparable_m0.pop("loss_weighting")
         comparable_m1.pop("loss_weighting")
+        comparable_m0["stages"]["stage2"]["quality_eval"].pop("output_dir")
+        comparable_m1["stages"]["stage2"]["quality_eval"].pop("output_dir")
         for field in ("lambda_initial", "lambda_max", "lambda_growth"):
             comparable_m0["stages"]["stage2"].pop(field, None)
             comparable_m1["stages"]["stage2"].pop(field, None)
         self.assertEqual(comparable_m0, comparable_m1)
 
-        g_loop._validate_train_g_config(stage1)
         g_loop._validate_train_g_config(m0)
         g_loop._validate_train_g_config(m1)
 
