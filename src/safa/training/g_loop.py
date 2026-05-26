@@ -306,11 +306,11 @@ def _training_batch_config(config: dict, *, world_size: int | None = None) -> _B
     if _requires_explicit_stage2_batch_semantics(config):
         if has_legacy:
             raise ValueError(
-                "medium_v1 Stage 2 M0/M1 configs must use explicit global_batch_size "
-                "and per_device_batch_size; remove legacy train_g config.batch_size"
+                "medium_v1 Stage 2 M0/M1 configs must use explicit global_batch_size + "
+                "per_device_batch_size; remove legacy train_g config.batch_size"
             )
         if not has_global or not has_per_device:
-            raise ValueError("medium_v1 Stage 2 M0/M1 configs require explicit global_batch_size and per_device_batch_size")
+            raise ValueError("medium_v1 Stage 2 M0/M1 configs require explicit global_batch_size + per_device_batch_size")
 
     if has_global or has_per_device:
         if has_legacy:

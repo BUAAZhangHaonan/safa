@@ -850,6 +850,16 @@ class MediumV1GSupportTests(unittest.TestCase):
                 self.assertEqual(config["validation"]["features"], expected_validation_features)
                 self.assertEqual(config["e0_checkpoint"], expected_e0_checkpoint)
 
+    def test_medium_v1_stage2_rejects_legacy_batch_size_with_explicit_batch_fields(self) -> None:
+        from safa.training import g_loop
+
+        config = yaml.safe_load(Path("configs/medium_v1/train_g_medium_v1_stage2_m0.yaml").read_text(encoding="utf-8"))
+        self.assertEqual(config["out_dir"], "artifacts/checkpoints/g_medium_v1_stage2_m0")
+        config["batch_size"] = 96
+
+        with self.assertRaisesRegex(ValueError, r"medium_v1 Stage 2 M0/M1.*global_batch_size \+ per_device_batch_size"):
+            g_loop._validate_train_g_config(config)
+
     def test_medium_v1_stage1_configs_enable_niqe_only_epoch_quality(self) -> None:
         from safa.training import g_loop
 
