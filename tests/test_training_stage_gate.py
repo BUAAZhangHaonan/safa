@@ -187,17 +187,56 @@ class StageGateTests(unittest.TestCase):
         from safa.training.g_loop import _resume_stage_progress_from_metrics, _resume_stage_start_epoch
 
         progress = _resume_stage_progress_from_metrics({"stage": "stage1", "stage_epoch": 51}, "last.pt")
+        stages = {"stage1": {"epochs": 200}, "stage2": {"epochs": 10}}
 
-        self.assertEqual(_resume_stage_start_epoch("stage1", 200, progress), 52)
-        self.assertEqual(_resume_stage_start_epoch("stage2", 10, progress), 0)
+        self.assertEqual(_resume_stage_start_epoch("stage1", stages, progress), 52)
+        self.assertEqual(_resume_stage_start_epoch("stage2", stages, progress), 0)
+
+    def test_stage1_checkpoint_initializes_stage2_only_from_epoch_zero(self) -> None:
+        from safa.training.g_loop import _resume_stage_progress_from_metrics, _resume_stage_start_epoch
+
+        progress = _resume_stage_progress_from_metrics({"stage": "stage1", "stage_epoch": 181}, "best_stage1.pt")
+        stages = {"stage1": {"epochs": 0}, "stage2": {"epochs": 20}}
+
+        self.assertEqual(_resume_stage_start_epoch("stage1", stages, progress), 0)
+        self.assertEqual(_resume_stage_start_epoch("stage2", stages, progress), 0)
+
+    def test_same_stage_resume_progress_exceeding_configured_epochs_fails_fast(self) -> None:
+        from safa.training.g_loop import _resume_stage_progress_from_metrics, _resume_stage_start_epoch
+
+        progress = _resume_stage_progress_from_metrics({"stage": "stage2", "stage_epoch": 7}, "stage2.pt")
+        stages = {"stage1": {"epochs": 0}, "stage2": {"epochs": 7}}
+
+        with self.assertRaisesRegex(ValueError, r"stage2.*exceeds configured stage2\.epochs=7"):
+            _resume_stage_start_epoch("stage2", stages, progress)
+
+    def test_stage1_checkpoint_is_not_silently_reset_without_stage2_work(self) -> None:
+        from safa.training.g_loop import _resume_stage_progress_from_metrics, _resume_stage_start_epoch
+
+        progress = _resume_stage_progress_from_metrics({"stage": "stage1", "stage_epoch": 181}, "stage1.pt")
+        stages = {"stage1": {"epochs": 0}, "stage2": {"epochs": 0}}
+
+        with self.assertRaisesRegex(ValueError, r"stage1.*exceeds configured stage1\.epochs=0"):
+            _resume_stage_start_epoch("stage1", stages, progress)
+
+    def test_stage2_checkpoint_cannot_resume_stage1_only_config(self) -> None:
+        from safa.training.g_loop import _resume_stage_progress_from_metrics, _resume_stage_start_epoch
+
+        progress = _resume_stage_progress_from_metrics({"stage": "stage2", "stage_epoch": 0}, "stage2.pt")
+        stages = {"stage1": {"epochs": 10}, "stage2": {"epochs": 0}}
+
+        self.assertEqual(_resume_stage_start_epoch("stage1", stages, progress), 10)
+        with self.assertRaisesRegex(ValueError, r"stage2.*exceeds configured stage2\.epochs=0"):
+            _resume_stage_start_epoch("stage2", stages, progress)
 
     def test_resume_stage_progress_supports_stage2_zero_based_field(self) -> None:
         from safa.training.g_loop import _resume_stage_progress_from_metrics, _resume_stage_start_epoch
 
         progress = _resume_stage_progress_from_metrics({"stage": "stage2", "stage_epoch_0based": 7}, "last.pt")
+        stages = {"stage1": {"epochs": 200}, "stage2": {"epochs": 20}}
 
-        self.assertEqual(_resume_stage_start_epoch("stage1", 200, progress), 200)
-        self.assertEqual(_resume_stage_start_epoch("stage2", 20, progress), 8)
+        self.assertEqual(_resume_stage_start_epoch("stage1", stages, progress), 200)
+        self.assertEqual(_resume_stage_start_epoch("stage2", stages, progress), 8)
 
     def test_resume_stage_progress_requires_checkpoint_progress_field(self) -> None:
         from safa.training.g_loop import _resume_stage_progress_from_metrics

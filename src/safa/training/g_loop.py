@@ -605,7 +605,7 @@ def train_g_from_config(config: dict) -> dict:
                 cleanup_distributed(distributed)
                 raise RuntimeError("Stage 2 is blocked by the Stage 1 face detection gate; see manifest.json on rank 0")
         epochs = int(stages[stage_name]["epochs"])
-        start_stage_epoch = _resume_stage_start_epoch(stage_name, epochs, resume_progress)
+        start_stage_epoch = _resume_stage_start_epoch(stage_name, stages, resume_progress)
         stage_epoch = start_stage_epoch - 1
         completed_stage_epochs = start_stage_epoch
         for stage_epoch in range(start_stage_epoch, epochs):
@@ -1300,17 +1300,19 @@ def _resume_stage_progress_from_metrics(metrics: dict | None, checkpoint_path: s
     return _ResumeProgress(stage=str(stage), stage_epoch=int(value))
 
 
-def _resume_stage_start_epoch(stage_name: str, epochs: int, resume_progress: _ResumeProgress | None) -> int:
-    if resume_progress is None:
-        return 0
+def _resume_stage_start_epoch(stage_name: str, stages: dict, resume_progress: _ResumeProgress | None) -> int:
     if stage_name not in ("stage1", "stage2"):
         raise ValueError(f"stage_name must be stage1 or stage2, got {stage_name!r}")
-    if epochs < 0:
-        raise ValueError(f"{stage_name} epochs must be non-negative, got {epochs!r}")
+    epochs_by_stage = _resume_stage_epochs(stages)
+    epochs = epochs_by_stage[stage_name]
+    if resume_progress is None:
+        return 0
     stage_order = {"stage1": 0, "stage2": 1}
     if stage_order[stage_name] < stage_order[resume_progress.stage]:
         return epochs
     if stage_name != resume_progress.stage:
+        return 0
+    if _stage1_checkpoint_initializes_stage2_only(stages, resume_progress):
         return 0
     start_epoch = resume_progress.stage_epoch + 1
     if start_epoch > epochs:
@@ -1319,6 +1321,28 @@ def _resume_stage_start_epoch(stage_name: str, epochs: int, resume_progress: _Re
             f"exceeds configured {stage_name}.epochs={epochs}"
         )
     return start_epoch
+
+
+def _resume_stage_epochs(stages: dict) -> dict[str, int]:
+    if not isinstance(stages, dict):
+        raise ValueError("stages must be a mapping")
+    epochs_by_stage: dict[str, int] = {}
+    for name in ("stage1", "stage2"):
+        stage_config = stages.get(name)
+        if not isinstance(stage_config, dict):
+            raise ValueError(f"stages.{name} must be a mapping")
+        value = _require_field(stage_config, "epochs", f"stages.{name}")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"stages.{name}.epochs must be a non-negative integer, got {value!r}")
+        epochs_by_stage[name] = int(value)
+    return epochs_by_stage
+
+
+def _stage1_checkpoint_initializes_stage2_only(stages: dict, resume_progress: _ResumeProgress) -> bool:
+    if resume_progress.stage != "stage1":
+        return False
+    epochs_by_stage = _resume_stage_epochs(stages)
+    return epochs_by_stage["stage1"] == 0 and epochs_by_stage["stage2"] > 0
 
 
 def _should_check_stage2_gate(stage_name: str, resume_progress: _ResumeProgress | None) -> bool:
