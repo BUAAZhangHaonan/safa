@@ -99,7 +99,7 @@ def append_log(path: Path, events: list[dict]) -> None:
     with path.open("a", encoding="utf-8") as handle:
         for event in events:
             detail = event.get("summary") or event.get("path") or event.get("reason", "")
-            handle.write(f"{event["time"]} {event["type"]}: {detail}\n")
+            handle.write(f"{event['time']} {event['type']}: {detail}\n")
 
 
 def check_tmux(session: str, command_runner: Callable[[Sequence[str]], CommandResult]) -> bool:
@@ -221,9 +221,9 @@ def assess_gpu_abnormal(snapshot: dict, config: MonitorConfig) -> tuple[bool, li
             reasons.append(f"gpu{index}:missing")
             continue
         if gpu.get("memory_used_ratio", 0.0) >= config.gpu_memory_high_ratio:
-            reasons.append(f"gpu{index}:memory_high:{gpu.get(memory_used_mb)}MB/{gpu.get(memory_total_mb)}MB")
+            reasons.append(f"gpu{index}:memory_high:{gpu.get('memory_used_mb')}MB/{gpu.get('memory_total_mb')}MB")
         if snapshot.get("processes") and gpu.get("memory_used_mb", 0) <= config.gpu_memory_low_mb:
-            reasons.append(f"gpu{index}:memory_low:{gpu.get(memory_used_mb)}MB")
+            reasons.append(f"gpu{index}:memory_low:{gpu.get('memory_used_mb')}MB")
     if snapshot.get("processes") and gpus and all(gpu.get("utilization_gpu_pct", 0) <= config.gpu_idle_util_pct for gpu in gpus):
         reasons.append("gpu3-6:all_idle")
     return bool(reasons), reasons
