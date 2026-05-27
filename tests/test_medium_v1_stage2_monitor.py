@@ -91,6 +91,50 @@ def test_single_shot_writes_status_and_only_event_summaries(tmp_path: Path) -> N
     assert "epoch_completed" in paths.log.read_text(encoding="utf-8")
 
 
+def test_single_shot_detects_nested_raw_distribution_quality_json(tmp_path: Path) -> None:
+    module = _load_script()
+    metrics = tmp_path / "last_metrics.json"
+    metrics.write_text(json.dumps({"stage_epoch_1based": 21, "loss": 0.2}), encoding="utf-8")
+    quality_dir = tmp_path / "quality"
+    epoch_dir = quality_dir / "epoch_0020"
+    epoch_dir.mkdir(parents=True)
+    distribution_json = epoch_dir / "stage2_epoch_0020_raw_distribution.json"
+    distribution_json.write_text(json.dumps({"fid": 12.3, "kid": 0.04}), encoding="utf-8")
+    log_path = tmp_path / "train.log"
+    log_path.write_text("ok\n", encoding="utf-8")
+
+    paths = module.MonitorPaths(
+        status=tmp_path / "status.json",
+        events=tmp_path / "events.jsonl",
+        log=tmp_path / "monitor.log",
+        metrics=metrics,
+        quality_dir=quality_dir,
+        train_log=log_path,
+    )
+    config = module.MonitorConfig(
+        tmux_session="unused",
+        process_pattern="synthetic-train-pattern",
+        gpu_indices=(3,),
+        gpu_memory_high_ratio=0.98,
+        gpu_memory_low_mb=0,
+    )
+
+    def fake_runner(command):
+        if command[0] == "nvidia-smi":
+            return module.CommandResult(0, "3, 1200, 2000, 80\n", "")
+        return module.CommandResult(1, "", "")
+
+    module.run_once(paths=paths, config=config, command_runner=fake_runner)
+
+    status = json.loads(paths.status.read_text(encoding="utf-8"))
+    distribution_path = distribution_json.as_posix()
+    assert status["quality_json_count"] == 1
+    assert status["latest_quality_jsons"] == [distribution_path]
+    events = [json.loads(line) for line in paths.events.read_text(encoding="utf-8").splitlines()]
+    quality_events = [event for event in events if event["type"] == "quality_json"]
+    assert [event["path"] for event in quality_events] == [distribution_path]
+
+
 def test_error_keyword_detection_does_not_match_nan_inside_paths_or_warnings(tmp_path: Path) -> None:
     module = _load_script()
     log_path = tmp_path / "train.log"

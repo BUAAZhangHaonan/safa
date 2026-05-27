@@ -166,7 +166,7 @@ def find_quality_jsons(quality_dir: Path) -> list[str]:
     paths = []
     for path in quality_dir.rglob("*.json"):
         name = path.name.lower()
-        if "fid" in name or "kid" in name:
+        if "fid" in name or "kid" in name or "distribution" in name:
             paths.append(path.as_posix())
     return sorted(paths)
 
