@@ -147,3 +147,62 @@ def test_error_keyword_detection_does_not_match_nan_inside_paths_or_warnings(tmp
     errors, _ = module.read_new_error_lines(log_path, {})
 
     assert errors == ["loss became nan at step 7"]
+
+
+def test_single_all_idle_sample_does_not_emit_gpu_abnormal_when_process_is_alive() -> None:
+    module = _load_script()
+    snapshot = {
+        "last_metrics": {},
+        "quality_jsons": [],
+        "errors": [],
+        "tmux_alive": True,
+        "processes": [{"pid": 123, "cmd": "train_g"}],
+        "gpus": [
+            {"index": 3, "memory_used_mb": 22000, "memory_total_mb": 24576, "memory_used_ratio": 0.895, "utilization_gpu_pct": 0},
+            {"index": 4, "memory_used_mb": 22000, "memory_total_mb": 24576, "memory_used_ratio": 0.895, "utilization_gpu_pct": 0},
+            {"index": 5, "memory_used_mb": 22000, "memory_total_mb": 24576, "memory_used_ratio": 0.895, "utilization_gpu_pct": 0},
+            {"index": 6, "memory_used_mb": 22000, "memory_total_mb": 24576, "memory_used_ratio": 0.895, "utilization_gpu_pct": 0},
+        ],
+    }
+    previous = {"state": {"last_health": {"tmux_alive": True, "process_alive": True, "gpu_abnormal": False}}}
+    config = module.MonitorConfig()
+
+    module.apply_gpu_abnormal_debounce(snapshot, previous, config)
+    events, state = module.build_events(snapshot, previous, now="2026-05-27T00:00:00Z")
+
+    assert snapshot["gpu_abnormal"] is False
+    assert "gpu3-6:all_idle" in snapshot["gpu_abnormal_observed_reasons"]
+    assert [event["type"] for event in events] == []
+    assert state["gpu_all_idle_consecutive_samples"] == 1
+
+
+def test_repeated_all_idle_samples_emit_gpu_abnormal_when_process_is_alive() -> None:
+    module = _load_script()
+    snapshot = {
+        "last_metrics": {},
+        "quality_jsons": [],
+        "errors": [],
+        "tmux_alive": True,
+        "processes": [{"pid": 123, "cmd": "train_g"}],
+        "gpus": [
+            {"index": 3, "memory_used_mb": 22000, "memory_total_mb": 24576, "memory_used_ratio": 0.895, "utilization_gpu_pct": 0},
+            {"index": 4, "memory_used_mb": 22000, "memory_total_mb": 24576, "memory_used_ratio": 0.895, "utilization_gpu_pct": 0},
+            {"index": 5, "memory_used_mb": 22000, "memory_total_mb": 24576, "memory_used_ratio": 0.895, "utilization_gpu_pct": 0},
+            {"index": 6, "memory_used_mb": 22000, "memory_total_mb": 24576, "memory_used_ratio": 0.895, "utilization_gpu_pct": 0},
+        ],
+    }
+    previous = {
+        "state": {
+            "gpu_all_idle_consecutive_samples": 1,
+            "last_health": {"tmux_alive": True, "process_alive": True, "gpu_abnormal": False},
+        }
+    }
+    config = module.MonitorConfig(gpu_all_idle_min_samples=2)
+
+    module.apply_gpu_abnormal_debounce(snapshot, previous, config)
+    events, state = module.build_events(snapshot, previous, now="2026-05-27T00:05:00Z")
+
+    assert snapshot["gpu_abnormal"] is True
+    assert snapshot["gpu_abnormal_reasons"] == ["gpu3-6:all_idle"]
+    assert [event["type"] for event in events] == ["gpu_abnormal"]
+    assert state["gpu_all_idle_consecutive_samples"] == 2

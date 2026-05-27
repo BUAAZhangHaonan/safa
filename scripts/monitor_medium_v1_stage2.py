@@ -56,6 +56,7 @@ class MonitorConfig(NamedTuple):
     gpu_memory_high_ratio: float = 0.98
     gpu_memory_low_mb: int = 1000
     gpu_idle_util_pct: int = 1
+    gpu_all_idle_min_samples: int = 2
 
 
 def utc_now() -> str:
@@ -229,6 +230,27 @@ def assess_gpu_abnormal(snapshot: dict, config: MonitorConfig) -> tuple[bool, li
     return bool(reasons), reasons
 
 
+def apply_gpu_abnormal_debounce(snapshot: dict, previous_status: dict, config: MonitorConfig) -> None:
+    raw_abnormal, raw_reasons = assess_gpu_abnormal(snapshot, config)
+    previous_state = previous_status.get("state", {}) if isinstance(previous_status, dict) else {}
+    previous_idle_count = previous_state.get("gpu_all_idle_consecutive_samples", 0)
+    if not isinstance(previous_idle_count, int):
+        previous_idle_count = 0
+
+    process_alive = bool(snapshot.get("processes"))
+    all_idle = "gpu3-6:all_idle" in raw_reasons and process_alive
+    idle_count = previous_idle_count + 1 if all_idle else 0
+
+    debounced_reasons = list(raw_reasons)
+    if all_idle and idle_count < config.gpu_all_idle_min_samples:
+        debounced_reasons = [reason for reason in debounced_reasons if reason != "gpu3-6:all_idle"]
+
+    snapshot["gpu_abnormal_observed_reasons"] = raw_reasons
+    snapshot["gpu_all_idle_consecutive_samples"] = idle_count
+    snapshot["gpu_abnormal"] = raw_abnormal and bool(debounced_reasons)
+    snapshot["gpu_abnormal_reasons"] = debounced_reasons
+
+
 def collect_snapshot(paths: MonitorPaths, config: MonitorConfig, previous_status: dict, command_runner: Callable[[Sequence[str]], CommandResult]) -> dict:
     previous_state = previous_status.get("state", {}) if isinstance(previous_status, dict) else {}
     metrics = read_json(paths.metrics)
@@ -245,9 +267,7 @@ def collect_snapshot(paths: MonitorPaths, config: MonitorConfig, previous_status
     snapshot["errors"] = errors
     snapshot["train_log_path"] = paths.train_log.as_posix()
     snapshot["train_log_offset"] = log_offset
-    gpu_abnormal, gpu_reasons = assess_gpu_abnormal(snapshot, config)
-    snapshot["gpu_abnormal"] = gpu_abnormal
-    snapshot["gpu_abnormal_reasons"] = gpu_reasons
+    apply_gpu_abnormal_debounce(snapshot, previous_status, config)
     return snapshot
 
 
@@ -296,6 +316,7 @@ def build_events(snapshot: dict, previous_status: dict, now: str) -> tuple[list[
         "seen_quality_jsons": _bounded_unique(seen_quality),
         "seen_error_signatures": _bounded_unique(seen_errors),
         "train_log_offset": snapshot.get("train_log_offset", previous_state.get("train_log_offset", 0)),
+        "gpu_all_idle_consecutive_samples": snapshot.get("gpu_all_idle_consecutive_samples", 0),
         "last_health": {"tmux_alive": tmux_alive, "process_alive": process_alive, "gpu_abnormal": gpu_abnormal},
     }
     return events, state
@@ -314,6 +335,8 @@ def compact_status(snapshot: dict, state: dict, events: list[dict], now: str) ->
         "gpus": snapshot.get("gpus", []),
         "gpu_abnormal": snapshot.get("gpu_abnormal"),
         "gpu_abnormal_reasons": snapshot.get("gpu_abnormal_reasons", []),
+        "gpu_abnormal_observed_reasons": snapshot.get("gpu_abnormal_observed_reasons", []),
+        "gpu_all_idle_consecutive_samples": snapshot.get("gpu_all_idle_consecutive_samples", 0),
         "new_event_count": len(events),
         "new_event_types": [event["type"] for event in events],
         "paths": {"events": DEFAULT_EVENTS.as_posix(), "log": DEFAULT_LOG.as_posix()},
@@ -352,6 +375,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tmux-session", default=DEFAULT_TMUX_SESSION)
     parser.add_argument("--process-pattern", default=DEFAULT_PROCESS_PATTERN)
     parser.add_argument("--gpus", default=",".join(str(index) for index in DEFAULT_GPU_INDICES))
+    parser.add_argument("--gpu-all-idle-min-samples", type=int, default=2)
     return parser.parse_args(argv)
 
 
@@ -359,7 +383,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     gpu_indices = tuple(int(part) for part in args.gpus.split(",") if part.strip())
     paths = MonitorPaths(status=args.status, events=args.events, log=args.log, metrics=args.metrics, quality_dir=args.quality_dir, train_log=args.train_log)
-    config = MonitorConfig(tmux_session=args.tmux_session, process_pattern=args.process_pattern, gpu_indices=gpu_indices)
+    config = MonitorConfig(
+        tmux_session=args.tmux_session,
+        process_pattern=args.process_pattern,
+        gpu_indices=gpu_indices,
+        gpu_all_idle_min_samples=args.gpu_all_idle_min_samples,
+    )
     if args.once:
         return run_once(paths, config)
     return loop(paths, config, args.interval)
