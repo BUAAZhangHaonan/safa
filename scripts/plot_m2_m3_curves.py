@@ -285,6 +285,7 @@ def plot_m2_m3_curves(
     m2_run: Path,
     m3_run: Path,
     out_dir: Path,
+    only: str | None = None,
     m0_history_json: Path | None = None,
     m2_history_json: Path | None = None,
     m3_history_json: Path | None = None,
@@ -292,9 +293,24 @@ def plot_m2_m3_curves(
     m2_quality_dir: Path | None = None,
     m3_quality_dir: Path | None = None,
 ) -> list[Path]:
-    m0 = _load_run('m0', m0_run, history_json=m0_history_json, quality_dir=m0_quality_dir)
+    if only is not None and only not in {'m2', 'm3'}:
+        raise ValueError(f"only must be 'm2', 'm3', or None; got {only!r}")
+
+    if only == 'm3':
+        m3 = _load_run('m3', m3_run, history_json=m3_history_json, quality_dir=m3_quality_dir)
+        outputs = [out_dir / 'm3_curves.png', out_dir / 'm3_projection_diagnostics.png']
+        _plot_run(m3, outputs[0])
+        _plot_projection(m3, outputs[1])
+        return outputs
+
     m2 = _load_run('m2', m2_run, history_json=m2_history_json, quality_dir=m2_quality_dir)
+    if only == 'm2':
+        output = out_dir / 'm2_curves.png'
+        _plot_run(m2, output)
+        return [output]
+
     m3 = _load_run('m3', m3_run, history_json=m3_history_json, quality_dir=m3_quality_dir)
+    m0 = _load_run('m0', m0_run, history_json=m0_history_json, quality_dir=m0_quality_dir)
     outputs = [
         out_dir / 'm2_curves.png',
         out_dir / 'm3_curves.png',
@@ -310,6 +326,7 @@ def plot_m2_m3_curves(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Plot medium_v2 M2/M3 curves from strict JSON metrics.')
+    parser.add_argument('--only', choices=('m2', 'm3'), help='plot only one stage and do not require the other stage inputs')
     parser.add_argument('--m0-run', type=Path, default=Path('artifacts/checkpoints/g_medium_v1_stage2_m0'))
     parser.add_argument('--m2-run', type=Path, default=Path('artifacts/checkpoints/g_medium_v2_stage2_m2_gram_weighted'))
     parser.add_argument('--m3-run', type=Path, default=Path('artifacts/checkpoints/g_medium_v2_stage2_m3_gram_projected'))
@@ -331,6 +348,7 @@ def main() -> int:
             m2_run=args.m2_run,
             m3_run=args.m3_run,
             out_dir=args.out_dir,
+            only=args.only,
             m0_history_json=args.m0_history_json,
             m2_history_json=args.m2_history_json,
             m3_history_json=args.m3_history_json,

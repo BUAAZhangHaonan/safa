@@ -28,6 +28,54 @@ def test_plot_m2_m3_curves_writes_expected_pngs(tmp_path: Path) -> None:
         assert path.stat().st_size > 0
 
 
+def test_plot_only_m2_does_not_require_m0_or_m3_inputs(tmp_path: Path) -> None:
+    from scripts.plot_m2_m3_curves import plot_m2_m3_curves
+
+    m2 = _write_run(tmp_path, 'm2', _rows('m2'), include_quality=True)
+    missing_m0 = tmp_path / 'missing_m0'
+    missing_m3 = tmp_path / 'missing_m3'
+    out_dir = tmp_path / 'plots'
+
+    outputs = plot_m2_m3_curves(
+        m0_run=missing_m0,
+        m2_run=m2,
+        m3_run=missing_m3,
+        out_dir=out_dir,
+        only='m2',
+    )
+
+    assert outputs == [out_dir / 'm2_curves.png']
+    assert outputs[0].is_file()
+    assert outputs[0].stat().st_size > 0
+    assert not (out_dir / 'm3_curves.png').exists()
+    assert not (out_dir / 'm0_m2_m3_comparison.png').exists()
+
+
+def test_plot_only_m3_does_not_require_m0_or_m2_inputs(tmp_path: Path) -> None:
+    from scripts.plot_m2_m3_curves import plot_m2_m3_curves
+
+    m3 = _write_run(tmp_path, 'm3', _rows('m3', include_projection=True), include_quality=True)
+    missing_m0 = tmp_path / 'missing_m0'
+    missing_m2 = tmp_path / 'missing_m2'
+    out_dir = tmp_path / 'plots'
+
+    outputs = plot_m2_m3_curves(
+        m0_run=missing_m0,
+        m2_run=missing_m2,
+        m3_run=m3,
+        out_dir=out_dir,
+        only='m3',
+    )
+
+    expected = [out_dir / 'm3_curves.png', out_dir / 'm3_projection_diagnostics.png']
+    assert outputs == expected
+    for path in expected:
+        assert path.is_file()
+        assert path.stat().st_size > 0
+    assert not (out_dir / 'm2_curves.png').exists()
+    assert not (out_dir / 'm0_m2_m3_comparison.png').exists()
+
+
 def test_plot_m2_m3_curves_fails_when_required_metric_is_missing(tmp_path: Path) -> None:
     from scripts.plot_m2_m3_curves import plot_m2_m3_curves
 
