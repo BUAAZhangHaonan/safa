@@ -1,0 +1,79 @@
+seed: 1337
+sampling_seed: 1337
+device: cuda:0
+num_workers: 8
+global_batch_size: 96
+per_device_batch_size: 24
+amp: false
+learning_rate: 0.0003
+weight_decay: 0.0
+image_size: 224
+embedding_dim: 512
+train_index: data/index/train_balanced_medium.jsonl
+train_features: artifacts/e0_features/train_balanced_medium_e0_medium_v1
+e0_checkpoint: artifacts/checkpoints/e0_medium_v1/best.pt
+out_dir: artifacts/checkpoints/g_medium_v2_stage2_m3_gram_projected
+resume_from: artifacts/checkpoints/g_medium_v1_stage1_long200_v4/best_stage1.pt
+allow_stage2_without_stage1_gate: true
+resume_from_legacy_stage1_metrics: false
+ema:
+  enabled: true
+  decay: 0.999
+  evaluate_raw: true
+  evaluate_ema: true
+  save_ema_checkpoint: true
+best_model: raw
+distributed:
+  backend: gloo
+generator:
+  model_type: conditional_flow_matching
+  base_channels: 32
+  channel_multipliers: [1, 2, 4, 4]
+  time_embedding_dim: 128
+  condition_dim: 512
+  sample_steps: 32
+  train_cycle_steps: 16
+  cycle_steps_schedule: []
+  sampler: heun
+grad_clip_norm: 1.0
+stages:
+  stage1:
+    epochs: 0
+    require_face_detection_gate: false
+  stage2:
+    epochs: 120
+    gradient_monitor:
+      enabled: true
+      interval: 20
+      max_samples: 8
+    stage2_objective:
+      type: gram_projected_two_step
+      lambda_repr: 1.0
+      point_weight: 1.0
+      relation_weight: 1.0
+      offdiag_only: true
+      repr_learning_rate: 0.00003
+      projection_eps: 0.000000000001
+    quality_eval:
+      enabled: true
+      metrics: [niqe, fid, kid]
+      niqe_interval_epochs: 1
+      niqe_max_samples: 512
+      distribution_interval_epochs: 20
+      distribution_max_samples: 3969
+      distribution_timeout_seconds: 3600
+      quality_num_workers: 2
+      real_index: data/index/val_single_face.jsonl
+      distribution_cuda_visible_devices: "0"
+      distribution_device: cuda:0
+      output_dir: artifacts/eval/g_medium_v2_stage2_m3_gram_projected/quality
+      model: raw
+validation:
+  enabled: true
+  index: data/index/val_single_face.jsonl
+  features: artifacts/e0_features/val_single_face_e0_medium_v1
+  max_samples: 512
+  batch_size: 16
+  face_detection:
+    enabled: true
+    model_name: buffalo_l

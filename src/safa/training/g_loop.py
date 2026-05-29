@@ -15,6 +15,8 @@ from safa.models.e0 import assert_e0_frozen, freeze_e0, load_e0_checkpoint
 from safa.models.generator import FlowGeneratorConfig, build_generator
 from safa.training.audit import audit_no_identity_supervision
 from safa.training.losses import cosine_cycle_loss, normalize_for_e0
+from safa.training.projected_update import project_gradient_onto_fm_feasible_cone
+from safa.training.representation_losses import hyperspherical_gram_loss
 from safa.training.multitask_loss import UncertaintyWeightedLoss
 from safa.training.transforms import generator_image_transform
 from safa.utils.device import assert_finite_tensor
@@ -55,6 +57,17 @@ class _LossWeightingRuntime:
 
 
 @dataclass(frozen=True)
+class _Stage2ObjectiveRuntime:
+    type: str
+    lambda_repr: float
+    point_weight: float
+    relation_weight: float
+    offdiag_only: bool
+    repr_learning_rate: float | None = None
+    projection_eps: float | None = None
+
+
+@dataclass(frozen=True)
 class _BatchConfig:
     global_batch_size: int
     per_device_batch_size: int
@@ -83,6 +96,7 @@ class _GeneratorTrainingStep:
         generator_config: FlowGeneratorConfig,
         sampling_seed: int,
         loss_weighting: _LossWeightingRuntime | None = None,
+        stage2_objective: _Stage2ObjectiveRuntime | None = None,
     ):
         from torch import nn
         schedule = generator_config.cycle_steps_schedule
@@ -96,6 +110,7 @@ class _GeneratorTrainingStep:
                 self.sampling_seed = int(sampling_seed)
                 self.loss_weighting = loss_weighting if loss_weighting is not None else _LossWeightingRuntime(type="legacy")
                 self.uncertainty_loss = UncertaintyWeightedLoss(["flow", "cycle"]) if self.loss_weighting.type == "uncertainty" else None
+                self.stage2_objective = stage2_objective
                 self._schedule = schedule
                 self._batch_idx = 0
                 self.last_loss_metrics: dict[str, float | str] = {}
@@ -145,6 +160,31 @@ class _GeneratorTrainingStep:
                         cycle_steps = self._schedule[self._batch_idx % len(self._schedule)]
                     else:
                         cycle_steps = self.generator_config.train_cycle_steps
+                    if self.stage2_objective is not None:
+                        repr_loss, repr_metrics = self._compute_repr_loss(z, sample_ids, cycle_steps=cycle_steps)
+                        self._batch_idx += 1
+                        if self.stage2_objective.type == "gram_weighted_sum":
+                            loss = flow_loss + self.stage2_objective.lambda_repr * repr_loss
+                            loss_metrics = self._stage2_repr_loss_metrics(
+                                flow_loss,
+                                cycle_loss,
+                                repr_loss,
+                                repr_metrics,
+                                effective_repr_weight=self.stage2_objective.lambda_repr,
+                            )
+                            self.last_loss_metrics = loss_metrics
+                            return loss, flow_metrics["flow_matching_mse"].detach(), repr_loss.detach(), flow_loss, repr_loss
+                        if self.stage2_objective.type == "gram_projected_two_step":
+                            loss_metrics = self._stage2_repr_loss_metrics(
+                                flow_loss,
+                                cycle_loss,
+                                repr_loss,
+                                repr_metrics,
+                                effective_repr_weight=self.stage2_objective.lambda_repr,
+                            )
+                            self.last_loss_metrics = loss_metrics
+                            return repr_loss, flow_metrics["flow_matching_mse"].detach(), repr_loss.detach(), flow_loss, repr_loss
+                        raise RuntimeError(f"Unsupported stage2_objective.type {self.stage2_objective.type!r}")
                     x_init = make_x_init_for_sample_ids(
                         sample_ids,
                         self.sampling_seed,
@@ -167,6 +207,53 @@ class _GeneratorTrainingStep:
                 loss, loss_metrics = self._combine_losses(flow_loss, cycle_loss, use_cycle=use_cycle, lambda_cycle=lambda_cycle)
                 self.last_loss_metrics = loss_metrics
                 return loss, flow_metrics["flow_matching_mse"].detach(), cycle_loss.detach(), flow_loss, cycle_loss
+
+            def _compute_repr_loss(self, z, sample_ids, *, cycle_steps: int):
+                if self.stage2_objective is None:
+                    raise RuntimeError("stage2_objective is required to compute representation loss")
+                x_init = make_x_init_for_sample_ids(
+                    sample_ids,
+                    self.sampling_seed,
+                    self.generator_config.image_size,
+                    z.device,
+                    z.dtype,
+                )
+                generated = self.generator.sample(
+                    z,
+                    steps=cycle_steps,
+                    checkpoint_steps=True,
+                    x_init=x_init,
+                    clamp_output=False,
+                )
+                assert_finite_tensor("stage2_generated_image", generated)
+                self.e0.eval()
+                e0_out = self.e0(normalize_for_e0(generated))
+                if "embedding" not in e0_out:
+                    raise RuntimeError("E0 output missing embedding for stage2 representation loss")
+                losses = hyperspherical_gram_loss(
+                    e0_out["embedding"],
+                    z,
+                    self.stage2_objective.point_weight,
+                    self.stage2_objective.relation_weight,
+                    offdiag_only=self.stage2_objective.offdiag_only,
+                )
+                return losses["total_loss"], losses
+
+            def _stage2_repr_loss_metrics(self, flow_loss, cycle_loss, repr_loss, repr_metrics: dict, *, effective_repr_weight: float):
+                return {
+                    "flow_loss_raw": float(flow_loss.detach().cpu()),
+                    "cycle_loss_raw": float(cycle_loss.detach().cpu()),
+                    "repr_loss": float(repr_loss.detach().cpu()),
+                    "repr_point_loss": float(repr_metrics["point_loss"].detach().cpu()),
+                    "repr_relation_loss": float(repr_metrics["relation_loss"].detach().cpu()),
+                    "stage2_objective_type": self.stage2_objective.type if self.stage2_objective is not None else "none",
+                    "lambda_repr": float(effective_repr_weight),
+                    "effective_repr_loss_weight": float(effective_repr_weight),
+                    "effective_cycle_loss_weight": 0.0,
+                    "flow_loss_normalized": float(flow_loss.detach().cpu()),
+                    "cycle_loss_normalized": 0.0,
+                    "loss_weighting_type": self.loss_weighting.type,
+                }
 
             def _combine_losses(self, flow_loss, cycle_loss, *, use_cycle: bool, lambda_cycle: float):
                 metrics = {
@@ -277,6 +364,56 @@ def _loss_weighting_runtime_from_config(config: dict) -> _LossWeightingRuntime:
     raise ValueError(f"loss_weighting.type must be 'fixed' or 'uncertainty', got {loss_type!r}")
 
 
+def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | None:
+    stage2 = stages.get("stage2") if isinstance(stages, dict) else None
+    if not isinstance(stage2, dict):
+        raise ValueError("stages.stage2 must be a mapping")
+    payload = stage2.get("stage2_objective")
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        raise ValueError("stages.stage2.stage2_objective must be a mapping")
+    context = "stages.stage2.stage2_objective"
+    objective_type = _require_field(payload, "type", context)
+    if objective_type not in ("gram_weighted_sum", "gram_projected_two_step"):
+        raise ValueError(
+            "stages.stage2.stage2_objective.type must be gram_weighted_sum or gram_projected_two_step, "
+            f"got {objective_type!r}"
+        )
+    lambda_repr = _require_numeric(payload, "lambda_repr", context)
+    point_weight = _require_numeric(payload, "point_weight", context)
+    relation_weight = _require_numeric(payload, "relation_weight", context)
+    if lambda_repr < 0.0:
+        raise ValueError(f"{context}.lambda_repr must be non-negative, got {lambda_repr!r}")
+    if point_weight < 0.0:
+        raise ValueError(f"{context}.point_weight must be non-negative, got {point_weight!r}")
+    if relation_weight < 0.0:
+        raise ValueError(f"{context}.relation_weight must be non-negative, got {relation_weight!r}")
+    offdiag_only = _require_bool(payload, "offdiag_only", context)
+    repr_learning_rate = None
+    projection_eps = None
+    if objective_type == "gram_projected_two_step":
+        repr_learning_rate = _require_numeric(payload, "repr_learning_rate", context)
+        projection_eps = _require_numeric(payload, "projection_eps", context)
+        if repr_learning_rate <= 0.0:
+            raise ValueError(f"{context}.repr_learning_rate must be positive, got {repr_learning_rate!r}")
+        if projection_eps < 0.0:
+            raise ValueError(f"{context}.projection_eps must be non-negative, got {projection_eps!r}")
+    else:
+        for field in ("repr_learning_rate", "projection_eps"):
+            if field in payload:
+                raise ValueError(f"{context}.{field} is only valid for gram_projected_two_step")
+    return _Stage2ObjectiveRuntime(
+        type=str(objective_type),
+        lambda_repr=float(lambda_repr),
+        point_weight=float(point_weight),
+        relation_weight=float(relation_weight),
+        offdiag_only=offdiag_only,
+        repr_learning_rate=None if repr_learning_rate is None else float(repr_learning_rate),
+        projection_eps=None if projection_eps is None else float(projection_eps),
+    )
+
+
 def _require_positive_int(config: dict, field: str, context: str) -> int:
     value = _require_field(config, field, context)
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -290,7 +427,12 @@ def _requires_explicit_stage2_batch_semantics(config: dict) -> bool:
         return False
     stage2_epochs = stages["stage2"].get("epochs", 0)
     out_dir = Path(str(config.get("out_dir", ""))).name
-    return int(stage2_epochs) > 0 and out_dir in {"g_medium_v1_stage2_m0", "g_medium_v1_stage2_m1_uw"}
+    return int(stage2_epochs) > 0 and out_dir in {
+        "g_medium_v1_stage2_m0",
+        "g_medium_v1_stage2_m1_uw",
+        "g_medium_v2_stage2_m2_gram_weighted",
+        "g_medium_v2_stage2_m3_gram_projected",
+    }
 
 
 def _training_batch_config(config: dict, *, world_size: int | None = None) -> _BatchConfig:
@@ -385,8 +527,12 @@ def _optimizer_param_groups(training_module, config: dict, loss_weighting: _Loss
     return groups
 
 
-def _stage2_lambda_schedule(stages: dict, loss_weighting: _LossWeightingRuntime) -> tuple[float, float, float]:
+def _stage2_lambda_schedule(
+    stages: dict, loss_weighting: _LossWeightingRuntime, stage2_objective: _Stage2ObjectiveRuntime | None = None
+) -> tuple[float, float, float]:
     stage2 = stages["stage2"]
+    if stage2_objective is not None:
+        return 0.0, 0.0, 0.0
     if loss_weighting.type == "legacy":
         return (
             float(_require_numeric(stage2, "lambda_initial", "stages.stage2")),
@@ -569,6 +715,7 @@ def train_g_from_config(config: dict) -> dict:
     ema_config = _ema_config(config)
     best_model = _best_model(config, ema_config)
     loss_weighting_runtime = _loss_weighting_runtime_from_config(config)
+    stage2_objective = _stage2_objective_from_config(stages)
     sampling_seed = sampling_base_seed_from_config(config)
     generator = build_generator(generator_config.to_dict()).to(device)
     resume_history = None
@@ -608,7 +755,7 @@ def train_g_from_config(config: dict) -> dict:
         ema = ExponentialMovingAverage(generator, decay=float(ema_config["decay"]))
         if resume_ema_state_dict is not None:
             ema.load_state_dict(resume_ema_state_dict)
-    training_module = _GeneratorTrainingStep(generator, e0, generator_config, sampling_seed, loss_weighting_runtime).to(device)
+    training_module = _GeneratorTrainingStep(generator, e0, generator_config, sampling_seed, loss_weighting_runtime, stage2_objective).to(device)
     set_seed(int(config["seed"]) + distributed.rank)
 
     _verify_e0_feature_cache_consistency(config)
@@ -664,7 +811,7 @@ def train_g_from_config(config: dict) -> dict:
             if distributed.is_main:
                 print("Resumed optimizer state from checkpoint; optimizer_resumed: true")
     assert_e0_frozen(e0, optimizer)
-    lambda_cycle, lambda_max, lambda_growth = _stage2_lambda_schedule(stages, loss_weighting_runtime)
+    lambda_cycle, lambda_max, lambda_growth = _stage2_lambda_schedule(stages, loss_weighting_runtime, stage2_objective)
     baseline_detection_rate = None
     best_checkpoint = out_dir / "best.pt"
     history: list[dict] = resume_history if resume_history is not None else []
@@ -742,56 +889,102 @@ def train_g_from_config(config: dict) -> dict:
                     try:
                         training_state._batch_idx = saved_batch_idx
                         with amp_ctx:
-                            _, _, _, gradient_flow_loss, gradient_cycle_loss = training_state(
+                            _, _, _, gradient_flow_loss, gradient_secondary_loss = training_state(
                                 gradient_images,
                                 gradient_z,
                                 gradient_sample_ids,
                                 True,
                                 lambda_cycle,
                             )
-                        gradient_cycle_weight = float(
-                            training_state.last_loss_metrics.get("loss_weighting_cycle_weight", lambda_cycle)
-                        )
-                        gradient_metrics = _compute_gradient_conflict_metrics(
-                            gradient_flow_loss,
-                            gradient_cycle_loss,
-                            training_state.generator.parameters(),
-                            lambda_cycle=gradient_cycle_weight,
-                            sample_size=gradient_sample_size,
-                            full_batch_size=gradient_full_batch_size,
-                        )
+                        if stage2_objective is not None and stage2_objective.type == "gram_weighted_sum":
+                            gradient_metrics = _compute_repr_gradient_conflict_metrics(
+                                gradient_flow_loss,
+                                gradient_secondary_loss,
+                                training_state.generator.parameters(),
+                                lambda_repr=stage2_objective.lambda_repr,
+                                sample_size=gradient_sample_size,
+                                full_batch_size=gradient_full_batch_size,
+                            )
+                        elif stage2_objective is None:
+                            gradient_cycle_weight = float(
+                                training_state.last_loss_metrics.get("loss_weighting_cycle_weight", lambda_cycle)
+                            )
+                            gradient_metrics = _compute_gradient_conflict_metrics(
+                                gradient_flow_loss,
+                                gradient_secondary_loss,
+                                training_state.generator.parameters(),
+                                lambda_cycle=gradient_cycle_weight,
+                                sample_size=gradient_sample_size,
+                                full_batch_size=gradient_full_batch_size,
+                            )
+                        else:
+                            gradient_metrics = {}
                     finally:
                         training_state._batch_idx = saved_batch_idx
                         training_state.last_loss_metrics = saved_loss_metrics
-                    totals["gradient_conflict_count"] += 1.0
-                    totals["gradient_cosine_fm_cycle"] += gradient_metrics["gradient_cosine_fm_cycle"]
-                    totals["gradient_norm_fm"] += gradient_metrics["gradient_norm_fm"]
-                    totals["gradient_norm_cycle"] += gradient_metrics["gradient_norm_cycle"]
-                    totals["weighted_gradient_norm_cycle"] += gradient_metrics["weighted_gradient_norm_cycle"]
-                    totals["weighted_gradient_ratio_cycle_to_fm"] += gradient_metrics["weighted_gradient_ratio_cycle_to_fm"]
-                    totals["gradient_conflict_sample_size"] = float(totals.get("gradient_conflict_sample_size", 0.0)) + float(
-                        gradient_metrics["gradient_conflict_sample_size"]
+                    if gradient_metrics:
+                        totals["gradient_conflict_count"] += 1.0
+                        totals["gradient_norm_fm"] += gradient_metrics["gradient_norm_fm"]
+                        if "gradient_cosine_fm_repr" in gradient_metrics:
+                            totals["gradient_cosine_fm_repr"] += gradient_metrics["gradient_cosine_fm_repr"]
+                            totals["gradient_norm_repr"] += gradient_metrics["gradient_norm_repr"]
+                            totals["weighted_gradient_norm_repr"] += gradient_metrics["weighted_gradient_norm_repr"]
+                            totals["weighted_repr_to_fm_ratio"] += gradient_metrics["weighted_repr_to_fm_ratio"]
+                        else:
+                            totals["gradient_cosine_fm_cycle"] += gradient_metrics["gradient_cosine_fm_cycle"]
+                            totals["gradient_norm_cycle"] += gradient_metrics["gradient_norm_cycle"]
+                            totals["weighted_gradient_norm_cycle"] += gradient_metrics["weighted_gradient_norm_cycle"]
+                            totals["weighted_gradient_ratio_cycle_to_fm"] += gradient_metrics["weighted_gradient_ratio_cycle_to_fm"]
+                        totals["gradient_conflict_sample_size"] = float(totals.get("gradient_conflict_sample_size", 0.0)) + float(
+                            gradient_metrics["gradient_conflict_sample_size"]
+                        )
+                        totals["gradient_conflict_full_batch_size"] = float(totals.get("gradient_conflict_full_batch_size", 0.0)) + float(
+                            gradient_metrics["gradient_conflict_full_batch_size"]
+                        )
+                        totals["gradient_conflict_samples"].append(gradient_metrics)
+                if stage_name == "stage2" and stage2_objective is not None and stage2_objective.type == "gram_projected_two_step":
+                    loss, flow_mse, cycle, flow_loss, cycle_loss, batch_grad_norm, projection_metrics = _run_projected_stage2_batch(
+                        training_module=training_module,
+                        optimizer=optimizer,
+                        images=images,
+                        z=z,
+                        sample_ids=sample_ids,
+                        lambda_cycle=lambda_cycle,
+                        amp_ctx=amp_ctx,
+                        grad_clip_norm=config.get("grad_clip_norm"),
+                        ema=ema,
+                        stage2_objective=stage2_objective,
                     )
-                    totals["gradient_conflict_full_batch_size"] = float(totals.get("gradient_conflict_full_batch_size", 0.0)) + float(
-                        gradient_metrics["gradient_conflict_full_batch_size"]
-                    )
-                    totals["gradient_conflict_samples"].append(gradient_metrics)
-                with amp_ctx:
-                    loss, flow_mse, cycle, flow_loss, cycle_loss = training_module(images, z, sample_ids, stage_name == "stage2", lambda_cycle)
+                    totals["m3_projection_count"] += 1.0
+                    for metric_name in (
+                        "projection_applied_fraction",
+                        "dot_before",
+                        "dot_after",
+                        "fm_first_order_effect_mean",
+                        "repr_descent_inner_product_mean",
+                        "projection_removed_norm_mean",
+                        "projected_repr_norm_mean",
+                    ):
+                        totals[metric_name] += float(projection_metrics[metric_name])
+                    totals["dot_after_abs_max"] = max(totals["dot_after_abs_max"], float(projection_metrics["dot_after_abs_max"]))
+                else:
+                    with amp_ctx:
+                        loss, flow_mse, cycle, flow_loss, cycle_loss = training_module(images, z, sample_ids, stage_name == "stage2", lambda_cycle)
+                    _assert_finite_training_scalars(loss, flow_mse, cycle)
+                    assert_finite_tensor("g_loss", loss)
+                    loss.backward()
+                    batch_grad_norm = 0.0
+                    if "grad_clip_norm" in config:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            unwrap_model(training_module).generator.parameters(),
+                            config["grad_clip_norm"],
+                        )
+                        batch_grad_norm = float(grad_norm) if isinstance(grad_norm, float) else float(grad_norm.detach().cpu())
+                    optimizer.step()
+                    if ema is not None:
+                        ema.update(unwrap_model(training_module).generator)
                 _assert_finite_training_scalars(loss, flow_mse, cycle)
                 _accumulate_extra_loss_metrics(totals, unwrap_model(training_module).last_loss_metrics, batch_size)
-                assert_finite_tensor("g_loss", loss)
-                loss.backward()
-                batch_grad_norm = 0.0
-                if "grad_clip_norm" in config:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        unwrap_model(training_module).generator.parameters(),
-                        config["grad_clip_norm"],
-                    )
-                    batch_grad_norm = float(grad_norm) if isinstance(grad_norm, float) else float(grad_norm.detach().cpu())
-                optimizer.step()
-                if ema is not None:
-                    ema.update(unwrap_model(training_module).generator)
                 seen += batch_size
                 totals["loss"] += float(loss.detach().cpu()) * batch_size
                 totals["flow_matching_mse"] += float(flow_mse.cpu()) * batch_size
@@ -925,15 +1118,12 @@ def _reduce_epoch_metrics(totals: dict, seen: int, device, distributed: Distribu
     import torch
 
     local_gradient_conflict_count = float(totals.get("gradient_conflict_count", 0.0))
-    weighted_gradient_norm_cycle = 0.0
-    weighted_gradient_ratio_cycle_to_fm = 0.0
     if local_gradient_conflict_count > 0.0:
-        weighted_gradient_norm_cycle = float(totals["weighted_gradient_norm_cycle"])
-        weighted_gradient_ratio_cycle_to_fm = float(totals["weighted_gradient_ratio_cycle_to_fm"])
         if "gradient_conflict_sample_size" not in totals:
             raise RuntimeError("Gradient conflict monitor is missing gradient_conflict_sample_size")
         if "gradient_conflict_full_batch_size" not in totals:
             raise RuntimeError("Gradient conflict monitor is missing gradient_conflict_full_batch_size")
+    local_m3_projection_count = float(totals.get("m3_projection_count", 0.0))
     values = torch.tensor(
         [
             float(totals["loss"]),
@@ -941,23 +1131,36 @@ def _reduce_epoch_metrics(totals: dict, seen: int, device, distributed: Distribu
             float(totals["cycle"]),
             float(totals["grad_norm"]),
             float(seen),
-            # These totals are present only when the Stage 2 gradient-conflict monitor records a batch.
             local_gradient_conflict_count,
             float(totals.get("gradient_cosine_fm_cycle", 0.0)),
             float(totals.get("gradient_norm_fm", 0.0)),
             float(totals.get("gradient_norm_cycle", 0.0)),
-            weighted_gradient_norm_cycle,
-            weighted_gradient_ratio_cycle_to_fm,
+            float(totals.get("weighted_gradient_norm_cycle", 0.0)),
+            float(totals.get("weighted_gradient_ratio_cycle_to_fm", 0.0)),
             float(totals.get("gradient_conflict_sample_size", 0.0)),
             float(totals.get("gradient_conflict_full_batch_size", 0.0)),
+            float(totals.get("gradient_cosine_fm_repr", 0.0)),
+            float(totals.get("gradient_norm_repr", 0.0)),
+            float(totals.get("weighted_gradient_norm_repr", 0.0)),
+            float(totals.get("weighted_repr_to_fm_ratio", 0.0)),
+            local_m3_projection_count,
+            float(totals.get("projection_applied_fraction", 0.0)),
+            float(totals.get("dot_before", 0.0)),
+            float(totals.get("dot_after", 0.0)),
+            float(totals.get("fm_first_order_effect_mean", 0.0)),
+            float(totals.get("repr_descent_inner_product_mean", 0.0)),
+            float(totals.get("projection_removed_norm_mean", 0.0)),
+            float(totals.get("projected_repr_norm_mean", 0.0)),
         ],
         device=device,
         dtype=torch.float64,
     )
+    dot_after_abs_max = torch.tensor(float(totals.get("dot_after_abs_max", 0.0)), device=device, dtype=torch.float64)
     if distributed.enabled:
         import torch.distributed as dist
 
         dist.all_reduce(values, op=dist.ReduceOp.SUM)
+        dist.all_reduce(dot_after_abs_max, op=dist.ReduceOp.MAX)
     metric_names = (
         "loss",
         "flow_matching_mse",
@@ -972,10 +1175,24 @@ def _reduce_epoch_metrics(totals: dict, seen: int, device, distributed: Distribu
         "weighted_gradient_ratio_cycle_to_fm",
         "gradient_conflict_sample_size",
         "gradient_conflict_full_batch_size",
+        "gradient_cosine_fm_repr",
+        "gradient_norm_repr",
+        "weighted_gradient_norm_repr",
+        "weighted_repr_to_fm_ratio",
+        "m3_projection_count",
+        "projection_applied_fraction",
+        "dot_before",
+        "dot_after",
+        "fm_first_order_effect_mean",
+        "repr_descent_inner_product_mean",
+        "projection_removed_norm_mean",
+        "projected_repr_norm_mean",
     )
     for index, name in enumerate(metric_names):
         if not bool(torch.isfinite(values[index]).item()):
             raise RuntimeError(f"Epoch metric {name} is not finite")
+    if not bool(torch.isfinite(dot_after_abs_max).item()):
+        raise RuntimeError("Epoch metric dot_after_abs_max is not finite")
     total_seen = float(values[4].item())
     if total_seen <= 0.0:
         raise RuntimeError("Cannot reduce epoch metrics from zero samples")
@@ -994,17 +1211,46 @@ def _reduce_epoch_metrics(totals: dict, seen: int, device, distributed: Distribu
                 "Gradient conflict monitor sample count mismatch: "
                 f"samples={len(gradient_samples)} count={int(gradient_conflict_count)}"
             )
+        if any("gradient_cosine_fm_repr" in sample for sample in gradient_samples):
+            metrics.update(
+                {
+                    "gradient_cosine_fm_repr": float(values[13].item() / gradient_conflict_count),
+                    "gradient_norm_fm": float(values[7].item() / gradient_conflict_count),
+                    "gradient_norm_repr": float(values[14].item() / gradient_conflict_count),
+                    "weighted_gradient_norm_repr": float(values[15].item() / gradient_conflict_count),
+                    "weighted_repr_to_fm_ratio": float(values[16].item() / gradient_conflict_count),
+                    "gradient_conflict_sample_size": float(values[11].item() / gradient_conflict_count),
+                    "gradient_conflict_full_batch_size": float(values[12].item() / gradient_conflict_count),
+                    "gradient_conflict_count": int(gradient_conflict_count),
+                    **_summarize_repr_gradient_conflict_samples(gradient_samples),
+                }
+            )
+        else:
+            metrics.update(
+                {
+                    "gradient_cosine_fm_cycle": float(values[6].item() / gradient_conflict_count),
+                    "gradient_norm_fm": float(values[7].item() / gradient_conflict_count),
+                    "gradient_norm_cycle": float(values[8].item() / gradient_conflict_count),
+                    "weighted_gradient_norm_cycle": float(values[9].item() / gradient_conflict_count),
+                    "weighted_gradient_ratio_cycle_to_fm": float(values[10].item() / gradient_conflict_count),
+                    "gradient_conflict_sample_size": float(values[11].item() / gradient_conflict_count),
+                    "gradient_conflict_full_batch_size": float(values[12].item() / gradient_conflict_count),
+                    "gradient_conflict_count": int(gradient_conflict_count),
+                    **_summarize_gradient_conflict_samples(gradient_samples),
+                }
+            )
+    m3_projection_count = float(values[17].item())
+    if m3_projection_count > 0.0:
         metrics.update(
             {
-                "gradient_cosine_fm_cycle": float(values[6].item() / gradient_conflict_count),
-                "gradient_norm_fm": float(values[7].item() / gradient_conflict_count),
-                "gradient_norm_cycle": float(values[8].item() / gradient_conflict_count),
-                "weighted_gradient_norm_cycle": float(values[9].item() / gradient_conflict_count),
-                "weighted_gradient_ratio_cycle_to_fm": float(values[10].item() / gradient_conflict_count),
-                "gradient_conflict_sample_size": float(values[11].item() / gradient_conflict_count),
-                "gradient_conflict_full_batch_size": float(values[12].item() / gradient_conflict_count),
-                "gradient_conflict_count": int(gradient_conflict_count),
-                **_summarize_gradient_conflict_samples(gradient_samples),
+                "projection_applied_fraction": float(values[18].item() / m3_projection_count),
+                "dot_before": float(values[19].item() / m3_projection_count),
+                "dot_after": float(values[20].item() / m3_projection_count),
+                "dot_after_abs_max": float(dot_after_abs_max.item()),
+                "fm_first_order_effect_mean": float(values[21].item() / m3_projection_count),
+                "repr_descent_inner_product_mean": float(values[22].item() / m3_projection_count),
+                "projection_removed_norm_mean": float(values[23].item() / m3_projection_count),
+                "projected_repr_norm_mean": float(values[24].item() / m3_projection_count),
             }
         )
     return metrics
@@ -1082,6 +1328,39 @@ def _summarize_gradient_conflict_samples(samples: list[dict]) -> dict[str, float
         "gradient_norm_ratio_cycle_to_fm_mean": float(ratios.mean().item()),
         "weighted_gradient_norm_cycle_mean": float(weighted_norm_cycle.mean().item()),
         "weighted_gradient_ratio_cycle_to_fm_mean": float(weighted_ratios.mean().item()),
+        "gradient_conflict_fraction": float((cosines < 0.0).to(dtype=torch.float64).mean().item()),
+    }
+
+
+def _summarize_repr_gradient_conflict_samples(samples: list[dict]) -> dict[str, float]:
+    import torch
+
+    if not samples:
+        raise RuntimeError("Gradient conflict monitor recorded no samples")
+    cosines = torch.tensor([_finite_sample_value(sample, "gradient_cosine_fm_repr") for sample in samples], dtype=torch.float64)
+    norm_fm = torch.tensor([_finite_sample_value(sample, "gradient_norm_fm") for sample in samples], dtype=torch.float64)
+    norm_repr = torch.tensor([_finite_sample_value(sample, "gradient_norm_repr") for sample in samples], dtype=torch.float64)
+    weighted_norm_repr = torch.tensor([_finite_sample_value(sample, "weighted_gradient_norm_repr") for sample in samples], dtype=torch.float64)
+    weighted_ratios = torch.tensor([_finite_sample_value(sample, "weighted_repr_to_fm_ratio") for sample in samples], dtype=torch.float64)
+    ratios = norm_repr / norm_fm
+    if not torch.isfinite(ratios).all():
+        raise RuntimeError("Representation gradient norm ratio contains non-finite values")
+    if not torch.isfinite(weighted_ratios).all():
+        raise RuntimeError("Weighted representation gradient norm ratio contains non-finite values")
+    if bool((norm_fm <= 0.0).any().item()) or bool((norm_repr <= 0.0).any().item()):
+        raise RuntimeError("Gradient norm samples must be positive")
+    if bool((weighted_norm_repr <= 0.0).any().item()) or bool((weighted_ratios <= 0.0).any().item()):
+        raise RuntimeError("Weighted gradient norm samples must be positive")
+    return {
+        "gradient_cosine_fm_repr_mean": float(cosines.mean().item()),
+        "gradient_cosine_fm_repr_p10": float(torch.quantile(cosines, 0.10).item()),
+        "gradient_cosine_fm_repr_p50": float(torch.quantile(cosines, 0.50).item()),
+        "gradient_cosine_fm_repr_p90": float(torch.quantile(cosines, 0.90).item()),
+        "gradient_norm_fm_mean": float(norm_fm.mean().item()),
+        "gradient_norm_repr_mean": float(norm_repr.mean().item()),
+        "gradient_norm_ratio_repr_to_fm_mean": float(ratios.mean().item()),
+        "weighted_gradient_norm_repr_mean": float(weighted_norm_repr.mean().item()),
+        "weighted_repr_to_fm_ratio_mean": float(weighted_ratios.mean().item()),
         "gradient_conflict_fraction": float((cosines < 0.0).to(dtype=torch.float64).mean().item()),
     }
 
@@ -1211,12 +1490,15 @@ def _validate_train_g_config(config: dict) -> None:
     ema_config = _ema_config(config)
     _best_model(config, ema_config)
     loss_weighting = _loss_weighting_runtime_from_config(config)
+    stage2_objective = _stage2_objective_from_config(stages)
+    if stage2_objective is not None and loss_weighting.type != "legacy":
+        raise ValueError("stage2_objective M2/M3 runs must not use loss_weighting/UW")
     if loss_weighting.type == "uncertainty":
         if int(_require_field(stages["stage1"], "epochs", "stages.stage1")) != 0:
             raise ValueError("loss_weighting.type='uncertainty' requires stages.stage1.epochs == 0")
         if int(_require_field(stages["stage2"], "epochs", "stages.stage2")) <= 0:
             raise ValueError("loss_weighting.type='uncertainty' requires stages.stage2.epochs > 0")
-    _stage2_lambda_schedule(stages, loss_weighting)
+    _stage2_lambda_schedule(stages, loss_weighting, stage2_objective)
     _validate_stage1_gate_config(stages["stage1"])
     batch_config = _training_batch_config(config)
     gradient_conflict = _stage2_gradient_conflict_config(stages)
@@ -1392,32 +1674,37 @@ def _stage_config(config: dict) -> dict:
 def _stage2_gradient_conflict_config(stages: dict) -> _GradientConflictConfig:
     stage2 = stages["stage2"]
     epochs = int(_require_field(stage2, "epochs", "stages.stage2"))
-    payload = stage2.get("gradient_conflict")
+    has_monitor = "gradient_monitor" in stage2
+    has_conflict = "gradient_conflict" in stage2
+    if has_monitor and has_conflict:
+        raise ValueError("Use only one of stages.stage2.gradient_monitor or stages.stage2.gradient_conflict")
+    field_name = "gradient_monitor" if has_monitor else "gradient_conflict"
+    context = f"stages.stage2.{field_name}"
+    payload = stage2.get(field_name)
     if payload is None:
         if epochs <= 0:
             return _GradientConflictConfig(enabled=False)
-        raise ValueError("stages.stage2.gradient_conflict is required when Stage 2 epochs > 0")
+        raise ValueError("stages.stage2.gradient_monitor or stages.stage2.gradient_conflict is required when Stage 2 epochs > 0")
     if not isinstance(payload, dict):
-        raise ValueError("stages.stage2.gradient_conflict must be a mapping")
+        raise ValueError(f"{context} must be a mapping")
     if "enabled" not in payload:
-        raise ValueError("stages.stage2.gradient_conflict.enabled is required")
+        raise ValueError(f"{context}.enabled is required")
     enabled = payload["enabled"]
     if not isinstance(enabled, bool):
-        raise ValueError("stages.stage2.gradient_conflict.enabled must be true or false")
+        raise ValueError(f"{context}.enabled must be true or false")
     if not enabled:
         if "interval" in payload:
             _validate_gradient_conflict_interval(payload["interval"])
         return _GradientConflictConfig(enabled=False)
     if "interval" not in payload:
-        raise ValueError("stages.stage2.gradient_conflict.interval is required when enabled")
+        raise ValueError(f"{context}.interval is required when enabled")
     if "max_samples" not in payload:
-        raise ValueError("stages.stage2.gradient_conflict.max_samples is required when enabled")
+        raise ValueError(f"{context}.max_samples is required when enabled")
     return _GradientConflictConfig(
         enabled=True,
         interval=_validate_gradient_conflict_interval(payload["interval"]),
         max_samples=_validate_gradient_conflict_max_samples(payload["max_samples"]),
     )
-
 
 def _validate_gradient_conflict_interval(value) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -1615,6 +1902,188 @@ def _compute_gradient_conflict_metrics(
         "gradient_conflict_sample_size": sample_size,
         "gradient_conflict_full_batch_size": full_batch_size,
     }
+
+
+def _compute_repr_gradient_conflict_metrics(
+    flow_loss,
+    repr_loss,
+    parameters,
+    *,
+    lambda_repr: float,
+    sample_size: int,
+    full_batch_size: int,
+) -> dict[str, float]:
+    import torch
+
+    sample_size = _validate_gradient_conflict_max_samples(sample_size)
+    full_batch_size = _validate_gradient_conflict_max_samples(full_batch_size)
+    if sample_size > full_batch_size:
+        raise RuntimeError(
+            "gradient_conflict_sample_size must be less than or equal to gradient_conflict_full_batch_size, "
+            f"got sample_size={sample_size} full_batch_size={full_batch_size}"
+        )
+    if isinstance(lambda_repr, bool):
+        raise RuntimeError("lambda_repr must be numeric, got bool")
+    lambda_repr = float(lambda_repr)
+    if not math.isfinite(lambda_repr):
+        raise RuntimeError("lambda_repr must be finite")
+    params = [param for param in parameters if param.requires_grad]
+    if not params:
+        raise RuntimeError("Cannot compute gradient conflict metrics without trainable generator parameters")
+    flow_gradient = _gradient_vector_for_loss("flow matching", flow_loss, params)
+    repr_gradient = _gradient_vector_for_loss("representation", repr_loss, params)
+    flow_norm = torch.linalg.vector_norm(flow_gradient)
+    repr_norm = torch.linalg.vector_norm(repr_gradient)
+    if not torch.isfinite(flow_norm):
+        raise RuntimeError("flow matching gradient norm is not finite")
+    if not torch.isfinite(repr_norm):
+        raise RuntimeError("representation gradient norm is not finite")
+    if float(flow_norm.detach().cpu()) <= 0.0:
+        raise RuntimeError("flow matching gradient has zero norm")
+    if float(repr_norm.detach().cpu()) <= 0.0:
+        raise RuntimeError("representation gradient has zero norm")
+    cosine = torch.dot(flow_gradient, repr_gradient) / (flow_norm * repr_norm)
+    if not torch.isfinite(cosine):
+        raise RuntimeError("gradient cosine between flow matching and representation losses is not finite")
+    weighted_repr_norm = lambda_repr * repr_norm
+    weighted_ratio = weighted_repr_norm / flow_norm
+    if not torch.isfinite(weighted_repr_norm):
+        raise RuntimeError("weighted representation gradient norm is not finite")
+    if not torch.isfinite(weighted_ratio):
+        raise RuntimeError("weighted representation-to-flow gradient norm ratio is not finite")
+    return {
+        "gradient_cosine_fm_repr": float(cosine.detach().cpu()),
+        "gradient_norm_fm": float(flow_norm.detach().cpu()),
+        "gradient_norm_repr": float(repr_norm.detach().cpu()),
+        "weighted_gradient_norm_repr": float(weighted_repr_norm.detach().cpu()),
+        "weighted_repr_to_fm_ratio": float(weighted_ratio.detach().cpu()),
+        "gradient_conflict_sample_size": sample_size,
+        "gradient_conflict_full_batch_size": full_batch_size,
+    }
+
+
+def _trainable_parameter_list(parameters) -> list:
+    params = [param for param in parameters if param.requires_grad]
+    if not params:
+        raise RuntimeError("Projected representation update requires trainable parameters")
+    return params
+
+
+def _synced_gradients_from_parameters(name: str, parameters: list) -> list:
+    import torch
+
+    gradients = []
+    has_gradient = False
+    for index, param in enumerate(parameters):
+        if param.grad is None:
+            gradients.append(torch.zeros_like(param))
+            continue
+        grad = param.grad.detach().clone()
+        if not torch.isfinite(grad).all():
+            raise RuntimeError(f"{name} gradient {index} contains non-finite values")
+        has_gradient = True
+        gradients.append(grad)
+    if not has_gradient:
+        raise RuntimeError(f"{name} backward produced no parameter gradients")
+    return gradients
+
+
+def _apply_projected_repr_step(parameters: list, projected_gradients: list, *, repr_learning_rate: float) -> None:
+    import torch
+
+    if isinstance(repr_learning_rate, bool) or not math.isfinite(float(repr_learning_rate)) or float(repr_learning_rate) <= 0.0:
+        raise ValueError(f"repr_learning_rate must be positive and finite, got {repr_learning_rate!r}")
+    if len(parameters) != len(projected_gradients):
+        raise ValueError("parameters and projected_gradients must have the same length")
+    with torch.no_grad():
+        for index, (param, projected_grad) in enumerate(zip(parameters, projected_gradients)):
+            if param.shape != projected_grad.shape:
+                raise ValueError(f"projected gradient {index} shape does not match parameter shape")
+            if param.device != projected_grad.device:
+                raise ValueError(f"projected gradient {index} device does not match parameter device")
+            if not torch.isfinite(projected_grad).all():
+                raise FloatingPointError(f"projected gradient {index} contains non-finite values")
+            param.data.add_(projected_grad, alpha=-float(repr_learning_rate))
+
+
+def _projection_result_metrics(result) -> dict[str, float]:
+    return {
+        "projection_applied_fraction": 1.0 if result.projection_applied else 0.0,
+        "dot_before": float(result.dot_before.detach().cpu()),
+        "dot_after": float(result.dot_after.detach().cpu()),
+        "dot_after_abs_max": abs(float(result.dot_after.detach().cpu())),
+        "fm_first_order_effect_mean": float(result.fm_first_order_effect.detach().cpu()),
+        "repr_descent_inner_product_mean": float(result.repr_descent_inner_product.detach().cpu()),
+        "projection_removed_norm_mean": float(result.projection_removed_norm.detach().cpu()),
+        "projected_repr_norm_mean": float(result.projected_repr_norm.detach().cpu()),
+    }
+
+
+def _run_projected_stage2_batch(
+    *,
+    training_module,
+    optimizer,
+    images,
+    z,
+    sample_ids: list[str],
+    lambda_cycle: float,
+    amp_ctx,
+    grad_clip_norm,
+    ema,
+    stage2_objective: _Stage2ObjectiveRuntime,
+) -> tuple:
+    import torch
+
+    if stage2_objective.type != "gram_projected_two_step":
+        raise RuntimeError("_run_projected_stage2_batch requires gram_projected_two_step")
+    if stage2_objective.repr_learning_rate is None or stage2_objective.projection_eps is None:
+        raise RuntimeError("gram_projected_two_step requires repr_learning_rate and projection_eps")
+    training_state = unwrap_model(training_module)
+    params = _trainable_parameter_list(training_state.generator.parameters())
+
+    optimizer.zero_grad(set_to_none=True)
+    with amp_ctx:
+        flow_loss, flow_mse, _, flow_loss_raw, _ = training_module(images, z, sample_ids, False, lambda_cycle)
+    _assert_finite_training_scalars(flow_loss, flow_mse, flow_loss_raw)
+    flow_loss.backward()
+    batch_grad_norm = 0.0
+    if grad_clip_norm is not None:
+        grad_norm = torch.nn.utils.clip_grad_norm_(training_state.generator.parameters(), grad_clip_norm)
+        batch_grad_norm = float(grad_norm) if isinstance(grad_norm, float) else float(grad_norm.detach().cpu())
+    optimizer.step()
+
+    optimizer.zero_grad(set_to_none=True)
+    with amp_ctx:
+        _, _, _, flow_loss_guard, _ = training_module(images, z, sample_ids, False, lambda_cycle)
+    assert_finite_tensor("m3_flow_loss_guard", flow_loss_guard)
+    flow_loss_guard.backward()
+    fm_gradients = _synced_gradients_from_parameters("M3 flow guard", params)
+
+    optimizer.zero_grad(set_to_none=True)
+    with amp_ctx:
+        repr_loss, flow_mse_guard, repr_detached, _, repr_loss_raw = training_module(images, z, sample_ids, True, lambda_cycle)
+    _assert_finite_training_scalars(repr_loss, flow_mse_guard, repr_detached)
+    repr_loss.backward()
+    repr_gradients = _synced_gradients_from_parameters("M3 representation", params)
+    optimizer.zero_grad(set_to_none=True)
+
+    weighted_repr_gradients = [stage2_objective.lambda_repr * grad for grad in repr_gradients]
+    projection = project_gradient_onto_fm_feasible_cone(
+        weighted_repr_gradients,
+        fm_gradients,
+        eps=stage2_objective.projection_eps,
+    )
+    _apply_projected_repr_step(params, projection.projected_gradients, repr_learning_rate=stage2_objective.repr_learning_rate)
+    if ema is not None:
+        ema.update(training_state.generator)
+
+    metrics = dict(training_state.last_loss_metrics)
+    metrics.update(_projection_result_metrics(projection))
+    metrics["flow_loss_guard"] = float(flow_loss_guard.detach().cpu())
+    metrics["stage2_objective_type"] = stage2_objective.type
+    training_state.last_loss_metrics = metrics
+    logged_loss = flow_loss_guard.detach() + stage2_objective.lambda_repr * repr_loss_raw.detach()
+    return logged_loss, flow_mse_guard.detach(), repr_detached.detach(), flow_loss_guard.detach(), repr_loss_raw.detach(), batch_grad_norm, metrics
 
 
 def _gradient_vector_for_loss(name: str, loss, params) -> object:
