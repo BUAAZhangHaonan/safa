@@ -68,14 +68,14 @@ def _rows(run: str, *, include_projection: bool = False) -> list[dict[str, float
             'validation_raw_zero_face_rate': 0.0,
             'validation_raw_multi_face_rate': 0.0,
             'validation_raw_face_detect_ge1_rate': 1.0,
-            'gram_point_loss': 0.20 / epoch,
-            'gram_relation_loss': 0.30 / epoch,
-            'gram_total_loss': 0.50 / epoch,
+            'repr_point_loss': 0.20 / epoch,
+            'repr_relation_loss': 0.30 / epoch,
+            'repr_loss': 0.50 / epoch,
         }
         if include_projection:
             row.update(
                 {
-                    'projection_applied_rate': 0.25 * epoch,
+                    'projection_applied_fraction': 0.25 * epoch,
                     'projection_removed_norm_mean': 0.03 * epoch,
                     'projected_repr_norm_mean': 0.10 * epoch,
                     'repr_descent_inner_product_mean': 0.02 * epoch,

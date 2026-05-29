@@ -43,10 +43,13 @@ def test_hyperspherical_gram_loss_returns_weighted_point_and_offdiag_relation_te
     expected_point = (1.0 - (pred * target).sum(dim=1)).mean()
     expected_relation = _manual_relation_loss(pred, target, offdiag_only=True)
     expected_total = 2.0 * expected_point + 3.0 * expected_relation
-    assert set(losses) == {"point_loss", "relation_loss", "total_loss"}
-    assert torch.allclose(losses["point_loss"], expected_point)
-    assert torch.allclose(losses["relation_loss"], expected_relation)
-    assert torch.allclose(losses["total_loss"], expected_total)
+    assert losses.keys() >= {"repr", "point", "relation"}
+    assert torch.allclose(losses["point"], expected_point)
+    assert torch.allclose(losses["relation"], expected_relation)
+    assert torch.allclose(losses["repr"], expected_total)
+    assert torch.allclose(losses["point_loss"], losses["point"])
+    assert torch.allclose(losses["relation_loss"], losses["relation"])
+    assert torch.allclose(losses["total_loss"], losses["repr"])
 
 
 def test_hyperspherical_gram_loss_can_include_diagonal_in_relation_loss() -> None:
@@ -62,9 +65,9 @@ def test_hyperspherical_gram_loss_can_include_diagonal_in_relation_loss() -> Non
     offdiag = hyperspherical_gram_loss(pred, target, 1.0, 1.0, offdiag_only=True)
     full = hyperspherical_gram_loss(pred, target, 1.0, 1.0, offdiag_only=False)
 
-    assert torch.allclose(offdiag["relation_loss"], _manual_relation_loss(pred, target, True))
-    assert torch.allclose(full["relation_loss"], _manual_relation_loss(pred, target, False))
-    assert full["relation_loss"] < offdiag["relation_loss"]
+    assert torch.allclose(offdiag["relation"], _manual_relation_loss(pred, target, True))
+    assert torch.allclose(full["relation"], _manual_relation_loss(pred, target, False))
+    assert full["relation"] < offdiag["relation"]
 
 
 @pytest.mark.parametrize(

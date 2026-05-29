@@ -21,10 +21,11 @@ Do not describe the relation term as providing a separate first-order gradient s
 - Quality dir: pending.
 - Privacy eval: pending and must be formal before any privacy pass claim.
 - Curves: m2_curves.png from scripts/plot_m2_m3_curves.py.
+- Quality cadence: NIQE every epoch; FID/KID every 20 epochs.
 
 Required table once data exists:
 
-| Epoch | loss | flow_loss_raw | cycle_loss_raw | gram_point_loss | gram_relation_loss | gram_total_loss | raw latent cosine | raw source preserved | single_face_eq1 | NIQE | FID | KID mean |
+| Epoch | loss | flow_loss_raw | cycle_loss_raw | repr_point_loss | repr_relation_loss | repr_loss | raw latent cosine | raw source preserved | single_face_eq1 | NIQE | FID | KID mean |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | pending | pending | pending | pending | pending | pending | pending | pending | pending | pending | pending | pending | pending |
 

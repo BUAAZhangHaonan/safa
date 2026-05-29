@@ -23,7 +23,7 @@ scripts/plot_m2_m3_curves.py must produce these files when all inputs exist:
 - m0_m2_m3_comparison.png
 - m3_projection_diagnostics.png
 
-The script is expected to fail fast when required JSON or required fields are missing. A missing curve is better than a fake curve.
+The script is expected to fail fast when required JSON or required fields are missing. A missing curve is better than a fake curve. M2/M3 quality cadence is NIQE every epoch and FID/KID every 20 epochs.
 
 ## Comparison Table
 

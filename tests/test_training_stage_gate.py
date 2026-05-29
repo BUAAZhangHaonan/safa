@@ -661,6 +661,42 @@ class StageGateTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["gradient_conflict_sample_size"], 2.0)
         self.assertAlmostEqual(metrics["gradient_conflict_full_batch_size"], 4.0)
 
+    def test_epoch_totals_initialize_m2_monitor_and_m3_projection_fields(self) -> None:
+        from safa.training.g_loop import _initial_epoch_totals
+
+        totals = _initial_epoch_totals()
+        m2_fields = (
+            "gradient_conflict_count",
+            "gradient_cosine_fm_repr",
+            "gradient_norm_repr",
+            "weighted_gradient_norm_repr",
+            "weighted_repr_to_fm_ratio",
+            "gradient_conflict_sample_size",
+            "gradient_conflict_full_batch_size",
+        )
+        m3_fields = (
+            "m3_projection_count",
+            "projection_applied_fraction",
+            "dot_before",
+            "dot_after",
+            "dot_after_abs_max",
+            "fm_first_order_effect_mean",
+            "repr_descent_inner_product_mean",
+            "projection_removed_norm_mean",
+            "projected_repr_norm_mean",
+        )
+        for field in m2_fields + m3_fields:
+            self.assertIn(field, totals)
+            self.assertEqual(totals[field], 0.0)
+        self.assertEqual(totals["gradient_conflict_samples"], [])
+        self.assertEqual(totals["extra_metric_sums"], {})
+
+        for field in m2_fields + m3_fields:
+            totals[field] += 1.0
+
+        self.assertEqual(totals["gradient_cosine_fm_repr"], 1.0)
+        self.assertEqual(totals["m3_projection_count"], 1.0)
+
     def test_epoch_metrics_include_gradient_quantiles_norm_ratio_and_conflict_fraction(self) -> None:
         import torch
 

@@ -237,15 +237,15 @@ class _GeneratorTrainingStep:
                     self.stage2_objective.relation_weight,
                     offdiag_only=self.stage2_objective.offdiag_only,
                 )
-                return losses["total_loss"], losses
+                return losses["repr"], losses
 
             def _stage2_repr_loss_metrics(self, flow_loss, cycle_loss, repr_loss, repr_metrics: dict, *, effective_repr_weight: float):
                 return {
                     "flow_loss_raw": float(flow_loss.detach().cpu()),
                     "cycle_loss_raw": float(cycle_loss.detach().cpu()),
                     "repr_loss": float(repr_loss.detach().cpu()),
-                    "repr_point_loss": float(repr_metrics["point_loss"].detach().cpu()),
-                    "repr_relation_loss": float(repr_metrics["relation_loss"].detach().cpu()),
+                    "repr_point_loss": float(repr_metrics["point"].detach().cpu()),
+                    "repr_relation_loss": float(repr_metrics["relation"].detach().cpu()),
                     "stage2_objective_type": self.stage2_objective.type if self.stage2_objective is not None else "none",
                     "lambda_repr": float(effective_repr_weight),
                     "effective_repr_loss_weight": float(effective_repr_weight),
@@ -433,6 +433,22 @@ def _requires_explicit_stage2_batch_semantics(config: dict) -> bool:
         "g_medium_v2_stage2_m2_gram_weighted",
         "g_medium_v2_stage2_m3_gram_projected",
     }
+
+
+def _requires_medium_v2_stage2_objective(config: dict, stages: dict) -> bool:
+    stage2 = stages.get("stage2") if isinstance(stages, dict) else None
+    if not isinstance(stage2, dict) or int(stage2.get("epochs", 0)) <= 0:
+        return False
+    markers = (str(config.get("experiment_name", "")), str(config.get("out_dir", "")))
+    for marker in markers:
+        if not marker:
+            continue
+        path = Path(marker)
+        if path.name.startswith("g_medium_v2_") or any(part == "medium_v2" for part in path.parts):
+            return True
+        if marker.startswith("medium_v2") or "medium_v2_" in marker:
+            return True
+    return False
 
 
 def _training_batch_config(config: dict, *, world_size: int | None = None) -> _BatchConfig:
@@ -846,20 +862,7 @@ def train_g_from_config(config: dict) -> dict:
             training_module.train()
             unwrap_model(training_module).reset_batch_idx()
             e0.eval()
-            totals = {
-                "loss": 0.0,
-                "flow_matching_mse": 0.0,
-                "cycle": 0.0,
-                "grad_norm": 0.0,
-                "gradient_conflict_count": 0.0,
-                "gradient_cosine_fm_cycle": 0.0,
-                "gradient_norm_fm": 0.0,
-                "gradient_norm_cycle": 0.0,
-                "weighted_gradient_norm_cycle": 0.0,
-                "weighted_gradient_ratio_cycle_to_fm": 0.0,
-                "gradient_conflict_samples": [],
-                "extra_metric_sums": {},
-            }
+            totals = _initial_epoch_totals()
             seen = 0
             for batch_index, batch in enumerate(tqdm(train_loader, desc=f"train_g {stage_name} epoch={stage_epoch}", disable=not distributed.is_main)):
                 images = batch["image"].to(device, non_blocking=True)
@@ -1112,6 +1115,38 @@ def train_g_from_config(config: dict) -> dict:
     barrier(distributed)
     cleanup_distributed(distributed)
     return manifest
+
+
+def _initial_epoch_totals() -> dict:
+    return {
+        "loss": 0.0,
+        "flow_matching_mse": 0.0,
+        "cycle": 0.0,
+        "grad_norm": 0.0,
+        "gradient_conflict_count": 0.0,
+        "gradient_cosine_fm_cycle": 0.0,
+        "gradient_norm_fm": 0.0,
+        "gradient_norm_cycle": 0.0,
+        "weighted_gradient_norm_cycle": 0.0,
+        "weighted_gradient_ratio_cycle_to_fm": 0.0,
+        "gradient_cosine_fm_repr": 0.0,
+        "gradient_norm_repr": 0.0,
+        "weighted_gradient_norm_repr": 0.0,
+        "weighted_repr_to_fm_ratio": 0.0,
+        "gradient_conflict_sample_size": 0.0,
+        "gradient_conflict_full_batch_size": 0.0,
+        "gradient_conflict_samples": [],
+        "m3_projection_count": 0.0,
+        "projection_applied_fraction": 0.0,
+        "dot_before": 0.0,
+        "dot_after": 0.0,
+        "dot_after_abs_max": 0.0,
+        "fm_first_order_effect_mean": 0.0,
+        "repr_descent_inner_product_mean": 0.0,
+        "projection_removed_norm_mean": 0.0,
+        "projected_repr_norm_mean": 0.0,
+        "extra_metric_sums": {},
+    }
 
 
 def _reduce_epoch_metrics(totals: dict, seen: int, device, distributed: DistributedContext) -> dict:
@@ -1491,6 +1526,8 @@ def _validate_train_g_config(config: dict) -> None:
     _best_model(config, ema_config)
     loss_weighting = _loss_weighting_runtime_from_config(config)
     stage2_objective = _stage2_objective_from_config(stages)
+    if stage2_objective is None and _requires_medium_v2_stage2_objective(config, stages):
+        raise ValueError("medium_v2 Stage 2 configs require stages.stage2.stage2_objective")
     if stage2_objective is not None and loss_weighting.type != "legacy":
         raise ValueError("stage2_objective M2/M3 runs must not use loss_weighting/UW")
     if loss_weighting.type == "uncertainty":

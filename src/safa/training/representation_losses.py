@@ -33,9 +33,12 @@ def hyperspherical_gram_loss(
 
     total_loss = point_weight_tensor * point_loss + relation_weight_tensor * relation_loss
     return {
+        "repr": total_loss,
+        "point": point_loss,
+        "relation": relation_loss,
+        "total_loss": total_loss,
         "point_loss": point_loss,
         "relation_loss": relation_loss,
-        "total_loss": total_loss,
     }
 
 

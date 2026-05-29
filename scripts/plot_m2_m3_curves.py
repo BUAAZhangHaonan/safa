@@ -20,9 +20,9 @@ BASE_REQUIRED_FIELDS = (
     'validation_raw_zero_face_rate',
     'validation_raw_multi_face_rate',
 )
-GRAM_REQUIRED_FIELDS = ('gram_point_loss', 'gram_relation_loss', 'gram_total_loss')
+GRAM_REQUIRED_FIELDS = ('repr_point_loss', 'repr_relation_loss', 'repr_loss')
 M3_PROJECTION_FIELDS = (
-    'projection_applied_rate',
+    'projection_applied_fraction',
     'projection_removed_norm_mean',
     'projected_repr_norm_mean',
     'repr_descent_inner_product_mean',
@@ -244,7 +244,7 @@ def _plot_run(run: RunSeries, output: Path) -> None:
         [
             ('loss', [(run.label, *_series(run, 'loss'))]),
             ('flow/cycle', [(f'{run.label} flow', *_series(run, 'flow_loss_raw')), (f'{run.label} cycle', *_series(run, 'cycle_loss_raw'))]),
-            ('gram loss', [(f'{run.label} point', *_series(run, 'gram_point_loss')), (f'{run.label} relation', *_series(run, 'gram_relation_loss')), (f'{run.label} total', *_series(run, 'gram_total_loss'))]),
+            ('repr loss', [(f'{run.label} point', *_series(run, 'repr_point_loss')), (f'{run.label} relation', *_series(run, 'repr_relation_loss')), (f'{run.label} total', *_series(run, 'repr_loss'))]),
             ('utility', [(run.label, *_utility(run))]),
             ('quality', [(f'{run.label} NIQE', *_quality_series(run, 'niqe')), (f'{run.label} FID', *_quality_series(run, 'fid'))]),
         ],
@@ -271,7 +271,7 @@ def _plot_projection(run: RunSeries, output: Path) -> None:
         output,
         'M3 projection diagnostics',
         [
-            ('applied rate', [(run.label, *_series(run, 'projection_applied_rate'))]),
+            ('applied fraction', [(run.label, *_series(run, 'projection_applied_fraction'))]),
             ('removed norm', [(run.label, *_series(run, 'projection_removed_norm_mean'))]),
             ('projected norm', [(run.label, *_series(run, 'projected_repr_norm_mean'))]),
             ('descent inner product', [(run.label, *_series(run, 'repr_descent_inner_product_mean'))]),

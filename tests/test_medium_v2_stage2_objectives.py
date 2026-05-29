@@ -42,6 +42,17 @@ def test_medium_v2_stage2_configs_use_explicit_paths_batches_and_objectives() ->
         g_loop._validate_train_g_config(config)
 
 
+def test_medium_v2_stage2_config_fails_fast_without_stage2_objective() -> None:
+    from safa.training import g_loop
+
+    path = REPO_ROOT / "configs" / "medium_v2" / "train_g_medium_v2_stage2_m2_gram_weighted.yaml"
+    config = yaml.safe_load(path.read_text(encoding="utf-8"))
+    del config["stages"]["stage2"]["stage2_objective"]
+
+    with pytest.raises(ValueError, match="medium_v2.*stage2_objective"):
+        g_loop._validate_train_g_config(config)
+
+
 def test_generator_training_step_gram_weighted_sum_outputs_repr_metrics() -> None:
     from torch import nn
 
@@ -100,6 +111,64 @@ def test_generator_training_step_gram_weighted_sum_outputs_repr_metrics() -> Non
     assert metrics["repr_point_loss"] > 0.0
     assert metrics["repr_relation_loss"] > 0.0
     assert torch.allclose(repr_loss, torch.as_tensor(metrics["repr_loss"], dtype=repr_loss.dtype))
+    assert torch.allclose(loss.detach(), flow_loss.detach() + 0.5 * repr_loss.detach())
+
+
+def test_generator_training_step_prefers_spec_repr_metric_fields(monkeypatch) -> None:
+    from torch import nn
+
+    from safa.models.generator import FlowGeneratorConfig
+    from safa.training import g_loop
+
+    class DummyGenerator(nn.Module):
+        def flow_matching_loss(self, images, z):
+            loss = z.sum() * 0.0 + torch.tensor(0.25, dtype=z.dtype, device=z.device)
+            return loss, {"flow_matching_mse": loss.detach()}
+
+        def sample(self, z, **kwargs):
+            pad = torch.zeros(z.shape[0], 1, device=z.device, dtype=z.dtype)
+            image = torch.cat([z, pad], dim=1).reshape(z.shape[0], 3, 1, 1)
+            return image.expand(z.shape[0], 3, 4, 4)
+
+    class DummyE0(nn.Module):
+        def forward(self, images):
+            return {"embedding": torch.nn.functional.normalize(images[:, :2, 0, 0], dim=1)}
+
+    def fake_hyperspherical_gram_loss(pred_embedding, target_embedding, point_weight, relation_weight, offdiag_only=True):
+        del pred_embedding, target_embedding, point_weight, relation_weight, offdiag_only
+        base = torch.tensor(1.0)
+        return {"repr": base, "point": base * 0.25, "relation": base * 0.75}
+
+    monkeypatch.setattr(g_loop, "hyperspherical_gram_loss", fake_hyperspherical_gram_loss)
+    objective = g_loop._stage2_objective_from_config(
+        {
+            "stage1": {"epochs": 0},
+            "stage2": {
+                "epochs": 1,
+                "stage2_objective": {
+                    "type": "gram_weighted_sum",
+                    "lambda_repr": 0.5,
+                    "point_weight": 1.0,
+                    "relation_weight": 1.0,
+                    "offdiag_only": True,
+                },
+            },
+        }
+    )
+    module = g_loop._GeneratorTrainingStep(
+        DummyGenerator(),
+        DummyE0(),
+        FlowGeneratorConfig(embedding_dim=2, image_size=4, train_cycle_steps=1),
+        1337,
+        stage2_objective=objective,
+    )
+
+    loss, _, repr_loss, flow_loss, _ = module(torch.zeros(2, 3, 4, 4), torch.eye(2), ["a", "b"], True, 0.0)
+
+    assert torch.allclose(repr_loss, torch.tensor(1.0))
+    assert module.last_loss_metrics["repr_loss"] == 1.0
+    assert module.last_loss_metrics["repr_point_loss"] == 0.25
+    assert module.last_loss_metrics["repr_relation_loss"] == 0.75
     assert torch.allclose(loss.detach(), flow_loss.detach() + 0.5 * repr_loss.detach())
 
 

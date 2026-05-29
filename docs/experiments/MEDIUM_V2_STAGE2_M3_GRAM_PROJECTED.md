@@ -23,10 +23,11 @@ For M3, the projection diagnostic should answer whether the representation updat
 - Quality dir: pending.
 - Privacy eval: pending and must be formal before any privacy pass claim.
 - Curves: m3_curves.png and m3_projection_diagnostics.png from scripts/plot_m2_m3_curves.py.
+- Quality cadence: NIQE every epoch; FID/KID every 20 epochs.
 
 Required table once data exists:
 
-| Epoch | loss | flow_loss_raw | cycle_loss_raw | gram_point_loss | gram_relation_loss | gram_total_loss | projection_applied_rate | projection_removed_norm_mean | projected_repr_norm_mean | repr_descent_inner_product_mean | raw latent cosine | raw source preserved | single_face_eq1 | NIQE | FID |
+| Epoch | loss | flow_loss_raw | cycle_loss_raw | repr_point_loss | repr_relation_loss | repr_loss | projection_applied_fraction | projection_removed_norm_mean | projected_repr_norm_mean | repr_descent_inner_product_mean | raw latent cosine | raw source preserved | single_face_eq1 | NIQE | FID |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | pending | pending | pending | pending | pending | pending | pending | pending | pending | pending | pending | pending | pending | pending | pending | pending |
 
