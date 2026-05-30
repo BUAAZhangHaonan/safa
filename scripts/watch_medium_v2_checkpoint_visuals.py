@@ -215,10 +215,16 @@ def build_manifest(
     sampling_seed: int,
     metrics: list[dict[str, Any]],
     note: str,
+    checkpoint_epoch_1based: int,
+    visual_epoch_1based: int,
+    backfilled_from_latest_checkpoint: bool,
 ) -> dict[str, Any]:
     return {
         "created_at": utc_now(),
         "epoch": int(epoch),
+        "visual_epoch_1based": int(visual_epoch_1based),
+        "checkpoint_epoch_1based": int(checkpoint_epoch_1based),
+        "backfilled_from_latest_checkpoint": bool(backfilled_from_latest_checkpoint),
         "output": str(out_path),
         "device": device,
         "sampling_seed": int(sampling_seed),
@@ -263,7 +269,7 @@ def query_nvidia_smi() -> str:
     result = subprocess.run(
         [
             "nvidia-smi",
-            "--query-gpu=index,utilization.gpu,memory.used,memory.total",
+            "--query-gpu=index,uuid,utilization.gpu,memory.used,memory.total",
             "--format=csv,noheader,nounits",
         ],
         check=True,
@@ -274,16 +280,64 @@ def query_nvidia_smi() -> str:
     return result.stdout
 
 
-def guard_gpu0_available(nvidia_smi_output: str, *, max_memory_mb: int, max_util_pct: int) -> None:
+def query_nvidia_smi_compute_apps() -> str:
+    result = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-compute-apps=gpu_uuid,pid,used_memory",
+            "--format=csv,noheader,nounits",
+        ],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return result.stdout
+
+
+def _own_gpu_memory_mb(compute_apps_output: str | None, gpu_uuid: str | None) -> int:
+    if not compute_apps_output or not gpu_uuid:
+        return 0
+    current_pid = os.getpid()
+    memory = 0
+    for line in compute_apps_output.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 3 or parts[0] != gpu_uuid:
+            continue
+        try:
+            pid = int(parts[1])
+            used = int(float(parts[2]))
+        except ValueError:
+            continue
+        if pid == current_pid:
+            memory += used
+    return memory
+
+
+def guard_gpu0_available(
+    nvidia_smi_output: str,
+    *,
+    max_memory_mb: int,
+    max_util_pct: int,
+    compute_apps_output: str | None = None,
+) -> None:
     for line in nvidia_smi_output.splitlines():
         parts = [part.strip() for part in line.split(",")]
-        if len(parts) < 4 or parts[0] != "0":
+        if len(parts) >= 5:
+            index, gpu_uuid, util_raw, memory_raw = parts[0], parts[1], parts[2], parts[3]
+        elif len(parts) >= 4:
+            index, gpu_uuid, util_raw, memory_raw = parts[0], None, parts[1], parts[2]
+        else:
             continue
-        util = int(float(parts[1]))
-        memory_used = int(float(parts[2]))
-        if util > int(max_util_pct) or memory_used > int(max_memory_mb):
+        if index != "0":
+            continue
+        util = int(float(util_raw))
+        memory_used = int(float(memory_raw))
+        own_memory = _own_gpu_memory_mb(compute_apps_output, gpu_uuid)
+        external_memory = max(0, memory_used - own_memory)
+        if util > int(max_util_pct) or external_memory > int(max_memory_mb):
             raise RuntimeError(
-                f"GPU0 is busy: utilization={util}% memory_used={memory_used}MiB "
+                f"GPU0 is busy: utilization={util}% memory_used={external_memory}MiB "
                 f"(limits {max_util_pct}%/{max_memory_mb}MiB)"
             )
         return
@@ -294,7 +348,12 @@ def wait_until_gpu0_available(*, max_memory_mb: int, max_util_pct: int, interval
     validate_cuda_visible_devices(os.environ.get("CUDA_VISIBLE_DEVICES"))
     while True:
         try:
-            guard_gpu0_available(query_nvidia_smi(), max_memory_mb=max_memory_mb, max_util_pct=max_util_pct)
+            guard_gpu0_available(
+                query_nvidia_smi(),
+                max_memory_mb=max_memory_mb,
+                max_util_pct=max_util_pct,
+                compute_apps_output=query_nvidia_smi_compute_apps(),
+            )
             return
         except RuntimeError:
             if not wait:
@@ -318,6 +377,9 @@ def generate_checkpoint_pairs(
     sample_seed: int | None,
     device: str,
     sampling_seed: int,
+    checkpoint_epoch_1based: int,
+    visual_epoch_1based: int,
+    backfilled_from_latest_checkpoint: bool,
 ) -> None:
     if device.startswith("cuda"):
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
@@ -412,6 +474,9 @@ def generate_checkpoint_pairs(
             sampling_seed=sampling_seed,
             metrics=metrics,
             note="latent_cosine/source_pred/generated_pred computed with E0 from config.e0_checkpoint",
+            checkpoint_epoch_1based=checkpoint_epoch_1based,
+            visual_epoch_1based=visual_epoch_1based,
+            backfilled_from_latest_checkpoint=backfilled_from_latest_checkpoint,
         ),
     )
 
@@ -516,6 +581,90 @@ def font(size: int) -> ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
+def read_checkpoint_history_epochs(checkpoint_path: Path) -> set[int]:
+    import torch
+
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    history = payload.get("history") if isinstance(payload, dict) else None
+    if not isinstance(history, list):
+        return set()
+    epochs: set[int] = set()
+    for row in history:
+        if not isinstance(row, dict) or "stage_epoch_1based" not in row:
+            continue
+        if row.get("stage") != "stage2":
+            continue
+        value = row["stage_epoch_1based"]
+        if isinstance(value, bool):
+            continue
+        try:
+            epoch = int(value)
+        except (TypeError, ValueError):
+            continue
+        if epoch > 0:
+            epochs.add(epoch)
+    return epochs
+
+
+def completed_epoch_numbers(paths: WatcherPaths) -> list[int]:
+    epochs: set[int] = set()
+    metrics_error: Exception | None = None
+    latest_metrics_epoch: int | None = None
+    if paths.metrics.is_file():
+        try:
+            latest_metrics_epoch = read_stage_epoch(paths.metrics)
+        except Exception as exc:
+            metrics_error = exc
+        else:
+            epochs.update(range(1, latest_metrics_epoch + 1))
+
+    if paths.checkpoint.is_file():
+        try:
+            epochs.update(read_checkpoint_history_epochs(paths.checkpoint))
+        except Exception:
+            if metrics_error is not None:
+                raise metrics_error
+
+    if latest_metrics_epoch is not None:
+        epochs = {epoch for epoch in epochs if epoch <= latest_metrics_epoch}
+    return sorted(epochs)
+
+
+def completed_visual_exists(paths: WatcherPaths, completed: dict[str, Any], epoch: int) -> bool:
+    epoch_key = f"{epoch:04d}"
+    out_path, manifest_path = output_paths(paths.out_dir, epoch)
+    state_path = completed.get(epoch_key)
+    return bool((state_path or out_path.is_file()) and out_path.is_file() and manifest_path.is_file())
+
+
+def checkpoint_for_visual_epoch(paths: WatcherPaths, visual_epoch: int, latest_epoch: int) -> tuple[Path, int, bool]:
+    for candidate in checkpoint_candidates(paths.checkpoint.parent, visual_epoch):
+        if candidate.is_file():
+            return candidate, visual_epoch, False
+    return paths.checkpoint, latest_epoch, visual_epoch != latest_epoch
+
+
+def checkpoint_candidates(checkpoint_dir: Path, epoch: int) -> list[Path]:
+    epoch4 = f"{epoch:04d}"
+    names = [
+        f"epoch_{epoch4}.pt",
+        f"checkpoint_epoch_{epoch4}.pt",
+        f"stage2_epoch_{epoch4}.pt",
+        f"epoch_{epoch}.pt",
+        f"checkpoint_epoch_{epoch}.pt",
+        f"stage2_epoch_{epoch}.pt",
+    ]
+    candidates = [checkpoint_dir / name for name in names]
+    candidates.extend(sorted(checkpoint_dir.glob(f"*epoch_{epoch4}*.pt")))
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate not in seen:
+            seen.add(candidate)
+            deduped.append(candidate)
+    return deduped
+
+
 def run_once(
     paths: WatcherPaths,
     *,
@@ -530,45 +679,63 @@ def run_once(
     completed = dict(state.get("completed", {})) if isinstance(state.get("completed"), dict) else {}
     events: list[dict[str, Any]] = []
 
-    if not paths.metrics.is_file():
-        events.append({"time": now, "type": "checkpoint_visual_waiting", "reason": f"metrics missing: {paths.metrics}"})
-        write_state(paths, completed, events)
-        return 0
     if not paths.checkpoint.is_file():
-        events.append({"time": now, "type": "checkpoint_visual_waiting", "reason": f"checkpoint missing: {paths.checkpoint}"})
+        raise FileNotFoundError(f"checkpoint not found: {paths.checkpoint}")
+
+    completed_epochs = completed_epoch_numbers(paths)
+    if not completed_epochs:
+        events.append(
+            {
+                "time": now,
+                "type": "checkpoint_visual_waiting",
+                "reason": f"no completed epochs found in metrics/checkpoint history: {paths.metrics}, {paths.checkpoint}",
+            }
+        )
         write_state(paths, completed, events)
         return 0
 
-    epoch = read_stage_epoch(paths.metrics)
-    epoch_key = f"{epoch:04d}"
-    out_path, manifest_path = output_paths(paths.out_dir, epoch)
-    if epoch_key in completed and out_path.is_file() and manifest_path.is_file():
+    pending_epochs = [epoch for epoch in completed_epochs if not completed_visual_exists(paths, completed, epoch)]
+    if not pending_epochs:
         write_state(paths, completed, events)
         return 0
 
     sampling_seed = config_sampling_seed(paths.config)
     paths.out_dir.mkdir(parents=True, exist_ok=True)
-    generate_func(
-        epoch=epoch,
-        paths=paths,
-        out_path=out_path,
-        manifest_path=manifest_path,
-        num_samples=num_samples,
-        sample_seed=sample_seed,
-        device=device,
-        sampling_seed=sampling_seed,
-    )
-    completed[epoch_key] = str(out_path)
-    events.append(
-        {
-            "time": now,
+    latest_epoch = max(completed_epochs)
+    for epoch in pending_epochs:
+        checkpoint_path, checkpoint_epoch, backfilled = checkpoint_for_visual_epoch(paths, epoch, latest_epoch)
+        epoch_paths = paths._replace(checkpoint=checkpoint_path)
+        out_path, manifest_path = output_paths(paths.out_dir, epoch)
+        generate_func(
+            epoch=epoch,
+            paths=epoch_paths,
+            out_path=out_path,
+            manifest_path=manifest_path,
+            num_samples=num_samples,
+            sample_seed=sample_seed,
+            device=device,
+            sampling_seed=sampling_seed,
+            checkpoint_epoch_1based=checkpoint_epoch,
+            visual_epoch_1based=epoch,
+            backfilled_from_latest_checkpoint=backfilled,
+        )
+        epoch_key = f"{epoch:04d}"
+        completed[epoch_key] = str(out_path)
+        event = {
+            "time": utc_now(),
             "type": "checkpoint_visual_created",
             "epoch": epoch,
+            "visual_epoch_1based": epoch,
+            "checkpoint_epoch_1based": checkpoint_epoch,
+            "backfilled_from_latest_checkpoint": backfilled,
+            "checkpoint": str(checkpoint_path),
             "out_path": str(out_path),
             "manifest_path": str(manifest_path),
         }
-    )
-    write_state(paths, completed, events)
+        events.append(event)
+        write_state(paths, completed, [event])
+    if len(events) != 1:
+        write_state(paths, completed, [])
     return 0
 
 

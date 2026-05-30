@@ -82,11 +82,60 @@ def test_run_once_detects_new_epoch_and_writes_manifest(tmp_path: Path) -> None:
         log=output_dir / "events.log",
         state=output_dir / "state.json",
     )
+    output_dir.mkdir()
+    completed = {}
+    for epoch in (1, 2):
+        out_path, manifest_path = module.output_paths(output_dir, epoch)
+        out_path.write_bytes(b"png")
+        module.write_manifest(
+            manifest_path,
+            module.build_manifest(
+                epoch=epoch,
+                paths=paths,
+                samples=[],
+                out_path=out_path,
+                device="cuda:0",
+                sampling_seed=1337,
+                metrics=[],
+                note="pre-existing",
+                checkpoint_epoch_1based=epoch,
+                visual_epoch_1based=epoch,
+                backfilled_from_latest_checkpoint=False,
+            ),
+        )
+        completed[f"{epoch:04d}"] = str(out_path)
+    module.write_json_atomic(paths.state, {"completed": completed})
 
     calls = []
 
-    def fake_generate(*, epoch, paths, out_path, manifest_path, num_samples, sample_seed, device, sampling_seed):
-        calls.append((epoch, out_path, manifest_path, num_samples, sample_seed, device, sampling_seed))
+    def fake_generate(
+        *,
+        epoch,
+        paths,
+        out_path,
+        manifest_path,
+        num_samples,
+        sample_seed,
+        device,
+        sampling_seed,
+        checkpoint_epoch_1based,
+        visual_epoch_1based,
+        backfilled_from_latest_checkpoint,
+    ):
+        calls.append(
+            (
+                epoch,
+                out_path,
+                manifest_path,
+                num_samples,
+                sample_seed,
+                device,
+                sampling_seed,
+                checkpoint_epoch_1based,
+                visual_epoch_1based,
+                backfilled_from_latest_checkpoint,
+            )
+        )
         out_path.write_bytes(b"png")
         module.write_manifest(
             manifest_path,
@@ -99,6 +148,9 @@ def test_run_once_detects_new_epoch_and_writes_manifest(tmp_path: Path) -> None:
                 sampling_seed=sampling_seed,
                 metrics=[{"sample_id": "sample-a", "label": 1}],
                 note="fake generation for unit test",
+                checkpoint_epoch_1based=checkpoint_epoch_1based,
+                visual_epoch_1based=visual_epoch_1based,
+                backfilled_from_latest_checkpoint=backfilled_from_latest_checkpoint,
             ),
         )
 
@@ -112,15 +164,140 @@ def test_run_once_detects_new_epoch_and_writes_manifest(tmp_path: Path) -> None:
             None,
             "cuda:0",
             1337,
+            3,
+            3,
+            False,
         )
     ]
     manifest = json.loads((output_dir / "epoch_0003_checkpoint_pairs_manifest.json").read_text(encoding="utf-8"))
     assert manifest["epoch"] == 3
+    assert manifest["visual_epoch_1based"] == 3
+    assert manifest["checkpoint_epoch_1based"] == 3
+    assert manifest["backfilled_from_latest_checkpoint"] is False
     assert manifest["inputs"]["index"] == str(index)
     assert manifest["inputs"]["features"] == str(features)
     assert manifest["samples"][0]["sample_id"] == "sample-a"
     events = [json.loads(line) for line in paths.events.read_text(encoding="utf-8").splitlines()]
     assert [event["type"] for event in events] == ["checkpoint_visual_created"]
+
+
+def test_run_once_backfills_missing_epochs_between_state_and_metrics(tmp_path: Path) -> None:
+    module = _load_script()
+    index = tmp_path / "val.jsonl"
+    features = tmp_path / "features"
+    checkpoint_dir = tmp_path / "checkpoints"
+    output_dir = tmp_path / "plots"
+    config = tmp_path / "config.yaml"
+    metrics = checkpoint_dir / "last_metrics.json"
+    checkpoint = checkpoint_dir / "last.pt"
+    _write_jsonl(index, [{"sample_id": "sample-a", "image_path": "/a.jpg", "label": 1}])
+    features.mkdir()
+    (features / "features.pt").write_bytes(b"fake")
+    (features / "manifest.json").write_text("{}", encoding="utf-8")
+    checkpoint_dir.mkdir()
+    checkpoint.write_bytes(b"fake")
+    config.write_text("sampling_seed: 1337\n", encoding="utf-8")
+    metrics.write_text(json.dumps({"stage_epoch_1based": 12}), encoding="utf-8")
+    paths = module.WatcherPaths(
+        metrics=metrics,
+        checkpoint=checkpoint,
+        config=config,
+        index=index,
+        features=features,
+        out_dir=output_dir,
+        events=output_dir / "events.jsonl",
+        log=output_dir / "events.log",
+        state=output_dir / "state.json",
+    )
+    output_dir.mkdir()
+    for epoch in (1, 2):
+        out_path, manifest_path = module.output_paths(output_dir, epoch)
+        out_path.write_bytes(b"png")
+        module.write_manifest(
+            manifest_path,
+            module.build_manifest(
+                epoch=epoch,
+                paths=paths,
+                samples=[],
+                out_path=out_path,
+                device="cuda:0",
+                sampling_seed=1337,
+                metrics=[],
+                note="pre-existing",
+                checkpoint_epoch_1based=epoch,
+                visual_epoch_1based=epoch,
+                backfilled_from_latest_checkpoint=False,
+            ),
+        )
+    module.write_json_atomic(
+        paths.state,
+        {
+            "completed": {
+                "0001": str(output_dir / "epoch_0001_checkpoint_pairs.png"),
+                "0002": str(output_dir / "epoch_0002_checkpoint_pairs.png"),
+            }
+        },
+    )
+
+    calls = []
+
+    def fake_generate(
+        *,
+        epoch,
+        paths,
+        out_path,
+        manifest_path,
+        num_samples,
+        sample_seed,
+        device,
+        sampling_seed,
+        checkpoint_epoch_1based,
+        visual_epoch_1based,
+        backfilled_from_latest_checkpoint,
+    ):
+        calls.append((epoch, checkpoint_epoch_1based, visual_epoch_1based, backfilled_from_latest_checkpoint))
+        out_path.write_bytes(b"png")
+        module.write_manifest(
+            manifest_path,
+            module.build_manifest(
+                epoch=epoch,
+                paths=paths,
+                samples=[],
+                out_path=out_path,
+                device=device,
+                sampling_seed=sampling_seed,
+                metrics=[],
+                note="fake generation for unit test",
+                checkpoint_epoch_1based=checkpoint_epoch_1based,
+                visual_epoch_1based=visual_epoch_1based,
+                backfilled_from_latest_checkpoint=backfilled_from_latest_checkpoint,
+            ),
+        )
+
+    assert module.run_once(paths, num_samples=1, generate_func=fake_generate) == 0
+
+    assert [call[0] for call in calls] == list(range(3, 13))
+    assert calls[0] == (3, 12, 3, True)
+    assert calls[-1] == (12, 12, 12, False)
+    manifest = json.loads((output_dir / "epoch_0003_checkpoint_pairs_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["visual_epoch_1based"] == 3
+    assert manifest["checkpoint_epoch_1based"] == 12
+    assert manifest["backfilled_from_latest_checkpoint"] is True
+
+
+def test_completed_epoch_numbers_caps_checkpoint_history_to_metrics_epoch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_script()
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    metrics = checkpoint_dir / "last_metrics.json"
+    checkpoint = checkpoint_dir / "last.pt"
+    metrics.write_text(json.dumps({"stage_epoch_1based": 12}), encoding="utf-8")
+    checkpoint.write_bytes(b"fake")
+    paths = module.WatcherPaths(metrics=metrics, checkpoint=checkpoint)
+
+    monkeypatch.setattr(module, "read_checkpoint_history_epochs", lambda _path: {1, 2, 12, 53, 182})
+
+    assert module.completed_epoch_numbers(paths) == list(range(1, 13))
 
 
 def test_gpu_guard_rejects_disallowed_visible_devices_and_busy_gpu0() -> None:
