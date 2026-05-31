@@ -71,6 +71,34 @@ def test_probe_configs_use_distinct_outputs_and_raw_quality_device() -> None:
         assert config["stages"]["stage2"]["stage2_objective"]["type"] == objective_type
 
 
+def test_medium_v2_stage1_long1000_continue_config_extends_pure_fm_stage1() -> None:
+    from safa.training import g_loop
+
+    path = REPO_ROOT / "configs" / "medium_v2" / "train_g_medium_v2_stage1_long1000_continue.yaml"
+    assert path.is_file()
+    config = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+    assert config["out_dir"] == "artifacts/checkpoints/g_medium_v2_stage1_long1000_continue"
+    assert config["resume_from"] == "artifacts/checkpoints/g_medium_v1_stage1_long200_v4/last.pt"
+    assert config["global_batch_size"] == 32
+    assert config["per_device_batch_size"] == 32
+    assert "batch_size" not in config
+    assert config["stages"]["stage1"]["epochs"] == 1000
+    assert config["stages"]["stage1"]["stable_epochs"] == 1001
+    assert config["stages"]["stage2"]["epochs"] == 0
+    assert "stage2_objective" not in config["stages"]["stage2"]
+    assert "gradient_monitor" not in config["stages"]["stage2"]
+    assert "gradient_conflict" in config["stages"]["stage2"]
+    quality_eval = config["stages"]["stage1"]["quality_eval"]
+    assert quality_eval["output_dir"] == "artifacts/eval/g_medium_v2_stage1_long1000_continue/quality"
+    assert quality_eval["niqe_interval_epochs"] == 1
+    assert quality_eval["distribution_interval_epochs"] == 20
+    assert quality_eval["metrics"] == ["niqe", "fid", "kid"]
+    assert "distribution_cuda_visible_devices" not in quality_eval
+
+    g_loop._validate_train_g_config(config)
+
+
 def test_medium_v2_stage2_config_fails_fast_without_stage2_objective() -> None:
     from safa.training import g_loop
 
