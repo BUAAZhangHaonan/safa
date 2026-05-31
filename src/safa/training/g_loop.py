@@ -161,6 +161,17 @@ class _GeneratorTrainingStep:
                     else:
                         cycle_steps = self.generator_config.train_cycle_steps
                     if self.stage2_objective is not None:
+                        if self.stage2_objective.type == "fm_only_probe":
+                            self._batch_idx += 1
+                            secondary_loss = flow_loss.new_tensor(0.0)
+                            self.last_loss_metrics = self._stage2_probe_loss_metrics(
+                                flow_loss,
+                                secondary_loss,
+                                objective_type="fm_only_probe",
+                                effective_flow_weight=1.0,
+                                effective_repr_weight=0.0,
+                            )
+                            return flow_loss, flow_metrics["flow_matching_mse"].detach(), secondary_loss.detach(), flow_loss, secondary_loss
                         repr_loss, repr_metrics = self._compute_repr_loss(z, sample_ids, cycle_steps=cycle_steps)
                         self._batch_idx += 1
                         if self.stage2_objective.type == "gram_weighted_sum":
@@ -171,6 +182,18 @@ class _GeneratorTrainingStep:
                                 repr_loss,
                                 repr_metrics,
                                 effective_repr_weight=self.stage2_objective.lambda_repr,
+                            )
+                            self.last_loss_metrics = loss_metrics
+                            return loss, flow_metrics["flow_matching_mse"].detach(), repr_loss.detach(), flow_loss, repr_loss
+                        if self.stage2_objective.type == "gram_repr_only_probe":
+                            loss = self.stage2_objective.lambda_repr * repr_loss
+                            loss_metrics = self._stage2_repr_loss_metrics(
+                                flow_loss,
+                                cycle_loss,
+                                repr_loss,
+                                repr_metrics,
+                                effective_repr_weight=self.stage2_objective.lambda_repr,
+                                effective_flow_weight=0.0,
                             )
                             self.last_loss_metrics = loss_metrics
                             return loss, flow_metrics["flow_matching_mse"].detach(), repr_loss.detach(), flow_loss, repr_loss
@@ -239,7 +262,9 @@ class _GeneratorTrainingStep:
                 )
                 return losses["repr"], losses
 
-            def _stage2_repr_loss_metrics(self, flow_loss, cycle_loss, repr_loss, repr_metrics: dict, *, effective_repr_weight: float):
+            def _stage2_repr_loss_metrics(
+                self, flow_loss, cycle_loss, repr_loss, repr_metrics: dict, *, effective_repr_weight: float, effective_flow_weight: float = 1.0
+            ):
                 return {
                     "flow_loss_raw": float(flow_loss.detach().cpu()),
                     "cycle_loss_raw": float(cycle_loss.detach().cpu()),
@@ -248,6 +273,26 @@ class _GeneratorTrainingStep:
                     "repr_relation_loss": float(repr_metrics["relation"].detach().cpu()),
                     "stage2_objective_type": self.stage2_objective.type if self.stage2_objective is not None else "none",
                     "lambda_repr": float(effective_repr_weight),
+                    "effective_flow_loss_weight": float(effective_flow_weight),
+                    "effective_repr_loss_weight": float(effective_repr_weight),
+                    "effective_cycle_loss_weight": 0.0,
+                    "flow_loss_normalized": float(flow_loss.detach().cpu()),
+                    "cycle_loss_normalized": 0.0,
+                    "loss_weighting_type": self.loss_weighting.type,
+                }
+
+            def _stage2_probe_loss_metrics(
+                self, flow_loss, secondary_loss, *, objective_type: str, effective_flow_weight: float, effective_repr_weight: float
+            ):
+                return {
+                    "flow_loss_raw": float(flow_loss.detach().cpu()),
+                    "cycle_loss_raw": 0.0,
+                    "repr_loss": float(secondary_loss.detach().cpu()),
+                    "repr_point_loss": 0.0,
+                    "repr_relation_loss": 0.0,
+                    "stage2_objective_type": objective_type,
+                    "lambda_repr": float(effective_repr_weight),
+                    "effective_flow_loss_weight": float(effective_flow_weight),
                     "effective_repr_loss_weight": float(effective_repr_weight),
                     "effective_cycle_loss_weight": 0.0,
                     "flow_loss_normalized": float(flow_loss.detach().cpu()),
@@ -375,10 +420,20 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
         raise ValueError("stages.stage2.stage2_objective must be a mapping")
     context = "stages.stage2.stage2_objective"
     objective_type = _require_field(payload, "type", context)
-    if objective_type not in ("gram_weighted_sum", "gram_projected_two_step"):
-        raise ValueError(
-            "stages.stage2.stage2_objective.type must be gram_weighted_sum or gram_projected_two_step, "
-            f"got {objective_type!r}"
+    allowed_types = ("gram_weighted_sum", "gram_projected_two_step", "fm_only_probe", "gram_repr_only_probe")
+    if objective_type not in allowed_types:
+        allowed = ", ".join(allowed_types)
+        raise ValueError(f"stages.stage2.stage2_objective.type must be one of {allowed}, got {objective_type!r}")
+    if objective_type == "fm_only_probe":
+        for field in ("lambda_repr", "point_weight", "relation_weight", "offdiag_only", "repr_learning_rate", "projection_eps"):
+            if field in payload:
+                raise ValueError(f"{context}.{field} is not valid for fm_only_probe")
+        return _Stage2ObjectiveRuntime(
+            type=str(objective_type),
+            lambda_repr=0.0,
+            point_weight=0.0,
+            relation_weight=0.0,
+            offdiag_only=True,
         )
     lambda_repr = _require_numeric(payload, "lambda_repr", context)
     point_weight = _require_numeric(payload, "point_weight", context)
@@ -412,7 +467,6 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
         repr_learning_rate=None if repr_learning_rate is None else float(repr_learning_rate),
         projection_eps=None if projection_eps is None else float(projection_eps),
     )
-
 
 def _require_positive_int(config: dict, field: str, context: str) -> int:
     value = _require_field(config, field, context)
