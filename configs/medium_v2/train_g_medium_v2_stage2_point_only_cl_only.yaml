@@ -1,11 +1,10 @@
-# medium_v1 G Stage 2 M1: uncertainty-weighted flow/cycle losses.
+experiment_name: medium_v2_stage2_point_only_cl_only
 seed: 1337
 sampling_seed: 1337
 device: cuda:0
 num_workers: 8
-global_batch_size: 96
+global_batch_size: 48
 per_device_batch_size: 24
-# Max stable 24GB per-card batch from smoke probe.
 amp: false
 learning_rate: 0.0003
 weight_decay: 0.0
@@ -14,15 +13,10 @@ embedding_dim: 512
 train_index: data/index/train_balanced_medium.jsonl
 train_features: artifacts/e0_features/train_balanced_medium_e0_medium_v1
 e0_checkpoint: artifacts/checkpoints/e0_medium_v1/best.pt
-out_dir: artifacts/checkpoints/g_medium_v1_stage2_m1_uw
+out_dir: artifacts/checkpoints/g_medium_v2_stage2_point_only_cl_only
 resume_from: artifacts/checkpoints/g_medium_v1_stage1_long200_v4/best_stage1.pt
 allow_stage2_without_stage1_gate: true
 resume_from_legacy_stage1_metrics: false
-loss_weighting:
-  type: uncertainty
-  calibration_batches: 20
-  log_var_lr: 0.0001
-  log_var_weight_decay: 0.0
 ema:
   enabled: true
   decay: 0.999
@@ -48,12 +42,17 @@ stages:
     epochs: 0
     require_face_detection_gate: false
   stage2:
-    epochs: 200
-    flow_condition: embedding
-    gradient_conflict:
+    epochs: 120
+    gradient_monitor:
       enabled: true
       interval: 20
       max_samples: 8
+    stage2_objective:
+      type: gram_repr_only_probe
+      lambda_repr: 1.0
+      point_weight: 1.0
+      relation_weight: 0.0
+      offdiag_only: true
     quality_eval:
       enabled: true
       metrics: [niqe, fid, kid]
@@ -66,14 +65,13 @@ stages:
       real_index: data/index/val_single_face.jsonl
       distribution_cuda_visible_devices: "0"
       distribution_device: cuda:0
-      output_dir: artifacts/eval/g_medium_v1_stage2_m1_uw/quality
+      output_dir: artifacts/eval/g_medium_v2_stage2_point_only_cl_only/quality
       model: raw
 validation:
   enabled: true
   index: data/index/val_single_face.jsonl
   features: artifacts/e0_features/val_single_face_e0_medium_v1
   max_samples: 512
-  # Validation batch_size is per-device/eval batch; it does not change the training global batch.
   batch_size: 16
   face_detection:
     enabled: true

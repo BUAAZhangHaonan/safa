@@ -48,6 +48,7 @@ stages:
       max_samples: 8
     stage2_objective:
       type: gram_projected_two_step
+      flow_condition: embedding
       lambda_repr: 1.0
       point_weight: 1.0
       relation_weight: 1.0

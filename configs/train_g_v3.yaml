@@ -34,11 +34,13 @@ generator:
 stages:
   stage1:
     epochs: 30
+    flow_condition: embedding
     require_face_detection_gate: true
     stable_epochs: 3
     face_detection_threshold: 0.95
   stage2:
     epochs: 80
+    flow_condition: embedding
     lambda_initial: 0.01
     lambda_max: 0.03
     lambda_growth: 0.0025

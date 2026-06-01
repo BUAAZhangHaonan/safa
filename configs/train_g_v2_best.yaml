@@ -9,7 +9,8 @@ seed: 1337
 sampling_seed: 1337
 device: cuda:0
 num_workers: 8
-batch_size: 16
+global_batch_size: 64
+per_device_batch_size: 16
 learning_rate: 0.0003
 weight_decay: 0.0
 image_size: 224
@@ -46,6 +47,7 @@ stages:
     require_face_detection_gate: false
   stage2:
     epochs: 80
+    flow_condition: embedding
     lambda_initial: 0.01
     lambda_max: 0.01
     lambda_growth: 0

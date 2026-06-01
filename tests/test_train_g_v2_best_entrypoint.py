@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from argparse import Namespace
+import os
 from pathlib import Path
 import subprocess
+import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -49,7 +52,9 @@ class TrainGV2BestEntrypointTests(unittest.TestCase):
         config = yaml.safe_load(path.read_text(encoding="utf-8"))
         stage1_config = yaml.safe_load(Path("configs/train_g_v2_best_stage1.yaml").read_text(encoding="utf-8"))
 
-        self.assertEqual(config["batch_size"], 16)
+        self.assertNotIn("batch_size", config)
+        self.assertEqual(config["global_batch_size"], 64)
+        self.assertEqual(config["per_device_batch_size"], 16)
         self.assertEqual(config["validation"]["batch_size"], 16)
         self.assertEqual(stage1_config["batch_size"], 32)
         self.assertEqual(stage1_config["validation"]["batch_size"], 32)
@@ -187,12 +192,15 @@ class TrainGV2BestEntrypointTests(unittest.TestCase):
         self.assertIn('SESSION="${SESSION:-train_g_v2_best}"', script)
         self.assertIn('LOG="${LOG:-artifacts/logs/train_g_v2_best.log}"', script)
         self.assertIn('SAFA_CUDA_VISIBLE_DEVICES:-4,5,6,7', script)
+        self.assertIn('NPROC_PER_NODE="${NPROC_PER_NODE:-4}"', script)
         self.assertIn("tmux new-session", script)
-        self.assertIn("scripts/guarded_run.py --max-ram-fraction 0.90", script)
-        self.assertIn("--nproc_per_node=4", script)
+        self.assertIn("scripts/guarded_run.py", script)
+        self.assertIn("--max-ram-fraction", script)
+        self.assertIn('"--nproc_per_node=$NPROC_PER_NODE"', script)
+        self.assertIn("printf -v TMUX_COMMAND '%q '", script)
 
     def test_train_g_tmux_requires_values_for_options(self) -> None:
-        for option in ("--config", "--log", "--session"):
+        for option in ("--config", "--log", "--session", "--nproc-per-node"):
             with self.subTest(option=option):
                 result = subprocess.run(
                     ["bash", "scripts/run_train_g_tmux.sh", option],
@@ -205,6 +213,53 @@ class TrainGV2BestEntrypointTests(unittest.TestCase):
                 self.assertIn(f"{option} requires a value", result.stderr)
                 self.assertIn("Usage:", result.stderr)
                 self.assertNotIn("unbound variable", result.stderr)
+
+    def test_train_g_tmux_rejects_invalid_nproc_before_tmux(self) -> None:
+        result = subprocess.run(
+            ["bash", "scripts/run_train_g_tmux.sh", "--nproc-per-node", "0"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--nproc_per_node must be a positive integer", result.stderr)
+
+    def test_train_g_tmux_rejects_missing_config_before_tmux(self) -> None:
+        result = subprocess.run(
+            ["bash", "scripts/run_train_g_tmux.sh", "--config", "configs/does_not_exist.yaml"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("config not found: configs/does_not_exist.yaml", result.stderr)
+
+    def test_train_g_tmux_rejects_nproc_config_mismatch_before_tmux(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "mismatch.yaml"
+            config.write_text("global_batch_size: 48\nper_device_batch_size: 24\n", encoding="utf-8")
+            log = Path(tmp) / "train.log"
+            env = {
+                **os.environ,
+                "REPO_ROOT": str(Path.cwd()),
+                "PYTHON_BIN": sys.executable,
+                "CONFIG": str(config),
+                "LOG": str(log),
+            }
+
+            result = subprocess.run(
+                ["bash", "scripts/run_train_g_tmux.sh"],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--nproc_per_node=4 does not match global_batch_size / per_device_batch_size = 2", result.stderr)
+        self.assertNotIn("tmux", result.stderr)
 
 
 if __name__ == "__main__":

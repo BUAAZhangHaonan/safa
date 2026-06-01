@@ -41,6 +41,7 @@ grad_clip_norm: 1.0
 stages:
   stage1:
     epochs: 1000
+    flow_condition: embedding
     require_face_detection_gate: true
     face_detection_threshold: 1.0
     # Keep the gate from ending the continuation before epoch 1000.

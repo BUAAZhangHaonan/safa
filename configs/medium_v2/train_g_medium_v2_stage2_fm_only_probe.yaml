@@ -50,6 +50,7 @@ stages:
       enabled: false
     stage2_objective:
       type: fm_only_probe
+      flow_condition: embedding
     quality_eval:
       enabled: true
       metrics:

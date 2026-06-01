@@ -40,6 +40,7 @@ grad_clip_norm: 1.0
 stages:
   stage1:
     epochs: 200
+    flow_condition: embedding
     require_face_detection_gate: true
     face_detection_threshold: 1.0
     stable_epochs: 3

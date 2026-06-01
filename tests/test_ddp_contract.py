@@ -17,9 +17,11 @@ class DDPContractTests(unittest.TestCase):
     def test_train_g_tmux_uses_four_gpu_torchrun(self) -> None:
         script = Path("scripts/run_train_g_tmux.sh").read_text(encoding="utf-8")
         self.assertIn('SAFA_CUDA_VISIBLE_DEVICES:-4,5,6,7', script)
+        self.assertIn('NPROC_PER_NODE="${NPROC_PER_NODE:-4}"', script)
         self.assertIn("scripts/guarded_run.py", script)
         self.assertIn("torch.distributed.run", script)
-        self.assertIn("--nproc_per_node=4", script)
+        self.assertIn('"--nproc_per_node=$NPROC_PER_NODE"', script)
+        self.assertIn("printf -v TMUX_COMMAND '%q '", script)
         self.assertIn("tmux new-session", script)
 
     def test_sync_epoch_control_single_process_is_noop(self) -> None:

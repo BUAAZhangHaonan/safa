@@ -36,6 +36,7 @@ stages:
     require_face_detection_gate: false
   stage2:
     epochs: 40
+    flow_condition: embedding
     lambda_initial: 0.02
     lambda_max: 0.02
     lambda_growth: 0.0

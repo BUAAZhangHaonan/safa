@@ -38,6 +38,11 @@ _SAFA_PACKAGE_DIR = Path(__file__).resolve().parents[1]
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_NO_IDENTITY_SOURCE_PATHS = (Path(__file__).resolve().parent, _SAFA_PACKAGE_DIR / "models")
 
+_FLOW_CONDITION_EMBEDDING = "embedding"
+_FLOW_CONDITION_FIXED_NULL = "fixed_null_condition"
+_FLOW_CONDITIONS = (_FLOW_CONDITION_EMBEDDING, _FLOW_CONDITION_FIXED_NULL)
+_NAMED_REPR_WEIGHT_MODES = ((1.0, 0.0), (1.0, 1.0))
+
 
 @dataclass(frozen=True)
 class _GradientConflictConfig:
@@ -63,6 +68,7 @@ class _Stage2ObjectiveRuntime:
     point_weight: float
     relation_weight: float
     offdiag_only: bool
+    flow_condition: str = _FLOW_CONDITION_EMBEDDING
     repr_learning_rate: float | None = None
     projection_eps: float | None = None
 
@@ -151,10 +157,9 @@ class _GeneratorTrainingStep:
                     )
                 return state
 
-            def forward(self, images, z, sample_ids, use_cycle: bool, lambda_cycle: float):
-                import torch
-                flow_loss, flow_metrics = self.generator.flow_matching_loss(images, z)
-                cycle_loss = flow_loss.new_tensor(0.0)
+            def forward(self, images, z, sample_ids, use_cycle: bool, lambda_cycle: float, flow_condition: str | None = None):
+                effective_flow_condition = self._effective_flow_condition(use_cycle=use_cycle, flow_condition=flow_condition)
+                cycle_loss = z.new_tensor(0.0)
                 if use_cycle:
                     if self._schedule:
                         cycle_steps = self._schedule[self._batch_idx % len(self._schedule)]
@@ -162,6 +167,7 @@ class _GeneratorTrainingStep:
                         cycle_steps = self.generator_config.train_cycle_steps
                     if self.stage2_objective is not None:
                         if self.stage2_objective.type == "fm_only_probe":
+                            flow_loss, flow_metrics = self._compute_flow_loss(images, z, effective_flow_condition)
                             self._batch_idx += 1
                             secondary_loss = flow_loss.new_tensor(0.0)
                             self.last_loss_metrics = self._stage2_probe_loss_metrics(
@@ -170,11 +176,13 @@ class _GeneratorTrainingStep:
                                 objective_type="fm_only_probe",
                                 effective_flow_weight=1.0,
                                 effective_repr_weight=0.0,
+                                flow_condition=effective_flow_condition,
                             )
                             return flow_loss, flow_metrics["flow_matching_mse"].detach(), secondary_loss.detach(), flow_loss, secondary_loss
                         repr_loss, repr_metrics = self._compute_repr_loss(z, sample_ids, cycle_steps=cycle_steps)
                         self._batch_idx += 1
                         if self.stage2_objective.type == "gram_weighted_sum":
+                            flow_loss, flow_metrics = self._compute_flow_loss(images, z, effective_flow_condition)
                             loss = flow_loss + self.stage2_objective.lambda_repr * repr_loss
                             loss_metrics = self._stage2_repr_loss_metrics(
                                 flow_loss,
@@ -182,10 +190,12 @@ class _GeneratorTrainingStep:
                                 repr_loss,
                                 repr_metrics,
                                 effective_repr_weight=self.stage2_objective.lambda_repr,
+                                flow_condition=effective_flow_condition,
                             )
                             self.last_loss_metrics = loss_metrics
                             return loss, flow_metrics["flow_matching_mse"].detach(), repr_loss.detach(), flow_loss, repr_loss
                         if self.stage2_objective.type == "gram_repr_only_probe":
+                            flow_loss = repr_loss.new_tensor(0.0)
                             loss = self.stage2_objective.lambda_repr * repr_loss
                             loss_metrics = self._stage2_repr_loss_metrics(
                                 flow_loss,
@@ -194,16 +204,19 @@ class _GeneratorTrainingStep:
                                 repr_metrics,
                                 effective_repr_weight=self.stage2_objective.lambda_repr,
                                 effective_flow_weight=0.0,
+                                flow_condition=effective_flow_condition,
                             )
                             self.last_loss_metrics = loss_metrics
-                            return loss, flow_metrics["flow_matching_mse"].detach(), repr_loss.detach(), flow_loss, repr_loss
+                            return loss, flow_loss.detach(), repr_loss.detach(), flow_loss, repr_loss
                         if self.stage2_objective.type == "gram_projected_two_step":
+                            flow_loss, flow_metrics = self._compute_flow_loss(images, z, effective_flow_condition)
                             loss_metrics = self._stage2_repr_loss_metrics(
                                 flow_loss,
                                 cycle_loss,
                                 repr_loss,
                                 repr_metrics,
                                 effective_repr_weight=self.stage2_objective.lambda_repr,
+                                flow_condition=effective_flow_condition,
                             )
                             self.last_loss_metrics = loss_metrics
                             return repr_loss, flow_metrics["flow_matching_mse"].detach(), repr_loss.detach(), flow_loss, repr_loss
@@ -227,9 +240,33 @@ class _GeneratorTrainingStep:
                     e0_out = self.e0(normalize_for_e0(generated))
                     cycle_loss = cosine_cycle_loss(e0_out["embedding"], z)
                     self._batch_idx += 1
+                flow_loss, flow_metrics = self._compute_flow_loss(images, z, effective_flow_condition)
                 loss, loss_metrics = self._combine_losses(flow_loss, cycle_loss, use_cycle=use_cycle, lambda_cycle=lambda_cycle)
+                loss_metrics["flow_condition"] = effective_flow_condition
                 self.last_loss_metrics = loss_metrics
                 return loss, flow_metrics["flow_matching_mse"].detach(), cycle_loss.detach(), flow_loss, cycle_loss
+
+            def _effective_flow_condition(self, *, use_cycle: bool, flow_condition: str | None) -> str:
+                if flow_condition is not None:
+                    _validate_flow_condition(flow_condition, "training flow_condition")
+                    return str(flow_condition)
+                if use_cycle and self.stage2_objective is not None:
+                    _validate_flow_condition(self.stage2_objective.flow_condition, "stages.stage2.stage2_objective.flow_condition")
+                    return self.stage2_objective.flow_condition
+                return _FLOW_CONDITION_EMBEDDING
+
+            def _compute_flow_loss(self, images, z, flow_condition: str):
+                condition_z = self._flow_condition_z(z, flow_condition)
+                return self.generator.flow_matching_loss(images, condition_z)
+
+            def _flow_condition_z(self, z, flow_condition: str):
+                _validate_flow_condition(flow_condition, "training flow_condition")
+                if flow_condition == _FLOW_CONDITION_EMBEDDING:
+                    return z
+                if flow_condition == _FLOW_CONDITION_FIXED_NULL:
+                    fixed_null_condition = z.new_zeros(z.shape)
+                    return fixed_null_condition
+                raise RuntimeError(f"Unsupported flow_condition {flow_condition!r}")
 
             def _compute_repr_loss(self, z, sample_ids, *, cycle_steps: int):
                 if self.stage2_objective is None:
@@ -263,7 +300,15 @@ class _GeneratorTrainingStep:
                 return losses["repr"], losses
 
             def _stage2_repr_loss_metrics(
-                self, flow_loss, cycle_loss, repr_loss, repr_metrics: dict, *, effective_repr_weight: float, effective_flow_weight: float = 1.0
+                self,
+                flow_loss,
+                cycle_loss,
+                repr_loss,
+                repr_metrics: dict,
+                *,
+                effective_repr_weight: float,
+                flow_condition: str,
+                effective_flow_weight: float = 1.0,
             ):
                 return {
                     "flow_loss_raw": float(flow_loss.detach().cpu()),
@@ -278,11 +323,19 @@ class _GeneratorTrainingStep:
                     "effective_cycle_loss_weight": 0.0,
                     "flow_loss_normalized": float(flow_loss.detach().cpu()),
                     "cycle_loss_normalized": 0.0,
+                    "flow_condition": flow_condition,
                     "loss_weighting_type": self.loss_weighting.type,
                 }
 
             def _stage2_probe_loss_metrics(
-                self, flow_loss, secondary_loss, *, objective_type: str, effective_flow_weight: float, effective_repr_weight: float
+                self,
+                flow_loss,
+                secondary_loss,
+                *,
+                objective_type: str,
+                effective_flow_weight: float,
+                effective_repr_weight: float,
+                flow_condition: str,
             ):
                 return {
                     "flow_loss_raw": float(flow_loss.detach().cpu()),
@@ -297,6 +350,7 @@ class _GeneratorTrainingStep:
                     "effective_cycle_loss_weight": 0.0,
                     "flow_loss_normalized": float(flow_loss.detach().cpu()),
                     "cycle_loss_normalized": 0.0,
+                    "flow_condition": flow_condition,
                     "loss_weighting_type": self.loss_weighting.type,
                 }
 
@@ -424,6 +478,11 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
     if objective_type not in allowed_types:
         allowed = ", ".join(allowed_types)
         raise ValueError(f"stages.stage2.stage2_objective.type must be one of {allowed}, got {objective_type!r}")
+    flow_condition = _flow_condition_from_config(
+        payload,
+        context,
+        required=objective_type in {"gram_weighted_sum", "gram_projected_two_step", "fm_only_probe"},
+    )
     if objective_type == "fm_only_probe":
         for field in ("lambda_repr", "point_weight", "relation_weight", "offdiag_only", "repr_learning_rate", "projection_eps"):
             if field in payload:
@@ -434,6 +493,7 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
             point_weight=0.0,
             relation_weight=0.0,
             offdiag_only=True,
+            flow_condition=flow_condition,
         )
     lambda_repr = _require_numeric(payload, "lambda_repr", context)
     point_weight = _require_numeric(payload, "point_weight", context)
@@ -445,6 +505,7 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
     if relation_weight < 0.0:
         raise ValueError(f"{context}.relation_weight must be non-negative, got {relation_weight!r}")
     offdiag_only = _require_bool(payload, "offdiag_only", context)
+    _validate_named_repr_weight_mode(objective_type, point_weight, relation_weight, context)
     repr_learning_rate = None
     projection_eps = None
     if objective_type == "gram_projected_two_step":
@@ -464,9 +525,56 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
         point_weight=float(point_weight),
         relation_weight=float(relation_weight),
         offdiag_only=offdiag_only,
+        flow_condition=flow_condition,
         repr_learning_rate=None if repr_learning_rate is None else float(repr_learning_rate),
         projection_eps=None if projection_eps is None else float(projection_eps),
     )
+
+
+def _flow_condition_from_config(payload: dict, context: str, *, required: bool = False) -> str:
+    if "flow_condition" not in payload:
+        if required:
+            raise ValueError(f"{context}.flow_condition is required for flow objectives")
+        return _FLOW_CONDITION_EMBEDDING
+    value = _require_field(payload, "flow_condition", context)
+    _validate_flow_condition(value, f"{context}.flow_condition")
+    return str(value)
+
+
+def _validate_flow_condition(value, context: str) -> None:
+    if value not in _FLOW_CONDITIONS:
+        allowed = ", ".join(_FLOW_CONDITIONS)
+        raise ValueError(f"{context} must be one of {allowed}, got {value!r}")
+
+
+def _validate_named_repr_weight_mode(objective_type: str, point_weight: float, relation_weight: float, context: str) -> None:
+    if objective_type != "gram_repr_only_probe":
+        return
+    mode = (float(point_weight), float(relation_weight))
+    if mode in _NAMED_REPR_WEIGHT_MODES:
+        return
+    raise ValueError(
+        f"{context} {objective_type} requires point_weight=1.0 and relation_weight to be "
+        f"0.0 (point-only) or 1.0 (point+Gram), got point_weight={point_weight!r}, relation_weight={relation_weight!r}"
+    )
+
+
+def _flow_condition_for_stage(stages: dict, stage_name: str, stage2_objective: _Stage2ObjectiveRuntime | None) -> str:
+    if stage_name not in ("stage1", "stage2"):
+        raise ValueError(f"stage_name must be stage1 or stage2, got {stage_name!r}")
+    stage = _require_field(stages, stage_name, "stages")
+    if not isinstance(stage, dict):
+        raise ValueError(f"stages.{stage_name} must be a mapping")
+    if stage_name == "stage2" and stage2_objective is not None:
+        if "flow_condition" in stage:
+            raise ValueError("stages.stage2.flow_condition is ambiguous when stages.stage2.stage2_objective.flow_condition is available")
+        if stage2_objective.type in {"gram_weighted_sum", "gram_projected_two_step", "fm_only_probe"}:
+            if "flow_condition" not in stage.get("stage2_objective", {}):
+                raise ValueError("stages.stage2.stage2_objective.flow_condition is required for flow objectives")
+            _validate_flow_condition(stage2_objective.flow_condition, "stages.stage2.stage2_objective.flow_condition")
+        return stage2_objective.flow_condition
+    required = int(stage.get("epochs", 0)) > 0
+    return _flow_condition_from_config(stage, f"stages.{stage_name}", required=required)
 
 def _require_positive_int(config: dict, field: str, context: str) -> int:
     value = _require_field(config, field, context)
@@ -906,6 +1014,7 @@ def train_g_from_config(config: dict) -> dict:
             if blocked:
                 cleanup_distributed(distributed)
                 raise RuntimeError("Stage 2 is blocked by the Stage 1 face detection gate; see manifest.json on rank 0")
+        stage_flow_condition = _flow_condition_for_stage(stages, stage_name, stage2_objective)
         epochs = int(stages[stage_name]["epochs"])
         start_stage_epoch = _resume_stage_start_epoch(stage_name, stages, resume_progress)
         stage_epoch = start_stage_epoch - 1
@@ -952,6 +1061,7 @@ def train_g_from_config(config: dict) -> dict:
                                 gradient_sample_ids,
                                 True,
                                 lambda_cycle,
+                                flow_condition=stage_flow_condition,
                             )
                         if stage2_objective is not None and stage2_objective.type == "gram_weighted_sum":
                             gradient_metrics = _compute_repr_gradient_conflict_metrics(
@@ -1011,6 +1121,7 @@ def train_g_from_config(config: dict) -> dict:
                         grad_clip_norm=config.get("grad_clip_norm"),
                         ema=ema,
                         stage2_objective=stage2_objective,
+                        flow_condition=stage_flow_condition,
                     )
                     totals["m3_projection_count"] += 1.0
                     for metric_name in (
@@ -1026,7 +1137,14 @@ def train_g_from_config(config: dict) -> dict:
                     totals["dot_after_abs_max"] = max(totals["dot_after_abs_max"], float(projection_metrics["dot_after_abs_max"]))
                 else:
                     with amp_ctx:
-                        loss, flow_mse, cycle, flow_loss, cycle_loss = training_module(images, z, sample_ids, stage_name == "stage2", lambda_cycle)
+                        loss, flow_mse, cycle, flow_loss, cycle_loss = training_module(
+                            images,
+                            z,
+                            sample_ids,
+                            stage_name == "stage2",
+                            lambda_cycle,
+                            flow_condition=stage_flow_condition,
+                        )
                     _assert_finite_training_scalars(loss, flow_mse, cycle)
                     assert_finite_tensor("g_loss", loss)
                     loss.backward()
@@ -1582,6 +1700,8 @@ def _validate_train_g_config(config: dict) -> None:
     stage2_objective = _stage2_objective_from_config(stages)
     if stage2_objective is None and _requires_medium_v2_stage2_objective(config, stages):
         raise ValueError("medium_v2 Stage 2 configs require stages.stage2.stage2_objective")
+    _flow_condition_for_stage(stages, "stage1", stage2_objective)
+    _flow_condition_for_stage(stages, "stage2", stage2_objective)
     if stage2_objective is not None and loss_weighting.type != "legacy":
         raise ValueError("stage2_objective M2/M3 runs must not use loss_weighting/UW")
     if loss_weighting.type == "uncertainty":
@@ -2122,6 +2242,7 @@ def _run_projected_stage2_batch(
     grad_clip_norm,
     ema,
     stage2_objective: _Stage2ObjectiveRuntime,
+    flow_condition: str,
 ) -> tuple:
     import torch
 
@@ -2134,7 +2255,14 @@ def _run_projected_stage2_batch(
 
     optimizer.zero_grad(set_to_none=True)
     with amp_ctx:
-        flow_loss, flow_mse, _, flow_loss_raw, _ = training_module(images, z, sample_ids, False, lambda_cycle)
+        flow_loss, flow_mse, _, flow_loss_raw, _ = training_module(
+            images,
+            z,
+            sample_ids,
+            False,
+            lambda_cycle,
+            flow_condition=flow_condition,
+        )
     _assert_finite_training_scalars(flow_loss, flow_mse, flow_loss_raw)
     flow_loss.backward()
     batch_grad_norm = 0.0
@@ -2145,14 +2273,28 @@ def _run_projected_stage2_batch(
 
     optimizer.zero_grad(set_to_none=True)
     with amp_ctx:
-        _, _, _, flow_loss_guard, _ = training_module(images, z, sample_ids, False, lambda_cycle)
+        _, _, _, flow_loss_guard, _ = training_module(
+            images,
+            z,
+            sample_ids,
+            False,
+            lambda_cycle,
+            flow_condition=flow_condition,
+        )
     assert_finite_tensor("m3_flow_loss_guard", flow_loss_guard)
     flow_loss_guard.backward()
     fm_gradients = _synced_gradients_from_parameters("M3 flow guard", params)
 
     optimizer.zero_grad(set_to_none=True)
     with amp_ctx:
-        repr_loss, flow_mse_guard, repr_detached, _, repr_loss_raw = training_module(images, z, sample_ids, True, lambda_cycle)
+        repr_loss, flow_mse_guard, repr_detached, _, repr_loss_raw = training_module(
+            images,
+            z,
+            sample_ids,
+            True,
+            lambda_cycle,
+            flow_condition=flow_condition,
+        )
     _assert_finite_training_scalars(repr_loss, flow_mse_guard, repr_detached)
     repr_loss.backward()
     repr_gradients = _synced_gradients_from_parameters("M3 representation", params)
