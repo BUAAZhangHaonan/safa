@@ -285,6 +285,110 @@ def test_run_once_backfills_missing_epochs_between_state_and_metrics(tmp_path: P
     assert manifest["backfilled_from_latest_checkpoint"] is True
 
 
+def test_run_once_can_limit_backfill_to_latest_and_every_n(tmp_path: Path) -> None:
+    module = _load_script()
+    index = tmp_path / "val.jsonl"
+    features = tmp_path / "features"
+    checkpoint_dir = tmp_path / "checkpoints"
+    output_dir = tmp_path / "plots"
+    config = tmp_path / "config.yaml"
+    metrics = checkpoint_dir / "last_metrics.json"
+    checkpoint = checkpoint_dir / "last.pt"
+    _write_jsonl(index, [{"sample_id": "sample-a", "image_path": "/a.jpg", "label": 1}])
+    features.mkdir()
+    (features / "features.pt").write_bytes(b"fake")
+    (features / "manifest.json").write_text("{}", encoding="utf-8")
+    checkpoint_dir.mkdir()
+    checkpoint.write_bytes(b"fake")
+    config.write_text("sampling_seed: 1337\n", encoding="utf-8")
+    metrics.write_text(json.dumps({"stage_epoch_1based": 45}), encoding="utf-8")
+    paths = module.WatcherPaths(
+        metrics=metrics,
+        checkpoint=checkpoint,
+        config=config,
+        index=index,
+        features=features,
+        out_dir=output_dir,
+        events=output_dir / "events.jsonl",
+        log=output_dir / "events.log",
+        state=output_dir / "state.json",
+    )
+
+    calls = []
+
+    def fake_generate(
+        *,
+        epoch,
+        paths,
+        out_path,
+        manifest_path,
+        num_samples,
+        sample_seed,
+        device,
+        sampling_seed,
+        checkpoint_epoch_1based,
+        visual_epoch_1based,
+        backfilled_from_latest_checkpoint,
+    ):
+        calls.append((epoch, checkpoint_epoch_1based, visual_epoch_1based, backfilled_from_latest_checkpoint))
+        out_path.write_bytes(b"png")
+        module.write_manifest(
+            manifest_path,
+            module.build_manifest(
+                epoch=epoch,
+                paths=paths,
+                samples=[],
+                out_path=out_path,
+                device=device,
+                sampling_seed=sampling_seed,
+                metrics=[],
+                note="fake generation for unit test",
+                checkpoint_epoch_1based=checkpoint_epoch_1based,
+                visual_epoch_1based=visual_epoch_1based,
+                backfilled_from_latest_checkpoint=backfilled_from_latest_checkpoint,
+            ),
+        )
+
+    assert module.run_once(paths, num_samples=1, backfill_every=20, generate_func=fake_generate) == 0
+
+    assert calls == [
+        (20, 45, 20, True),
+        (40, 45, 40, True),
+        (45, 45, 45, False),
+    ]
+
+
+def test_resolve_paths_uses_checkpoint_dir_output_dir_and_run_name(tmp_path: Path) -> None:
+    module = _load_script()
+    checkpoint_dir = tmp_path / "ckpt"
+    output_dir = tmp_path / "plots"
+
+    args = module.parse_args(
+        [
+            "--checkpoint-dir",
+            str(checkpoint_dir),
+            "--config",
+            str(tmp_path / "config.yaml"),
+            "--index",
+            str(tmp_path / "index.jsonl"),
+            "--features",
+            str(tmp_path / "features"),
+            "--output-dir",
+            str(output_dir),
+            "--run-name",
+            "stage1_long1000_checkpoint_visuals",
+        ]
+    )
+    paths = module.resolve_paths(args)
+
+    assert paths.metrics == checkpoint_dir / "last_metrics.json"
+    assert paths.checkpoint == checkpoint_dir / "last.pt"
+    assert paths.out_dir == output_dir
+    assert paths.events == output_dir / "stage1_long1000_checkpoint_visuals_events.jsonl"
+    assert paths.log == output_dir / "stage1_long1000_checkpoint_visuals.log"
+    assert paths.state == output_dir / "stage1_long1000_checkpoint_visuals_state.json"
+
+
 def test_completed_epoch_numbers_caps_checkpoint_history_to_metrics_epoch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     module = _load_script()
     checkpoint_dir = tmp_path / "checkpoints"
@@ -303,6 +407,10 @@ def test_completed_epoch_numbers_caps_checkpoint_history_to_metrics_epoch(tmp_pa
 def test_gpu_guard_rejects_disallowed_visible_devices_and_busy_gpu0() -> None:
     module = _load_script()
 
+    with pytest.raises(RuntimeError, match="GPU1"):
+        module.validate_cuda_visible_devices("1")
+    with pytest.raises(RuntimeError, match="GPU1"):
+        module.validate_cuda_visible_devices("0,1")
     with pytest.raises(RuntimeError, match="GPU3-6"):
         module.validate_cuda_visible_devices("3")
     with pytest.raises(RuntimeError, match="GPU3-6"):
@@ -331,6 +439,7 @@ def test_build_tmux_command_pins_gpu0_and_never_mentions_gpu3_6() -> None:
     assert command[:4] == ["tmux", "new-session", "-d", "-s"]
     assert "CUDA_VISIBLE_DEVICES=0" in joined
     assert "--device cuda:0" in joined
+    assert "--run-name checkpoint_visuals" in joined
     for forbidden in ("CUDA_VISIBLE_DEVICES=3", "CUDA_VISIBLE_DEVICES=4", "CUDA_VISIBLE_DEVICES=5", "CUDA_VISIBLE_DEVICES=6"):
         assert forbidden not in joined
 

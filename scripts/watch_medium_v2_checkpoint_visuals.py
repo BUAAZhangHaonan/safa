@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Watch M2 checkpoints and render fixed validation source/generated pairs."""
+"""Watch checkpoints and render fixed validation source/generated pairs."""
 
 from __future__ import annotations
 
@@ -253,6 +253,8 @@ def write_manifest(path: Path, manifest: dict[str, Any]) -> None:
 def validate_cuda_visible_devices(value: str | None) -> None:
     if value is None or value == "":
         return
+    blocked_reserved = False
+    blocked_training = False
     for raw in value.split(","):
         raw = raw.strip()
         if not raw:
@@ -261,8 +263,14 @@ def validate_cuda_visible_devices(value: str | None) -> None:
             index = int(raw)
         except ValueError:
             continue
+        if index == 1:
+            blocked_training = True
         if index in {3, 4, 5, 6}:
-            raise RuntimeError(f"CUDA_VISIBLE_DEVICES includes GPU3-6, which are reserved for M2: {value}")
+            blocked_reserved = True
+    if blocked_training:
+        raise RuntimeError(f"CUDA_VISIBLE_DEVICES includes GPU1, which is reserved for Stage1 training: {value}")
+    if blocked_reserved:
+        raise RuntimeError(f"CUDA_VISIBLE_DEVICES includes GPU3-6, which are reserved for M2: {value}")
 
 
 def query_nvidia_smi() -> str:
@@ -637,6 +645,15 @@ def completed_visual_exists(paths: WatcherPaths, completed: dict[str, Any], epoc
     return bool((state_path or out_path.is_file()) and out_path.is_file() and manifest_path.is_file())
 
 
+def select_pending_epochs(pending_epochs: list[int], *, latest_epoch: int, backfill_every: int | None) -> list[int]:
+    if backfill_every is None:
+        return pending_epochs
+    if isinstance(backfill_every, bool) or int(backfill_every) <= 0:
+        raise ValueError(f"backfill_every must be a positive integer, got {backfill_every!r}")
+    every = int(backfill_every)
+    return [epoch for epoch in pending_epochs if epoch == latest_epoch or epoch % every == 0]
+
+
 def checkpoint_for_visual_epoch(paths: WatcherPaths, visual_epoch: int, latest_epoch: int) -> tuple[Path, int, bool]:
     for candidate in checkpoint_candidates(paths.checkpoint.parent, visual_epoch):
         if candidate.is_file():
@@ -671,6 +688,7 @@ def run_once(
     num_samples: int = 16,
     sample_seed: int | None = None,
     device: str = "cuda:0",
+    backfill_every: int | None = None,
     generate_func: GenerateFunc = generate_checkpoint_pairs,
 ) -> int:
     validate_required_inputs(paths)
@@ -694,14 +712,18 @@ def run_once(
         write_state(paths, completed, events)
         return 0
 
-    pending_epochs = [epoch for epoch in completed_epochs if not completed_visual_exists(paths, completed, epoch)]
+    latest_epoch = max(completed_epochs)
+    pending_epochs = select_pending_epochs(
+        [epoch for epoch in completed_epochs if not completed_visual_exists(paths, completed, epoch)],
+        latest_epoch=latest_epoch,
+        backfill_every=backfill_every,
+    )
     if not pending_epochs:
         write_state(paths, completed, events)
         return 0
 
     sampling_seed = config_sampling_seed(paths.config)
     paths.out_dir.mkdir(parents=True, exist_ok=True)
-    latest_epoch = max(completed_epochs)
     for epoch in pending_epochs:
         checkpoint_path, checkpoint_epoch, backfilled = checkpoint_for_visual_epoch(paths, epoch, latest_epoch)
         epoch_paths = paths._replace(checkpoint=checkpoint_path)
@@ -763,10 +785,11 @@ def loop(
     sample_seed: int | None,
     interval_seconds: int,
     device: str,
+    backfill_every: int | None,
 ) -> int:
     while True:
         try:
-            run_once(paths, num_samples=num_samples, sample_seed=sample_seed, device=device)
+            run_once(paths, num_samples=num_samples, sample_seed=sample_seed, device=device, backfill_every=backfill_every)
         except Exception as exc:
             now = utc_now()
             events = [{"time": now, "type": "checkpoint_visual_error", "error": f"{type(exc).__name__}: {exc}"}]
@@ -783,33 +806,71 @@ def build_tmux_command(
     interval: int,
     device: str,
     cuda_visible_devices: str,
+    checkpoint_dir: Path = DEFAULT_CHECKPOINT_DIR,
+    config: Path = DEFAULT_CONFIG,
+    index: Path = DEFAULT_INDEX,
+    features: Path = DEFAULT_FEATURES,
+    output_dir: Path = DEFAULT_OUT_DIR,
+    run_name: str = "checkpoint_visuals",
+    backfill_every: int | None = None,
 ) -> list[str]:
+    validate_cuda_visible_devices(cuda_visible_devices)
+    extra = ""
+    if backfill_every is not None:
+        extra = f" --backfill-every {int(backfill_every)}"
     script_command = (
         f"cd {shlex.quote(str(REPO_ROOT))} && "
         f"CUDA_VISIBLE_DEVICES={shlex.quote(cuda_visible_devices)} PYTHONPATH=src "
         f"{shlex.quote(python_exe)} {shlex.quote(script)} "
-        f"--interval {int(interval)} --device {shlex.quote(device)}"
+        f"--interval {int(interval)} --device {shlex.quote(device)} "
+        f"--checkpoint-dir {shlex.quote(str(checkpoint_dir))} "
+        f"--config {shlex.quote(str(config))} "
+        f"--index {shlex.quote(str(index))} "
+        f"--features {shlex.quote(str(features))} "
+        f"--output-dir {shlex.quote(str(output_dir))} "
+        f"--run-name {shlex.quote(run_name)}"
+        f"{extra}"
     )
     return ["tmux", "new-session", "-d", "-s", session_name, script_command]
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Watch medium v2 M2 last.pt and render checkpoint pair visuals.")
+    parser = argparse.ArgumentParser(description="Watch a medium v2 checkpoint and render checkpoint pair visuals.")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--interval", type=int, default=300)
-    parser.add_argument("--metrics", type=Path, default=DEFAULT_METRICS)
-    parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
+    parser.add_argument("--checkpoint-dir", type=Path, default=DEFAULT_CHECKPOINT_DIR)
+    parser.add_argument("--metrics", type=Path, default=None)
+    parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--index", type=Path, default=DEFAULT_INDEX)
     parser.add_argument("--features", type=Path, default=DEFAULT_FEATURES)
-    parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
-    parser.add_argument("--events", type=Path, default=DEFAULT_EVENTS)
-    parser.add_argument("--log", type=Path, default=DEFAULT_LOG)
-    parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
+    parser.add_argument("--out-dir", "--output-dir", dest="out_dir", type=Path, default=DEFAULT_OUT_DIR)
+    parser.add_argument("--events", type=Path, default=None)
+    parser.add_argument("--log", type=Path, default=None)
+    parser.add_argument("--state", type=Path, default=None)
+    parser.add_argument("--run-name", default="checkpoint_visuals")
     parser.add_argument("--num-samples", type=int, default=16)
     parser.add_argument("--sample-seed", type=int, default=None)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--backfill-every", type=int, default=None)
     return parser.parse_args(argv)
+
+
+def resolve_paths(args: argparse.Namespace) -> WatcherPaths:
+    checkpoint_dir = Path(args.checkpoint_dir)
+    out_dir = Path(args.out_dir)
+    run_name = str(args.run_name)
+    return WatcherPaths(
+        metrics=Path(args.metrics) if args.metrics is not None else checkpoint_dir / "last_metrics.json",
+        checkpoint=Path(args.checkpoint) if args.checkpoint is not None else checkpoint_dir / "last.pt",
+        config=Path(args.config),
+        index=Path(args.index),
+        features=Path(args.features),
+        out_dir=out_dir,
+        events=Path(args.events) if args.events is not None else out_dir / f"{run_name}_events.jsonl",
+        log=Path(args.log) if args.log is not None else out_dir / f"{run_name}.log",
+        state=Path(args.state) if args.state is not None else out_dir / f"{run_name}_state.json",
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -817,25 +878,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.device.startswith("cuda"):
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
         validate_cuda_visible_devices(os.environ.get("CUDA_VISIBLE_DEVICES"))
-    paths = WatcherPaths(
-        metrics=args.metrics,
-        checkpoint=args.checkpoint,
-        config=args.config,
-        index=args.index,
-        features=args.features,
-        out_dir=args.out_dir,
-        events=args.events,
-        log=args.log,
-        state=args.state,
-    )
+    paths = resolve_paths(args)
     if args.once:
-        return run_once(paths, num_samples=args.num_samples, sample_seed=args.sample_seed, device=args.device)
+        return run_once(
+            paths,
+            num_samples=args.num_samples,
+            sample_seed=args.sample_seed,
+            device=args.device,
+            backfill_every=args.backfill_every,
+        )
     return loop(
         paths,
         num_samples=args.num_samples,
         sample_seed=args.sample_seed,
         interval_seconds=args.interval,
         device=args.device,
+        backfill_every=args.backfill_every,
     )
 
 
