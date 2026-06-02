@@ -274,6 +274,55 @@ Relation metric table 是 2026-06-02 12:46:44 CST (UTC+08) 写入本文的 captu
 
 在 2026-06-02 12:46:44 CST (UTC+08) 的 snapshot 中，P+G 没有超过 P。它在 point metrics 和 relation metrics 上都更差：raw repr_point_loss 更高，offdiag Gram 误差更高，pairwise correlation 更低。所以现在不能写 Gram 已经有帮助。
 
+### 2026-06-03 pre-stop P/P+G snapshot
+
+这次只读检查没有停止训练、没有停止 watcher，也没有启动 M3。latest `last_metrics.json` 的落盘时间是 2026-06-03 01:11:05 CST for Point-only 和 2026-06-03 01:40:18 CST for Point+Gram。relation summary 的落盘时间是 2026-06-03 01:15:08 CST 和 2026-06-03 01:50:49 CST。
+
+| Metric | Point-only CL-only | Point+Gram CL-only |
+| --- | ---: | ---: |
+| stage_epoch_1based | 22 | 28 |
+| loss | 0.006282156319543719 | 0.0070958162331953645 |
+| repr_point_loss | 0.006282156319543719 | 0.006655988897569478 |
+| repr_relation_loss | 0.0004995158842764795 | 0.000439827333856374 |
+| grad_norm | 0.033481443786621094 | 0.0502570367872715 |
+| raw latent cosine mean | 0.9536038227379322 | 0.894861675798893 |
+| raw source prediction preserved | 0.8984375 | 0.76171875 |
+| raw single_face_eq1 rate | 0.0 | 0.001953125 |
+| raw face_detect_ge1 rate | 0.0 | 0.001953125 |
+| raw zero_face rate | 1.0 | 0.998046875 |
+| raw multi_face rate | 0.0 | 0.0 |
+| EMA latent cosine mean | 0.9507150780409575 | 0.8854449465870857 |
+| EMA source prediction preserved | 0.884765625 | 0.736328125 |
+| EMA single_face_eq1 rate | 0.0 | 0.0 |
+| EMA face_detect_ge1 rate | 0.0 | 0.0 |
+| NIQE mean | 9.12577004070587 | 10.822569135586313 |
+| NIQE std | 1.0474253714863426 | 3.098093102891729 |
+| FID/KID | missing | missing |
+
+Latest validation relation metrics still favor Point-only. Both summaries use `sample_count=512.0`.
+
+| Run | Variant | repr_point_loss | repr_relation_loss | offdiag_gram_mae | offdiag_gram_mse | pairwise_pearson | pairwise_spearman |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Point-only epoch22 | raw | 0.0463919224129043 | 0.022804933895805086 | 0.11016760002496145 | 0.022804933895805086 | 0.9450920872419294 | 0.9409817234161033 |
+| Point-only epoch22 | EMA | 0.04928911969992582 | 0.024106661564289776 | 0.11363663295576282 | 0.024106661564289776 | 0.9424966109763318 | 0.9382520285892924 |
+| Point+Gram epoch28 | raw | 0.10513666144989699 | 0.040115730819789155 | 0.15543402880915425 | 0.040115730819789155 | 0.9303443795852158 | 0.9343045251284067 |
+| Point+Gram epoch28 | EMA | 0.11455198297192151 | 0.04207123885029448 | 0.15717286437673514 | 0.04207123885029448 | 0.926595788475514 | 0.9305572203646052 |
+
+Point-only is better than Point+Gram in this pre-stop snapshot. It has lower loss, better raw latent cosine, better raw source prediction preservation, lower NIQE, lower validation point loss, lower off-diagonal Gram error, and higher pairwise correlations. Point+Gram has a smaller training-time `repr_relation_loss`, but its validation relation summary is worse, so that does not prove a useful Gram gain.
+
+Gram has not proved an O(B^2) acceleration. The Gram term adds O(B^2) pairwise constraints inside a batch, but the current evidence does not show faster convergence or better validation geometry than Point-only.
+
+CL-only remains a convergence diagnostic only. Point-only has raw and EMA face rates at 0.0. Point+Gram has raw `single_face_eq1_rate=0.001953125`, which is only 1/512, and EMA face rate is 0.0. This is still a face-generation collapse, so these runs cannot be used as generator-quality evidence.
+
+Pair visualizations were backfilled on 2026-06-03 02:00 CST with `CUDA_VISIBLE_DEVICES=1` and a one-shot wrapper around `scripts/watch_medium_v2_checkpoint_visuals.py`; no watcher or M3 job was started. The latest exact checkpoint-pair paths are:
+
+| Run | Latest pair visualization | Manifest |
+| --- | --- | --- |
+| Point-only CL-only epoch22 | `artifacts/plots/medium_v2/stage2_point_only_cl_only/epoch_0022_checkpoint_pairs.png` | `artifacts/plots/medium_v2/stage2_point_only_cl_only/epoch_0022_checkpoint_pairs_manifest.json` |
+| Point+Gram CL-only epoch28 | `artifacts/plots/medium_v2/stage2_point_gram_cl_only/epoch_0028_checkpoint_pairs.png` | `artifacts/plots/medium_v2/stage2_point_gram_cl_only/epoch_0028_checkpoint_pairs_manifest.json` |
+
+Backfilled visualization coverage is now complete up to those latest landed metrics: Point-only has checkpoint-pair PNGs for epochs 1-22, and Point+Gram has checkpoint-pair PNGs for epochs 1-28. Because per-epoch checkpoint files were not present for the lagging epochs, Point-only epochs 19-21 use the latest epoch22 checkpoint, and Point+Gram epochs 22-27 use the latest epoch28 checkpoint. The manifests record `backfilled_from_latest_checkpoint=true` for those rows.
+
 ## M0 epoch100 ad-hoc privacy probe
 
 这个 probe 只能作为粗略信号。它不是 formal privacy pass。metadata 必须保留：`ad_hoc_ignore_guard=true`，`not_formal_privacy_pass=true`，`stage_epoch_1based=100`，`generated_image_count=512`，`num_pairs=512`。
