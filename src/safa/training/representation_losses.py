@@ -42,6 +42,25 @@ def hyperspherical_gram_loss(
     }
 
 
+def hyperspherical_point_cosine_loss(pred_embedding, target_embedding, point_weight) -> dict[str, "torch.Tensor"]:
+    import torch
+
+    _validate_point_embedding_pair(pred_embedding, target_embedding)
+    point_weight_tensor = _validate_scalar_weight("point_weight", point_weight, pred_embedding)
+
+    point_loss = (1.0 - torch.sum(pred_embedding * target_embedding, dim=1)).mean()
+    relation_loss = torch.zeros((), dtype=pred_embedding.dtype, device=pred_embedding.device)
+    total_loss = point_weight_tensor * point_loss
+    return {
+        "repr": total_loss,
+        "point": point_loss,
+        "relation": relation_loss,
+        "total_loss": total_loss,
+        "point_loss": point_loss,
+        "relation_loss": relation_loss,
+    }
+
+
 def _validate_embedding_pair(pred_embedding, target_embedding) -> None:
     import torch
 
@@ -55,6 +74,25 @@ def _validate_embedding_pair(pred_embedding, target_embedding) -> None:
         raise ValueError("pred_embedding and target_embedding must have the same shape")
     if pred_embedding.shape[0] <= 1:
         raise ValueError("Batch dimension B > 1 is required")
+    if not torch.isfinite(pred_embedding).all() or not torch.isfinite(target_embedding).all():
+        raise FloatingPointError("pred_embedding and target_embedding must be finite")
+    _validate_unit_norm("pred_embedding", pred_embedding)
+    _validate_unit_norm("target_embedding", target_embedding)
+
+
+def _validate_point_embedding_pair(pred_embedding, target_embedding) -> None:
+    import torch
+
+    if not isinstance(pred_embedding, torch.Tensor):
+        raise TypeError("pred_embedding must be a torch.Tensor")
+    if not isinstance(target_embedding, torch.Tensor):
+        raise TypeError("target_embedding must be a torch.Tensor")
+    if pred_embedding.ndim != 2 or target_embedding.ndim != 2:
+        raise ValueError("pred_embedding and target_embedding must be 2D")
+    if pred_embedding.shape != target_embedding.shape:
+        raise ValueError("pred_embedding and target_embedding must have the same shape")
+    if pred_embedding.shape[0] <= 0:
+        raise ValueError("Batch dimension B > 0 is required")
     if not torch.isfinite(pred_embedding).all() or not torch.isfinite(target_embedding).all():
         raise FloatingPointError("pred_embedding and target_embedding must be finite")
     _validate_unit_norm("pred_embedding", pred_embedding)

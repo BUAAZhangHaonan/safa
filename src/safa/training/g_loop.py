@@ -21,7 +21,7 @@ from safa.models.generator import FlowGeneratorConfig, build_generator
 from safa.training.audit import audit_no_identity_supervision
 from safa.training.losses import cosine_cycle_loss, normalize_for_e0
 from safa.training.projected_update import project_gradient_onto_fm_feasible_cone
-from safa.training.representation_losses import hyperspherical_gram_loss
+from safa.training.representation_losses import hyperspherical_gram_loss, hyperspherical_point_cosine_loss
 from safa.training.multitask_loss import UncertaintyWeightedLoss
 from safa.training.transforms import generator_image_transform
 from safa.utils.device import assert_finite_tensor
@@ -47,6 +47,8 @@ _FLOW_CONDITION_EMBEDDING = "embedding"
 _FLOW_CONDITION_FIXED_NULL = "fixed_null_condition"
 _FLOW_CONDITIONS = (_FLOW_CONDITION_EMBEDDING, _FLOW_CONDITION_FIXED_NULL)
 _NAMED_REPR_WEIGHT_MODES = ((1.0, 0.0), (1.0, 1.0))
+_GRAM_PROJECTED_TWO_STEP = "gram_projected_two_step"
+_POINT_PROJECTED_TWO_STEP = "point_projected_two_step"
 
 
 @dataclass(frozen=True)
@@ -213,7 +215,7 @@ class _GeneratorTrainingStep:
                             )
                             self.last_loss_metrics = loss_metrics
                             return loss, flow_loss.detach(), repr_loss.detach(), flow_loss, repr_loss
-                        if self.stage2_objective.type == "gram_projected_two_step":
+                        if self.stage2_objective.type in {_GRAM_PROJECTED_TWO_STEP, _POINT_PROJECTED_TWO_STEP}:
                             flow_loss, flow_metrics = self._compute_flow_loss(images, z, effective_flow_condition)
                             loss_metrics = self._stage2_repr_loss_metrics(
                                 flow_loss,
@@ -295,13 +297,20 @@ class _GeneratorTrainingStep:
                 e0_out = self.e0(normalize_for_e0(generated))
                 if "embedding" not in e0_out:
                     raise RuntimeError("E0 output missing embedding for stage2 representation loss")
-                losses = hyperspherical_gram_loss(
-                    e0_out["embedding"],
-                    z,
-                    self.stage2_objective.point_weight,
-                    self.stage2_objective.relation_weight,
-                    offdiag_only=self.stage2_objective.offdiag_only,
-                )
+                if self.stage2_objective.type == _POINT_PROJECTED_TWO_STEP or self.stage2_objective.relation_weight == 0.0:
+                    losses = hyperspherical_point_cosine_loss(
+                        e0_out["embedding"],
+                        z,
+                        self.stage2_objective.point_weight,
+                    )
+                else:
+                    losses = hyperspherical_gram_loss(
+                        e0_out["embedding"],
+                        z,
+                        self.stage2_objective.point_weight,
+                        self.stage2_objective.relation_weight,
+                        offdiag_only=self.stage2_objective.offdiag_only,
+                    )
                 return losses["repr"], losses
 
             def _stage2_repr_loss_metrics(
@@ -479,14 +488,14 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
         raise ValueError("stages.stage2.stage2_objective must be a mapping")
     context = "stages.stage2.stage2_objective"
     objective_type = _require_field(payload, "type", context)
-    allowed_types = ("gram_weighted_sum", "gram_projected_two_step", "fm_only_probe", "gram_repr_only_probe")
+    allowed_types = ("gram_weighted_sum", _GRAM_PROJECTED_TWO_STEP, _POINT_PROJECTED_TWO_STEP, "fm_only_probe", "gram_repr_only_probe")
     if objective_type not in allowed_types:
         allowed = ", ".join(allowed_types)
         raise ValueError(f"stages.stage2.stage2_objective.type must be one of {allowed}, got {objective_type!r}")
     flow_condition = _flow_condition_from_config(
         payload,
         context,
-        required=objective_type in {"gram_weighted_sum", "gram_projected_two_step", "fm_only_probe"},
+        required=objective_type in {"gram_weighted_sum", _GRAM_PROJECTED_TWO_STEP, _POINT_PROJECTED_TWO_STEP, "fm_only_probe"},
     )
     if objective_type == "fm_only_probe":
         for field in ("lambda_repr", "point_weight", "relation_weight", "offdiag_only", "repr_learning_rate", "projection_eps"):
@@ -502,18 +511,40 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
         )
     lambda_repr = _require_numeric(payload, "lambda_repr", context)
     point_weight = _require_numeric(payload, "point_weight", context)
-    relation_weight = _require_numeric(payload, "relation_weight", context)
     if lambda_repr < 0.0:
         raise ValueError(f"{context}.lambda_repr must be non-negative, got {lambda_repr!r}")
     if point_weight < 0.0:
         raise ValueError(f"{context}.point_weight must be non-negative, got {point_weight!r}")
+
+    if objective_type == _POINT_PROJECTED_TWO_STEP:
+        for field in ("relation_weight", "offdiag_only"):
+            if field in payload:
+                raise ValueError(f"{context}.{field} is not valid for {_POINT_PROJECTED_TWO_STEP}")
+        repr_learning_rate = _require_numeric(payload, "repr_learning_rate", context)
+        projection_eps = _require_numeric(payload, "projection_eps", context)
+        if repr_learning_rate <= 0.0:
+            raise ValueError(f"{context}.repr_learning_rate must be positive, got {repr_learning_rate!r}")
+        if projection_eps < 0.0:
+            raise ValueError(f"{context}.projection_eps must be non-negative, got {projection_eps!r}")
+        return _Stage2ObjectiveRuntime(
+            type=str(objective_type),
+            lambda_repr=float(lambda_repr),
+            point_weight=float(point_weight),
+            relation_weight=0.0,
+            offdiag_only=False,
+            flow_condition=flow_condition,
+            repr_learning_rate=float(repr_learning_rate),
+            projection_eps=float(projection_eps),
+        )
+
+    relation_weight = _require_numeric(payload, "relation_weight", context)
     if relation_weight < 0.0:
         raise ValueError(f"{context}.relation_weight must be non-negative, got {relation_weight!r}")
     offdiag_only = _require_bool(payload, "offdiag_only", context)
     _validate_named_repr_weight_mode(objective_type, point_weight, relation_weight, context)
     repr_learning_rate = None
     projection_eps = None
-    if objective_type == "gram_projected_two_step":
+    if objective_type == _GRAM_PROJECTED_TWO_STEP:
         repr_learning_rate = _require_numeric(payload, "repr_learning_rate", context)
         projection_eps = _require_numeric(payload, "projection_eps", context)
         if repr_learning_rate <= 0.0:
@@ -523,7 +554,7 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
     else:
         for field in ("repr_learning_rate", "projection_eps"):
             if field in payload:
-                raise ValueError(f"{context}.{field} is only valid for gram_projected_two_step")
+                raise ValueError(f"{context}.{field} is only valid for projected two-step objectives")
     return _Stage2ObjectiveRuntime(
         type=str(objective_type),
         lambda_repr=float(lambda_repr),
@@ -573,7 +604,7 @@ def _flow_condition_for_stage(stages: dict, stage_name: str, stage2_objective: _
     if stage_name == "stage2" and stage2_objective is not None:
         if "flow_condition" in stage:
             raise ValueError("stages.stage2.flow_condition is ambiguous when stages.stage2.stage2_objective.flow_condition is available")
-        if stage2_objective.type in {"gram_weighted_sum", "gram_projected_two_step", "fm_only_probe"}:
+        if stage2_objective.type in {"gram_weighted_sum", _GRAM_PROJECTED_TWO_STEP, _POINT_PROJECTED_TWO_STEP, "fm_only_probe"}:
             if "flow_condition" not in stage.get("stage2_objective", {}):
                 raise ValueError("stages.stage2.stage2_objective.flow_condition is required for flow objectives")
             _validate_flow_condition(stage2_objective.flow_condition, "stages.stage2.stage2_objective.flow_condition")
@@ -599,6 +630,7 @@ def _requires_explicit_stage2_batch_semantics(config: dict) -> bool:
         "g_medium_v1_stage2_m1_uw",
         "g_medium_v2_stage2_m2_gram_weighted",
         "g_medium_v2_stage2_m3_gram_projected",
+        "g_medium_v2_stage2_m3_point_projected",
     }
 
 
@@ -985,6 +1017,9 @@ def train_g_from_config(config: dict) -> dict:
     )
     optimizer_resumed = False
     if config.get("resume_from"):
+        _assert_required_resume_optimizer_state(
+            config, stages, resume_progress, resume_optimizer_state_dict, str(config["resume_from"])
+        )
         if resume_optimizer_state_dict is None:
             if distributed.is_main:
                 print("Resume checkpoint has no optimizer_state_dict; optimizer_resumed: false")
@@ -1114,7 +1149,7 @@ def train_g_from_config(config: dict) -> dict:
                             gradient_metrics["gradient_conflict_full_batch_size"]
                         )
                         totals["gradient_conflict_samples"].append(gradient_metrics)
-                if stage_name == "stage2" and stage2_objective is not None and stage2_objective.type == "gram_projected_two_step":
+                if stage_name == "stage2" and stage2_objective is not None and stage2_objective.type in {_GRAM_PROJECTED_TWO_STEP, _POINT_PROJECTED_TWO_STEP}:
                     loss, flow_mse, cycle, flow_loss, cycle_loss, batch_grad_norm, projection_metrics = _run_projected_stage2_batch(
                         training_module=training_module,
                         optimizer=optimizer,
@@ -1158,6 +1193,7 @@ def train_g_from_config(config: dict) -> dict:
                         grad_norm = torch.nn.utils.clip_grad_norm_(
                             unwrap_model(training_module).generator.parameters(),
                             config["grad_clip_norm"],
+                            error_if_nonfinite=True,
                         )
                         batch_grad_norm = float(grad_norm) if isinstance(grad_norm, float) else float(grad_norm.detach().cpu())
                     optimizer.step()
@@ -2010,6 +2046,34 @@ def _should_check_stage2_gate(stage_name: str, resume_progress: _ResumeProgress 
     return stage_name == "stage2" and not (resume_progress is not None and resume_progress.stage == "stage2")
 
 
+def _assert_required_resume_optimizer_state(
+    config: dict,
+    stages: dict,
+    resume_progress: _ResumeProgress | None,
+    resume_optimizer_state_dict: dict | None,
+    resume_path: str,
+) -> None:
+    if not config.get("resume_from") or resume_optimizer_state_dict is not None:
+        return
+    if resume_progress is None:
+        raise RuntimeError(f"resume_from checkpoint is missing stage progress, cannot decide optimizer_state_dict requirement: {resume_path}")
+    if not _stage2_training_uses_resume_checkpoint(stages, resume_progress):
+        return
+    raise RuntimeError(
+        "Stage 2 resume checkpoint is missing required optimizer_state_dict; "
+        f"refusing to silently restart AdamW state: {resume_path}"
+    )
+
+
+def _stage2_training_uses_resume_checkpoint(stages: dict, resume_progress: _ResumeProgress) -> bool:
+    epochs_by_stage = _resume_stage_epochs(stages)
+    if epochs_by_stage["stage2"] <= 0:
+        return False
+    if resume_progress.stage == "stage2":
+        return True
+    return _stage1_checkpoint_initializes_stage2_only(stages, resume_progress)
+
+
 def _resume_history_for_checkpoint_selection(history: list[dict], checkpoint_path: str, config: dict, stages: dict) -> list[dict]:
     if not isinstance(history, list):
         raise ValueError(f"resume_from checkpoint history must be a list: {checkpoint_path}")
@@ -2251,10 +2315,10 @@ def _run_projected_stage2_batch(
 ) -> tuple:
     import torch
 
-    if stage2_objective.type != "gram_projected_two_step":
-        raise RuntimeError("_run_projected_stage2_batch requires gram_projected_two_step")
+    if stage2_objective.type not in {_GRAM_PROJECTED_TWO_STEP, _POINT_PROJECTED_TWO_STEP}:
+        raise RuntimeError("_run_projected_stage2_batch requires a projected two-step objective")
     if stage2_objective.repr_learning_rate is None or stage2_objective.projection_eps is None:
-        raise RuntimeError("gram_projected_two_step requires repr_learning_rate and projection_eps")
+        raise RuntimeError("projected two-step objective requires repr_learning_rate and projection_eps")
     training_state = unwrap_model(training_module)
     params = _trainable_parameter_list(training_state.generator.parameters())
 
@@ -2272,7 +2336,11 @@ def _run_projected_stage2_batch(
     flow_loss.backward()
     batch_grad_norm = 0.0
     if grad_clip_norm is not None:
-        grad_norm = torch.nn.utils.clip_grad_norm_(training_state.generator.parameters(), grad_clip_norm)
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            training_state.generator.parameters(),
+            grad_clip_norm,
+            error_if_nonfinite=True,
+        )
         batch_grad_norm = float(grad_norm) if isinstance(grad_norm, float) else float(grad_norm.detach().cpu())
     optimizer.step()
 

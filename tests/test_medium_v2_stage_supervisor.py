@@ -112,10 +112,25 @@ def test_marker_and_ready_m2_constructs_m3_launch_command(tmp_path: Path) -> Non
 
     assert exit_code == 0
     launch = next(call for call in calls if call[:3] == ("tmux", "new-session", "-d"))
-    assert launch[4] == "train_g_medium_v2_stage2_m3_gram_projected_gpu3_6"
+    assert launch[4] == "train_g_medium_v2_stage2_m3_point_projected_gpu3_6"
     command_text = launch[5]
     assert "CUDA_VISIBLE_DEVICES=3,4,5,6" in command_text
-    assert "configs/medium_v2/train_g_medium_v2_stage2_m3_gram_projected.yaml" in command_text
+    assert "configs/medium_v2/train_g_medium_v2_stage2_m3_point_projected.yaml" in command_text
     assert "torch.distributed.run --standalone --nproc_per_node=4" in command_text
     status = json.loads(paths.status.read_text(encoding="utf-8"))
     assert status["state"] == "m3_started"
+
+
+def test_privacy_guard_pass_requires_explicit_formal_eval_flag() -> None:
+    module = _load_script()
+
+    metrics = {
+        "validation_raw_latent_cosine_mean": 0.99,
+        "validation_raw_single_face_eq1_rate": 1.0,
+    }
+
+    assert module.privacy_guard_pass(metrics) is False
+    metrics["privacy_guard_pass"] = True
+    assert module.privacy_guard_pass(metrics) is True
+    metrics["privacy_guard_pass"] = False
+    assert module.privacy_guard_pass(metrics) is False

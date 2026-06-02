@@ -243,15 +243,13 @@ def _generator_state_dict_for_eval(payload: dict, config: dict, checkpoint_path:
 
 
 def _eval_checkpoint_model_source(payload: dict, config: dict) -> str:
-    if "checkpoint_model" in config:
-        source = config["checkpoint_model"]
-        if source not in ("raw", "ema"):
-            raise ValueError(f"checkpoint_model must be 'raw' or 'ema', got {source!r}")
-        return str(source)
-    training_config = payload.get("training_config") if isinstance(payload, dict) else None
-    if isinstance(training_config, dict) and training_config.get("best_model") == "ema":
-        return "ema"
-    return "raw"
+    del payload
+    if "checkpoint_model" not in config:
+        raise ValueError("checkpoint_model is required for eval and must be 'raw' or 'ema'")
+    source = config["checkpoint_model"]
+    if source not in ("raw", "ema"):
+        raise ValueError(f"checkpoint_model must be 'raw' or 'ema', got {source!r}")
+    return str(source)
 
 
 def _feature_metadata_for_eval(dataset, generator, e0_checkpoint: dict, cache_path: str) -> dict:

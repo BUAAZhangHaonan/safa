@@ -40,9 +40,9 @@ DEFAULT_REQUIRED_EPOCHS = 120
 M2_NAME = "m2"
 M3_NAME = "m3"
 M2_RUN = Path("artifacts/checkpoints/g_medium_v2_stage2_m2_gram_weighted")
-M3_RUN = Path("artifacts/checkpoints/g_medium_v2_stage2_m3_gram_projected")
+M3_RUN = Path("artifacts/checkpoints/g_medium_v2_stage2_m3_point_projected")
 M2_DOC = "MEDIUM_V2_STAGE2_M2_GRAM_WEIGHTED_DRAFT.md"
-M3_DOC = "MEDIUM_V2_STAGE2_M3_GRAM_PROJECTED_DRAFT.md"
+M3_DOC = "MEDIUM_V2_STAGE2_M3_POINT_PROJECTED_DRAFT.md"
 COMPARISON_DOC = "MEDIUM_V2_M0_M2_M3_COMPARISON_DRAFT.md"
 
 
@@ -62,8 +62,8 @@ class StageSupervisorPaths(NamedTuple):
     m2_best_checkpoint: Path = M2_RUN / "best_raw_utility.pt"
     m3_metrics: Path = M3_RUN / "last_metrics.json"
     m3_history: Path = M3_RUN / "history.json"
-    m3_quality_dir: Path = Path("artifacts/eval/g_medium_v2_stage2_m3_gram_projected/quality")
-    m3_train_log: Path = Path("artifacts/logs/train_g_medium_v2_stage2_m3_gram_projected_gpu3_6.log")
+    m3_quality_dir: Path = Path("artifacts/eval/g_medium_v2_stage2_m3_point_projected/quality")
+    m3_train_log: Path = Path("artifacts/logs/train_g_medium_v2_stage2_m3_point_projected_gpu3_6.log")
     m3_last_checkpoint: Path = M3_RUN / "last.pt"
     m3_best_checkpoint: Path = M3_RUN / "best_raw_utility.pt"
     privacy_skip_json: Path = DEFAULT_REPORT_DIR / "medium_v2_m3_privacy_skipped.json"
@@ -71,10 +71,10 @@ class StageSupervisorPaths(NamedTuple):
 
 class StageSupervisorConfig(NamedTuple):
     m2_session: str = "train_g_medium_v2_stage2_m2_gram_weighted_gpu3_6"
-    m3_session: str = "train_g_medium_v2_stage2_m3_gram_projected_gpu3_6"
+    m3_session: str = "train_g_medium_v2_stage2_m3_point_projected_gpu3_6"
     m2_process_pattern: str = "safa.cli.train_g --config configs/medium_v2/train_g_medium_v2_stage2_m2_gram_weighted.yaml"
-    m3_process_pattern: str = "safa.cli.train_g --config configs/medium_v2/train_g_medium_v2_stage2_m3_gram_projected.yaml"
-    m3_config: str = "configs/medium_v2/train_g_medium_v2_stage2_m3_gram_projected.yaml"
+    m3_process_pattern: str = "safa.cli.train_g --config configs/medium_v2/train_g_medium_v2_stage2_m3_point_projected.yaml"
+    m3_config: str = "configs/medium_v2/train_g_medium_v2_stage2_m3_point_projected.yaml"
     gpu_visible_devices: str = DEFAULT_GPUS
     python_bin: str = DEFAULT_PYTHON
     required_epochs: int = DEFAULT_REQUIRED_EPOCHS
@@ -388,13 +388,12 @@ def maybe_start_m3(
 
 
 def privacy_guard_pass(metrics: dict[str, Any]) -> bool:
-    value = metrics.get("privacy_guard_pass")
-    if isinstance(value, bool):
-        return value
-    validation = summarize_metrics(metrics).get("validation", {})
-    cosine = validation.get("cosine")
-    single_face = validation.get("single_face")
-    return isinstance(cosine, float) and cosine >= 0.95 and isinstance(single_face, float) and single_face >= 1.0
+    if "privacy_guard_pass" not in metrics:
+        return False
+    value = metrics["privacy_guard_pass"]
+    if not isinstance(value, bool):
+        raise ValueError("privacy_guard_pass must be true or false when present")
+    return value
 
 
 def write_privacy_skip_if_needed(paths: StageSupervisorPaths, m3_status: dict[str, Any], now: str) -> list[dict[str, Any]]:

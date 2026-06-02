@@ -163,6 +163,30 @@ class MediumV1GSupportTests(unittest.TestCase):
 
         calibrate.assert_not_called()
 
+    def test_stage2_resume_requires_optimizer_state_without_silent_override(self) -> None:
+        from safa.training import g_loop
+
+        stages = {"stage1": {"epochs": 0}, "stage2": {"epochs": 120}}
+        with self.assertRaisesRegex(RuntimeError, "optimizer_state_dict"):
+            g_loop._assert_required_resume_optimizer_state(
+                {"resume_from": "stage2.pt"},
+                stages,
+                g_loop._ResumeProgress(stage="stage2", stage_epoch=12),
+                None,
+                "stage2.pt",
+            )
+        with self.assertRaisesRegex(RuntimeError, "optimizer_state_dict"):
+            g_loop._assert_required_resume_optimizer_state(
+                {"resume_from": "stage1.pt"},
+                stages,
+                g_loop._ResumeProgress(stage="stage1", stage_epoch=199),
+                None,
+                "stage1.pt",
+            )
+        g_loop._assert_required_resume_optimizer_state(
+            {"resume_from": "stage2.pt"}, stages, g_loop._ResumeProgress(stage="stage2", stage_epoch=12), {"state": []}, "stage2.pt"
+        )
+
     def test_quality_eval_hook_generates_epoch_images_instead_of_reusing_generated_dir(self) -> None:
         from safa.training import g_loop
 

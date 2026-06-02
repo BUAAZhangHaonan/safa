@@ -29,6 +29,13 @@ def test_medium_v2_stage2_configs_use_explicit_paths_batches_and_objectives() ->
             "gradient_monitor": {"enabled": True, "interval": 20, "max_samples": 8},
             "flow_condition": "embedding",
         },
+        "train_g_medium_v2_stage2_m3_point_projected.yaml": {
+            "objective": "point_projected_two_step",
+            "global_batch_size": 96,
+            "epochs": 120,
+            "gradient_monitor": {"enabled": True, "interval": 20, "max_samples": 8},
+            "flow_condition": "embedding",
+        },
         "train_g_medium_v2_stage2_fm_only_probe.yaml": {
             "objective": "fm_only_probe",
             "global_batch_size": 24,
@@ -87,6 +94,12 @@ def test_medium_v2_stage2_configs_use_explicit_paths_batches_and_objectives() ->
             assert objective["flow_condition"] == expected_config["flow_condition"]
         else:
             assert "flow_condition" not in objective
+        if expected_config["objective"] == "point_projected_two_step":
+            assert "relation_weight" not in objective
+            assert "offdiag_only" not in objective
+            assert objective["point_weight"] == 1.0
+            assert objective["repr_learning_rate"] > 0.0
+            assert "grad_clip_norm" not in config
 
         g_loop._validate_train_g_config(config)
 
@@ -390,6 +403,46 @@ def test_stage2_objective_accepts_only_named_repr_weight_modes() -> None:
         )
 
 
+def test_point_projected_objective_requires_point_only_contract() -> None:
+    from safa.training import g_loop
+
+    objective = g_loop._stage2_objective_from_config(
+        {
+            "stage1": {"epochs": 0},
+            "stage2": {
+                "epochs": 1,
+                "stage2_objective": {
+                    "type": "point_projected_two_step",
+                    "flow_condition": "embedding",
+                    "lambda_repr": 1.0,
+                    "point_weight": 1.0,
+                    "repr_learning_rate": 0.00003,
+                    "projection_eps": 1e-12,
+                },
+            },
+        }
+    )
+
+    assert objective.type == "point_projected_two_step"
+    assert objective.relation_weight == 0.0
+    assert objective.offdiag_only is False
+
+    for forbidden in ("relation_weight", "offdiag_only"):
+        payload = {
+            "type": "point_projected_two_step",
+            "flow_condition": "embedding",
+            "lambda_repr": 1.0,
+            "point_weight": 1.0,
+            "repr_learning_rate": 0.00003,
+            "projection_eps": 1e-12,
+            forbidden: 0.0,
+        }
+        with pytest.raises(ValueError, match=forbidden):
+            g_loop._stage2_objective_from_config(
+                {"stage1": {"epochs": 0}, "stage2": {"epochs": 1, "stage2_objective": payload}}
+            )
+
+
 def test_generator_training_step_gram_repr_only_probe_does_not_compute_flow_loss(monkeypatch) -> None:
     from torch import nn
 
@@ -449,6 +502,70 @@ def test_generator_training_step_gram_repr_only_probe_does_not_compute_flow_loss
     assert module.last_loss_metrics["flow_loss_raw"] == 0.0
     assert module.last_loss_metrics["effective_flow_loss_weight"] == 0.0
     assert module.last_loss_metrics["effective_repr_loss_weight"] == 1.0
+
+
+def test_generator_training_step_point_projected_uses_point_loss_without_gram(monkeypatch) -> None:
+    from torch import nn
+
+    from safa.models.generator import FlowGeneratorConfig
+    from safa.training import g_loop
+
+    class DummyGenerator(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(0.25))
+
+        def flow_matching_loss(self, images, z):
+            loss = self.weight.square() + images.sum() * 0.0 + z.sum() * 0.0
+            return loss, {"flow_matching_mse": loss.detach()}
+
+        def sample(self, z, **kwargs):
+            pad = torch.zeros(z.shape[0], 1, device=z.device, dtype=z.dtype)
+            image = torch.cat([z, pad], dim=1).reshape(z.shape[0], 3, 1, 1)
+            return image.expand(z.shape[0], 3, 4, 4)
+
+    class DummyE0(nn.Module):
+        def forward(self, images):
+            return {"embedding": torch.nn.functional.normalize(images[:, :2, 0, 0], dim=1)}
+
+    def forbidden_gram_loss(*args, **kwargs):
+        raise AssertionError("point-projected objective must not compute Gram loss")
+
+    def fake_point_loss(pred_embedding, target_embedding, point_weight):
+        del pred_embedding, target_embedding, point_weight
+        base = torch.tensor(1.5)
+        return {"repr": base, "point": base, "relation": base.new_tensor(0.0)}
+
+    monkeypatch.setattr(g_loop, "hyperspherical_gram_loss", forbidden_gram_loss)
+    monkeypatch.setattr(g_loop, "hyperspherical_point_cosine_loss", fake_point_loss, raising=False)
+    objective = g_loop._stage2_objective_from_config(
+        {
+            "stage1": {"epochs": 0},
+            "stage2": {
+                "epochs": 1,
+                "stage2_objective": {
+                    "type": "point_projected_two_step",
+                    "flow_condition": "embedding",
+                    "lambda_repr": 1.0,
+                    "point_weight": 1.0,
+                    "repr_learning_rate": 0.00003,
+                    "projection_eps": 1e-12,
+                },
+            },
+        }
+    )
+    module = g_loop._GeneratorTrainingStep(
+        DummyGenerator(), DummyE0(), FlowGeneratorConfig(embedding_dim=2, image_size=4), 1337, stage2_objective=objective
+    )
+
+    loss, _, repr_loss, flow_loss, raw_repr_loss = module(torch.zeros(2, 3, 4, 4), torch.eye(2), ["a", "b"], True, 0.0)
+
+    assert torch.allclose(repr_loss, torch.tensor(1.5))
+    assert torch.allclose(raw_repr_loss, torch.tensor(1.5))
+    assert torch.allclose(loss.detach(), repr_loss.detach())
+    assert torch.allclose(flow_loss.detach(), torch.tensor(0.25).square())
+    assert module.last_loss_metrics["stage2_objective_type"] == "point_projected_two_step"
+    assert module.last_loss_metrics["repr_relation_loss"] == 0.0
 
 
 def test_generator_training_step_prefers_spec_repr_metric_fields(monkeypatch) -> None:
@@ -521,3 +638,10 @@ def test_projected_repr_manual_step_uses_param_data_add_not_optimizer_step() -> 
     assert ".data.add_" in source
     assert "optimizer.step" not in source
     assert "AdamW" not in source
+
+
+def test_projected_stage2_fm_clip_fails_fast_on_nonfinite_gradients() -> None:
+    from safa.training.g_loop import _run_projected_stage2_batch
+
+    source = inspect.getsource(_run_projected_stage2_batch)
+    assert "error_if_nonfinite=True" in source

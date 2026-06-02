@@ -415,7 +415,13 @@ class EvalContractTests(unittest.TestCase):
 
             with patch("safa.evaluation.runner.build_generator", side_effect=AssertionError("must not build without ema state")):
                 with self.assertRaisesRegex(ValueError, "ema_model_state_dict"):
-                    _load_generator(str(path), {}, "cpu")
+                    _load_generator(str(path), {"checkpoint_model": "ema"}, "cpu")
+
+    def test_eval_checkpoint_model_source_requires_explicit_config(self) -> None:
+        from safa.evaluation import runner
+
+        with self.assertRaisesRegex(ValueError, "checkpoint_model.*required"):
+            runner._eval_checkpoint_model_source({"training_config": {"best_model": "ema"}}, {})
 
     def test_eval_feature_metadata_uses_cache_dim_and_checks_model_dims(self) -> None:
         from safa.evaluation.runner import _feature_metadata_for_eval

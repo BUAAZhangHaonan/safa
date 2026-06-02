@@ -329,7 +329,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--only', choices=('m2', 'm3'), help='plot only one stage and do not require the other stage inputs')
     parser.add_argument('--m0-run', type=Path, default=Path('artifacts/checkpoints/g_medium_v1_stage2_m0'))
     parser.add_argument('--m2-run', type=Path, default=Path('artifacts/checkpoints/g_medium_v2_stage2_m2_gram_weighted'))
-    parser.add_argument('--m3-run', type=Path, default=Path('artifacts/checkpoints/g_medium_v2_stage2_m3_gram_projected'))
+    parser.add_argument('--m3-run', type=Path, default=Path('artifacts/checkpoints/g_medium_v2_stage2_m3_point_projected'))
     parser.add_argument('--m0-history-json', type=Path)
     parser.add_argument('--m2-history-json', type=Path)
     parser.add_argument('--m3-history-json', type=Path)

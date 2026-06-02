@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import math
 
 import pytest
@@ -68,6 +69,35 @@ def test_hyperspherical_gram_loss_can_include_diagonal_in_relation_loss() -> Non
     assert torch.allclose(offdiag["relation"], _manual_relation_loss(pred, target, True))
     assert torch.allclose(full["relation"], _manual_relation_loss(pred, target, False))
     assert full["relation"] < offdiag["relation"]
+
+
+def test_point_cosine_loss_allows_singleton_batch_and_does_not_compute_gram() -> None:
+    from safa.training import representation_losses
+
+    pred = torch.tensor([[1.0, 0.0]], dtype=torch.float64)
+    target = torch.tensor([[0.0, 1.0]], dtype=torch.float64)
+
+    losses = representation_losses.hyperspherical_point_cosine_loss(pred, target, point_weight=2.0)
+
+    assert torch.allclose(losses["point"], torch.tensor(1.0, dtype=torch.float64))
+    assert torch.allclose(losses["relation"], torch.tensor(0.0, dtype=torch.float64))
+    assert torch.allclose(losses["repr"], torch.tensor(2.0, dtype=torch.float64))
+    source = inspect.getsource(representation_losses.hyperspherical_point_cosine_loss)
+    forbidden_tokens = ("@", "matmul", "mm(", "bmm(", "gram")
+    assert not any(token in source.lower() for token in forbidden_tokens)
+
+
+def test_point_cosine_loss_rejects_invalid_inputs() -> None:
+    from safa.training.representation_losses import hyperspherical_point_cosine_loss
+
+    with pytest.raises((ValueError, FloatingPointError), match="unit-norm"):
+        hyperspherical_point_cosine_loss(torch.tensor([[2.0, 0.0]]), torch.tensor([[1.0, 0.0]]), point_weight=1.0)
+    with pytest.raises(FloatingPointError, match="finite"):
+        hyperspherical_point_cosine_loss(torch.tensor([[float("nan"), 0.0]]), torch.tensor([[1.0, 0.0]]), point_weight=1.0)
+    with pytest.raises(FloatingPointError, match="point_weight"):
+        hyperspherical_point_cosine_loss(
+            torch.tensor([[1.0, 0.0]]), torch.tensor([[1.0, 0.0]]), point_weight=float("inf")
+        )
 
 
 @pytest.mark.parametrize(
