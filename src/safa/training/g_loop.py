@@ -2249,6 +2249,20 @@ def _trainable_parameter_list(parameters) -> list:
     return params
 
 
+def _assert_finite_parameter_gradients(name: str, parameters: list) -> None:
+    import torch
+
+    has_gradient = False
+    for index, param in enumerate(parameters):
+        if param.grad is None:
+            continue
+        has_gradient = True
+        if not torch.isfinite(param.grad.detach()).all():
+            raise RuntimeError(f"{name} gradient {index} contains non-finite values")
+    if not has_gradient:
+        raise RuntimeError(f"{name} backward produced no parameter gradients")
+
+
 def _synced_gradients_from_parameters(name: str, parameters: list) -> list:
     import torch
 
@@ -2334,6 +2348,7 @@ def _run_projected_stage2_batch(
         )
     _assert_finite_training_scalars(flow_loss, flow_mse, flow_loss_raw)
     flow_loss.backward()
+    _assert_finite_parameter_gradients("M3 flow matching", params)
     batch_grad_norm = 0.0
     if grad_clip_norm is not None:
         grad_norm = torch.nn.utils.clip_grad_norm_(

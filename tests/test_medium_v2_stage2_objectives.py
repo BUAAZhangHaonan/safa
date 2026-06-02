@@ -645,3 +645,89 @@ def test_projected_stage2_fm_clip_fails_fast_on_nonfinite_gradients() -> None:
 
     source = inspect.getsource(_run_projected_stage2_batch)
     assert "error_if_nonfinite=True" in source
+
+
+def test_projected_stage2_rejects_nonfinite_fm_gradients_without_clip_before_optimizer_step() -> None:
+    from contextlib import nullcontext
+    from torch import nn
+
+    from safa.training import g_loop
+
+    class FiniteLossWithNonfiniteGrad(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, value):
+            ctx.save_for_backward(value)
+            return value.new_tensor(1.0)
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            (value,) = ctx.saved_tensors
+            return torch.full_like(value, float("inf")) * grad_output
+
+    class DummyGenerator(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(1.0))
+
+    class DummyTrainingModule(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.generator = DummyGenerator()
+            self.last_loss_metrics = {"flow_loss_raw": 1.0}
+
+        def forward(self, images, z, sample_ids, include_repr, lambda_cycle, flow_condition):
+            del images, z, sample_ids, include_repr, lambda_cycle, flow_condition
+            loss = FiniteLossWithNonfiniteGrad.apply(self.generator.weight)
+            finite = loss.detach()
+            return loss, finite, finite, finite, finite
+
+    class OptimizerMustNotStep:
+        def __init__(self, parameters) -> None:
+            self.parameters = list(parameters)
+            self.step_calls = 0
+
+        def zero_grad(self, set_to_none=True):
+            for parameter in self.parameters:
+                if set_to_none:
+                    parameter.grad = None
+                elif parameter.grad is not None:
+                    parameter.grad.zero_()
+
+        def step(self):
+            self.step_calls += 1
+            raise AssertionError("optimizer.step must not run after non-finite gradients")
+
+    objective = g_loop._stage2_objective_from_config(
+        {
+            "stage1": {"epochs": 0},
+            "stage2": {
+                "epochs": 1,
+                "stage2_objective": {
+                    "type": "point_projected_two_step",
+                    "flow_condition": "embedding",
+                    "lambda_repr": 1.0,
+                    "point_weight": 1.0,
+                    "repr_learning_rate": 0.00003,
+                    "projection_eps": 1e-12,
+                },
+            },
+        }
+    )
+    module = DummyTrainingModule()
+    optimizer = OptimizerMustNotStep(module.generator.parameters())
+
+    with pytest.raises(RuntimeError, match="M3 flow matching gradient 0 contains non-finite values"):
+        g_loop._run_projected_stage2_batch(
+            training_module=module,
+            optimizer=optimizer,
+            images=torch.zeros(1, 3, 4, 4),
+            z=torch.zeros(1, 2),
+            sample_ids=["sample"],
+            lambda_cycle=0.0,
+            amp_ctx=nullcontext(),
+            grad_clip_norm=None,
+            ema=None,
+            stage2_objective=objective,
+            flow_condition="embedding",
+        )
+    assert optimizer.step_calls == 0
