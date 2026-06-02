@@ -404,17 +404,44 @@ def test_completed_epoch_numbers_caps_checkpoint_history_to_metrics_epoch(tmp_pa
     assert module.completed_epoch_numbers(paths) == list(range(1, 13))
 
 
-def test_gpu_guard_rejects_disallowed_visible_devices_and_busy_gpu0() -> None:
+def test_gpu_guard_rejects_gpu1_without_explicit_watcher_override(monkeypatch: pytest.MonkeyPatch) -> None:
     module = _load_script()
+    monkeypatch.delenv("SAFA_ALLOW_GPU1_WATCHER", raising=False)
 
-    with pytest.raises(RuntimeError, match="GPU1"):
+    with pytest.raises(RuntimeError, match="SAFA_ALLOW_GPU1_WATCHER=1"):
         module.validate_cuda_visible_devices("1")
-    with pytest.raises(RuntimeError, match="GPU1"):
+    with pytest.raises(RuntimeError, match="SAFA_ALLOW_GPU1_WATCHER=1"):
         module.validate_cuda_visible_devices("0,1")
+
+
+def test_gpu_guard_allows_gpu1_with_explicit_watcher_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_script()
+    monkeypatch.setenv("SAFA_ALLOW_GPU1_WATCHER", "1")
+
+    module.validate_cuda_visible_devices("1")
+    module.validate_cuda_visible_devices("0,1")
+
+
+def test_gpu_guard_keeps_other_visible_device_rules(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_script()
+    monkeypatch.delenv("SAFA_ALLOW_GPU1_WATCHER", raising=False)
+
+    module.validate_cuda_visible_devices(None)
+    module.validate_cuda_visible_devices("")
+    module.validate_cuda_visible_devices("0")
+    module.validate_cuda_visible_devices("2")
     with pytest.raises(RuntimeError, match="GPU3-6"):
         module.validate_cuda_visible_devices("3")
     with pytest.raises(RuntimeError, match="GPU3-6"):
         module.validate_cuda_visible_devices("0,3")
+
+    monkeypatch.setenv("SAFA_ALLOW_GPU1_WATCHER", "1")
+    with pytest.raises(RuntimeError, match="GPU3-6"):
+        module.validate_cuda_visible_devices("1,3")
+
+
+def test_gpu_guard_rejects_busy_gpu0() -> None:
+    module = _load_script()
 
     busy = "0, 99, 2048, 24576\n1, 0, 0, 24576\n"
     with pytest.raises(RuntimeError, match="GPU0 is busy"):
@@ -442,6 +469,23 @@ def test_build_tmux_command_pins_gpu0_and_never_mentions_gpu3_6() -> None:
     assert "--run-name checkpoint_visuals" in joined
     for forbidden in ("CUDA_VISIBLE_DEVICES=3", "CUDA_VISIBLE_DEVICES=4", "CUDA_VISIBLE_DEVICES=5", "CUDA_VISIBLE_DEVICES=6"):
         assert forbidden not in joined
+
+
+def test_build_tmux_command_propagates_gpu1_watcher_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_script()
+    monkeypatch.setenv("SAFA_ALLOW_GPU1_WATCHER", "1")
+
+    command = module.build_tmux_command(
+        session_name="watch_medium_v2_m3_checkpoint_visuals",
+        python_exe="/env/bin/python",
+        script="scripts/watch_medium_v2_checkpoint_visuals.py",
+        interval=60,
+        device="cuda:0",
+        cuda_visible_devices="1",
+    )
+    joined = " ".join(command)
+
+    assert "SAFA_ALLOW_GPU1_WATCHER=1 CUDA_VISIBLE_DEVICES=1 PYTHONPATH=src" in joined
 
 
 def test_draw_checkpoint_pair_grid_writes_image(tmp_path: Path) -> None:

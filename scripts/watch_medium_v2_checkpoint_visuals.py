@@ -35,6 +35,8 @@ DEFAULT_EVENTS = DEFAULT_OUT_DIR / "checkpoint_visuals_events.jsonl"
 DEFAULT_LOG = DEFAULT_OUT_DIR / "checkpoint_visuals.log"
 DEFAULT_STATE = DEFAULT_OUT_DIR / "checkpoint_visuals_state.json"
 DEFAULT_PYTHON = "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python"
+GPU1_WATCHER_OVERRIDE_ENV = "SAFA_ALLOW_GPU1_WATCHER"
+GPU1_WATCHER_OVERRIDE_VALUE = "1"
 
 IMAGE_SIZE = 132
 TILE_WIDTH = 360
@@ -250,25 +252,36 @@ def write_manifest(path: Path, manifest: dict[str, Any]) -> None:
     write_json_atomic(path, manifest)
 
 
-def validate_cuda_visible_devices(value: str | None) -> None:
+def _cuda_visible_device_indices(value: str | None) -> set[int]:
     if value is None or value == "":
-        return
-    blocked_reserved = False
-    blocked_training = False
+        return set()
+    indices: set[int] = set()
     for raw in value.split(","):
         raw = raw.strip()
         if not raw:
             continue
         try:
-            index = int(raw)
+            indices.add(int(raw))
         except ValueError:
             continue
-        if index == 1:
-            blocked_training = True
-        if index in {3, 4, 5, 6}:
-            blocked_reserved = True
-    if blocked_training:
-        raise RuntimeError(f"CUDA_VISIBLE_DEVICES includes GPU1, which is reserved for Stage1 training: {value}")
+    return indices
+
+
+def _gpu1_watcher_override_enabled() -> bool:
+    return os.environ.get(GPU1_WATCHER_OVERRIDE_ENV) == GPU1_WATCHER_OVERRIDE_VALUE
+
+
+def validate_cuda_visible_devices(value: str | None) -> None:
+    if value is None or value == "":
+        return
+    indices = _cuda_visible_device_indices(value)
+    blocked_gpu1 = 1 in indices and not _gpu1_watcher_override_enabled()
+    blocked_reserved = bool(indices & {3, 4, 5, 6})
+    if blocked_gpu1:
+        raise RuntimeError(
+            "CUDA_VISIBLE_DEVICES includes GPU1. Checkpoint watchers may use GPU1 only after an explicit "
+            f"override; set {GPU1_WATCHER_OVERRIDE_ENV}={GPU1_WATCHER_OVERRIDE_VALUE} to allow it: {value}"
+        )
     if blocked_reserved:
         raise RuntimeError(f"CUDA_VISIBLE_DEVICES includes GPU3-6, which are reserved for M2: {value}")
 
@@ -818,9 +831,12 @@ def build_tmux_command(
     extra = ""
     if backfill_every is not None:
         extra = f" --backfill-every {int(backfill_every)}"
+    env_parts = [f"CUDA_VISIBLE_DEVICES={shlex.quote(cuda_visible_devices)}", "PYTHONPATH=src"]
+    if 1 in _cuda_visible_device_indices(cuda_visible_devices):
+        env_parts.insert(0, f"{GPU1_WATCHER_OVERRIDE_ENV}={GPU1_WATCHER_OVERRIDE_VALUE}")
     script_command = (
         f"cd {shlex.quote(str(REPO_ROOT))} && "
-        f"CUDA_VISIBLE_DEVICES={shlex.quote(cuda_visible_devices)} PYTHONPATH=src "
+        f"{' '.join(env_parts)} "
         f"{shlex.quote(python_exe)} {shlex.quote(script)} "
         f"--interval {int(interval)} --device {shlex.quote(device)} "
         f"--checkpoint-dir {shlex.quote(str(checkpoint_dir))} "
