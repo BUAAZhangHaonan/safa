@@ -33,12 +33,14 @@ class StageGateTests(unittest.TestCase):
             "stages": {
                 "stage1": {
                     "epochs": 1,
+                    "flow_condition": "embedding",
                     "require_face_detection_gate": True,
                     "face_detection_threshold": 0.95,
                     "stable_epochs": 1,
                 },
                 "stage2": {
                     "epochs": 1,
+                    "flow_condition": "embedding",
                     "lambda_initial": 0.005,
                     "lambda_max": 0.01,
                     "lambda_growth": 0.005,
@@ -915,6 +917,22 @@ class StageGateTests(unittest.TestCase):
 
         self.assertFalse(_is_better(current, [previous], best_model="ema"))
         self.assertTrue(_is_better(current, [previous], best_model="raw"))
+
+    def test_attach_validation_metrics_adds_raw_ema_and_legacy_relation_prefixes(self) -> None:
+        from safa.training.g_loop import _attach_validation_metrics
+
+        metrics = {"stage": "stage2"}
+        raw_metrics = {"repr_point_loss": 0.10, "pairwise_pearson": 0.20}
+        ema_metrics = {"repr_point_loss": 0.30, "pairwise_pearson": 0.40}
+
+        _attach_validation_metrics(metrics, raw_metrics, ema_metrics)
+
+        self.assertEqual(metrics["validation_raw_repr_point_loss"], 0.10)
+        self.assertEqual(metrics["validation_raw_pairwise_pearson"], 0.20)
+        self.assertEqual(metrics["validation_repr_point_loss"], 0.10)
+        self.assertEqual(metrics["validation_pairwise_pearson"], 0.20)
+        self.assertEqual(metrics["validation_ema_repr_point_loss"], 0.30)
+        self.assertEqual(metrics["validation_ema_pairwise_pearson"], 0.40)
 
     def test_stage1_single_face_checkpoint_prefers_zero_multi_face_over_composite(self) -> None:
         from safa.training.g_loop import _is_better_single_face_stage1

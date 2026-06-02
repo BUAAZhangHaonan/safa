@@ -667,14 +667,31 @@ class EvalContractTests(unittest.TestCase):
                 return torch.zeros(z.shape[0], 3, 4, 4, device=z.device, dtype=z.dtype)
 
         class DummyE0(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.generated_embeddings = [
+                    torch.tensor([[1.0, 0.0, 0.0]]),
+                    torch.tensor([[1.0, 0.0, 0.0]]),
+                    torch.tensor([[0.0, 1.0, 0.0]]),
+                ]
+                self.calls = 0
+
             def forward(self, images):
                 batch = images.shape[0]
-                return {"embedding": torch.ones(batch, 2, device=images.device), "logits": torch.zeros(batch, 2, device=images.device)}
+                generated_call = self.calls % 2 == 1
+                self.calls += 1
+                if generated_call:
+                    embedding = self.generated_embeddings.pop(0).to(images.device)
+                else:
+                    embedding = torch.zeros(batch, 3, device=images.device)
+                    embedding[:, 0] = 1.0
+                return {"embedding": embedding, "logits": torch.zeros(batch, 2, device=images.device)}
 
         generator = DummyGenerator()
         loader = [
-            {"image": torch.zeros(1, 3, 4, 4), "z": torch.ones(1, 2), "sample_id": ["same-sample"]},
-            {"image": torch.zeros(1, 3, 4, 4), "z": torch.ones(1, 2), "sample_id": ["same-sample"]},
+            {"image": torch.zeros(1, 3, 4, 4), "z": torch.tensor([[1.0, 0.0, 0.0]]), "sample_id": ["same-sample"]},
+            {"image": torch.zeros(1, 3, 4, 4), "z": torch.tensor([[1.0, 0.0, 0.0]]), "sample_id": ["same-sample"]},
+            {"image": torch.zeros(1, 3, 4, 4), "z": torch.tensor([[0.0, 1.0, 0.0]]), "sample_id": ["different-sample"]},
         ]
 
         _evaluate_validation(
@@ -683,11 +700,11 @@ class EvalContractTests(unittest.TestCase):
             loader,
             detector=None,
             device=torch.device("cpu"),
-            generator_config=FlowGeneratorConfig(embedding_dim=2, image_size=4, sample_steps=1),
+            generator_config=FlowGeneratorConfig(embedding_dim=3, image_size=4, sample_steps=1),
             sampling_seed=1337,
         )
 
-        self.assertEqual(len(generator.x_inits), 2)
+        self.assertEqual(len(generator.x_inits), 3)
         self.assertTrue(torch.equal(generator.x_inits[0], generator.x_inits[1]))
 
     @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for validation metric tests")
@@ -702,37 +719,103 @@ class EvalContractTests(unittest.TestCase):
                 return torch.zeros(z.shape[0], 3, 4, 4, device=z.device, dtype=z.dtype)
 
         class DummyE0(torch.nn.Module):
+            def __init__(self, generated_embeddings):
+                super().__init__()
+                self.generated_embeddings = generated_embeddings
+                self.calls = 0
+
             def forward(self, images):
                 batch = images.shape[0]
-                return {"embedding": torch.ones(batch, 2, device=images.device), "logits": torch.zeros(batch, 2, device=images.device)}
+                generated_call = self.calls % 2 == 1
+                self.calls += 1
+                if generated_call:
+                    embedding = self.generated_embeddings.to(images.device)
+                else:
+                    embedding = torch.zeros(batch, self.generated_embeddings.shape[1], device=images.device)
+                    embedding[:, 0] = 1.0
+                return {"embedding": embedding, "logits": torch.zeros(batch, 2, device=images.device)}
 
         class DummyDetector:
             def detect_counts(self, images):
                 return [0, 1, 2]
 
+        z = torch.tensor(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [2.0**-0.5, 2.0**-0.5, 0.0],
+            ]
+        )
         loader = [
             {
                 "image": torch.zeros(3, 3, 4, 4),
-                "z": torch.ones(3, 2),
+                "z": z,
                 "sample_id": ["zero", "single", "multi"],
             }
         ]
 
         metrics = _evaluate_validation(
             DummyGenerator(),
-            DummyE0(),
+            DummyE0(z),
             loader,
             detector=DummyDetector(),
             device=torch.device("cpu"),
-            generator_config=FlowGeneratorConfig(embedding_dim=2, image_size=4, sample_steps=1),
+            generator_config=FlowGeneratorConfig(embedding_dim=3, image_size=4, sample_steps=1),
             sampling_seed=1337,
         )
 
+        self.assertAlmostEqual(metrics["repr_point_loss"], 0.0)
+        self.assertAlmostEqual(metrics["repr_relation_loss"], 0.0)
+        self.assertAlmostEqual(metrics["offdiag_gram_mse"], 0.0)
+        self.assertAlmostEqual(metrics["offdiag_gram_mae"], 0.0)
+        self.assertAlmostEqual(metrics["pairwise_pearson"], 1.0)
+        self.assertAlmostEqual(metrics["pairwise_spearman"], 1.0)
         self.assertAlmostEqual(metrics["face_detect_ge1_rate"], 2.0 / 3.0)
         self.assertAlmostEqual(metrics["single_face_eq1_rate"], 1.0 / 3.0)
         self.assertAlmostEqual(metrics["zero_face_rate"], 1.0 / 3.0)
         self.assertAlmostEqual(metrics["multi_face_rate"], 1.0 / 3.0)
         self.assertAlmostEqual(metrics["face_detection_rate"], metrics["face_detect_ge1_rate"])
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for validation metric tests")
+    def test_validation_relation_metrics_fail_fast_above_dense_gram_cap(self) -> None:
+        import torch
+
+        from safa.evaluation.metrics import DEFAULT_DENSE_GRAM_MAX_SAMPLES
+        from safa.models.generator import FlowGeneratorConfig
+        from safa.training.g_loop import _evaluate_validation
+
+        class DummyGenerator(torch.nn.Module):
+            def sample(self, z, **kwargs):
+                return torch.zeros(z.shape[0], 3, 4, 4, device=z.device, dtype=z.dtype)
+
+        class DummyE0(torch.nn.Module):
+            def forward(self, images):
+                embedding = torch.zeros(images.shape[0], 2, device=images.device)
+                embedding[:, 0] = 1.0
+                return {"embedding": embedding, "logits": torch.zeros(images.shape[0], 2, device=images.device)}
+
+        sample_count = DEFAULT_DENSE_GRAM_MAX_SAMPLES + 1
+        z = torch.zeros(sample_count, 2)
+        z[:, 0] = 1.0
+        loader = [
+            {
+                "image": torch.zeros(sample_count, 3, 4, 4),
+                "z": z,
+                "sample_id": [f"sample-{index}" for index in range(sample_count)],
+            }
+        ]
+
+        with patch("safa.training.g_loop.compute_validation_relation_metrics", side_effect=AssertionError("dense Gram should not run")):
+            with self.assertRaisesRegex(ValueError, "dense Gram cap.*2048"):
+                _evaluate_validation(
+                    DummyGenerator(),
+                    DummyE0(),
+                    loader,
+                    detector=None,
+                    device=torch.device("cpu"),
+                    generator_config=FlowGeneratorConfig(embedding_dim=2, image_size=4, sample_steps=1),
+                    sampling_seed=1337,
+                )
 
     @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for privacy cache tests")
     def test_privacy_pass_uses_cached_generated_images(self) -> None:

@@ -9,7 +9,12 @@ import subprocess
 import sys
 from contextlib import nullcontext
 from safa.data.feature_dataset import FeatureAlignedAffectNet
-from safa.evaluation.metrics import face_count_rates
+from safa.evaluation.metrics import (
+    DEFAULT_DENSE_GRAM_MAX_SAMPLES,
+    compute_validation_relation_metrics,
+    face_count_rates,
+    validate_dense_gram_sample_count,
+)
 from safa.evaluation.recognizers import InsightFaceDetector
 from safa.models.e0 import assert_e0_frozen, freeze_e0, load_e0_checkpoint
 from safa.models.generator import FlowGeneratorConfig, build_generator
@@ -2944,6 +2949,8 @@ def _evaluate_validation(generator, e0, loader, detector, device, generator_conf
     detected_counts = []
     latent_cosine_sum = 0.0
     source_preserved_sum = 0.0
+    target_embedding_chunks = []
+    generated_embedding_chunks = []
     amp_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if use_amp else nullcontext()
     with torch.no_grad(), amp_ctx:
         for batch in loader:
@@ -2955,9 +2962,12 @@ def _evaluate_validation(generator, e0, loader, detector, device, generator_conf
             assert_finite_tensor("validation_generated_image", generated)
             source_out = e0(normalize_for_e0(source))
             generated_out = e0(normalize_for_e0(generated))
-            cosine = F.cosine_similarity(generated_out["embedding"], z, dim=1)
+            generated_embedding = generated_out["embedding"]
+            cosine = F.cosine_similarity(generated_embedding, z, dim=1)
             latent_cosine_sum += float(cosine.detach().sum().cpu())
             source_preserved_sum += float((generated_out["logits"].argmax(dim=1) == source_out["logits"].argmax(dim=1)).float().sum().cpu())
+            target_embedding_chunks.append(z.detach().to(dtype=torch.float32).cpu())
+            generated_embedding_chunks.append(generated_embedding.detach().to(dtype=torch.float32).cpu())
             if detector is not None:
                 counts = detector.detect_counts(generated)
                 if len(counts) != int(z.shape[0]):
@@ -2970,6 +2980,17 @@ def _evaluate_validation(generator, e0, loader, detector, device, generator_conf
         "latent_cosine_mean": latent_cosine_sum / total,
         "source_prediction_preserved": source_preserved_sum / total,
     }
+    validate_dense_gram_sample_count(
+        total,
+        dense_gram_cap=DEFAULT_DENSE_GRAM_MAX_SAMPLES,
+        context="training validation relation metrics",
+    )
+    metrics.update(
+        compute_validation_relation_metrics(
+            torch.cat(generated_embedding_chunks, dim=0),
+            torch.cat(target_embedding_chunks, dim=0),
+        )
+    )
     if detector is not None:
         metrics.update(face_count_rates(detected_counts))
         metrics["face_detection_rate"] = metrics["face_detect_ge1_rate"]
