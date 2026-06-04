@@ -66,6 +66,56 @@ def project_gradient_onto_fm_feasible_cone(
     )
 
 
+def project_gradient_to_dot_lower_bound(
+    g_repr: list[torch.Tensor],
+    g_fm: list[torch.Tensor],
+    lower_bound: float,
+    eps: float,
+) -> ProjectionResult:
+    _validate_gradient_lists(g_repr, g_fm)
+    if not isinstance(lower_bound, (float, int)):
+        raise TypeError("lower_bound must be a real scalar")
+    if not math.isfinite(float(lower_bound)):
+        raise ValueError("lower_bound must be finite")
+    _validate_eps(eps)
+
+    dot_before = _dot(g_repr, g_fm)
+    fm_norm_squared = _squared_norm(g_fm)
+    fm_norm = torch.sqrt(fm_norm_squared)
+    repr_norm = torch.sqrt(_squared_norm(g_repr))
+    eps_tensor = torch.as_tensor(eps, dtype=fm_norm.dtype, device=fm_norm.device)
+    lower_bound_tensor = torch.as_tensor(float(lower_bound), dtype=dot_before.dtype, device=dot_before.device)
+
+    projection_applied = bool((dot_before < lower_bound_tensor).item() and (fm_norm > eps_tensor).item())
+    if projection_applied:
+        coefficient = (dot_before - lower_bound_tensor) / fm_norm_squared
+        projected_gradients = [repr_grad - coefficient * fm_grad for repr_grad, fm_grad in zip(g_repr, g_fm)]
+    else:
+        projected_gradients = [repr_grad.clone() for repr_grad in g_repr]
+
+    dot_after = _dot(projected_gradients, g_fm)
+    if projection_applied and not torch.allclose(dot_after, lower_bound_tensor, rtol=1e-5, atol=1e-6):
+        raise RuntimeError("Projected representation gradient does not satisfy the FM dot-product lower bound")
+
+    projected_repr_norm = torch.sqrt(_squared_norm(projected_gradients))
+    removed_gradients = [repr_grad - projected_grad for repr_grad, projected_grad in zip(g_repr, projected_gradients)]
+    projection_removed_norm = torch.sqrt(_squared_norm(removed_gradients))
+    repr_descent_inner_product = _dot(g_repr, projected_gradients)
+    fm_first_order_effect = -dot_after
+    return ProjectionResult(
+        dot_before=dot_before,
+        dot_after=dot_after,
+        fm_norm=fm_norm,
+        repr_norm=repr_norm,
+        projected_repr_norm=projected_repr_norm,
+        projection_applied=projection_applied,
+        projection_removed_norm=projection_removed_norm,
+        repr_descent_inner_product=repr_descent_inner_product,
+        fm_first_order_effect=fm_first_order_effect,
+        projected_gradients=projected_gradients,
+    )
+
+
 def _validate_gradient_lists(g_repr: list[torch.Tensor], g_fm: list[torch.Tensor]) -> None:
     if not isinstance(g_repr, list) or not isinstance(g_fm, list):
         raise TypeError("g_repr and g_fm must be list[Tensor]")

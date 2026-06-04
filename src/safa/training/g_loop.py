@@ -20,7 +20,7 @@ from safa.models.e0 import assert_e0_frozen, freeze_e0, load_e0_checkpoint
 from safa.models.generator import FlowGeneratorConfig, build_generator
 from safa.training.audit import audit_no_identity_supervision
 from safa.training.losses import cosine_cycle_loss, normalize_for_e0
-from safa.training.projected_update import project_gradient_onto_fm_feasible_cone
+from safa.training.projected_update import project_gradient_onto_fm_feasible_cone, project_gradient_to_dot_lower_bound
 from safa.training.representation_losses import hyperspherical_gram_loss, hyperspherical_point_cosine_loss
 from safa.training.multitask_loss import UncertaintyWeightedLoss
 from safa.training.transforms import generator_image_transform
@@ -49,6 +49,8 @@ _FLOW_CONDITIONS = (_FLOW_CONDITION_EMBEDDING, _FLOW_CONDITION_FIXED_NULL)
 _NAMED_REPR_WEIGHT_MODES = ((1.0, 0.0), (1.0, 1.0))
 _GRAM_PROJECTED_TWO_STEP = "gram_projected_two_step"
 _POINT_PROJECTED_TWO_STEP = "point_projected_two_step"
+_POINT_DESCENT_CREDIT_PROJECTED = "point_descent_credit_projected"
+_PROJECTED_STAGE2_OBJECTIVES = (_GRAM_PROJECTED_TWO_STEP, _POINT_PROJECTED_TWO_STEP, _POINT_DESCENT_CREDIT_PROJECTED)
 
 
 @dataclass(frozen=True)
@@ -215,7 +217,7 @@ class _GeneratorTrainingStep:
                             )
                             self.last_loss_metrics = loss_metrics
                             return loss, flow_loss.detach(), repr_loss.detach(), flow_loss, repr_loss
-                        if self.stage2_objective.type in {_GRAM_PROJECTED_TWO_STEP, _POINT_PROJECTED_TWO_STEP}:
+                        if self.stage2_objective.type in _PROJECTED_STAGE2_OBJECTIVES:
                             flow_loss, flow_metrics = self._compute_flow_loss(images, z, effective_flow_condition)
                             loss_metrics = self._stage2_repr_loss_metrics(
                                 flow_loss,
@@ -297,7 +299,7 @@ class _GeneratorTrainingStep:
                 e0_out = self.e0(normalize_for_e0(generated))
                 if "embedding" not in e0_out:
                     raise RuntimeError("E0 output missing embedding for stage2 representation loss")
-                if self.stage2_objective.type == _POINT_PROJECTED_TWO_STEP or self.stage2_objective.relation_weight == 0.0:
+                if self.stage2_objective.type in {_POINT_PROJECTED_TWO_STEP, _POINT_DESCENT_CREDIT_PROJECTED} or self.stage2_objective.relation_weight == 0.0:
                     losses = hyperspherical_point_cosine_loss(
                         e0_out["embedding"],
                         z,
@@ -488,14 +490,21 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
         raise ValueError("stages.stage2.stage2_objective must be a mapping")
     context = "stages.stage2.stage2_objective"
     objective_type = _require_field(payload, "type", context)
-    allowed_types = ("gram_weighted_sum", _GRAM_PROJECTED_TWO_STEP, _POINT_PROJECTED_TWO_STEP, "fm_only_probe", "gram_repr_only_probe")
+    allowed_types = (
+        "gram_weighted_sum",
+        _GRAM_PROJECTED_TWO_STEP,
+        _POINT_PROJECTED_TWO_STEP,
+        _POINT_DESCENT_CREDIT_PROJECTED,
+        "fm_only_probe",
+        "gram_repr_only_probe",
+    )
     if objective_type not in allowed_types:
         allowed = ", ".join(allowed_types)
         raise ValueError(f"stages.stage2.stage2_objective.type must be one of {allowed}, got {objective_type!r}")
     flow_condition = _flow_condition_from_config(
         payload,
         context,
-        required=objective_type in {"gram_weighted_sum", _GRAM_PROJECTED_TWO_STEP, _POINT_PROJECTED_TWO_STEP, "fm_only_probe"},
+        required=objective_type in {"gram_weighted_sum", *_PROJECTED_STAGE2_OBJECTIVES, "fm_only_probe"},
     )
     if objective_type == "fm_only_probe":
         for field in ("lambda_repr", "point_weight", "relation_weight", "offdiag_only", "repr_learning_rate", "projection_eps"):
@@ -516,10 +525,10 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
     if point_weight < 0.0:
         raise ValueError(f"{context}.point_weight must be non-negative, got {point_weight!r}")
 
-    if objective_type == _POINT_PROJECTED_TWO_STEP:
+    if objective_type in {_POINT_PROJECTED_TWO_STEP, _POINT_DESCENT_CREDIT_PROJECTED}:
         for field in ("relation_weight", "offdiag_only"):
             if field in payload:
-                raise ValueError(f"{context}.{field} is not valid for {_POINT_PROJECTED_TWO_STEP}")
+                raise ValueError(f"{context}.{field} is not valid for {objective_type}")
         repr_learning_rate = _require_numeric(payload, "repr_learning_rate", context)
         projection_eps = _require_numeric(payload, "projection_eps", context)
         if repr_learning_rate <= 0.0:
@@ -604,7 +613,7 @@ def _flow_condition_for_stage(stages: dict, stage_name: str, stage2_objective: _
     if stage_name == "stage2" and stage2_objective is not None:
         if "flow_condition" in stage:
             raise ValueError("stages.stage2.flow_condition is ambiguous when stages.stage2.stage2_objective.flow_condition is available")
-        if stage2_objective.type in {"gram_weighted_sum", _GRAM_PROJECTED_TWO_STEP, _POINT_PROJECTED_TWO_STEP, "fm_only_probe"}:
+        if stage2_objective.type in {"gram_weighted_sum", *_PROJECTED_STAGE2_OBJECTIVES, "fm_only_probe"}:
             if "flow_condition" not in stage.get("stage2_objective", {}):
                 raise ValueError("stages.stage2.stage2_objective.flow_condition is required for flow objectives")
             _validate_flow_condition(stage2_objective.flow_condition, "stages.stage2.stage2_objective.flow_condition")
@@ -1149,7 +1158,7 @@ def train_g_from_config(config: dict) -> dict:
                             gradient_metrics["gradient_conflict_full_batch_size"]
                         )
                         totals["gradient_conflict_samples"].append(gradient_metrics)
-                if stage_name == "stage2" and stage2_objective is not None and stage2_objective.type in {_GRAM_PROJECTED_TWO_STEP, _POINT_PROJECTED_TWO_STEP}:
+                if stage_name == "stage2" and stage2_objective is not None and stage2_objective.type in _PROJECTED_STAGE2_OBJECTIVES:
                     loss, flow_mse, cycle, flow_loss, cycle_loss, batch_grad_norm, projection_metrics = _run_projected_stage2_batch(
                         training_module=training_module,
                         optimizer=optimizer,
@@ -2329,7 +2338,7 @@ def _run_projected_stage2_batch(
 ) -> tuple:
     import torch
 
-    if stage2_objective.type not in {_GRAM_PROJECTED_TWO_STEP, _POINT_PROJECTED_TWO_STEP}:
+    if stage2_objective.type not in _PROJECTED_STAGE2_OBJECTIVES:
         raise RuntimeError("_run_projected_stage2_batch requires a projected two-step objective")
     if stage2_objective.repr_learning_rate is None or stage2_objective.projection_eps is None:
         raise RuntimeError("projected two-step objective requires repr_learning_rate and projection_eps")
@@ -2347,6 +2356,7 @@ def _run_projected_stage2_batch(
             flow_condition=flow_condition,
         )
     _assert_finite_training_scalars(flow_loss, flow_mse, flow_loss_raw)
+    pre_flow_loss_value = float(flow_loss.detach().cpu())
     flow_loss.backward()
     _assert_finite_parameter_gradients("M3 flow matching", params)
     batch_grad_norm = 0.0
@@ -2370,6 +2380,7 @@ def _run_projected_stage2_batch(
             flow_condition=flow_condition,
         )
     assert_finite_tensor("m3_flow_loss_guard", flow_loss_guard)
+    flow_loss_guard_value = float(flow_loss_guard.detach().cpu())
     flow_loss_guard.backward()
     fm_gradients = _synced_gradients_from_parameters("M3 flow guard", params)
 
@@ -2389,18 +2400,41 @@ def _run_projected_stage2_batch(
     optimizer.zero_grad(set_to_none=True)
 
     weighted_repr_gradients = [stage2_objective.lambda_repr * grad for grad in repr_gradients]
-    projection = project_gradient_onto_fm_feasible_cone(
-        weighted_repr_gradients,
-        fm_gradients,
-        eps=stage2_objective.projection_eps,
-    )
+    fm_descent_credit = 0.0
+    credit_dot_lower_bound = 0.0
+    if stage2_objective.type == _POINT_DESCENT_CREDIT_PROJECTED:
+        fm_descent_credit = max(0.0, pre_flow_loss_value - flow_loss_guard_value)
+        credit_dot_lower_bound = -fm_descent_credit / float(stage2_objective.repr_learning_rate)
+        projection = project_gradient_to_dot_lower_bound(
+            weighted_repr_gradients,
+            fm_gradients,
+            lower_bound=credit_dot_lower_bound,
+            eps=stage2_objective.projection_eps,
+        )
+    else:
+        projection = project_gradient_onto_fm_feasible_cone(
+            weighted_repr_gradients,
+            fm_gradients,
+            eps=stage2_objective.projection_eps,
+        )
     _apply_projected_repr_step(params, projection.projected_gradients, repr_learning_rate=stage2_objective.repr_learning_rate)
     if ema is not None:
         ema.update(training_state.generator)
 
     metrics = dict(training_state.last_loss_metrics)
     metrics.update(_projection_result_metrics(projection))
-    metrics["flow_loss_guard"] = float(flow_loss_guard.detach().cpu())
+    first_order_fm_increase = max(
+        0.0,
+        float((-float(stage2_objective.repr_learning_rate) * projection.dot_after).detach().cpu()),
+    )
+    metrics["fm_descent_credit"] = float(fm_descent_credit)
+    metrics["credit_dot_lower_bound"] = float(credit_dot_lower_bound)
+    if fm_descent_credit > 0.0:
+        metrics["credit_budget_used_fraction"] = float(first_order_fm_increase / fm_descent_credit)
+    else:
+        metrics["credit_budget_used_fraction"] = 0.0
+    metrics["pre_flow_loss_before_fm_step"] = float(pre_flow_loss_value)
+    metrics["flow_loss_guard"] = float(flow_loss_guard_value)
     metrics["stage2_objective_type"] = stage2_objective.type
     training_state.last_loss_metrics = metrics
     logged_loss = flow_loss_guard.detach() + stage2_objective.lambda_repr * repr_loss_raw.detach()

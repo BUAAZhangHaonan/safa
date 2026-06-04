@@ -36,6 +36,13 @@ def test_medium_v2_stage2_configs_use_explicit_paths_batches_and_objectives() ->
             "gradient_monitor": {"enabled": True, "interval": 20, "max_samples": 8},
             "flow_condition": "embedding",
         },
+        "train_g_medium_v2_stage2_m3_point_descent_credit_projected_smoke10.yaml": {
+            "objective": "point_descent_credit_projected",
+            "global_batch_size": 96,
+            "epochs": 10,
+            "gradient_monitor": {"enabled": True, "interval": 20, "max_samples": 8},
+            "flow_condition": "embedding",
+        },
         "train_g_medium_v2_stage2_fm_only_probe.yaml": {
             "objective": "fm_only_probe",
             "global_batch_size": 24,
@@ -94,12 +101,18 @@ def test_medium_v2_stage2_configs_use_explicit_paths_batches_and_objectives() ->
             assert objective["flow_condition"] == expected_config["flow_condition"]
         else:
             assert "flow_condition" not in objective
-        if expected_config["objective"] == "point_projected_two_step":
+        if expected_config["objective"] in {"point_projected_two_step", "point_descent_credit_projected"}:
             assert "relation_weight" not in objective
             assert "offdiag_only" not in objective
             assert objective["point_weight"] == 1.0
             assert objective["repr_learning_rate"] > 0.0
             assert "grad_clip_norm" not in config
+        if expected_config["objective"] == "point_descent_credit_projected":
+            assert config["out_dir"] == "artifacts/checkpoints/g_medium_v2_stage2_m3_point_descent_credit_projected_smoke10"
+            assert (
+                config["stages"]["stage2"]["quality_eval"]["output_dir"]
+                == "artifacts/eval/g_medium_v2_stage2_m3_point_descent_credit_projected_smoke10/quality"
+            )
 
         g_loop._validate_train_g_config(config)
 
@@ -403,7 +416,8 @@ def test_stage2_objective_accepts_only_named_repr_weight_modes() -> None:
         )
 
 
-def test_point_projected_objective_requires_point_only_contract() -> None:
+@pytest.mark.parametrize("objective_type", ["point_projected_two_step", "point_descent_credit_projected"])
+def test_point_projected_objective_requires_point_only_contract(objective_type: str) -> None:
     from safa.training import g_loop
 
     objective = g_loop._stage2_objective_from_config(
@@ -412,7 +426,7 @@ def test_point_projected_objective_requires_point_only_contract() -> None:
             "stage2": {
                 "epochs": 1,
                 "stage2_objective": {
-                    "type": "point_projected_two_step",
+                    "type": objective_type,
                     "flow_condition": "embedding",
                     "lambda_repr": 1.0,
                     "point_weight": 1.0,
@@ -423,13 +437,13 @@ def test_point_projected_objective_requires_point_only_contract() -> None:
         }
     )
 
-    assert objective.type == "point_projected_two_step"
+    assert objective.type == objective_type
     assert objective.relation_weight == 0.0
     assert objective.offdiag_only is False
 
     for forbidden in ("relation_weight", "offdiag_only"):
         payload = {
-            "type": "point_projected_two_step",
+            "type": objective_type,
             "flow_condition": "embedding",
             "lambda_repr": 1.0,
             "point_weight": 1.0,
@@ -504,7 +518,8 @@ def test_generator_training_step_gram_repr_only_probe_does_not_compute_flow_loss
     assert module.last_loss_metrics["effective_repr_loss_weight"] == 1.0
 
 
-def test_generator_training_step_point_projected_uses_point_loss_without_gram(monkeypatch) -> None:
+@pytest.mark.parametrize("objective_type", ["point_projected_two_step", "point_descent_credit_projected"])
+def test_generator_training_step_point_projected_uses_point_loss_without_gram(monkeypatch, objective_type: str) -> None:
     from torch import nn
 
     from safa.models.generator import FlowGeneratorConfig
@@ -544,7 +559,7 @@ def test_generator_training_step_point_projected_uses_point_loss_without_gram(mo
             "stage2": {
                 "epochs": 1,
                 "stage2_objective": {
-                    "type": "point_projected_two_step",
+                    "type": objective_type,
                     "flow_condition": "embedding",
                     "lambda_repr": 1.0,
                     "point_weight": 1.0,
@@ -564,8 +579,89 @@ def test_generator_training_step_point_projected_uses_point_loss_without_gram(mo
     assert torch.allclose(raw_repr_loss, torch.tensor(1.5))
     assert torch.allclose(loss.detach(), repr_loss.detach())
     assert torch.allclose(flow_loss.detach(), torch.tensor(0.25).square())
-    assert module.last_loss_metrics["stage2_objective_type"] == "point_projected_two_step"
+    assert module.last_loss_metrics["stage2_objective_type"] == objective_type
     assert module.last_loss_metrics["repr_relation_loss"] == 0.0
+
+
+def test_descent_credit_projected_batch_records_credit_budget_metrics() -> None:
+    from contextlib import nullcontext
+    from torch import nn
+
+    from safa.training import g_loop
+
+    class DummyGenerator(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(1.0))
+
+    class DummyTrainingModule(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.generator = DummyGenerator()
+            self.last_loss_metrics = {}
+
+        def forward(self, images, z, sample_ids, include_repr, lambda_cycle, flow_condition):
+            del images, z, sample_ids, lambda_cycle, flow_condition
+            if include_repr:
+                repr_loss = -self.generator.weight
+                zero = repr_loss.new_tensor(0.0)
+                self.last_loss_metrics = {
+                    "repr_loss": float(repr_loss.detach().cpu()),
+                    "repr_point_loss": float(repr_loss.detach().cpu()),
+                    "repr_relation_loss": 0.0,
+                    "stage2_objective_type": "point_descent_credit_projected",
+                    "lambda_repr": 1.0,
+                    "effective_flow_loss_weight": 1.0,
+                    "effective_repr_loss_weight": 1.0,
+                    "effective_cycle_loss_weight": 0.0,
+                    "flow_condition": "embedding",
+                }
+                return repr_loss, zero, repr_loss.detach(), zero, repr_loss
+            flow_loss = self.generator.weight.square()
+            zero = flow_loss.new_tensor(0.0)
+            return flow_loss, flow_loss.detach(), zero, flow_loss, zero
+
+    objective = g_loop._stage2_objective_from_config(
+        {
+            "stage1": {"epochs": 0},
+            "stage2": {
+                "epochs": 1,
+                "stage2_objective": {
+                    "type": "point_descent_credit_projected",
+                    "flow_condition": "embedding",
+                    "lambda_repr": 1.0,
+                    "point_weight": 1.0,
+                    "repr_learning_rate": 1.0,
+                    "projection_eps": 1e-12,
+                },
+            },
+        }
+    )
+    module = DummyTrainingModule()
+    optimizer = torch.optim.AdamW(module.generator.parameters(), lr=0.1, weight_decay=0.0)
+
+    _, _, _, flow_loss_guard, _, _, metrics = g_loop._run_projected_stage2_batch(
+        training_module=module,
+        optimizer=optimizer,
+        images=torch.zeros(1, 3, 4, 4),
+        z=torch.zeros(1, 2),
+        sample_ids=["sample"],
+        lambda_cycle=0.0,
+        amp_ctx=nullcontext(),
+        grad_clip_norm=None,
+        ema=None,
+        stage2_objective=objective,
+        flow_condition="embedding",
+    )
+
+    assert metrics["stage2_objective_type"] == "point_descent_credit_projected"
+    assert metrics["pre_flow_loss_before_fm_step"] == pytest.approx(1.0)
+    assert metrics["flow_loss_guard"] == pytest.approx(float(flow_loss_guard.detach().cpu()))
+    assert metrics["fm_descent_credit"] == pytest.approx(metrics["pre_flow_loss_before_fm_step"] - metrics["flow_loss_guard"])
+    assert metrics["credit_dot_lower_bound"] == pytest.approx(-metrics["fm_descent_credit"])
+    assert metrics["dot_after"] == pytest.approx(metrics["credit_dot_lower_bound"])
+    assert metrics["credit_budget_used_fraction"] == pytest.approx(1.0)
+    assert metrics["projection_applied_fraction"] == 1.0
 
 
 def test_generator_training_step_prefers_spec_repr_metric_fields(monkeypatch) -> None:
