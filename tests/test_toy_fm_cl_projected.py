@@ -152,6 +152,36 @@ def _budgeted_cl_payload(tmp_path) -> dict:
     }
 
 
+def _descent_credit_payload(tmp_path) -> dict:
+    return {
+        "run_name": "descent_credit_ok",
+        "output_dir": str(tmp_path),
+        "device": "cpu",
+        "seed": 1,
+        "deltas_deg": [0.0],
+        "methods": ["descent_credit_projected"],
+        "lambdas": [1.0],
+        "soft_margins": [0.0],
+        "steps": 2,
+        "batch_size": 8,
+        "eval_batch_size": 8,
+        "hidden_dim": 8,
+        "layers": 1,
+        "sigma": 0.02,
+        "k_classes": 4,
+        "sample_steps": 2,
+        "learning_rate": 0.001,
+        "fm_learning_rate": 0.001,
+        "repr_learning_rate": 0.001,
+        "weight_decay": 0.0,
+        "repr_relation_weight": 0.0,
+        "normalize_losses": True,
+        "calibration_batches": 1,
+        "eval_interval": 1,
+        "projection_eps": 1e-12,
+    }
+
+
 def test_toy_config_requires_all_keys(tmp_path) -> None:
     toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
     config_path = tmp_path / "bad_config.json"
@@ -609,6 +639,66 @@ def test_budgeted_cl_line_search_uses_full_repr_gradient_source() -> None:
     assert "_manual_parameter_step(model, g_repr," in source
     assert "projection.projected_gradients" not in source
     assert "project_gradient_onto_fm_feasible_cone" not in source
+
+
+def test_descent_credit_projected_rejects_mixed_method_grid(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config_path = tmp_path / "descent_credit_mixed_methods.json"
+    payload = _descent_credit_payload(tmp_path)
+    payload["methods"] = ["weighted_sum", "descent_credit_projected"]
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="descent_credit_projected requires a standalone config"):
+        toy.load_config(config_path)
+
+
+def test_descent_credit_projected_rejects_lambda_sweep(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config_path = tmp_path / "descent_credit_bad_lambda.json"
+    payload = _descent_credit_payload(tmp_path)
+    payload["lambdas"] = [0.1, 1.0]
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"descent_credit_projected requires lambdas to equal \[1\.0\]"):
+        toy.load_config(config_path)
+
+
+def test_descent_credit_projected_rejects_unused_budget_fields(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config_path = tmp_path / "descent_credit_unused_fields.json"
+    payload = _descent_credit_payload(tmp_path)
+    payload["fm_delta_target"] = 0.01
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="descent_credit_projected does not use these config fields"):
+        toy.load_config(config_path)
+
+
+def test_descent_credit_projected_direct_call_rejects_non_unit_lambda(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config = toy.ToyConfig(**_descent_credit_payload(tmp_path))
+
+    with pytest.raises(ValueError, match="descent_credit_projected uses fixed lambda_repr=1.0"):
+        toy.run_single_experiment(
+            config,
+            delta_deg=15.0,
+            method="descent_credit_projected",
+            lambda_repr=0.1,
+            soft_margin=0.0,
+        )
+
+
+def test_project_gradient_to_dot_lower_bound_projects_conflict() -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    g_repr = [torch.tensor([-1.0, 0.0])]
+    g_fm = [torch.tensor([1.0, 0.0])]
+
+    result = toy.project_gradient_to_dot_lower_bound(g_repr, g_fm, lower_bound=-0.25, eps=1e-12)
+
+    assert result.projection_applied
+    assert result.dot_before.item() == pytest.approx(-1.0)
+    assert result.dot_after.item() == pytest.approx(-0.25)
+    assert result.projected_gradients[0].tolist() == pytest.approx([-0.25, 0.0])
 
 
 @pytest.mark.parametrize(
@@ -1096,6 +1186,67 @@ def test_budgeted_cl_line_search_smoke_run_persists_full_direction_metrics(tmp_p
     assert trained_metric["line_search_flow_delta"] <= config.fm_delta_target
     assert trained_metric["line_search_repr_delta"] < 0.0
     assert trained_metric["budgeted_direction_norm_ratio"] == pytest.approx(1.0)
+
+
+def test_descent_credit_projected_smoke_run_persists_credit_metrics(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    payload = _descent_credit_payload(tmp_path)
+    payload.update(
+        {
+            "run_name": "pytest_descent_credit",
+            "seed": 61,
+            "deltas_deg": [15.0],
+            "steps": 3,
+            "batch_size": 16,
+            "eval_batch_size": 16,
+            "repr_learning_rate": 0.001,
+            "eval_interval": 1,
+        }
+    )
+    config = toy.ToyConfig(**payload)
+
+    summary = toy.run_experiment_grid(config)
+    run_dir = tmp_path / "pytest_descent_credit"
+    rows = [
+        json.loads(line)
+        for line in (run_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    trained_metric = next(row for row in rows if row["step"] > 0)
+
+    assert summary["experiments"][0]["method"] == "descent_credit_projected"
+    for key in [
+        "fm_descent_credit",
+        "credit_dot_lower_bound",
+        "credit_budget_used_fraction",
+        "net_fm_delta_after_two_step",
+        "actual_fm_delta_after_repr_step",
+    ]:
+        assert key in summary["experiments"][0]["final"]
+        assert key in trained_metric
+    assert trained_metric["fm_descent_credit"] >= 0.0
+    assert trained_metric["credit_dot_lower_bound"] <= 0.0
+    assert trained_metric["credit_budget_used_fraction"] >= 0.0
+
+
+def test_run_single_experiment_invokes_metrics_callback(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    payload = _descent_credit_payload(tmp_path)
+    payload.update({"steps": 2, "eval_interval": 1, "batch_size": 8, "eval_batch_size": 8})
+    config = toy.ToyConfig(**payload)
+    emitted: list[dict] = []
+
+    result = toy.run_single_experiment(
+        config,
+        delta_deg=15.0,
+        method="descent_credit_projected",
+        lambda_repr=1.0,
+        soft_margin=0.0,
+        metrics_callback=emitted.append,
+    )
+
+    assert [row["step"] for row in emitted] == [0, 1, 2]
+    assert emitted == result["metrics"]
 
 
 def test_adaptive_margin_projected_ema_mode_records_baseline(tmp_path) -> None:

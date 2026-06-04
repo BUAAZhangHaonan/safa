@@ -80,6 +80,7 @@ SUPPORTED_METHODS = {
     "line_search_projected",
     "dual_step_projected",
     "budgeted_cl_line_search",
+    "descent_credit_projected",
 }
 NORM_EPS = 1.0e-12
 
@@ -195,6 +196,7 @@ def validate_config(config: ToyConfig) -> None:
     _validate_line_search_config(config)
     _validate_dual_step_config(config)
     _validate_budgeted_cl_line_search_config(config)
+    _validate_descent_credit_projected_config(config)
 
 
 class ToyVectorField(nn.Module):
@@ -224,6 +226,10 @@ def run_experiment_grid(config: ToyConfig) -> dict[str, Any]:
     metrics_path = run_dir / "metrics.jsonl"
     metrics_path.write_text("", encoding="utf-8")
 
+    def append_metric(row: dict[str, Any]) -> None:
+        with metrics_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+
     experiments: list[dict[str, Any]] = []
     final_points: list[dict[str, Any]] = []
     for delta_deg in config.deltas_deg:
@@ -235,12 +241,10 @@ def run_experiment_grid(config: ToyConfig) -> dict[str, Any]:
                     method=method,
                     lambda_repr=float(lambda_repr),
                     soft_margin=float(soft_margin),
+                    metrics_callback=append_metric,
                 )
                 experiments.append(result)
                 final_points.append(result["final"])
-                with metrics_path.open("a", encoding="utf-8") as handle:
-                    for row in result["metrics"]:
-                        handle.write(json.dumps(row, sort_keys=True) + "\n")
 
     summary = {
         "run_name": config.run_name,
@@ -269,6 +273,7 @@ def run_single_experiment(
     method: str,
     lambda_repr: float,
     soft_margin: float,
+    metrics_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     validate_config(config)
     if method not in SUPPORTED_METHODS:
@@ -285,6 +290,11 @@ def run_single_experiment(
             raise ValueError("budgeted_cl_line_search uses fixed lambda_repr=1.0")
         if not math.isclose(float(soft_margin), 0.0, rel_tol=0.0, abs_tol=1e-12):
             raise ValueError("budgeted_cl_line_search requires soft_margin=0.0")
+    if method == "descent_credit_projected":
+        if lambda_repr != 1.0:
+            raise ValueError("descent_credit_projected uses fixed lambda_repr=1.0")
+        if not math.isclose(float(soft_margin), 0.0, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError("descent_credit_projected requires soft_margin=0.0")
     device = torch.device(config.device)
     seed_offset = _stable_seed_offset(method, delta_deg, lambda_repr, soft_margin)
     train_generator = torch.Generator(device=device).manual_seed(config.seed + seed_offset)
@@ -310,6 +320,8 @@ def run_single_experiment(
     )
 
     metrics = [initial]
+    if metrics_callback is not None:
+        metrics_callback(initial)
     stat_window = _new_stat_window()
     for step in range(1, config.steps + 1):
         batch = _sample_batch(config, delta_deg, config.batch_size, device, train_generator)
@@ -388,6 +400,17 @@ def run_single_experiment(
                 lambda_repr,
                 soft_margin=soft_margin,
             )
+        elif method == "descent_credit_projected":
+            step_stats = _step_descent_credit_projected(
+                config,
+                model,
+                fm_optimizer,
+                batch,
+                flow_scale,
+                repr_scale,
+                lambda_repr,
+                soft_margin=soft_margin,
+            )
         elif method == "dual_step_projected":
             step_stats = _step_dual_step_projected(
                 config,
@@ -408,19 +431,20 @@ def run_single_experiment(
             raise RuntimeError(f"Unhandled method: {method}")
         _accumulate_stats(stat_window, step_stats)
         if step % config.eval_interval == 0 or step == config.steps:
-            metrics.append(
-                _evaluate_model(
-                    config,
-                    model,
-                    eval_batch,
-                    delta_deg,
-                    method,
-                    lambda_repr,
-                    soft_margin,
-                    step=step,
-                    train_stats=_summarize_stat_window(stat_window),
-                )
+            metric = _evaluate_model(
+                config,
+                model,
+                eval_batch,
+                delta_deg,
+                method,
+                lambda_repr,
+                soft_margin,
+                step=step,
+                train_stats=_summarize_stat_window(stat_window),
             )
+            metrics.append(metric)
+            if metrics_callback is not None:
+                metrics_callback(metric)
             stat_window = _new_stat_window()
 
     final = metrics[-1]
@@ -481,6 +505,49 @@ def project_gradient_with_soft_margin(
     )
 
 
+def project_gradient_to_dot_lower_bound(
+    g_repr: list[torch.Tensor],
+    g_fm: list[torch.Tensor],
+    lower_bound: float,
+    eps: float,
+) -> ProjectionResult:
+    _validate_gradient_lists(g_repr, g_fm)
+    if not isinstance(lower_bound, (float, int)) or not math.isfinite(float(lower_bound)):
+        raise ValueError("lower_bound must be finite")
+    dot_before = _dot(g_repr, g_fm)
+    fm_norm_squared = _squared_norm(g_fm)
+    fm_norm = torch.sqrt(fm_norm_squared)
+    repr_norm = torch.sqrt(_squared_norm(g_repr))
+    eps_tensor = torch.as_tensor(eps, dtype=fm_norm.dtype, device=fm_norm.device)
+    lower_bound_tensor = torch.as_tensor(float(lower_bound), dtype=dot_before.dtype, device=dot_before.device)
+    projection_applied = bool((dot_before < lower_bound_tensor).item() and (fm_norm > eps_tensor).item())
+    if projection_applied:
+        coefficient = (dot_before - lower_bound_tensor) / fm_norm_squared
+        projected_gradients = [repr_grad - coefficient * fm_grad for repr_grad, fm_grad in zip(g_repr, g_fm)]
+    else:
+        projected_gradients = [repr_grad.clone() for repr_grad in g_repr]
+    dot_after = _dot(projected_gradients, g_fm)
+    if projection_applied and not torch.allclose(dot_after, lower_bound_tensor, rtol=1e-5, atol=1e-6):
+        raise RuntimeError("Projected gradient does not satisfy the requested dot-product lower bound")
+    projected_repr_norm = torch.sqrt(_squared_norm(projected_gradients))
+    removed_gradients = [repr_grad - projected_grad for repr_grad, projected_grad in zip(g_repr, projected_gradients)]
+    projection_removed_norm = torch.sqrt(_squared_norm(removed_gradients))
+    repr_descent_inner_product = _dot(g_repr, projected_gradients)
+    fm_first_order_effect = -dot_after
+    return ProjectionResult(
+        dot_before=dot_before,
+        dot_after=dot_after,
+        fm_norm=fm_norm,
+        repr_norm=repr_norm,
+        projected_repr_norm=projected_repr_norm,
+        projection_applied=projection_applied,
+        projection_removed_norm=projection_removed_norm,
+        repr_descent_inner_product=repr_descent_inner_product,
+        fm_first_order_effect=fm_first_order_effect,
+        projected_gradients=projected_gradients,
+    )
+
+
 def _method_parameter_grid(config: ToyConfig, method: str) -> list[tuple[float, float]]:
     if method in {"fm_only", "repr_only"}:
         return [(config.lambdas[0], config.soft_margins[0])]
@@ -495,6 +562,8 @@ def _method_parameter_grid(config: ToyConfig, method: str) -> list[tuple[float, 
     if method == "dual_step_projected":
         return [(1.0, 0.0)]
     if method == "budgeted_cl_line_search":
+        return [(1.0, 0.0)]
+    if method == "descent_credit_projected":
         return [(1.0, 0.0)]
     return [(lambda_repr, config.soft_margins[0]) for lambda_repr in config.lambdas]
 
@@ -901,6 +970,72 @@ def _step_budgeted_cl_line_search(
     return stats
 
 
+def _step_descent_credit_projected(
+    config: ToyConfig,
+    model: ToyVectorField,
+    fm_optimizer: torch.optim.Optimizer,
+    batch: dict[str, torch.Tensor],
+    flow_scale: torch.Tensor,
+    repr_scale: torch.Tensor,
+    lambda_repr: float,
+    soft_margin: float,
+) -> dict[str, float]:
+    if lambda_repr != 1.0:
+        raise ValueError("descent_credit_projected uses fixed lambda_repr=1.0")
+    if not math.isclose(float(soft_margin), 0.0, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError("descent_credit_projected requires soft_margin=0.0")
+
+    fm_optimizer.zero_grad(set_to_none=True)
+    pre_losses = _compute_losses(config, model, batch)
+    pre_flow_objective = pre_losses["flow"] / flow_scale
+    pre_flow_value = float(pre_flow_objective.detach().cpu())
+    pre_flow_objective.backward()
+    fm_optimizer.step()
+
+    post_losses = _compute_losses(config, model, batch)
+    flow_objective = post_losses["flow"] / flow_scale
+    repr_objective = post_losses["repr"] / repr_scale
+    flow_guard_value = float(flow_objective.detach().cpu())
+    fm_descent_credit = max(0.0, pre_flow_value - flow_guard_value)
+    dot_lower_bound = -fm_descent_credit / float(config.repr_learning_rate)
+    g_fm, g_repr = _task_gradients(model, flow_objective, repr_objective)
+    projection = project_gradient_to_dot_lower_bound(
+        g_repr,
+        g_fm,
+        lower_bound=dot_lower_bound,
+        eps=config.projection_eps,
+    )
+    projected_dot_after = _dot(projection.projected_gradients, g_fm)
+    _manual_parameter_step(model, projection.projected_gradients, config.repr_learning_rate)
+
+    after_losses = _compute_losses(config, model, batch)
+    after_flow_value = float((after_losses["flow"] / flow_scale).detach().cpu())
+    actual_fm_delta = after_flow_value - flow_guard_value
+    net_fm_delta = after_flow_value - pre_flow_value
+    first_order_fm_increase = max(0.0, float((-config.repr_learning_rate * projected_dot_after).detach().cpu()))
+    if fm_descent_credit > 0.0:
+        credit_budget_used_fraction = first_order_fm_increase / fm_descent_credit
+    else:
+        credit_budget_used_fraction = 0.0
+
+    stats = _stats_from_projection(
+        projection,
+        actual_fm_delta=actual_fm_delta,
+        fm_delta_target=fm_descent_credit,
+        scaled_dot_after=projected_dot_after,
+        repr_learning_rate=config.repr_learning_rate,
+    )
+    stats.update(
+        {
+            "fm_descent_credit": float(fm_descent_credit),
+            "credit_dot_lower_bound": float(dot_lower_bound),
+            "credit_budget_used_fraction": float(credit_budget_used_fraction),
+            "net_fm_delta_after_two_step": float(net_fm_delta),
+        }
+    )
+    return stats
+
+
 def _step_dual_step_projected(
     config: ToyConfig,
     model: ToyVectorField,
@@ -1209,6 +1344,10 @@ def _new_stat_window() -> dict[str, list[float]]:
         "primal_dual_violation": [],
         "primal_dual_warmup_active": [],
         "budgeted_direction_norm_ratio": [],
+        "fm_descent_credit": [],
+        "credit_dot_lower_bound": [],
+        "credit_budget_used_fraction": [],
+        "net_fm_delta_after_two_step": [],
     }
 
 
@@ -1242,6 +1381,10 @@ def _empty_step_stats() -> dict[str, float]:
         "primal_dual_violation": 0.0,
         "primal_dual_warmup_active": 0.0,
         "budgeted_direction_norm_ratio": 0.0,
+        "fm_descent_credit": 0.0,
+        "credit_dot_lower_bound": 0.0,
+        "credit_budget_used_fraction": 0.0,
+        "net_fm_delta_after_two_step": 0.0,
     }
 
 
@@ -1274,6 +1417,10 @@ def _accumulate_stats(window: dict[str, list[float]], step_stats: dict[str, floa
     window["primal_dual_violation"].append(float(step_stats["primal_dual_violation"]))
     window["primal_dual_warmup_active"].append(float(step_stats["primal_dual_warmup_active"]))
     window["budgeted_direction_norm_ratio"].append(float(step_stats["budgeted_direction_norm_ratio"]))
+    window["fm_descent_credit"].append(float(step_stats["fm_descent_credit"]))
+    window["credit_dot_lower_bound"].append(float(step_stats["credit_dot_lower_bound"]))
+    window["credit_budget_used_fraction"].append(float(step_stats["credit_budget_used_fraction"]))
+    window["net_fm_delta_after_two_step"].append(float(step_stats["net_fm_delta_after_two_step"]))
 
 
 def _summarize_stat_window(window: dict[str, list[float]]) -> dict[str, float]:
@@ -1308,6 +1455,10 @@ def _summarize_stat_window(window: dict[str, list[float]]) -> dict[str, float]:
         "primal_dual_violation": _mean(window["primal_dual_violation"]),
         "primal_dual_warmup_active": _mean(window["primal_dual_warmup_active"]),
         "budgeted_direction_norm_ratio": _mean(window["budgeted_direction_norm_ratio"]),
+        "fm_descent_credit": _mean(window["fm_descent_credit"]),
+        "credit_dot_lower_bound": _mean(window["credit_dot_lower_bound"]),
+        "credit_budget_used_fraction": _mean(window["credit_budget_used_fraction"]),
+        "net_fm_delta_after_two_step": _mean(window["net_fm_delta_after_two_step"]),
     }
 
 
@@ -1368,6 +1519,10 @@ def _stats_from_projection(
         "primal_dual_violation": 0.0,
         "primal_dual_warmup_active": 0.0,
         "budgeted_direction_norm_ratio": 0.0,
+        "fm_descent_credit": 0.0,
+        "credit_dot_lower_bound": 0.0,
+        "credit_budget_used_fraction": 0.0,
+        "net_fm_delta_after_two_step": 0.0,
     }
 
 
@@ -1409,6 +1564,10 @@ def _stats_from_gradients(
         "primal_dual_violation": 0.0,
         "primal_dual_warmup_active": 0.0,
         "budgeted_direction_norm_ratio": 0.0,
+        "fm_descent_credit": 0.0,
+        "credit_dot_lower_bound": 0.0,
+        "credit_budget_used_fraction": 0.0,
+        "net_fm_delta_after_two_step": 0.0,
     }
 
 
@@ -1687,6 +1846,41 @@ def _validate_budgeted_cl_line_search_config(config: ToyConfig) -> None:
     _require_finite_scalar(config.fm_delta_target, "fm_delta_target", min_value=0.0)
     _require_positive_int(config.line_search_max_backtracks, "line_search_max_backtracks")
     _require_open_unit_scalar(config.line_search_contraction, "line_search_contraction")
+
+
+def _validate_descent_credit_projected_config(config: ToyConfig) -> None:
+    if "descent_credit_projected" not in config.methods:
+        return
+    if config.methods != ["descent_credit_projected"]:
+        raise ValueError("descent_credit_projected requires a standalone config")
+    if config.lambdas != [1.0]:
+        raise ValueError("descent_credit_projected requires lambdas to equal [1.0]")
+    if config.soft_margins != [0.0]:
+        raise ValueError("descent_credit_projected requires soft_margins to equal [0.0]")
+    unused = [
+        name
+        for name, value in {
+            "adaptive_margin_mode": config.adaptive_margin_mode,
+            "adaptive_margin_target": config.adaptive_margin_target,
+            "adaptive_margin_ema_beta": config.adaptive_margin_ema_beta,
+            "adaptive_margin_step": config.adaptive_margin_step,
+            "adaptive_margin_min": config.adaptive_margin_min,
+            "adaptive_margin_max": config.adaptive_margin_max,
+            "adaptive_margin_initial": config.adaptive_margin_initial,
+            "fm_delta_target": config.fm_delta_target,
+            "line_search_max_backtracks": config.line_search_max_backtracks,
+            "line_search_contraction": config.line_search_contraction,
+            "dual_lr": config.dual_lr,
+            "dual_max": config.dual_max,
+            "primal_dual_warmup_steps": config.primal_dual_warmup_steps,
+            "trust_radius_initial": config.trust_radius_initial,
+            "trust_radius_min": config.trust_radius_min,
+            "trust_radius_max": config.trust_radius_max,
+        }.items()
+        if value is not None
+    ]
+    if unused:
+        raise ValueError(f"descent_credit_projected does not use these config fields: {unused}")
 
 
 def _require_finite_scalar(value: float | None, name: str, min_value: float | None = None) -> float:
