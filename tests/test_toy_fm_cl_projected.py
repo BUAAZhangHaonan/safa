@@ -9,6 +9,48 @@ import pytest
 torch = pytest.importorskip("torch")
 
 
+def _adaptive_trust_payload(tmp_path) -> dict:
+    return {
+        "run_name": "adaptive_trust_ok",
+        "output_dir": str(tmp_path),
+        "device": "cpu",
+        "seed": 1,
+        "deltas_deg": [0.0],
+        "methods": ["adaptive_trust_projected"],
+        "lambdas": [1.0],
+        "soft_margins": [0.02],
+        "steps": 2,
+        "batch_size": 8,
+        "eval_batch_size": 8,
+        "hidden_dim": 8,
+        "layers": 1,
+        "sigma": 0.02,
+        "k_classes": 4,
+        "sample_steps": 2,
+        "learning_rate": 0.001,
+        "fm_learning_rate": 0.001,
+        "repr_learning_rate": 0.001,
+        "weight_decay": 0.0,
+        "repr_relation_weight": 0.0,
+        "normalize_losses": True,
+        "calibration_batches": 1,
+        "eval_interval": 1,
+        "projection_eps": 1e-12,
+        "adaptive_margin_mode": "target",
+        "adaptive_margin_target": 1.0,
+        "adaptive_margin_ema_beta": None,
+        "adaptive_margin_step": 0.01,
+        "adaptive_margin_min": 0.0,
+        "adaptive_margin_max": 0.05,
+        "adaptive_margin_initial": 0.02,
+        "fm_delta_target": 0.01,
+        "dual_lr": 0.5,
+        "trust_radius_initial": 1.0,
+        "trust_radius_min": 0.25,
+        "trust_radius_max": 2.0,
+    }
+
+
 def test_toy_config_requires_all_keys(tmp_path) -> None:
     toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
     config_path = tmp_path / "bad_config.json"
@@ -248,6 +290,64 @@ def test_adaptive_method_rejects_mixed_method_grid(tmp_path) -> None:
         toy.load_config(config_path)
 
 
+def test_adaptive_trust_projected_requires_explicit_trust_fields_and_standalone_config(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    missing_path = tmp_path / "adaptive_trust_missing_config.json"
+    payload = _adaptive_trust_payload(tmp_path)
+    for key in ["fm_delta_target", "dual_lr", "trust_radius_initial", "trust_radius_min", "trust_radius_max"]:
+        payload.pop(key)
+    missing_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="adaptive_trust_projected requires"):
+        toy.load_config(missing_path)
+
+    mixed_path = tmp_path / "adaptive_trust_mixed_config.json"
+    mixed_payload = _adaptive_trust_payload(tmp_path)
+    mixed_payload["methods"] = ["weighted_sum", "adaptive_trust_projected"]
+    mixed_path.write_text(json.dumps(mixed_payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="adaptive_trust_projected requires a standalone config"):
+        toy.load_config(mixed_path)
+
+
+def test_adaptive_trust_projected_load_config_accepts_explicit_fields(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config_path = tmp_path / "adaptive_trust_config.json"
+    config_path.write_text(json.dumps(_adaptive_trust_payload(tmp_path)), encoding="utf-8")
+
+    config = toy.load_config(config_path)
+
+    assert config.methods == ["adaptive_trust_projected"]
+    assert config.lambdas == [1.0]
+    assert config.soft_margins[0] == pytest.approx(config.adaptive_margin_initial)
+    assert config.fm_delta_target == pytest.approx(0.01)
+    assert config.dual_lr == pytest.approx(0.5)
+    assert config.trust_radius_initial == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("lambdas", [0.1], "lambdas to equal \\[1.0\\]"),
+        ("soft_margins", [0.03], "soft_margins\\[0\\] to equal adaptive_margin_initial"),
+    ],
+)
+def test_adaptive_trust_projected_fails_fast_on_lambda_and_margin_mismatch(
+    tmp_path,
+    field: str,
+    value,
+    match: str,
+) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    payload = _adaptive_trust_payload(tmp_path)
+    payload[field] = value
+    config_path = tmp_path / f"adaptive_trust_bad_{field}.json"
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=match):
+        toy.load_config(config_path)
+
+
 def test_soft_margin_projection_allows_explicit_fm_budget() -> None:
     toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
     g_repr = [torch.tensor([1.0, 0.0])]
@@ -446,6 +546,135 @@ def test_adaptive_margin_projected_rejects_direct_call_lambda_mismatch(tmp_path)
             config,
             delta_deg=15.0,
             method="adaptive_margin_projected",
+            lambda_repr=0.1,
+            soft_margin=0.02,
+        )
+
+
+def test_adaptive_trust_projected_smoke_run_persists_trust_metrics(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config = toy.ToyConfig(
+        run_name="pytest_adaptive_trust",
+        output_dir=str(tmp_path),
+        device="cpu",
+        seed=23,
+        deltas_deg=[15.0],
+        methods=["adaptive_trust_projected"],
+        lambdas=[1.0],
+        soft_margins=[0.02],
+        steps=4,
+        batch_size=16,
+        eval_batch_size=16,
+        hidden_dim=8,
+        layers=1,
+        sigma=0.02,
+        k_classes=4,
+        sample_steps=2,
+        learning_rate=0.001,
+        fm_learning_rate=0.001,
+        repr_learning_rate=0.001,
+        weight_decay=0.0,
+        repr_relation_weight=0.0,
+        normalize_losses=True,
+        calibration_batches=1,
+        eval_interval=1,
+        projection_eps=1e-12,
+        adaptive_margin_mode="target",
+        adaptive_margin_target=1.0,
+        adaptive_margin_ema_beta=None,
+        adaptive_margin_step=0.01,
+        adaptive_margin_min=0.0,
+        adaptive_margin_max=0.05,
+        adaptive_margin_initial=0.02,
+        fm_delta_target=0.01,
+        dual_lr=0.5,
+        trust_radius_initial=1.0,
+        trust_radius_min=0.25,
+        trust_radius_max=2.0,
+    )
+
+    summary = toy.run_experiment_grid(config)
+    run_dir = tmp_path / "pytest_adaptive_trust"
+    rows = [
+        json.loads(line)
+        for line in (run_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    trained_metric = next(row for row in rows if row["step"] > 0)
+
+    assert summary["experiments"][0]["method"] == "adaptive_trust_projected"
+    for key in [
+        "trust_radius_used",
+        "trust_radius_next",
+        "trust_scale",
+        "trust_region_active",
+        "dual_value_used",
+        "dual_value_next",
+        "fm_budget_violation",
+        "fm_delta_target",
+        "scaled_dot_after_mean",
+        "repr_step_fm_first_order_effect",
+    ]:
+        assert key in summary["experiments"][0]["final"]
+        assert key in trained_metric
+    assert "trust_radius" not in trained_metric
+    assert "dual_value" not in trained_metric
+    assert trained_metric["fm_delta_target"] == pytest.approx(0.01)
+    assert trained_metric["trust_radius_used"] == pytest.approx(1.0)
+    assert trained_metric["trust_radius_next"] >= 0.25
+    assert trained_metric["trust_radius_next"] <= 2.0
+    assert trained_metric["scaled_dot_after_mean"] == pytest.approx(
+        -trained_metric["repr_step_fm_first_order_effect"] / config.repr_learning_rate
+    )
+
+
+def test_adaptive_trust_projected_direct_call_rejects_parameter_mismatch(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config = toy.ToyConfig(
+        run_name="pytest_adaptive_trust_direct",
+        output_dir=str(tmp_path),
+        device="cpu",
+        seed=29,
+        deltas_deg=[15.0],
+        methods=["adaptive_trust_projected"],
+        lambdas=[1.0],
+        soft_margins=[0.02],
+        steps=2,
+        batch_size=8,
+        eval_batch_size=8,
+        hidden_dim=8,
+        layers=1,
+        sigma=0.02,
+        k_classes=4,
+        sample_steps=2,
+        learning_rate=0.001,
+        fm_learning_rate=0.001,
+        repr_learning_rate=0.001,
+        weight_decay=0.0,
+        repr_relation_weight=0.0,
+        normalize_losses=True,
+        calibration_batches=1,
+        eval_interval=1,
+        projection_eps=1e-12,
+        adaptive_margin_mode="target",
+        adaptive_margin_target=1.0,
+        adaptive_margin_ema_beta=None,
+        adaptive_margin_step=0.01,
+        adaptive_margin_min=0.0,
+        adaptive_margin_max=0.05,
+        adaptive_margin_initial=0.02,
+        fm_delta_target=0.01,
+        dual_lr=0.5,
+        trust_radius_initial=1.0,
+        trust_radius_min=0.25,
+        trust_radius_max=2.0,
+    )
+
+    with pytest.raises(ValueError, match="adaptive_trust_projected uses fixed lambda_repr=1.0"):
+        toy.run_single_experiment(
+            config,
+            delta_deg=15.0,
+            method="adaptive_trust_projected",
             lambda_repr=0.1,
             soft_margin=0.02,
         )

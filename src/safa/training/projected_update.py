@@ -29,6 +29,26 @@ class AdaptiveMarginAdjustment:
     direction: str
 
 
+@dataclass(frozen=True)
+class TrustRegionScaleResult:
+    trust_radius: float
+    trust_scale: float
+    trust_region_active: bool
+    scaled_norm: float
+    projected_norm: float
+    scaled_gradients: list[torch.Tensor]
+
+
+@dataclass(frozen=True)
+class DualBudgetControlResult:
+    previous_dual_value: float
+    next_dual_value: float
+    previous_trust_radius: float
+    next_trust_radius: float
+    direction: str
+    fm_budget_violation: float
+
+
 def project_gradient_onto_fm_feasible_cone(
     g_repr: list[torch.Tensor],
     g_fm: list[torch.Tensor],
@@ -72,6 +92,102 @@ def project_gradient_onto_fm_feasible_cone(
         repr_descent_inner_product=repr_descent_inner_product,
         fm_first_order_effect=fm_first_order_effect,
         projected_gradients=projected_gradients,
+    )
+
+
+def apply_fm_anchor_trust_region_scaling(
+    projected_gradients: list[torch.Tensor],
+    g_fm: list[torch.Tensor],
+    trust_radius: float,
+    eps: float,
+) -> TrustRegionScaleResult:
+    _validate_gradient_lists(projected_gradients, g_fm)
+    trust_radius = _validate_real_scalar(trust_radius, "trust_radius", min_value=0.0)
+    _validate_eps(eps)
+
+    projected_norm_tensor = torch.sqrt(_squared_norm(projected_gradients))
+    fm_norm_tensor = torch.sqrt(_squared_norm(g_fm))
+    eps_tensor = torch.as_tensor(eps, dtype=projected_norm_tensor.dtype, device=projected_norm_tensor.device)
+
+    if bool((projected_norm_tensor <= eps_tensor).item()):
+        scaled_gradients = [gradient.clone() for gradient in projected_gradients]
+        trust_scale = 1.0
+        scaled_norm_tensor = projected_norm_tensor
+        trust_region_active = False
+    else:
+        max_projected_norm_tensor = fm_norm_tensor * trust_radius
+        scale_tensor = torch.clamp(max_projected_norm_tensor / projected_norm_tensor, max=1.0)
+        if not torch.isfinite(scale_tensor):
+            raise FloatingPointError("Trust-region scale must be finite")
+        trust_scale = float(scale_tensor.detach().cpu())
+        scaled_gradients = [gradient * scale_tensor for gradient in projected_gradients]
+        scaled_norm_tensor = torch.sqrt(_squared_norm(scaled_gradients))
+        trust_region_active = trust_scale < 1.0
+        if trust_region_active:
+            max_allowed = max_projected_norm_tensor + eps_tensor
+            within_roundoff = torch.allclose(
+                scaled_norm_tensor,
+                max_projected_norm_tensor,
+                rtol=1e-5,
+                atol=max(float(eps), 1e-6),
+            )
+            if bool((scaled_norm_tensor > max_allowed).item()) and not within_roundoff:
+                raise RuntimeError("Trust-region scaling exceeded the requested FM-anchored radius")
+
+    return TrustRegionScaleResult(
+        trust_radius=trust_radius,
+        trust_scale=trust_scale,
+        trust_region_active=trust_region_active,
+        scaled_norm=float(scaled_norm_tensor.detach().cpu()),
+        projected_norm=float(projected_norm_tensor.detach().cpu()),
+        scaled_gradients=scaled_gradients,
+    )
+
+
+def update_dual_budget_controller(
+    current_dual_value: float,
+    current_trust_radius: float,
+    actual_fm_delta: float,
+    fm_delta_target: float,
+    dual_lr: float,
+    trust_radius_min: float,
+    trust_radius_max: float,
+) -> DualBudgetControlResult:
+    current_dual_value = _validate_real_scalar(current_dual_value, "current_dual_value", min_value=0.0)
+    trust_radius_min = _validate_real_scalar(trust_radius_min, "trust_radius_min", min_value=0.0)
+    trust_radius_max = _validate_real_scalar(trust_radius_max, "trust_radius_max", min_value=trust_radius_min)
+    current_trust_radius = _validate_real_scalar(
+        current_trust_radius,
+        "current_trust_radius",
+        min_value=trust_radius_min,
+    )
+    if current_trust_radius > trust_radius_max:
+        raise ValueError("current_trust_radius must be <= trust_radius_max")
+    actual_fm_delta = _validate_real_scalar(actual_fm_delta, "actual_fm_delta")
+    fm_delta_target = _validate_real_scalar(fm_delta_target, "fm_delta_target", min_value=0.0)
+    dual_lr = _validate_real_scalar(dual_lr, "dual_lr", min_value=0.0)
+
+    fm_budget_violation = actual_fm_delta - fm_delta_target
+    if fm_budget_violation > 0.0:
+        direction = "tighten"
+    elif fm_budget_violation < 0.0:
+        direction = "loosen"
+    else:
+        direction = "hold"
+
+    next_dual_value = max(0.0, current_dual_value + dual_lr * fm_budget_violation)
+    proposed_trust_radius = current_trust_radius * math.exp(-dual_lr * fm_budget_violation)
+    next_trust_radius = min(max(proposed_trust_radius, trust_radius_min), trust_radius_max)
+    if not math.isfinite(next_trust_radius):
+        raise FloatingPointError("next_trust_radius must be finite")
+
+    return DualBudgetControlResult(
+        previous_dual_value=current_dual_value,
+        next_dual_value=next_dual_value,
+        previous_trust_radius=current_trust_radius,
+        next_trust_radius=next_trust_radius,
+        direction=direction,
+        fm_budget_violation=fm_budget_violation,
     )
 
 

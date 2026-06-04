@@ -13,9 +13,13 @@ from torch import nn
 
 from safa.training.projected_update import (
     AdaptiveMarginAdjustment,
+    DualBudgetControlResult,
     ProjectionResult,
+    TrustRegionScaleResult,
+    apply_fm_anchor_trust_region_scaling,
     compute_adaptive_margin_adjustment,
     project_gradient_onto_fm_feasible_cone,
+    update_dual_budget_controller,
 )
 
 
@@ -53,6 +57,11 @@ class ToyConfig:
     adaptive_margin_min: float | None = None
     adaptive_margin_max: float | None = None
     adaptive_margin_initial: float | None = None
+    fm_delta_target: float | None = None
+    dual_lr: float | None = None
+    trust_radius_initial: float | None = None
+    trust_radius_min: float | None = None
+    trust_radius_max: float | None = None
 
 
 SUPPORTED_METHODS = {
@@ -63,6 +72,7 @@ SUPPORTED_METHODS = {
     "pcgrad",
     "soft_margin_projected",
     "adaptive_margin_projected",
+    "adaptive_trust_projected",
 }
 NORM_EPS = 1.0e-12
 
@@ -71,6 +81,13 @@ NORM_EPS = 1.0e-12
 class AdaptiveMarginState:
     margin: float
     ema_fm_loss: float | None
+
+
+@dataclass
+class AdaptiveTrustState:
+    margin_state: AdaptiveMarginState
+    dual_value: float
+    trust_radius: float
 
 
 def load_config(path: str | Path) -> ToyConfig:
@@ -158,6 +175,7 @@ def validate_config(config: ToyConfig) -> None:
         if not isinstance(value, (float, int)) or not math.isfinite(float(value)) or float(value) < 0.0:
             raise ValueError("all soft_margins must be finite non-negative numbers")
     _validate_adaptive_margin_config(config)
+    _validate_adaptive_trust_config(config)
 
 
 class ToyVectorField(nn.Module):
@@ -236,13 +254,13 @@ def run_single_experiment(
     validate_config(config)
     if method not in SUPPORTED_METHODS:
         raise ValueError(f"Unsupported method: {method}")
-    if method == "adaptive_margin_projected":
+    if method in {"adaptive_margin_projected", "adaptive_trust_projected"}:
         if lambda_repr != 1.0:
-            raise ValueError("adaptive_margin_projected uses fixed lambda_repr=1.0")
+            raise ValueError(f"{method} uses fixed lambda_repr=1.0")
         if config.adaptive_margin_initial is None:
-            raise ValueError("adaptive_margin_projected requires adaptive_margin_initial")
+            raise ValueError(f"{method} requires adaptive_margin_initial")
         if not math.isclose(float(soft_margin), float(config.adaptive_margin_initial), rel_tol=0.0, abs_tol=1e-12):
-            raise ValueError("adaptive_margin_projected soft_margin must equal adaptive_margin_initial")
+            raise ValueError(f"{method} soft_margin must equal adaptive_margin_initial")
     device = torch.device(config.device)
     seed_offset = _stable_seed_offset(method, delta_deg, lambda_repr, soft_margin)
     train_generator = torch.Generator(device=device).manual_seed(config.seed + seed_offset)
@@ -253,6 +271,7 @@ def run_single_experiment(
     eval_batch = _sample_batch(config, delta_deg, config.eval_batch_size, device, eval_generator)
     flow_scale, repr_scale = _calibrate_loss_scales(config, model, delta_deg, device, train_generator)
     adaptive_state = _new_adaptive_margin_state(config) if method == "adaptive_margin_projected" else None
+    adaptive_trust_state = _new_adaptive_trust_state(config) if method == "adaptive_trust_projected" else None
     initial = _evaluate_model(
         config,
         model,
@@ -308,6 +327,19 @@ def run_single_experiment(
                 lambda_repr,
                 soft_margin=soft_margin,
                 adaptive_state=adaptive_state,
+            )
+        elif method == "adaptive_trust_projected":
+            step_stats = _step_projected_two_step(
+                config,
+                model,
+                fm_optimizer,
+                batch,
+                flow_scale,
+                repr_scale,
+                lambda_repr,
+                soft_margin=soft_margin,
+                adaptive_state=adaptive_trust_state.margin_state,
+                adaptive_trust_state=adaptive_trust_state,
             )
         elif method == "pcgrad":
             step_stats = _step_pcgrad(config, model, optimizer, batch, flow_scale, repr_scale, lambda_repr)
@@ -393,9 +425,9 @@ def _method_parameter_grid(config: ToyConfig, method: str) -> list[tuple[float, 
         return [(config.lambdas[0], config.soft_margins[0])]
     if method == "soft_margin_projected":
         return [(lambda_repr, margin) for lambda_repr in config.lambdas for margin in config.soft_margins]
-    if method == "adaptive_margin_projected":
+    if method in {"adaptive_margin_projected", "adaptive_trust_projected"}:
         if config.adaptive_margin_initial is None:
-            raise ValueError("adaptive_margin_projected requires adaptive_margin_initial")
+            raise ValueError(f"{method} requires adaptive_margin_initial")
         return [(1.0, float(config.adaptive_margin_initial))]
     return [(lambda_repr, config.soft_margins[0]) for lambda_repr in config.lambdas]
 
@@ -569,6 +601,7 @@ def _step_projected_two_step(
     lambda_repr: float,
     soft_margin: float,
     adaptive_state: AdaptiveMarginState | None = None,
+    adaptive_trust_state: AdaptiveTrustState | None = None,
 ) -> dict[str, float]:
     fm_optimizer.zero_grad(set_to_none=True)
     losses = _compute_losses(config, model, batch)
@@ -599,9 +632,40 @@ def _step_projected_two_step(
             epsilon=effective_margin,
             eps=config.projection_eps,
         )
-    _manual_parameter_step(model, projection.projected_gradients, config.repr_learning_rate)
+    trust_result = None
+    if adaptive_trust_state is not None:
+        trust_result = apply_fm_anchor_trust_region_scaling(
+            projected_gradients=projection.projected_gradients,
+            g_fm=g_fm,
+            trust_radius=adaptive_trust_state.trust_radius,
+            eps=config.projection_eps,
+        )
+        step_gradients = trust_result.scaled_gradients
+    else:
+        step_gradients = projection.projected_gradients
+    scaled_dot_after = _dot(step_gradients, g_fm)
+    _manual_parameter_step(model, step_gradients, config.repr_learning_rate)
     after_losses = _compute_losses(config, model, batch)
     actual_fm_delta = float((after_losses["flow"] / flow_scale).detach().cpu()) - flow_guard_value
+    dual_update = None
+    if adaptive_trust_state is not None:
+        if config.fm_delta_target is None:
+            raise ValueError("adaptive_trust_projected requires fm_delta_target")
+        if config.dual_lr is None:
+            raise ValueError("adaptive_trust_projected requires dual_lr")
+        if config.trust_radius_min is None or config.trust_radius_max is None:
+            raise ValueError("adaptive_trust_projected requires trust_radius_min and trust_radius_max")
+        dual_update = update_dual_budget_controller(
+            current_dual_value=adaptive_trust_state.dual_value,
+            current_trust_radius=adaptive_trust_state.trust_radius,
+            actual_fm_delta=actual_fm_delta,
+            fm_delta_target=config.fm_delta_target,
+            dual_lr=config.dual_lr,
+            trust_radius_min=config.trust_radius_min,
+            trust_radius_max=config.trust_radius_max,
+        )
+        adaptive_trust_state.dual_value = dual_update.next_dual_value
+        adaptive_trust_state.trust_radius = dual_update.next_trust_radius
     return _stats_from_projection(
         projection,
         actual_fm_delta=actual_fm_delta,
@@ -609,6 +673,11 @@ def _step_projected_two_step(
         adaptive_normalized_fm_loss=adaptive_normalized_fm_loss,
         adaptive_margin_baseline=adaptive_margin_baseline,
         adaptive_margin_direction=adaptive_margin_direction,
+        trust_result=trust_result,
+        dual_update=dual_update,
+        fm_delta_target=0.0 if config.fm_delta_target is None else float(config.fm_delta_target),
+        scaled_dot_after=scaled_dot_after,
+        repr_learning_rate=config.repr_learning_rate,
     )
 
 
@@ -770,6 +839,16 @@ def _new_stat_window() -> dict[str, list[float]]:
         "adaptive_normalized_fm_loss": [],
         "adaptive_margin_baseline": [],
         "adaptive_margin_direction": [],
+        "trust_radius_used": [],
+        "trust_radius_next": [],
+        "trust_scale": [],
+        "trust_region_active": [],
+        "dual_value_used": [],
+        "dual_value_next": [],
+        "fm_budget_violation": [],
+        "fm_delta_target": [],
+        "scaled_dot_after": [],
+        "repr_step_fm_first_order_effect": [],
     }
 
 
@@ -784,6 +863,16 @@ def _empty_step_stats() -> dict[str, float]:
         "adaptive_normalized_fm_loss": 0.0,
         "adaptive_margin_baseline": 0.0,
         "adaptive_margin_direction": 0.0,
+        "trust_radius_used": 0.0,
+        "trust_radius_next": 0.0,
+        "trust_scale": 0.0,
+        "trust_region_active": 0.0,
+        "dual_value_used": 0.0,
+        "dual_value_next": 0.0,
+        "fm_budget_violation": 0.0,
+        "fm_delta_target": 0.0,
+        "scaled_dot_after_mean": 0.0,
+        "repr_step_fm_first_order_effect": 0.0,
     }
 
 
@@ -797,6 +886,16 @@ def _accumulate_stats(window: dict[str, list[float]], step_stats: dict[str, floa
     window["adaptive_normalized_fm_loss"].append(float(step_stats["adaptive_normalized_fm_loss"]))
     window["adaptive_margin_baseline"].append(float(step_stats["adaptive_margin_baseline"]))
     window["adaptive_margin_direction"].append(float(step_stats["adaptive_margin_direction"]))
+    window["trust_radius_used"].append(float(step_stats["trust_radius_used"]))
+    window["trust_radius_next"].append(float(step_stats["trust_radius_next"]))
+    window["trust_scale"].append(float(step_stats["trust_scale"]))
+    window["trust_region_active"].append(float(step_stats["trust_region_active"]))
+    window["dual_value_used"].append(float(step_stats["dual_value_used"]))
+    window["dual_value_next"].append(float(step_stats["dual_value_next"]))
+    window["fm_budget_violation"].append(float(step_stats["fm_budget_violation"]))
+    window["fm_delta_target"].append(float(step_stats["fm_delta_target"]))
+    window["scaled_dot_after"].append(float(step_stats["scaled_dot_after_mean"]))
+    window["repr_step_fm_first_order_effect"].append(float(step_stats["repr_step_fm_first_order_effect"]))
 
 
 def _summarize_stat_window(window: dict[str, list[float]]) -> dict[str, float]:
@@ -812,6 +911,16 @@ def _summarize_stat_window(window: dict[str, list[float]]) -> dict[str, float]:
         "adaptive_normalized_fm_loss": _mean(window["adaptive_normalized_fm_loss"]),
         "adaptive_margin_baseline": _mean(window["adaptive_margin_baseline"]),
         "adaptive_margin_direction": _mean(window["adaptive_margin_direction"]),
+        "trust_radius_used": _mean(window["trust_radius_used"]),
+        "trust_radius_next": _mean(window["trust_radius_next"]),
+        "trust_scale": _mean(window["trust_scale"]),
+        "trust_region_active": _mean(window["trust_region_active"]),
+        "dual_value_used": _mean(window["dual_value_used"]),
+        "dual_value_next": _mean(window["dual_value_next"]),
+        "fm_budget_violation": _mean(window["fm_budget_violation"]),
+        "fm_delta_target": _mean(window["fm_delta_target"]),
+        "scaled_dot_after_mean": _mean(window["scaled_dot_after"]),
+        "repr_step_fm_first_order_effect": _mean(window["repr_step_fm_first_order_effect"]),
     }
 
 
@@ -828,8 +937,19 @@ def _stats_from_projection(
     adaptive_normalized_fm_loss: float = 0.0,
     adaptive_margin_baseline: float = 0.0,
     adaptive_margin_direction: float = 0.0,
+    trust_result: TrustRegionScaleResult | None = None,
+    dual_update: DualBudgetControlResult | None = None,
+    fm_delta_target: float = 0.0,
+    scaled_dot_after: torch.Tensor | None = None,
+    repr_learning_rate: float = 1.0,
 ) -> dict[str, float]:
-    ratio = projection.projected_repr_norm / projection.repr_norm
+    if trust_result is None:
+        ratio = projection.projected_repr_norm / projection.repr_norm
+    else:
+        ratio = projection.repr_norm.new_tensor(trust_result.scaled_norm) / projection.repr_norm
+    if scaled_dot_after is None:
+        scaled_dot_after = projection.dot_after
+    repr_step_fm_first_order_effect = -float(repr_learning_rate) * scaled_dot_after
     return {
         "conflict_fraction": 1.0 if projection.dot_before < 0 else 0.0,
         "dot_before_mean": float(projection.dot_before.detach().cpu()),
@@ -840,6 +960,18 @@ def _stats_from_projection(
         "adaptive_normalized_fm_loss": float(adaptive_normalized_fm_loss),
         "adaptive_margin_baseline": float(adaptive_margin_baseline),
         "adaptive_margin_direction": float(adaptive_margin_direction),
+        "trust_radius_used": 0.0 if trust_result is None else float(trust_result.trust_radius),
+        "trust_radius_next": 0.0 if dual_update is None else float(dual_update.next_trust_radius),
+        "trust_scale": 0.0 if trust_result is None else float(trust_result.trust_scale),
+        "trust_region_active": 0.0
+        if trust_result is None
+        else float(1.0 if trust_result.trust_region_active else 0.0),
+        "dual_value_used": 0.0 if dual_update is None else float(dual_update.previous_dual_value),
+        "dual_value_next": 0.0 if dual_update is None else float(dual_update.next_dual_value),
+        "fm_budget_violation": 0.0 if dual_update is None else float(dual_update.fm_budget_violation),
+        "fm_delta_target": float(fm_delta_target),
+        "scaled_dot_after_mean": float(scaled_dot_after.detach().cpu()),
+        "repr_step_fm_first_order_effect": float(repr_step_fm_first_order_effect.detach().cpu()),
     }
 
 
@@ -862,12 +994,22 @@ def _stats_from_gradients(
         "adaptive_normalized_fm_loss": 0.0,
         "adaptive_margin_baseline": 0.0,
         "adaptive_margin_direction": 0.0,
+        "trust_radius_used": 0.0,
+        "trust_radius_next": 0.0,
+        "trust_scale": 0.0,
+        "trust_region_active": 0.0,
+        "dual_value_used": 0.0,
+        "dual_value_next": 0.0,
+        "fm_budget_violation": 0.0,
+        "fm_delta_target": 0.0,
+        "scaled_dot_after_mean": float(dot_after.detach().cpu()),
+        "repr_step_fm_first_order_effect": float((-dot_after).detach().cpu()),
     }
 
 
 def _initial_step_stats(method: str, soft_margin: float) -> dict[str, float]:
     stats = _empty_step_stats()
-    if method == "adaptive_margin_projected":
+    if method in {"adaptive_margin_projected", "adaptive_trust_projected"}:
         stats["adaptive_margin"] = float(soft_margin)
     return stats
 
@@ -878,6 +1020,16 @@ def _new_adaptive_margin_state(config: ToyConfig) -> AdaptiveMarginState:
     return AdaptiveMarginState(
         margin=float(config.adaptive_margin_initial),
         ema_fm_loss=None,
+    )
+
+
+def _new_adaptive_trust_state(config: ToyConfig) -> AdaptiveTrustState:
+    if config.trust_radius_initial is None:
+        raise ValueError("adaptive_trust_projected requires trust_radius_initial")
+    return AdaptiveTrustState(
+        margin_state=_new_adaptive_margin_state(config),
+        dual_value=0.0,
+        trust_radius=float(config.trust_radius_initial),
     )
 
 
@@ -946,14 +1098,22 @@ def _ema_update(previous: float | None, value: float, beta: float | None) -> flo
 
 
 def _validate_adaptive_margin_config(config: ToyConfig) -> None:
-    if "adaptive_margin_projected" not in config.methods:
+    adaptive_methods = [method for method in ("adaptive_margin_projected", "adaptive_trust_projected") if method in config.methods]
+    if not adaptive_methods:
         return
-    if config.methods != ["adaptive_margin_projected"]:
+    if len(adaptive_methods) != 1:
+        raise ValueError("adaptive margin methods require standalone configs")
+    method = adaptive_methods[0]
+    if config.methods != [method]:
+        if method == "adaptive_trust_projected":
+            raise ValueError("adaptive_trust_projected requires a standalone config")
         raise ValueError("adaptive_margin_projected must run in a dedicated config")
     if config.lambdas != [1.0]:
+        if method == "adaptive_trust_projected":
+            raise ValueError("adaptive_trust_projected requires lambdas to equal [1.0]")
         raise ValueError("adaptive_margin_projected uses fixed lambda_repr=1.0; set lambdas to [1.0]")
     if len(config.soft_margins) != 1:
-        raise ValueError("adaptive_margin_projected requires exactly one soft_margin placeholder")
+        raise ValueError(f"{method} requires exactly one soft_margin placeholder")
 
     missing = [
         name
@@ -967,14 +1127,14 @@ def _validate_adaptive_margin_config(config: ToyConfig) -> None:
         if value is None
     ]
     if missing:
-        raise ValueError(f"adaptive_margin_projected requires explicit config fields: {missing}")
+        raise ValueError(f"{method} requires explicit config fields: {missing}")
 
     if config.adaptive_margin_mode not in {"target", "ema"}:
         raise ValueError("adaptive_margin_mode must be 'target' or 'ema'")
     if config.adaptive_margin_mode == "target" and config.adaptive_margin_target is None:
-        raise ValueError("adaptive_margin_projected requires adaptive_margin_target in target mode")
+        raise ValueError(f"{method} requires adaptive_margin_target in target mode")
     if config.adaptive_margin_mode == "ema" and config.adaptive_margin_ema_beta is None:
-        raise ValueError("adaptive_margin_projected requires adaptive_margin_ema_beta in ema mode")
+        raise ValueError(f"{method} requires adaptive_margin_ema_beta in ema mode")
 
     adaptive_margin_step = _require_finite_scalar(config.adaptive_margin_step, "adaptive_margin_step", min_value=0.0)
     adaptive_margin_min = _require_finite_scalar(config.adaptive_margin_min, "adaptive_margin_min", min_value=0.0)
@@ -991,6 +1151,8 @@ def _validate_adaptive_margin_config(config: ToyConfig) -> None:
     if adaptive_margin_initial > adaptive_margin_max:
         raise ValueError("adaptive_margin_initial must be <= adaptive_margin_max")
     if not math.isclose(float(config.soft_margins[0]), adaptive_margin_initial, rel_tol=0.0, abs_tol=1e-12):
+        if method == "adaptive_trust_projected":
+            raise ValueError("adaptive_trust_projected requires soft_margins[0] to equal adaptive_margin_initial")
         raise ValueError("adaptive_margin_projected soft_margins[0] must equal adaptive_margin_initial")
     if config.adaptive_margin_mode == "target":
         _require_finite_scalar(config.adaptive_margin_target, "adaptive_margin_target", min_value=0.0)
@@ -1004,6 +1166,38 @@ def _validate_adaptive_margin_config(config: ToyConfig) -> None:
             raise ValueError("adaptive_margin_ema_beta must be < 1.0")
     if adaptive_margin_step > adaptive_margin_max - adaptive_margin_min and adaptive_margin_max > adaptive_margin_min:
         raise ValueError("adaptive_margin_step must not exceed the adaptive margin range")
+
+
+def _validate_adaptive_trust_config(config: ToyConfig) -> None:
+    if "adaptive_trust_projected" not in config.methods:
+        return
+    missing = [
+        name
+        for name, value in {
+            "dual_lr": config.dual_lr,
+            "trust_radius_initial": config.trust_radius_initial,
+            "trust_radius_min": config.trust_radius_min,
+            "trust_radius_max": config.trust_radius_max,
+            "fm_delta_target": config.fm_delta_target,
+        }.items()
+        if value is None
+    ]
+    if missing:
+        raise ValueError(f"adaptive_trust_projected requires explicit config fields: {missing}")
+
+    dual_lr = _require_finite_scalar(config.dual_lr, "dual_lr", min_value=0.0)
+    if dual_lr <= 0.0:
+        raise ValueError("dual_lr must be positive")
+    _require_finite_scalar(config.fm_delta_target, "fm_delta_target", min_value=0.0)
+    trust_radius_min = _require_finite_scalar(config.trust_radius_min, "trust_radius_min", min_value=0.0)
+    trust_radius_max = _require_finite_scalar(config.trust_radius_max, "trust_radius_max", min_value=trust_radius_min)
+    trust_radius_initial = _require_finite_scalar(
+        config.trust_radius_initial,
+        "trust_radius_initial",
+        min_value=trust_radius_min,
+    )
+    if trust_radius_initial > trust_radius_max:
+        raise ValueError("trust_radius_initial must lie within [trust_radius_min, trust_radius_max]")
 
 
 def _require_finite_scalar(value: float | None, name: str, min_value: float | None = None) -> float:
