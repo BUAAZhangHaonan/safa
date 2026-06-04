@@ -41,8 +41,7 @@ $$
 对应的流匹配损失为
 
 $$
-\mathcal{L}_{\text{FM}}(\theta)
-=
+\mathcal{L}_{\text{FM}}(\theta) =
 \mathbb{E}_{x_1,\xi,t}
 \left[
 \left\|v_\theta(x_t,t;c_\varnothing)-u_t\right\|^2
@@ -72,8 +71,7 @@ $$
 点级表征保持损失定义为
 
 $$
-\mathcal{L}_{\text{repr}}(\theta)
-=
+\mathcal{L}_{\text{repr}}(\theta) =
 \mathbb{E}_{x_0,\xi}
 \left[
 1 - E_0\big(G_\theta(\xi;c(z_0))\big)^\top z_0
@@ -89,11 +87,8 @@ $$
 则有局部展开
 
 $$
-1 - z^\top z_0
-=
-1 - \cos\phi
-=
-\frac{1}{2}\phi^2 + O(\phi^4).
+1 - z^\top z_0 =
+1 - \cos\phi = \frac{1}{2}\phi^2 + O(\phi^4).
 $$
 
 因此，点级余弦距离、球面测地距离平方 $\phi^2$ 和切空间误差 $\sin^2\phi$ 在小角度区域局部二阶等价。该结论说明，单纯替换这些点级距离形式并不会改变主要优化结构；方法的关键不在于改写点级距离，而在于如何让表征目标与人脸先验目标解耦优化。
@@ -117,12 +112,10 @@ $$
 在某次迭代中，记
 
 $$
-\nabla_{\text{FM}}
-=
+\nabla_{\text{FM}} =
 \nabla_\theta \mathcal{L}_{\text{FM}}(\theta),
 \quad
-\nabla_{\text{repr}}
-=
+\nabla_{\text{repr}} =
 \nabla_\theta \mathcal{L}_{\text{repr}}(\theta).
 $$
 
@@ -135,8 +128,7 @@ $$
 在该约束下，表征更新方向由以下二次子问题给出：
 
 $$
-v^*
-=
+v^* =
 \arg\min_v
 \left\{
 \nabla_{\text{repr}}^\top v
@@ -158,8 +150,7 @@ $$
 则无约束最优解 $v^*=-\eta\nabla_{\text{repr}}$ 已满足 FM 可行性，因为
 
 $$
-\nabla_{\text{FM}}^\top v^*
-=
+\nabla_{\text{FM}}^\top v^* =
 -\eta\nabla_{\text{FM}}^\top\nabla_{\text{repr}}
 \le 0.
 $$
@@ -173,8 +164,7 @@ $$
 则直接沿 $-\nabla_{\text{repr}}$ 更新会使 FM 损失出现一阶上升。此时最优解落在约束边界上，并等价于将 $\nabla_{\text{repr}}$ 投影到 $\nabla_{\text{FM}}$ 的正交补：
 
 $$
-v^*
-=
+v^* =
 -\eta
 \left(
 \nabla_{\text{repr}}
@@ -185,8 +175,7 @@ v^*
 \|\nabla_{\text{FM}}\|^2
 }
 \nabla_{\text{FM}}
-\right)
-=
+\right) =
 -\eta
 P_{\perp\nabla_{\text{FM}}}(\nabla_{\text{repr}}).
 $$
@@ -224,8 +213,7 @@ $$
 所以，表征更新不会使 FM 目标产生一阶上升。若 $\mathcal{L}_{\text{FM}}$ 在当前邻域内为 $L$-光滑，则有
 
 $$
-\mathcal{L}_{\text{FM}}(\theta + v^*)
--
+\mathcal{L}_{\text{FM}}(\theta + v^*) -
 \mathcal{L}_{\text{FM}}(\theta)
 \le
 \frac{L\eta^2}{2}\|d\|^2.
@@ -234,8 +222,7 @@ $$
 同时，表征损失的一阶变化为
 
 $$
-\nabla_{\text{repr}}^\top v^*
-=
+\nabla_{\text{repr}}^\top v^* =
 -\eta\nabla_{\text{repr}}^\top d.
 $$
 
@@ -250,10 +237,8 @@ $$
 首先沿 FM 目标下降：
 
 $$
-\theta_{t+\frac{1}{2}}
-=
-\theta_t
--
+\theta_{t+\frac{1}{2}} =
+\theta_t -
 \eta_1
 \nabla_\theta\mathcal{L}_{\text{FM}}(\theta_t).
 $$
@@ -265,20 +250,17 @@ $$
 在 $\theta_{t+\frac{1}{2}}$ 处重新计算梯度
 
 $$
-\tilde{\nabla}_{\text{FM}}
-=
+\tilde{\nabla}_{\text{FM}} =
 \nabla_\theta\mathcal{L}_{\text{FM}}(\theta_{t+\frac{1}{2}}),
 \quad
-\tilde{\nabla}_{\text{repr}}
-=
+\tilde{\nabla}_{\text{repr}} =
 \nabla_\theta\mathcal{L}_{\text{repr}}(\theta_{t+\frac{1}{2}}).
 $$
 
 定义
 
 $$
-\tilde{d}
-=
+\tilde{d} =
 \begin{cases}
 \tilde{\nabla}_{\text{repr}},
 & \tilde{\nabla}_{\text{repr}}^\top\tilde{\nabla}_{\text{FM}} \ge 0, \\[4pt]
@@ -290,10 +272,8 @@ $$
 然后更新
 
 $$
-\theta_{t+1}
-=
-\theta_{t+\frac{1}{2}}
--
+\theta_{t+1} =
+\theta_{t+\frac{1}{2}} -
 \eta_2\tilde{d}.
 $$
 
@@ -306,13 +286,11 @@ $$
 定义先验一致性代理为
 
 $$
-\mathcal{L}_{\text{prior}}(\phi)
-=
+\mathcal{L}_{\text{prior}}(\phi) =
 \mathbb{E}
 \left[
 \left\|
-v_{\theta^*}(x_t,t;c_\phi(z_0))
--
+v_{\theta^*}(x_t,t;c_\phi(z_0)) -
 v_{\theta^*}(x_t,t;c_\varnothing)
 \right\|^2
 \right].
