@@ -1227,6 +1227,11 @@ def test_descent_credit_projected_smoke_run_persists_credit_metrics(tmp_path) ->
     assert trained_metric["fm_descent_credit"] >= 0.0
     assert trained_metric["credit_dot_lower_bound"] <= 0.0
     assert trained_metric["credit_budget_used_fraction"] >= 0.0
+    expected_lower_bound = -trained_metric["fm_descent_credit"] / config.repr_learning_rate
+    assert trained_metric["credit_dot_lower_bound"] == pytest.approx(expected_lower_bound, abs=1.0e-6)
+    assert trained_metric["dot_after_mean"] + 1.0e-6 >= trained_metric["credit_dot_lower_bound"]
+    if trained_metric["fm_descent_credit"] > 0.0:
+        assert trained_metric["credit_budget_used_fraction"] <= 1.0 + 1.0e-5
 
 
 def test_run_single_experiment_invokes_metrics_callback(tmp_path) -> None:
