@@ -8,7 +8,12 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from safa.training.projected_update import ProjectionResult, project_gradient_onto_fm_feasible_cone
+from safa.training.projected_update import (
+    AdaptiveMarginAdjustment,
+    ProjectionResult,
+    compute_adaptive_margin_adjustment,
+    project_gradient_onto_fm_feasible_cone,
+)
 
 
 def _dot(left: list["torch.Tensor"], right: list["torch.Tensor"]):
@@ -64,6 +69,36 @@ def test_tiny_fm_gradient_keeps_repr_gradient_unprojected_even_when_conflicting(
     assert result.dot_before < 0
     assert torch.allclose(result.dot_after, result.dot_before)
     assert torch.allclose(result.projected_gradients[0], g_repr[0])
+
+
+@pytest.mark.parametrize(
+    ("normalized_fm_loss", "baseline", "expected_margin", "expected_direction"),
+    [
+        (1.2, 1.0, 0.05, "tighten"),
+        (0.8, 1.0, 0.11, "loosen"),
+    ],
+)
+def test_adaptive_margin_adjustment_moves_in_expected_direction(
+    normalized_fm_loss: float,
+    baseline: float,
+    expected_margin: float,
+    expected_direction: str,
+) -> None:
+    result = compute_adaptive_margin_adjustment(
+        current_margin=0.08,
+        normalized_fm_loss=normalized_fm_loss,
+        baseline=baseline,
+        step=0.03,
+        min_margin=0.0,
+        max_margin=0.11,
+    )
+
+    assert is_dataclass(AdaptiveMarginAdjustment)
+    assert isinstance(result, AdaptiveMarginAdjustment)
+    assert result.direction == expected_direction
+    assert result.next_margin == pytest.approx(expected_margin)
+    assert result.baseline == pytest.approx(baseline)
+    assert result.normalized_fm_loss == pytest.approx(normalized_fm_loss)
 
 
 @pytest.mark.parametrize(

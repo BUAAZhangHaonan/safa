@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass, fields
+from dataclasses import MISSING, asdict, dataclass, fields
 import json
 import math
 from pathlib import Path
@@ -11,7 +11,12 @@ from typing import Any
 import torch
 from torch import nn
 
-from safa.training.projected_update import ProjectionResult, project_gradient_onto_fm_feasible_cone
+from safa.training.projected_update import (
+    AdaptiveMarginAdjustment,
+    ProjectionResult,
+    compute_adaptive_margin_adjustment,
+    project_gradient_onto_fm_feasible_cone,
+)
 
 
 @dataclass(frozen=True)
@@ -41,6 +46,13 @@ class ToyConfig:
     calibration_batches: int
     eval_interval: int
     projection_eps: float
+    adaptive_margin_mode: str | None = None
+    adaptive_margin_target: float | None = None
+    adaptive_margin_ema_beta: float | None = None
+    adaptive_margin_step: float | None = None
+    adaptive_margin_min: float | None = None
+    adaptive_margin_max: float | None = None
+    adaptive_margin_initial: float | None = None
 
 
 SUPPORTED_METHODS = {
@@ -50,8 +62,15 @@ SUPPORTED_METHODS = {
     "projected_two_step",
     "pcgrad",
     "soft_margin_projected",
+    "adaptive_margin_projected",
 }
 NORM_EPS = 1.0e-12
+
+
+@dataclass
+class AdaptiveMarginState:
+    margin: float
+    ema_fm_loss: float | None
 
 
 def load_config(path: str | Path) -> ToyConfig:
@@ -60,10 +79,15 @@ def load_config(path: str | Path) -> ToyConfig:
         payload = json.load(handle)
     if not isinstance(payload, dict):
         raise TypeError("Toy config must be a JSON object")
-    required = {item.name for item in fields(ToyConfig)}
+    config_fields = {item.name for item in fields(ToyConfig)}
+    required = {
+        item.name
+        for item in fields(ToyConfig)
+        if item.default is MISSING and item.default_factory is MISSING
+    }
     actual = set(payload)
     missing = sorted(required - actual)
-    extra = sorted(actual - required)
+    extra = sorted(actual - config_fields)
     if missing:
         raise KeyError(f"Missing required config keys: {missing}")
     if extra:
@@ -133,6 +157,7 @@ def validate_config(config: ToyConfig) -> None:
     for value in config.soft_margins:
         if not isinstance(value, (float, int)) or not math.isfinite(float(value)) or float(value) < 0.0:
             raise ValueError("all soft_margins must be finite non-negative numbers")
+    _validate_adaptive_margin_config(config)
 
 
 class ToyVectorField(nn.Module):
@@ -211,6 +236,13 @@ def run_single_experiment(
     validate_config(config)
     if method not in SUPPORTED_METHODS:
         raise ValueError(f"Unsupported method: {method}")
+    if method == "adaptive_margin_projected":
+        if lambda_repr != 1.0:
+            raise ValueError("adaptive_margin_projected uses fixed lambda_repr=1.0")
+        if config.adaptive_margin_initial is None:
+            raise ValueError("adaptive_margin_projected requires adaptive_margin_initial")
+        if not math.isclose(float(soft_margin), float(config.adaptive_margin_initial), rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError("adaptive_margin_projected soft_margin must equal adaptive_margin_initial")
     device = torch.device(config.device)
     seed_offset = _stable_seed_offset(method, delta_deg, lambda_repr, soft_margin)
     train_generator = torch.Generator(device=device).manual_seed(config.seed + seed_offset)
@@ -220,7 +252,18 @@ def run_single_experiment(
     fm_optimizer = torch.optim.AdamW(model.parameters(), lr=config.fm_learning_rate, weight_decay=config.weight_decay)
     eval_batch = _sample_batch(config, delta_deg, config.eval_batch_size, device, eval_generator)
     flow_scale, repr_scale = _calibrate_loss_scales(config, model, delta_deg, device, train_generator)
-    initial = _evaluate_model(config, model, eval_batch, delta_deg, method, lambda_repr, soft_margin, step=0)
+    adaptive_state = _new_adaptive_margin_state(config) if method == "adaptive_margin_projected" else None
+    initial = _evaluate_model(
+        config,
+        model,
+        eval_batch,
+        delta_deg,
+        method,
+        lambda_repr,
+        soft_margin,
+        step=0,
+        train_stats=_initial_step_stats(method, soft_margin),
+    )
 
     metrics = [initial]
     stat_window = _new_stat_window()
@@ -253,6 +296,18 @@ def run_single_experiment(
                 repr_scale,
                 lambda_repr,
                 soft_margin=soft_margin,
+            )
+        elif method == "adaptive_margin_projected":
+            step_stats = _step_projected_two_step(
+                config,
+                model,
+                fm_optimizer,
+                batch,
+                flow_scale,
+                repr_scale,
+                lambda_repr,
+                soft_margin=soft_margin,
+                adaptive_state=adaptive_state,
             )
         elif method == "pcgrad":
             step_stats = _step_pcgrad(config, model, optimizer, batch, flow_scale, repr_scale, lambda_repr)
@@ -338,6 +393,10 @@ def _method_parameter_grid(config: ToyConfig, method: str) -> list[tuple[float, 
         return [(config.lambdas[0], config.soft_margins[0])]
     if method == "soft_margin_projected":
         return [(lambda_repr, margin) for lambda_repr in config.lambdas for margin in config.soft_margins]
+    if method == "adaptive_margin_projected":
+        if config.adaptive_margin_initial is None:
+            raise ValueError("adaptive_margin_projected requires adaptive_margin_initial")
+        return [(1.0, float(config.adaptive_margin_initial))]
     return [(lambda_repr, config.soft_margins[0]) for lambda_repr in config.lambdas]
 
 
@@ -509,6 +568,7 @@ def _step_projected_two_step(
     repr_scale: torch.Tensor,
     lambda_repr: float,
     soft_margin: float,
+    adaptive_state: AdaptiveMarginState | None = None,
 ) -> dict[str, float]:
     fm_optimizer.zero_grad(set_to_none=True)
     losses = _compute_losses(config, model, batch)
@@ -520,19 +580,36 @@ def _step_projected_two_step(
     repr_objective = lambda_repr * post_losses["repr"] / repr_scale
     flow_guard_value = float(flow_objective.detach().cpu())
     g_fm, g_repr = _task_gradients(model, flow_objective, repr_objective)
-    if soft_margin == 0.0:
+    effective_margin = soft_margin
+    adaptive_normalized_fm_loss = 0.0
+    adaptive_margin_baseline = 0.0
+    adaptive_margin_direction = 0.0
+    if adaptive_state is not None:
+        adjustment = _update_adaptive_margin(config, adaptive_state, flow_guard_value)
+        effective_margin = adjustment.next_margin
+        adaptive_normalized_fm_loss = adjustment.normalized_fm_loss
+        adaptive_margin_baseline = adjustment.baseline
+        adaptive_margin_direction = _adaptive_margin_direction_value(adjustment.direction)
+    if effective_margin == 0.0:
         projection = project_gradient_onto_fm_feasible_cone(g_repr, g_fm, eps=config.projection_eps)
     else:
         projection = project_gradient_with_soft_margin(
             g_repr,
             g_fm,
-            epsilon=soft_margin,
+            epsilon=effective_margin,
             eps=config.projection_eps,
         )
     _manual_parameter_step(model, projection.projected_gradients, config.repr_learning_rate)
     after_losses = _compute_losses(config, model, batch)
     actual_fm_delta = float((after_losses["flow"] / flow_scale).detach().cpu()) - flow_guard_value
-    return _stats_from_projection(projection, actual_fm_delta=actual_fm_delta)
+    return _stats_from_projection(
+        projection,
+        actual_fm_delta=actual_fm_delta,
+        adaptive_margin=effective_margin,
+        adaptive_normalized_fm_loss=adaptive_normalized_fm_loss,
+        adaptive_margin_baseline=adaptive_margin_baseline,
+        adaptive_margin_direction=adaptive_margin_direction,
+    )
 
 
 def _step_pcgrad(
@@ -689,6 +766,10 @@ def _new_stat_window() -> dict[str, list[float]]:
         "dot_after": [],
         "actual_fm_delta_after_repr_step": [],
         "projected_repr_norm_ratio": [],
+        "adaptive_margin": [],
+        "adaptive_normalized_fm_loss": [],
+        "adaptive_margin_baseline": [],
+        "adaptive_margin_direction": [],
     }
 
 
@@ -699,6 +780,10 @@ def _empty_step_stats() -> dict[str, float]:
         "dot_after_mean": 0.0,
         "actual_fm_delta_after_repr_step": 0.0,
         "projected_repr_norm_ratio": 0.0,
+        "adaptive_margin": 0.0,
+        "adaptive_normalized_fm_loss": 0.0,
+        "adaptive_margin_baseline": 0.0,
+        "adaptive_margin_direction": 0.0,
     }
 
 
@@ -708,6 +793,10 @@ def _accumulate_stats(window: dict[str, list[float]], step_stats: dict[str, floa
     window["dot_after"].append(float(step_stats["dot_after_mean"]))
     window["actual_fm_delta_after_repr_step"].append(float(step_stats["actual_fm_delta_after_repr_step"]))
     window["projected_repr_norm_ratio"].append(float(step_stats["projected_repr_norm_ratio"]))
+    window["adaptive_margin"].append(float(step_stats["adaptive_margin"]))
+    window["adaptive_normalized_fm_loss"].append(float(step_stats["adaptive_normalized_fm_loss"]))
+    window["adaptive_margin_baseline"].append(float(step_stats["adaptive_margin_baseline"]))
+    window["adaptive_margin_direction"].append(float(step_stats["adaptive_margin_direction"]))
 
 
 def _summarize_stat_window(window: dict[str, list[float]]) -> dict[str, float]:
@@ -719,6 +808,10 @@ def _summarize_stat_window(window: dict[str, list[float]]) -> dict[str, float]:
         "dot_after_mean": _mean(window["dot_after"]),
         "actual_fm_delta_after_repr_step": _mean(window["actual_fm_delta_after_repr_step"]),
         "projected_repr_norm_ratio": _mean(window["projected_repr_norm_ratio"]),
+        "adaptive_margin": _mean(window["adaptive_margin"]),
+        "adaptive_normalized_fm_loss": _mean(window["adaptive_normalized_fm_loss"]),
+        "adaptive_margin_baseline": _mean(window["adaptive_margin_baseline"]),
+        "adaptive_margin_direction": _mean(window["adaptive_margin_direction"]),
     }
 
 
@@ -728,7 +821,14 @@ def _mean(values: list[float]) -> float:
     return float(sum(values) / len(values))
 
 
-def _stats_from_projection(projection: ProjectionResult, actual_fm_delta: float) -> dict[str, float]:
+def _stats_from_projection(
+    projection: ProjectionResult,
+    actual_fm_delta: float,
+    adaptive_margin: float = 0.0,
+    adaptive_normalized_fm_loss: float = 0.0,
+    adaptive_margin_baseline: float = 0.0,
+    adaptive_margin_direction: float = 0.0,
+) -> dict[str, float]:
     ratio = projection.projected_repr_norm / projection.repr_norm
     return {
         "conflict_fraction": 1.0 if projection.dot_before < 0 else 0.0,
@@ -736,6 +836,10 @@ def _stats_from_projection(projection: ProjectionResult, actual_fm_delta: float)
         "dot_after_mean": float(projection.dot_after.detach().cpu()),
         "actual_fm_delta_after_repr_step": float(actual_fm_delta),
         "projected_repr_norm_ratio": float(ratio.detach().cpu()),
+        "adaptive_margin": float(adaptive_margin),
+        "adaptive_normalized_fm_loss": float(adaptive_normalized_fm_loss),
+        "adaptive_margin_baseline": float(adaptive_margin_baseline),
+        "adaptive_margin_direction": float(adaptive_margin_direction),
     }
 
 
@@ -754,7 +858,163 @@ def _stats_from_gradients(
         "dot_after_mean": float(dot_after.detach().cpu()),
         "actual_fm_delta_after_repr_step": float(actual_fm_delta),
         "projected_repr_norm_ratio": float((projected_norm / repr_norm).detach().cpu()),
+        "adaptive_margin": 0.0,
+        "adaptive_normalized_fm_loss": 0.0,
+        "adaptive_margin_baseline": 0.0,
+        "adaptive_margin_direction": 0.0,
     }
+
+
+def _initial_step_stats(method: str, soft_margin: float) -> dict[str, float]:
+    stats = _empty_step_stats()
+    if method == "adaptive_margin_projected":
+        stats["adaptive_margin"] = float(soft_margin)
+    return stats
+
+
+def _new_adaptive_margin_state(config: ToyConfig) -> AdaptiveMarginState:
+    if config.adaptive_margin_initial is None:
+        raise ValueError("adaptive_margin_projected requires adaptive_margin_initial")
+    return AdaptiveMarginState(
+        margin=float(config.adaptive_margin_initial),
+        ema_fm_loss=None,
+    )
+
+
+def _update_adaptive_margin(
+    config: ToyConfig,
+    adaptive_state: AdaptiveMarginState,
+    normalized_fm_loss: float,
+) -> AdaptiveMarginAdjustment:
+    if config.adaptive_margin_mode is None:
+        raise ValueError("adaptive_margin_projected requires adaptive_margin_mode")
+    baseline = _adaptive_margin_baseline(config, adaptive_state, normalized_fm_loss)
+    if config.adaptive_margin_step is None:
+        raise ValueError("adaptive_margin_projected requires adaptive_margin_step")
+    if config.adaptive_margin_min is None or config.adaptive_margin_max is None:
+        raise ValueError("adaptive_margin_projected requires adaptive_margin_min and adaptive_margin_max")
+    adjustment = compute_adaptive_margin_adjustment(
+        current_margin=adaptive_state.margin,
+        normalized_fm_loss=normalized_fm_loss,
+        baseline=baseline,
+        step=config.adaptive_margin_step,
+        min_margin=config.adaptive_margin_min,
+        max_margin=config.adaptive_margin_max,
+    )
+    adaptive_state.margin = adjustment.next_margin
+    if config.adaptive_margin_mode == "ema":
+        adaptive_state.ema_fm_loss = _ema_update(
+            adaptive_state.ema_fm_loss,
+            normalized_fm_loss,
+            config.adaptive_margin_ema_beta,
+        )
+    return adjustment
+
+
+def _adaptive_margin_baseline(
+    config: ToyConfig,
+    adaptive_state: AdaptiveMarginState,
+    normalized_fm_loss: float,
+) -> float:
+    if config.adaptive_margin_mode == "target":
+        if config.adaptive_margin_target is None:
+            raise ValueError("adaptive_margin_projected requires adaptive_margin_target in target mode")
+        return float(config.adaptive_margin_target)
+    if config.adaptive_margin_mode == "ema":
+        if adaptive_state.ema_fm_loss is None:
+            return float(normalized_fm_loss)
+        return float(adaptive_state.ema_fm_loss)
+    raise ValueError("adaptive_margin_mode must be one of {'target', 'ema'}")
+
+
+def _adaptive_margin_direction_value(direction: str) -> float:
+    if direction == "tighten":
+        return -1.0
+    if direction == "hold":
+        return 0.0
+    if direction == "loosen":
+        return 1.0
+    raise ValueError(f"Unsupported adaptive margin direction: {direction}")
+
+
+def _ema_update(previous: float | None, value: float, beta: float | None) -> float:
+    if beta is None:
+        raise ValueError("adaptive_margin_projected requires adaptive_margin_ema_beta in ema mode")
+    if previous is None:
+        return float(value)
+    return float(beta) * float(previous) + (1.0 - float(beta)) * float(value)
+
+
+def _validate_adaptive_margin_config(config: ToyConfig) -> None:
+    if "adaptive_margin_projected" not in config.methods:
+        return
+    if config.methods != ["adaptive_margin_projected"]:
+        raise ValueError("adaptive_margin_projected must run in a dedicated config")
+    if config.lambdas != [1.0]:
+        raise ValueError("adaptive_margin_projected uses fixed lambda_repr=1.0; set lambdas to [1.0]")
+    if len(config.soft_margins) != 1:
+        raise ValueError("adaptive_margin_projected requires exactly one soft_margin placeholder")
+
+    missing = [
+        name
+        for name, value in {
+            "adaptive_margin_mode": config.adaptive_margin_mode,
+            "adaptive_margin_step": config.adaptive_margin_step,
+            "adaptive_margin_min": config.adaptive_margin_min,
+            "adaptive_margin_max": config.adaptive_margin_max,
+            "adaptive_margin_initial": config.adaptive_margin_initial,
+        }.items()
+        if value is None
+    ]
+    if missing:
+        raise ValueError(f"adaptive_margin_projected requires explicit config fields: {missing}")
+
+    if config.adaptive_margin_mode not in {"target", "ema"}:
+        raise ValueError("adaptive_margin_mode must be 'target' or 'ema'")
+    if config.adaptive_margin_mode == "target" and config.adaptive_margin_target is None:
+        raise ValueError("adaptive_margin_projected requires adaptive_margin_target in target mode")
+    if config.adaptive_margin_mode == "ema" and config.adaptive_margin_ema_beta is None:
+        raise ValueError("adaptive_margin_projected requires adaptive_margin_ema_beta in ema mode")
+
+    adaptive_margin_step = _require_finite_scalar(config.adaptive_margin_step, "adaptive_margin_step", min_value=0.0)
+    adaptive_margin_min = _require_finite_scalar(config.adaptive_margin_min, "adaptive_margin_min", min_value=0.0)
+    adaptive_margin_max = _require_finite_scalar(
+        config.adaptive_margin_max,
+        "adaptive_margin_max",
+        min_value=adaptive_margin_min,
+    )
+    adaptive_margin_initial = _require_finite_scalar(
+        config.adaptive_margin_initial,
+        "adaptive_margin_initial",
+        min_value=adaptive_margin_min,
+    )
+    if adaptive_margin_initial > adaptive_margin_max:
+        raise ValueError("adaptive_margin_initial must be <= adaptive_margin_max")
+    if not math.isclose(float(config.soft_margins[0]), adaptive_margin_initial, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError("adaptive_margin_projected soft_margins[0] must equal adaptive_margin_initial")
+    if config.adaptive_margin_mode == "target":
+        _require_finite_scalar(config.adaptive_margin_target, "adaptive_margin_target", min_value=0.0)
+    if config.adaptive_margin_mode == "ema":
+        adaptive_margin_ema_beta = _require_finite_scalar(
+            config.adaptive_margin_ema_beta,
+            "adaptive_margin_ema_beta",
+            min_value=0.0,
+        )
+        if adaptive_margin_ema_beta >= 1.0:
+            raise ValueError("adaptive_margin_ema_beta must be < 1.0")
+    if adaptive_margin_step > adaptive_margin_max - adaptive_margin_min and adaptive_margin_max > adaptive_margin_min:
+        raise ValueError("adaptive_margin_step must not exceed the adaptive margin range")
+
+
+def _require_finite_scalar(value: float | None, name: str, min_value: float | None = None) -> float:
+    if value is None:
+        raise ValueError(f"{name} is required")
+    if not isinstance(value, (float, int)) or not math.isfinite(float(value)):
+        raise ValueError(f"{name} must be finite")
+    scalar = float(value)
+    if min_value is not None and scalar < min_value:
+        raise ValueError(f"{name} must be >= {min_value}")
+    return scalar
 
 
 def _validate_gradient_lists(g_repr: list[torch.Tensor], g_fm: list[torch.Tensor]) -> None:

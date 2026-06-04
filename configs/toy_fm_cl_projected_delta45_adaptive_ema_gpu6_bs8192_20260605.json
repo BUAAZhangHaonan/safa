@@ -1,0 +1,42 @@
+{
+  "adaptive_margin_ema_beta": 0.9,
+  "adaptive_margin_initial": 0.02,
+  "adaptive_margin_max": 0.1,
+  "adaptive_margin_min": 0.0,
+  "adaptive_margin_mode": "ema",
+  "adaptive_margin_step": 0.005,
+  "adaptive_margin_target": null,
+  "batch_size": 8192,
+  "calibration_batches": 4,
+  "deltas_deg": [
+    45.0
+  ],
+  "device": "cuda:0",
+  "eval_batch_size": 1024,
+  "eval_interval": 1000,
+  "fm_learning_rate": 0.001,
+  "hidden_dim": 64,
+  "k_classes": 8,
+  "lambdas": [
+    1.0
+  ],
+  "layers": 3,
+  "learning_rate": 0.001,
+  "methods": [
+    "adaptive_margin_projected"
+  ],
+  "normalize_losses": true,
+  "output_dir": "artifacts/toy_fm_cl_projected",
+  "projection_eps": 1e-12,
+  "repr_learning_rate": 0.001,
+  "repr_relation_weight": 1.0,
+  "run_name": "delta45_adaptive_ema_gpu6_bs8192_20260605",
+  "sample_steps": 16,
+  "seed": 1337,
+  "sigma": 0.05,
+  "soft_margins": [
+    0.02
+  ],
+  "steps": 5000,
+  "weight_decay": 0.0
+}

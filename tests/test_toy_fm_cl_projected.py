@@ -18,6 +18,236 @@ def test_toy_config_requires_all_keys(tmp_path) -> None:
         toy.load_config(config_path)
 
 
+def test_adaptive_method_requires_explicit_margin_fields(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config_path = tmp_path / "adaptive_missing_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "run_name": "adaptive_missing",
+                "output_dir": str(tmp_path),
+                "device": "cpu",
+                "seed": 1,
+                "deltas_deg": [0.0],
+                "methods": ["adaptive_margin_projected"],
+                "lambdas": [1.0],
+                "soft_margins": [0.02],
+                "steps": 2,
+                "batch_size": 8,
+                "eval_batch_size": 8,
+                "hidden_dim": 8,
+                "layers": 1,
+                "sigma": 0.02,
+                "k_classes": 4,
+                "sample_steps": 2,
+                "learning_rate": 0.001,
+                "fm_learning_rate": 0.001,
+                "repr_learning_rate": 0.001,
+                "weight_decay": 0.0,
+                "repr_relation_weight": 0.0,
+                "normalize_losses": True,
+                "calibration_batches": 1,
+                "eval_interval": 1,
+                "projection_eps": 1e-12,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="adaptive_margin_projected requires"):
+        toy.load_config(config_path)
+
+
+def test_adaptive_method_load_config_accepts_explicit_margin_fields(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config_path = tmp_path / "adaptive_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "run_name": "adaptive_ok",
+                "output_dir": str(tmp_path),
+                "device": "cpu",
+                "seed": 1,
+                "deltas_deg": [0.0],
+                "methods": ["adaptive_margin_projected"],
+                "lambdas": [1.0],
+                "soft_margins": [0.02],
+                "steps": 2,
+                "batch_size": 8,
+                "eval_batch_size": 8,
+                "hidden_dim": 8,
+                "layers": 1,
+                "sigma": 0.02,
+                "k_classes": 4,
+                "sample_steps": 2,
+                "learning_rate": 0.001,
+                "fm_learning_rate": 0.001,
+                "repr_learning_rate": 0.001,
+                "weight_decay": 0.0,
+                "repr_relation_weight": 0.0,
+                "normalize_losses": True,
+                "calibration_batches": 1,
+                "eval_interval": 1,
+                "projection_eps": 1e-12,
+                "adaptive_margin_mode": "target",
+                "adaptive_margin_target": 1.0,
+                "adaptive_margin_ema_beta": None,
+                "adaptive_margin_step": 0.01,
+                "adaptive_margin_min": 0.0,
+                "adaptive_margin_max": 0.05,
+                "adaptive_margin_initial": 0.02,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = toy.load_config(config_path)
+
+    assert config.methods == ["adaptive_margin_projected"]
+    assert config.adaptive_margin_initial == pytest.approx(0.02)
+
+
+def test_adaptive_method_rejects_lambda_sweep(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config_path = tmp_path / "adaptive_bad_lambda.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "run_name": "adaptive_bad_lambda",
+                "output_dir": str(tmp_path),
+                "device": "cpu",
+                "seed": 1,
+                "deltas_deg": [0.0],
+                "methods": ["adaptive_margin_projected"],
+                "lambdas": [0.1],
+                "soft_margins": [0.02],
+                "steps": 2,
+                "batch_size": 8,
+                "eval_batch_size": 8,
+                "hidden_dim": 8,
+                "layers": 1,
+                "sigma": 0.1,
+                "k_classes": 4,
+                "sample_steps": 2,
+                "learning_rate": 0.001,
+                "fm_learning_rate": 0.001,
+                "repr_learning_rate": 0.001,
+                "weight_decay": 0.0,
+                "repr_relation_weight": 0.0,
+                "normalize_losses": True,
+                "calibration_batches": 1,
+                "eval_interval": 1,
+                "projection_eps": 1.0e-12,
+                "adaptive_margin_mode": "target",
+                "adaptive_margin_target": 1.0,
+                "adaptive_margin_ema_beta": None,
+                "adaptive_margin_step": 0.01,
+                "adaptive_margin_min": 0.0,
+                "adaptive_margin_max": 0.05,
+                "adaptive_margin_initial": 0.02,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="fixed lambda_repr=1.0"):
+        toy.load_config(config_path)
+
+
+def test_adaptive_method_rejects_soft_margin_mismatch(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config_path = tmp_path / "adaptive_bad_margin.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "run_name": "adaptive_bad_margin",
+                "output_dir": str(tmp_path),
+                "device": "cpu",
+                "seed": 1,
+                "deltas_deg": [0.0],
+                "methods": ["adaptive_margin_projected"],
+                "lambdas": [1.0],
+                "soft_margins": [0.03],
+                "steps": 2,
+                "batch_size": 8,
+                "eval_batch_size": 8,
+                "hidden_dim": 8,
+                "layers": 1,
+                "sigma": 0.1,
+                "k_classes": 4,
+                "sample_steps": 2,
+                "learning_rate": 0.001,
+                "fm_learning_rate": 0.001,
+                "repr_learning_rate": 0.001,
+                "weight_decay": 0.0,
+                "repr_relation_weight": 0.0,
+                "normalize_losses": True,
+                "calibration_batches": 1,
+                "eval_interval": 1,
+                "projection_eps": 1.0e-12,
+                "adaptive_margin_mode": "target",
+                "adaptive_margin_target": 1.0,
+                "adaptive_margin_ema_beta": None,
+                "adaptive_margin_step": 0.01,
+                "adaptive_margin_min": 0.0,
+                "adaptive_margin_max": 0.05,
+                "adaptive_margin_initial": 0.02,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="soft_margins\\[0\\] must equal adaptive_margin_initial"):
+        toy.load_config(config_path)
+
+
+def test_adaptive_method_rejects_mixed_method_grid(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config_path = tmp_path / "adaptive_mixed_grid.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "run_name": "adaptive_mixed_grid",
+                "output_dir": str(tmp_path),
+                "device": "cpu",
+                "seed": 1,
+                "deltas_deg": [0.0],
+                "methods": ["weighted_sum", "adaptive_margin_projected"],
+                "lambdas": [1.0],
+                "soft_margins": [0.02],
+                "steps": 2,
+                "batch_size": 8,
+                "eval_batch_size": 8,
+                "hidden_dim": 8,
+                "layers": 1,
+                "sigma": 0.1,
+                "k_classes": 4,
+                "sample_steps": 2,
+                "learning_rate": 0.001,
+                "fm_learning_rate": 0.001,
+                "repr_learning_rate": 0.001,
+                "weight_decay": 0.0,
+                "repr_relation_weight": 0.0,
+                "normalize_losses": True,
+                "calibration_batches": 1,
+                "eval_interval": 1,
+                "projection_eps": 1.0e-12,
+                "adaptive_margin_mode": "target",
+                "adaptive_margin_target": 1.0,
+                "adaptive_margin_ema_beta": None,
+                "adaptive_margin_step": 0.01,
+                "adaptive_margin_min": 0.0,
+                "adaptive_margin_max": 0.05,
+                "adaptive_margin_initial": 0.02,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="dedicated config"):
+        toy.load_config(config_path)
+
+
 def test_soft_margin_projection_allows_explicit_fm_budget() -> None:
     toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
     g_repr = [torch.tensor([1.0, 0.0])]
@@ -42,7 +272,7 @@ def test_delta_zero_projected_smoke_improves_fm_and_repr(tmp_path) -> None:
         seed=7,
         deltas_deg=[0.0],
         methods=["projected_two_step"],
-        lambdas=[0.1],
+        lambdas=[1.0],
         soft_margins=[0.0],
         steps=80,
         batch_size=64,
@@ -70,6 +300,204 @@ def test_delta_zero_projected_smoke_improves_fm_and_repr(tmp_path) -> None:
     assert result["final"]["repr_cosine_mean"] > result["initial"]["repr_cosine_mean"]
     assert result["final"]["conflict_fraction"] >= 0.0
     assert "projected_repr_norm_ratio" in result["final"]
+
+
+def test_adaptive_margin_projected_runs_and_records_margin_metrics(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config = toy.ToyConfig(
+        run_name="pytest_adaptive",
+        output_dir=str(tmp_path),
+        device="cpu",
+        seed=17,
+        deltas_deg=[15.0],
+        methods=["adaptive_margin_projected"],
+        lambdas=[1.0],
+        soft_margins=[0.02],
+        steps=6,
+        batch_size=24,
+        eval_batch_size=32,
+        hidden_dim=8,
+        layers=1,
+        sigma=0.02,
+        k_classes=4,
+        sample_steps=2,
+        learning_rate=0.001,
+        fm_learning_rate=0.001,
+        repr_learning_rate=0.001,
+        weight_decay=0.0,
+        repr_relation_weight=0.0,
+        normalize_losses=True,
+        calibration_batches=1,
+        eval_interval=3,
+        projection_eps=1e-12,
+        adaptive_margin_mode="target",
+        adaptive_margin_target=1.0,
+        adaptive_margin_ema_beta=None,
+        adaptive_margin_step=0.01,
+        adaptive_margin_min=0.0,
+        adaptive_margin_max=0.05,
+        adaptive_margin_initial=0.02,
+    )
+
+    result = toy.run_single_experiment(
+        config,
+        delta_deg=15.0,
+        method="adaptive_margin_projected",
+        lambda_repr=1.0,
+        soft_margin=0.02,
+    )
+
+    assert result["final"]["adaptive_margin"] >= 0.0
+    assert result["final"]["adaptive_margin"] <= 0.05
+    assert "actual_fm_delta_after_repr_step" in result["final"]
+    assert "repr_cosine_mean" in result["final"]
+    assert "valid_fm_loss" in result["final"]
+    assert "adaptive_normalized_fm_loss" in result["final"]
+    assert "adaptive_margin_baseline" in result["final"]
+    assert "adaptive_margin_direction" in result["final"]
+
+
+def test_adaptive_margin_projected_rejects_direct_call_margin_mismatch(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config = toy.ToyConfig(
+        run_name="pytest_adaptive_mismatch",
+        output_dir=str(tmp_path),
+        device="cpu",
+        seed=17,
+        deltas_deg=[15.0],
+        methods=["adaptive_margin_projected"],
+        lambdas=[1.0],
+        soft_margins=[0.02],
+        steps=2,
+        batch_size=8,
+        eval_batch_size=8,
+        hidden_dim=8,
+        layers=1,
+        sigma=0.02,
+        k_classes=4,
+        sample_steps=2,
+        learning_rate=0.001,
+        fm_learning_rate=0.001,
+        repr_learning_rate=0.001,
+        weight_decay=0.0,
+        repr_relation_weight=0.0,
+        normalize_losses=True,
+        calibration_batches=1,
+        eval_interval=1,
+        projection_eps=1e-12,
+        adaptive_margin_mode="target",
+        adaptive_margin_target=1.0,
+        adaptive_margin_ema_beta=None,
+        adaptive_margin_step=0.01,
+        adaptive_margin_min=0.0,
+        adaptive_margin_max=0.05,
+        adaptive_margin_initial=0.02,
+    )
+
+    with pytest.raises(ValueError, match="soft_margin must equal adaptive_margin_initial"):
+        toy.run_single_experiment(
+            config,
+            delta_deg=15.0,
+            method="adaptive_margin_projected",
+            lambda_repr=1.0,
+            soft_margin=0.03,
+        )
+
+
+def test_adaptive_margin_projected_rejects_direct_call_lambda_mismatch(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config = toy.ToyConfig(
+        run_name="pytest_adaptive_bad_lambda_call",
+        output_dir=str(tmp_path),
+        device="cpu",
+        seed=17,
+        deltas_deg=[15.0],
+        methods=["adaptive_margin_projected"],
+        lambdas=[1.0],
+        soft_margins=[0.02],
+        steps=2,
+        batch_size=8,
+        eval_batch_size=8,
+        hidden_dim=8,
+        layers=1,
+        sigma=0.02,
+        k_classes=4,
+        sample_steps=2,
+        learning_rate=0.001,
+        fm_learning_rate=0.001,
+        repr_learning_rate=0.001,
+        weight_decay=0.0,
+        repr_relation_weight=0.0,
+        normalize_losses=True,
+        calibration_batches=1,
+        eval_interval=1,
+        projection_eps=1e-12,
+        adaptive_margin_mode="target",
+        adaptive_margin_target=1.0,
+        adaptive_margin_ema_beta=None,
+        adaptive_margin_step=0.01,
+        adaptive_margin_min=0.0,
+        adaptive_margin_max=0.05,
+        adaptive_margin_initial=0.02,
+    )
+
+    with pytest.raises(ValueError, match="fixed lambda_repr=1.0"):
+        toy.run_single_experiment(
+            config,
+            delta_deg=15.0,
+            method="adaptive_margin_projected",
+            lambda_repr=0.1,
+            soft_margin=0.02,
+        )
+
+
+def test_adaptive_margin_projected_ema_mode_records_baseline(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config = toy.ToyConfig(
+        run_name="pytest_adaptive_ema",
+        output_dir=str(tmp_path),
+        device="cpu",
+        seed=21,
+        deltas_deg=[15.0],
+        methods=["adaptive_margin_projected"],
+        lambdas=[1.0],
+        soft_margins=[0.02],
+        steps=4,
+        batch_size=16,
+        eval_batch_size=16,
+        hidden_dim=8,
+        layers=1,
+        sigma=0.02,
+        k_classes=4,
+        sample_steps=2,
+        learning_rate=0.001,
+        fm_learning_rate=0.001,
+        repr_learning_rate=0.001,
+        weight_decay=0.0,
+        repr_relation_weight=0.0,
+        normalize_losses=True,
+        calibration_batches=1,
+        eval_interval=2,
+        projection_eps=1e-12,
+        adaptive_margin_mode="ema",
+        adaptive_margin_target=None,
+        adaptive_margin_ema_beta=0.9,
+        adaptive_margin_step=0.01,
+        adaptive_margin_min=0.0,
+        adaptive_margin_max=0.05,
+        adaptive_margin_initial=0.02,
+    )
+
+    result = toy.run_single_experiment(
+        config,
+        delta_deg=15.0,
+        method="adaptive_margin_projected",
+        lambda_repr=1.0,
+        soft_margin=0.02,
+    )
+
+    assert result["final"]["adaptive_margin_baseline"] > 0.0
+    assert result["final"]["adaptive_normalized_fm_loss"] > 0.0
 
 
 def test_toy_grid_writes_required_outputs(tmp_path) -> None:
@@ -151,6 +579,13 @@ def test_toy_grid_runs_weighted_pcgrad_and_soft_margin(tmp_path) -> None:
         calibration_batches=1,
         eval_interval=2,
         projection_eps=1e-12,
+        adaptive_margin_mode="target",
+        adaptive_margin_target=1.0,
+        adaptive_margin_ema_beta=None,
+        adaptive_margin_step=0.01,
+        adaptive_margin_min=0.0,
+        adaptive_margin_max=0.08,
+        adaptive_margin_initial=0.05,
     )
 
     summary = toy.run_experiment_grid(config)

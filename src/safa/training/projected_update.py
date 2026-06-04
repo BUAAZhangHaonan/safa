@@ -20,6 +20,15 @@ class ProjectionResult:
     projected_gradients: list[torch.Tensor]
 
 
+@dataclass(frozen=True)
+class AdaptiveMarginAdjustment:
+    previous_margin: float
+    next_margin: float
+    normalized_fm_loss: float
+    baseline: float
+    direction: str
+
+
 def project_gradient_onto_fm_feasible_cone(
     g_repr: list[torch.Tensor],
     g_fm: list[torch.Tensor],
@@ -66,6 +75,41 @@ def project_gradient_onto_fm_feasible_cone(
     )
 
 
+def compute_adaptive_margin_adjustment(
+    current_margin: float,
+    normalized_fm_loss: float,
+    baseline: float,
+    step: float,
+    min_margin: float,
+    max_margin: float,
+) -> AdaptiveMarginAdjustment:
+    current_margin = _validate_real_scalar(current_margin, "current_margin", min_value=0.0)
+    normalized_fm_loss = _validate_real_scalar(normalized_fm_loss, "normalized_fm_loss")
+    baseline = _validate_real_scalar(baseline, "baseline")
+    step = _validate_real_scalar(step, "step", min_value=0.0)
+    min_margin = _validate_real_scalar(min_margin, "min_margin", min_value=0.0)
+    max_margin = _validate_real_scalar(max_margin, "max_margin", min_value=min_margin)
+    if current_margin < min_margin or current_margin > max_margin:
+        raise ValueError("current_margin must lie within [min_margin, max_margin]")
+
+    if normalized_fm_loss > baseline:
+        next_margin = max(min_margin, current_margin - step)
+        direction = "tighten"
+    elif normalized_fm_loss < baseline:
+        next_margin = min(max_margin, current_margin + step)
+        direction = "loosen"
+    else:
+        next_margin = current_margin
+        direction = "hold"
+    return AdaptiveMarginAdjustment(
+        previous_margin=current_margin,
+        next_margin=next_margin,
+        normalized_fm_loss=normalized_fm_loss,
+        baseline=baseline,
+        direction=direction,
+    )
+
+
 def _validate_gradient_lists(g_repr: list[torch.Tensor], g_fm: list[torch.Tensor]) -> None:
     if not isinstance(g_repr, list) or not isinstance(g_fm, list):
         raise TypeError("g_repr and g_fm must be list[Tensor]")
@@ -93,6 +137,17 @@ def _validate_eps(eps: float) -> None:
         raise TypeError("eps must be a real scalar")
     if not math.isfinite(float(eps)) or float(eps) < 0.0:
         raise ValueError("eps must be finite and non-negative")
+
+
+def _validate_real_scalar(value: float, name: str, min_value: float | None = None) -> float:
+    if not isinstance(value, (float, int)):
+        raise TypeError(f"{name} must be a real scalar")
+    scalar = float(value)
+    if not math.isfinite(scalar):
+        raise ValueError(f"{name} must be finite")
+    if min_value is not None and scalar < min_value:
+        raise ValueError(f"{name} must be >= {min_value}")
+    return scalar
 
 
 def _dot(left: list[torch.Tensor], right: list[torch.Tensor]) -> torch.Tensor:
