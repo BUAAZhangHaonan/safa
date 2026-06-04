@@ -2,7 +2,7 @@
 
 Date: 2026-06-04
 
-This note summarizes the current medium-v2 results after the M3 point-projected run reached epoch 49. It is an interim failure analysis, not a final paper conclusion.
+This note summarizes the current medium-v2 results after the M3 point-projected run reached epoch 50. It is an interim failure analysis, not a final paper conclusion.
 
 ## Conclusion
 
@@ -22,14 +22,14 @@ The result should not be explained only as "the 5M FM is too small." The CL-only
 | Point-only CL-only | epoch 22 | 0.9536 | 0.8984 | 0.0000 | 371.632 at epoch 20 | 0.43597 at epoch 20 | 9.126 | CL alone can raise cosine, but generation collapses away from detectable faces. |
 | Point+Gram CL-only | epoch 28 | 0.8949 | 0.7617 | 0.0020 | 335.702 at epoch 20 | 0.35693 at epoch 20 | 10.823 | Gram did not beat point-only in this probe. It also collapses generation. |
 | Null-FM | epoch 120 | 0.1045 | 0.1406 | 1.0000 | 80.233 | 0.07296 | 5.944 | Null conditioning can generate faces, but it intentionally drops E0 condition information. |
-| M3 point-projected | epoch 49 | 0.6411 raw / 0.6726 EMA | 0.5020 raw / 0.5137 EMA | 1.0000 | 72.870 at epoch 40 | 0.06233 at epoch 40 | 4.774 | Face quality is protected better than M0, but CL utility is almost unchanged from Stage 1. |
+| M3 point-projected | epoch 50 | 0.6310 raw / 0.6739 EMA | 0.4883 raw / 0.5234 EMA | 1.0000 | 72.870 at epoch 40 | 0.06233 at epoch 40 | 5.920 | Face quality is protected better than M0, but CL utility is almost unchanged from Stage 1. |
 
 The most important comparison is Stage1 vs M3:
 
-| Metric | Stage1 epoch 200 | M3 epoch 49 raw | M3 epoch 49 EMA |
+| Metric | Stage1 epoch 200 | M3 epoch 50 raw | M3 epoch 50 EMA |
 | --- | ---: | ---: | ---: |
-| Latent cosine | 0.6388 | 0.6411 | 0.6726 |
-| Source prediction preserved | 0.4922 | 0.5020 | 0.5137 |
+| Latent cosine | 0.6388 | 0.6310 | 0.6739 |
+| Source prediction preserved | 0.4922 | 0.4883 | 0.5234 |
 | Single-face eq1 | 0.9980 | 1.0000 | 1.0000 |
 
 This is the clearest evidence for the "near standstill" diagnosis. M3 protects faces, but it does not substantially improve representation preservation.
@@ -42,20 +42,20 @@ Latest M3 epoch-level values:
 
 | Metric | Value |
 | --- | ---: |
-| stage2 epoch | 49 |
-| total loss | 0.42990 |
-| repr loss | 0.37185 |
-| repr point loss | 0.37185 |
+| stage2 epoch | 50 |
+| total loss | 0.42572 |
+| repr loss | 0.36709 |
+| repr point loss | 0.36709 |
 | repr relation loss | 0.0 |
-| raw latent cosine mean | 0.64106 |
-| EMA latent cosine mean | 0.67260 |
-| raw source prediction preserved | 0.50195 |
-| EMA source prediction preserved | 0.51367 |
+| raw latent cosine mean | 0.63098 |
+| EMA latent cosine mean | 0.67389 |
+| raw source prediction preserved | 0.48828 |
+| EMA source prediction preserved | 0.52344 |
 | raw single-face eq1 | 1.0 |
 | EMA single-face eq1 | 1.0 |
-| projection applied fraction | 0.39936 |
-| fm first-order effect mean | -0.03849 |
-| repr descent inner product mean | 42.04735 |
+| projection applied fraction | 0.36422 |
+| fm first-order effect mean | -0.04264 |
+| repr descent inner product mean | 42.23281 |
 
 The projection machinery is active. About 40% of monitored batches apply projection. The reported FM first-order effect is negative, so the projected representation step is not increasing FM loss to first order on average. But this local property has not produced useful global progress in latent cosine.
 
@@ -97,7 +97,7 @@ So we should not write that DDPM, FM, or MeanFlow proves a model must exceed som
 
 ### 1. Projected update does not create effective CL progress
 
-M3's raw cosine moved from Stage1's 0.6388 to 0.6411 after 49 epochs. EMA reaches 0.6726, but that is still far below the 0.95 guard.
+M3's raw cosine moved from Stage1's 0.6388 to 0.6310 after 50 epochs. EMA reaches 0.6739, but that is still far below the 0.95 guard.
 
 This means the current projected update has not delivered the intended "FM and CL both make useful progress" behavior.
 
@@ -172,4 +172,3 @@ This document does not prove that:
 - Point-only cosine is the final best representation loss.
 
 It does show that the current M3 point-projected implementation has not achieved efficient FM/CL decoupling on the current 5M SAFA prototype.
-
