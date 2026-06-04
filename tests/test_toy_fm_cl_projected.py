@@ -182,6 +182,13 @@ def _descent_credit_payload(tmp_path) -> dict:
     }
 
 
+def _descent_scaled_payload(tmp_path) -> dict:
+    payload = _descent_credit_payload(tmp_path)
+    payload["run_name"] = "descent_scaled_ok"
+    payload["methods"] = ["descent_credit_scaled"]
+    return payload
+
+
 def test_toy_config_requires_all_keys(tmp_path) -> None:
     toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
     config_path = tmp_path / "bad_config.json"
@@ -683,6 +690,53 @@ def test_descent_credit_projected_direct_call_rejects_non_unit_lambda(tmp_path) 
             config,
             delta_deg=15.0,
             method="descent_credit_projected",
+            lambda_repr=0.1,
+            soft_margin=0.0,
+        )
+
+
+def test_descent_credit_scaled_rejects_mixed_method_grid(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config_path = tmp_path / "descent_scaled_mixed_methods.json"
+    payload = _descent_scaled_payload(tmp_path)
+    payload["methods"] = ["weighted_sum", "descent_credit_scaled"]
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="descent_credit_scaled requires a standalone config"):
+        toy.load_config(config_path)
+
+
+def test_descent_credit_scaled_rejects_lambda_sweep(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config_path = tmp_path / "descent_scaled_bad_lambda.json"
+    payload = _descent_scaled_payload(tmp_path)
+    payload["lambdas"] = [0.1, 1.0]
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"descent_credit_scaled requires lambdas to equal \[1\.0\]"):
+        toy.load_config(config_path)
+
+
+def test_descent_credit_scaled_rejects_unused_budget_fields(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config_path = tmp_path / "descent_scaled_unused_fields.json"
+    payload = _descent_scaled_payload(tmp_path)
+    payload["fm_delta_target"] = 0.01
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="descent_credit_scaled does not use these config fields"):
+        toy.load_config(config_path)
+
+
+def test_descent_credit_scaled_direct_call_rejects_non_unit_lambda(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config = toy.ToyConfig(**_descent_scaled_payload(tmp_path))
+
+    with pytest.raises(ValueError, match="descent_credit_scaled uses fixed lambda_repr=1.0"):
+        toy.run_single_experiment(
+            config,
+            delta_deg=15.0,
+            method="descent_credit_scaled",
             lambda_repr=0.1,
             soft_margin=0.0,
         )
@@ -1227,6 +1281,53 @@ def test_descent_credit_projected_smoke_run_persists_credit_metrics(tmp_path) ->
     assert trained_metric["fm_descent_credit"] >= 0.0
     assert trained_metric["credit_dot_lower_bound"] <= 0.0
     assert trained_metric["credit_budget_used_fraction"] >= 0.0
+    expected_lower_bound = -trained_metric["fm_descent_credit"] / config.repr_learning_rate
+    assert trained_metric["credit_dot_lower_bound"] == pytest.approx(expected_lower_bound, abs=1.0e-6)
+    assert trained_metric["dot_after_mean"] + 1.0e-6 >= trained_metric["credit_dot_lower_bound"]
+    if trained_metric["fm_descent_credit"] > 0.0:
+        assert trained_metric["credit_budget_used_fraction"] <= 1.0 + 1.0e-5
+
+
+def test_descent_credit_scaled_smoke_run_persists_scale_metrics(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    payload = _descent_scaled_payload(tmp_path)
+    payload.update(
+        {
+            "run_name": "pytest_descent_scaled",
+            "seed": 71,
+            "deltas_deg": [15.0],
+            "steps": 3,
+            "batch_size": 16,
+            "eval_batch_size": 16,
+            "repr_learning_rate": 0.001,
+            "eval_interval": 1,
+        }
+    )
+    config = toy.ToyConfig(**payload)
+
+    summary = toy.run_experiment_grid(config)
+    run_dir = tmp_path / "pytest_descent_scaled"
+    rows = [
+        json.loads(line)
+        for line in (run_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    trained_metric = next(row for row in rows if row["step"] > 0)
+
+    assert summary["experiments"][0]["method"] == "descent_credit_scaled"
+    for key in [
+        "fm_descent_credit",
+        "credit_dot_lower_bound",
+        "credit_budget_used_fraction",
+        "net_fm_delta_after_two_step",
+        "actual_fm_delta_after_repr_step",
+        "credit_scale",
+        "effective_repr_lr",
+    ]:
+        assert key in summary["experiments"][0]["final"]
+        assert key in trained_metric
+    assert 0.0 <= trained_metric["credit_scale"] <= 1.0
+    assert trained_metric["effective_repr_lr"] == pytest.approx(config.repr_learning_rate * trained_metric["credit_scale"])
     expected_lower_bound = -trained_metric["fm_descent_credit"] / config.repr_learning_rate
     assert trained_metric["credit_dot_lower_bound"] == pytest.approx(expected_lower_bound, abs=1.0e-6)
     assert trained_metric["dot_after_mean"] + 1.0e-6 >= trained_metric["credit_dot_lower_bound"]
