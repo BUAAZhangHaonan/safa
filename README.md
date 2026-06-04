@@ -1,7 +1,3 @@
-
-
-
-
 ## SAFA
 
 ### 1. 问题形式化
@@ -166,8 +162,7 @@ $$
 v^*
 = -\eta
 \left(
-\nabla_{\text{repr}}
-- \frac{
+\nabla_{\text{repr}} - \frac{
 \nabla_{\text{repr}}^\top\nabla_{\text{FM}}
 }{
 \|\nabla_{\text{FM}}\|^2
@@ -211,8 +206,7 @@ $$
 所以，表征更新不会使 FM 目标产生一阶上升。若 $\mathcal{L}_{\text{FM}}$ 在当前邻域内为 $L$-光滑，则有
 
 $$
-\mathcal{L}_{\text{FM}}(\theta + v^*)
-- \mathcal{L}_{\text{FM}}(\theta)
+\mathcal{L}_{\text{FM}}(\theta + v^*) - \mathcal{L}_{\text{FM}}(\theta)
 \le \frac{L\eta^2}{2}\|d\|^2.
 $$
 
@@ -235,8 +229,7 @@ $$
 
 $$
 \theta_{t+\frac{1}{2}}
-= \theta_t
-- \eta_1
+= \theta_t - \eta_1
 \nabla_\theta\mathcal{L}_{\text{FM}}(\theta_t).
 $$
 
@@ -257,8 +250,7 @@ $$
 定义
 
 $$
-\tilde{d}
-=
+\tilde{d} =
 \begin{cases}
 \tilde{\nabla}_{\text{repr}},
 & \tilde{\nabla}_{\text{repr}}^\top\tilde{\nabla}_{\text{FM}} \ge 0, \\[4pt]
@@ -271,8 +263,7 @@ $$
 
 $$
 \theta_{t+1}
-= \theta_{t+\frac{1}{2}}
-- \eta_2\tilde{d}.
+= \theta_{t+\frac{1}{2}} - \eta_2\tilde{d}.
 $$
 
 该两子步机制给出明确的分工：流匹配步负责推动人脸先验继续下降，投影表征步负责在 FM 一阶可行方向内推动表征保持。由此，FM 与表征目标不再通过一个手工权重直接相加，而是在参数空间中以一阶约束的方式解耦。
@@ -288,8 +279,7 @@ $$
 = \mathbb{E}
 \left[
 \left\|
-v_{\theta^*}(x_t,t;c_\phi(z_0))
-- v_{\theta^*}(x_t,t;c_\varnothing)
+v_{\theta^*}(x_t,t;c_\phi(z_0)) - v_{\theta^*}(x_t,t;c_\varnothing)
 \right\|^2
 \right].
 $$
