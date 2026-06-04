@@ -27,6 +27,10 @@ REQUIRED_METRIC_KEYS = {
 }
 
 
+class EmptyMetricsFileError(RuntimeError):
+    pass
+
+
 def refresh_visuals(run_dir: str | Path, expected_experiments: int, steps_per_experiment: int) -> dict[str, Any]:
     if expected_experiments <= 0:
         raise ValueError("expected_experiments must be positive")
@@ -38,7 +42,7 @@ def refresh_visuals(run_dir: str | Path, expected_experiments: int, steps_per_ex
         raise FileNotFoundError(f"Missing toy metrics file: {metrics_path}")
     rows = _read_metric_rows(metrics_path)
     if not rows:
-        raise ValueError(f"Toy metrics file is empty: {metrics_path}")
+        raise EmptyMetricsFileError(f"Toy metrics file is empty: {metrics_path}")
     live_curves = run_path / "live_curves.png"
     live_tradeoff = run_path / "live_tradeoff.png"
     _plot_live_curves(rows, live_curves)
@@ -62,7 +66,7 @@ def watch_visuals(
         try:
             progress = refresh_visuals(run_path, expected_experiments, steps_per_experiment)
             print(json.dumps(progress, sort_keys=True), flush=True)
-        except FileNotFoundError as error:
+        except (FileNotFoundError, EmptyMetricsFileError) as error:
             print(json.dumps({"status": "waiting_for_metrics", "message": str(error)}, sort_keys=True), flush=True)
         if stop_when_summary_exists and (run_path / "summary.json").is_file():
             if (run_path / "metrics.jsonl").is_file():
