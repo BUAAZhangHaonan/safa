@@ -79,6 +79,7 @@ SUPPORTED_METHODS = {
     "adaptive_trust_projected",
     "line_search_projected",
     "dual_step_projected",
+    "budgeted_cl_line_search",
 }
 NORM_EPS = 1.0e-12
 
@@ -193,6 +194,7 @@ def validate_config(config: ToyConfig) -> None:
     _validate_adaptive_trust_config(config)
     _validate_line_search_config(config)
     _validate_dual_step_config(config)
+    _validate_budgeted_cl_line_search_config(config)
 
 
 class ToyVectorField(nn.Module):
@@ -278,6 +280,11 @@ def run_single_experiment(
             raise ValueError(f"{method} requires adaptive_margin_initial")
         if not math.isclose(float(soft_margin), float(config.adaptive_margin_initial), rel_tol=0.0, abs_tol=1e-12):
             raise ValueError(f"{method} soft_margin must equal adaptive_margin_initial")
+    if method == "budgeted_cl_line_search":
+        if lambda_repr != 1.0:
+            raise ValueError("budgeted_cl_line_search uses fixed lambda_repr=1.0")
+        if not math.isclose(float(soft_margin), 0.0, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError("budgeted_cl_line_search requires soft_margin=0.0")
     device = torch.device(config.device)
     seed_offset = _stable_seed_offset(method, delta_deg, lambda_repr, soft_margin)
     train_generator = torch.Generator(device=device).manual_seed(config.seed + seed_offset)
@@ -361,6 +368,17 @@ def run_single_experiment(
             )
         elif method == "line_search_projected":
             step_stats = _step_line_search_projected(
+                config,
+                model,
+                fm_optimizer,
+                batch,
+                flow_scale,
+                repr_scale,
+                lambda_repr,
+                soft_margin=soft_margin,
+            )
+        elif method == "budgeted_cl_line_search":
+            step_stats = _step_budgeted_cl_line_search(
                 config,
                 model,
                 fm_optimizer,
@@ -475,6 +493,8 @@ def _method_parameter_grid(config: ToyConfig, method: str) -> list[tuple[float, 
     if method == "line_search_projected":
         return [(1.0, 0.0)]
     if method == "dual_step_projected":
+        return [(1.0, 0.0)]
+    if method == "budgeted_cl_line_search":
         return [(1.0, 0.0)]
     return [(lambda_repr, config.soft_margins[0]) for lambda_repr in config.lambdas]
 
@@ -803,6 +823,84 @@ def _step_line_search_projected(
     return stats
 
 
+def _step_budgeted_cl_line_search(
+    config: ToyConfig,
+    model: ToyVectorField,
+    fm_optimizer: torch.optim.Optimizer,
+    batch: dict[str, torch.Tensor],
+    flow_scale: torch.Tensor,
+    repr_scale: torch.Tensor,
+    lambda_repr: float,
+    soft_margin: float,
+) -> dict[str, float]:
+    if not math.isclose(float(soft_margin), 0.0, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError("budgeted_cl_line_search requires soft_margins[0] to equal 0.0")
+    fm_delta_target = _require_finite_scalar(config.fm_delta_target, "fm_delta_target", min_value=0.0)
+    max_backtracks = _require_positive_int(config.line_search_max_backtracks, "line_search_max_backtracks")
+    contraction = _require_open_unit_scalar(config.line_search_contraction, "line_search_contraction")
+
+    fm_optimizer.zero_grad(set_to_none=True)
+    losses = _compute_losses(config, model, batch)
+    (losses["flow"] / flow_scale).backward()
+    fm_optimizer.step()
+
+    post_losses = _compute_losses(config, model, batch)
+    flow_objective = post_losses["flow"] / flow_scale
+    repr_objective = lambda_repr * post_losses["repr"] / repr_scale
+    flow_before = float(flow_objective.detach().cpu())
+    repr_before = float(repr_objective.detach().cpu())
+    g_fm, g_repr = _task_gradients(model, flow_objective, repr_objective)
+    theta_half = _copy_parameters(model)
+
+    def evaluate_candidate(alpha: float) -> tuple[float, float]:
+        _restore_parameters(model, theta_half)
+        _manual_parameter_step(model, g_repr, config.repr_learning_rate * alpha)
+        candidate_losses = _compute_losses(config, model, batch)
+        return (
+            float((candidate_losses["flow"] / flow_scale).detach().cpu()),
+            float((lambda_repr * candidate_losses["repr"] / repr_scale).detach().cpu()),
+        )
+
+    line_search = _find_line_search_acceptance(
+        normalized_flow_before=flow_before,
+        normalized_repr_before=repr_before,
+        fm_delta_target=fm_delta_target,
+        max_backtracks=max_backtracks,
+        contraction=contraction,
+        evaluate_candidate=evaluate_candidate,
+    )
+    if not line_search.accepted:
+        _restore_parameters(model, theta_half)
+        raise RuntimeError(
+            "budgeted_cl_line_search failed to find an acceptable representation step "
+            f"after {line_search.attempts} attempts; "
+            f"last_flow_delta={line_search.flow_delta:.6g}, "
+            f"last_repr_delta={line_search.repr_delta:.6g}"
+        )
+
+    dot_before = _dot(g_repr, g_fm)
+    stats = _stats_from_gradients(
+        g_repr,
+        g_fm,
+        dot_before,
+        dot_before,
+        actual_fm_delta=line_search.flow_delta,
+    )
+    stats.update(
+        {
+            "fm_delta_target": float(fm_delta_target),
+            "fm_budget_violation": float(line_search.flow_delta - fm_delta_target),
+            "line_search_attempts": float(line_search.attempts),
+            "line_search_alpha": float(line_search.alpha),
+            "line_search_accepted": 1.0,
+            "line_search_flow_delta": float(line_search.flow_delta),
+            "line_search_repr_delta": float(line_search.repr_delta),
+            "budgeted_direction_norm_ratio": 1.0,
+        }
+    )
+    return stats
+
+
 def _step_dual_step_projected(
     config: ToyConfig,
     model: ToyVectorField,
@@ -1110,6 +1208,7 @@ def _new_stat_window() -> dict[str, list[float]]:
         "effective_repr_lr": [],
         "primal_dual_violation": [],
         "primal_dual_warmup_active": [],
+        "budgeted_direction_norm_ratio": [],
     }
 
 
@@ -1142,6 +1241,7 @@ def _empty_step_stats() -> dict[str, float]:
         "effective_repr_lr": 0.0,
         "primal_dual_violation": 0.0,
         "primal_dual_warmup_active": 0.0,
+        "budgeted_direction_norm_ratio": 0.0,
     }
 
 
@@ -1173,6 +1273,7 @@ def _accumulate_stats(window: dict[str, list[float]], step_stats: dict[str, floa
     window["effective_repr_lr"].append(float(step_stats["effective_repr_lr"]))
     window["primal_dual_violation"].append(float(step_stats["primal_dual_violation"]))
     window["primal_dual_warmup_active"].append(float(step_stats["primal_dual_warmup_active"]))
+    window["budgeted_direction_norm_ratio"].append(float(step_stats["budgeted_direction_norm_ratio"]))
 
 
 def _summarize_stat_window(window: dict[str, list[float]]) -> dict[str, float]:
@@ -1206,6 +1307,7 @@ def _summarize_stat_window(window: dict[str, list[float]]) -> dict[str, float]:
         "effective_repr_lr": _mean(window["effective_repr_lr"]),
         "primal_dual_violation": _mean(window["primal_dual_violation"]),
         "primal_dual_warmup_active": _mean(window["primal_dual_warmup_active"]),
+        "budgeted_direction_norm_ratio": _mean(window["budgeted_direction_norm_ratio"]),
     }
 
 
@@ -1265,6 +1367,7 @@ def _stats_from_projection(
         "effective_repr_lr": 0.0,
         "primal_dual_violation": 0.0,
         "primal_dual_warmup_active": 0.0,
+        "budgeted_direction_norm_ratio": 0.0,
     }
 
 
@@ -1305,6 +1408,7 @@ def _stats_from_gradients(
         "effective_repr_lr": 0.0,
         "primal_dual_violation": 0.0,
         "primal_dual_warmup_active": 0.0,
+        "budgeted_direction_norm_ratio": 0.0,
     }
 
 
@@ -1557,6 +1661,32 @@ def _validate_dual_step_config(config: ToyConfig) -> None:
     if dual_max <= 0.0:
         raise ValueError("dual_max must be positive")
     _require_non_negative_int(config.primal_dual_warmup_steps, "primal_dual_warmup_steps")
+
+
+def _validate_budgeted_cl_line_search_config(config: ToyConfig) -> None:
+    if "budgeted_cl_line_search" not in config.methods:
+        return
+    if config.methods != ["budgeted_cl_line_search"]:
+        raise ValueError("budgeted_cl_line_search requires a standalone config")
+    if config.lambdas != [1.0]:
+        raise ValueError("budgeted_cl_line_search requires lambdas to equal [1.0]")
+    missing = [
+        name
+        for name, value in {
+            "fm_delta_target": config.fm_delta_target,
+            "line_search_max_backtracks": config.line_search_max_backtracks,
+            "line_search_contraction": config.line_search_contraction,
+        }.items()
+        if value is None
+    ]
+    if missing:
+        raise ValueError(f"budgeted_cl_line_search requires explicit config fields: {missing}")
+    if config.soft_margins != [0.0]:
+        raise ValueError("budgeted_cl_line_search requires soft_margins to equal [0.0]")
+
+    _require_finite_scalar(config.fm_delta_target, "fm_delta_target", min_value=0.0)
+    _require_positive_int(config.line_search_max_backtracks, "line_search_max_backtracks")
+    _require_open_unit_scalar(config.line_search_contraction, "line_search_contraction")
 
 
 def _require_finite_scalar(value: float | None, name: str, min_value: float | None = None) -> float:

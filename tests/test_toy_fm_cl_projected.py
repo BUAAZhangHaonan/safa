@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import json
 
 import pytest
@@ -115,6 +116,39 @@ def _dual_step_payload(tmp_path) -> dict:
         "dual_lr": 10.0,
         "dual_max": 100.0,
         "primal_dual_warmup_steps": 1,
+    }
+
+
+def _budgeted_cl_payload(tmp_path) -> dict:
+    return {
+        "run_name": "budgeted_cl_ok",
+        "output_dir": str(tmp_path),
+        "device": "cpu",
+        "seed": 1,
+        "deltas_deg": [0.0],
+        "methods": ["budgeted_cl_line_search"],
+        "lambdas": [1.0],
+        "soft_margins": [0.0],
+        "steps": 2,
+        "batch_size": 8,
+        "eval_batch_size": 8,
+        "hidden_dim": 8,
+        "layers": 1,
+        "sigma": 0.02,
+        "k_classes": 4,
+        "sample_steps": 2,
+        "learning_rate": 0.001,
+        "fm_learning_rate": 0.001,
+        "repr_learning_rate": 0.001,
+        "weight_decay": 0.0,
+        "repr_relation_weight": 0.0,
+        "normalize_losses": True,
+        "calibration_batches": 1,
+        "eval_interval": 1,
+        "projection_eps": 1e-12,
+        "fm_delta_target": 1.0,
+        "line_search_max_backtracks": 4,
+        "line_search_contraction": 0.5,
     }
 
 
@@ -518,6 +552,63 @@ def test_dual_step_projected_rejects_invalid_dual_parameters(tmp_path, key: str,
 
     with pytest.raises(ValueError, match=match):
         toy.load_config(config_path)
+
+
+def test_budgeted_cl_line_search_requires_explicit_fields(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config_path = tmp_path / "budgeted_cl_missing_config.json"
+    payload = _budgeted_cl_payload(tmp_path)
+    for key in ["fm_delta_target", "line_search_max_backtracks", "line_search_contraction"]:
+        payload.pop(key)
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="budgeted_cl_line_search requires explicit config fields"):
+        toy.load_config(config_path)
+
+
+def test_budgeted_cl_line_search_rejects_mixed_method_grid(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config_path = tmp_path / "budgeted_cl_mixed_methods.json"
+    payload = _budgeted_cl_payload(tmp_path)
+    payload["methods"] = ["weighted_sum", "budgeted_cl_line_search"]
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="budgeted_cl_line_search requires a standalone config"):
+        toy.load_config(config_path)
+
+
+def test_budgeted_cl_line_search_rejects_lambda_sweep(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config_path = tmp_path / "budgeted_cl_bad_lambda.json"
+    payload = _budgeted_cl_payload(tmp_path)
+    payload["lambdas"] = [0.1, 1.0]
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"budgeted_cl_line_search requires lambdas to equal \[1\.0\]"):
+        toy.load_config(config_path)
+
+
+def test_budgeted_cl_line_search_direct_call_rejects_non_unit_lambda(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config = toy.ToyConfig(**_budgeted_cl_payload(tmp_path))
+
+    with pytest.raises(ValueError, match="budgeted_cl_line_search uses fixed lambda_repr=1.0"):
+        toy.run_single_experiment(
+            config,
+            delta_deg=15.0,
+            method="budgeted_cl_line_search",
+            lambda_repr=0.1,
+            soft_margin=0.0,
+        )
+
+
+def test_budgeted_cl_line_search_uses_full_repr_gradient_source() -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    source = inspect.getsource(toy._step_budgeted_cl_line_search)
+
+    assert "_manual_parameter_step(model, g_repr," in source
+    assert "projection.projected_gradients" not in source
+    assert "project_gradient_onto_fm_feasible_cone" not in source
 
 
 @pytest.mark.parametrize(
@@ -961,6 +1052,50 @@ def test_dual_step_projected_smoke_run_persists_dual_metrics(tmp_path) -> None:
         assert key in trained_metric
     assert trained_metric["effective_repr_lr"] > 0.0
     assert trained_metric["primal_dual_warmup_active"] >= 0.0
+
+
+def test_budgeted_cl_line_search_smoke_run_persists_full_direction_metrics(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    payload = _budgeted_cl_payload(tmp_path)
+    payload.update(
+        {
+            "run_name": "pytest_budgeted_cl",
+            "seed": 51,
+            "deltas_deg": [15.0],
+            "steps": 3,
+            "batch_size": 16,
+            "eval_batch_size": 16,
+            "fm_delta_target": 1.0,
+            "repr_learning_rate": 0.001,
+            "eval_interval": 1,
+        }
+    )
+    config = toy.ToyConfig(**payload)
+
+    summary = toy.run_experiment_grid(config)
+    run_dir = tmp_path / "pytest_budgeted_cl"
+    rows = [
+        json.loads(line)
+        for line in (run_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    trained_metric = next(row for row in rows if row["step"] > 0)
+
+    assert summary["experiments"][0]["method"] == "budgeted_cl_line_search"
+    for key in [
+        "line_search_attempts",
+        "line_search_alpha",
+        "line_search_accepted",
+        "line_search_flow_delta",
+        "line_search_repr_delta",
+        "budgeted_direction_norm_ratio",
+    ]:
+        assert key in summary["experiments"][0]["final"]
+        assert key in trained_metric
+    assert trained_metric["line_search_accepted"] == pytest.approx(1.0)
+    assert trained_metric["line_search_flow_delta"] <= config.fm_delta_target
+    assert trained_metric["line_search_repr_delta"] < 0.0
+    assert trained_metric["budgeted_direction_norm_ratio"] == pytest.approx(1.0)
 
 
 def test_adaptive_margin_projected_ema_mode_records_baseline(tmp_path) -> None:
