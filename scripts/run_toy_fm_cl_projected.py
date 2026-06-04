@@ -6,7 +6,7 @@ from dataclasses import MISSING, asdict, dataclass, fields
 import json
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 from torch import nn
@@ -58,6 +58,8 @@ class ToyConfig:
     adaptive_margin_max: float | None = None
     adaptive_margin_initial: float | None = None
     fm_delta_target: float | None = None
+    line_search_max_backtracks: int | None = None
+    line_search_contraction: float | None = None
     dual_lr: float | None = None
     trust_radius_initial: float | None = None
     trust_radius_min: float | None = None
@@ -73,6 +75,7 @@ SUPPORTED_METHODS = {
     "soft_margin_projected",
     "adaptive_margin_projected",
     "adaptive_trust_projected",
+    "line_search_projected",
 }
 NORM_EPS = 1.0e-12
 
@@ -88,6 +91,15 @@ class AdaptiveTrustState:
     margin_state: AdaptiveMarginState
     dual_value: float
     trust_radius: float
+
+
+@dataclass(frozen=True)
+class LineSearchAcceptanceResult:
+    attempts: int
+    alpha: float
+    accepted: bool
+    flow_delta: float
+    repr_delta: float
 
 
 def load_config(path: str | Path) -> ToyConfig:
@@ -176,6 +188,7 @@ def validate_config(config: ToyConfig) -> None:
             raise ValueError("all soft_margins must be finite non-negative numbers")
     _validate_adaptive_margin_config(config)
     _validate_adaptive_trust_config(config)
+    _validate_line_search_config(config)
 
 
 class ToyVectorField(nn.Module):
@@ -341,6 +354,17 @@ def run_single_experiment(
                 adaptive_state=adaptive_trust_state.margin_state,
                 adaptive_trust_state=adaptive_trust_state,
             )
+        elif method == "line_search_projected":
+            step_stats = _step_line_search_projected(
+                config,
+                model,
+                fm_optimizer,
+                batch,
+                flow_scale,
+                repr_scale,
+                lambda_repr,
+                soft_margin=soft_margin,
+            )
         elif method == "pcgrad":
             step_stats = _step_pcgrad(config, model, optimizer, batch, flow_scale, repr_scale, lambda_repr)
         else:
@@ -429,6 +453,8 @@ def _method_parameter_grid(config: ToyConfig, method: str) -> list[tuple[float, 
         if config.adaptive_margin_initial is None:
             raise ValueError(f"{method} requires adaptive_margin_initial")
         return [(1.0, float(config.adaptive_margin_initial))]
+    if method == "line_search_projected":
+        return [(1.0, 0.0)]
     return [(lambda_repr, config.soft_margins[0]) for lambda_repr in config.lambdas]
 
 
@@ -681,6 +707,81 @@ def _step_projected_two_step(
     )
 
 
+def _step_line_search_projected(
+    config: ToyConfig,
+    model: ToyVectorField,
+    fm_optimizer: torch.optim.Optimizer,
+    batch: dict[str, torch.Tensor],
+    flow_scale: torch.Tensor,
+    repr_scale: torch.Tensor,
+    lambda_repr: float,
+    soft_margin: float,
+) -> dict[str, float]:
+    if not math.isclose(float(soft_margin), 0.0, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError("line_search_projected requires soft_margins[0] to equal 0.0")
+    fm_delta_target = _require_finite_scalar(config.fm_delta_target, "fm_delta_target", min_value=0.0)
+    max_backtracks = _require_positive_int(config.line_search_max_backtracks, "line_search_max_backtracks")
+    contraction = _require_open_unit_scalar(config.line_search_contraction, "line_search_contraction")
+
+    fm_optimizer.zero_grad(set_to_none=True)
+    losses = _compute_losses(config, model, batch)
+    (losses["flow"] / flow_scale).backward()
+    fm_optimizer.step()
+
+    post_losses = _compute_losses(config, model, batch)
+    flow_objective = post_losses["flow"] / flow_scale
+    repr_objective = lambda_repr * post_losses["repr"] / repr_scale
+    flow_before = float(flow_objective.detach().cpu())
+    repr_before = float(repr_objective.detach().cpu())
+    g_fm, g_repr = _task_gradients(model, flow_objective, repr_objective)
+    projection = project_gradient_onto_fm_feasible_cone(g_repr, g_fm, eps=config.projection_eps)
+    theta_half = _copy_parameters(model)
+
+    def evaluate_candidate(alpha: float) -> tuple[float, float]:
+        _restore_parameters(model, theta_half)
+        _manual_parameter_step(model, projection.projected_gradients, config.repr_learning_rate * alpha)
+        candidate_losses = _compute_losses(config, model, batch)
+        return (
+            float((candidate_losses["flow"] / flow_scale).detach().cpu()),
+            float((lambda_repr * candidate_losses["repr"] / repr_scale).detach().cpu()),
+        )
+
+    line_search = _find_line_search_acceptance(
+        normalized_flow_before=flow_before,
+        normalized_repr_before=repr_before,
+        fm_delta_target=fm_delta_target,
+        max_backtracks=max_backtracks,
+        contraction=contraction,
+        evaluate_candidate=evaluate_candidate,
+    )
+    if not line_search.accepted:
+        _restore_parameters(model, theta_half)
+        raise RuntimeError(
+            "line_search_projected failed to find an acceptable representation step "
+            f"after {line_search.attempts} attempts; "
+            f"last_flow_delta={line_search.flow_delta:.6g}, "
+            f"last_repr_delta={line_search.repr_delta:.6g}"
+        )
+
+    stats = _stats_from_projection(
+        projection,
+        actual_fm_delta=line_search.flow_delta,
+        fm_delta_target=fm_delta_target,
+        scaled_dot_after=_dot(projection.projected_gradients, g_fm),
+        repr_learning_rate=config.repr_learning_rate * line_search.alpha,
+    )
+    stats.update(
+        {
+            "line_search_attempts": float(line_search.attempts),
+            "line_search_alpha": float(line_search.alpha),
+            "line_search_accepted": 1.0,
+            "line_search_flow_delta": float(line_search.flow_delta),
+            "line_search_repr_delta": float(line_search.repr_delta),
+        }
+    )
+    return stats
+
+
 def _step_pcgrad(
     config: ToyConfig,
     model: ToyVectorField,
@@ -758,6 +859,66 @@ def _manual_parameter_step(model: ToyVectorField, gradients: list[torch.Tensor],
                 raise ValueError("Gradient shape does not match toy model parameter shape")
             parameter.add_(gradient, alpha=-learning_rate)
     model.zero_grad(set_to_none=True)
+
+
+def _copy_parameters(model: ToyVectorField) -> list[torch.Tensor]:
+    return [parameter.detach().clone() for parameter in model.parameters()]
+
+
+def _restore_parameters(model: ToyVectorField, values: list[torch.Tensor]) -> None:
+    parameters = list(model.parameters())
+    if len(parameters) != len(values):
+        raise ValueError("Parameter snapshot length does not match toy model parameters")
+    with torch.no_grad():
+        for parameter, value in zip(parameters, values):
+            if parameter.shape != value.shape:
+                raise ValueError("Parameter snapshot shape does not match toy model parameter shape")
+            parameter.copy_(value)
+    model.zero_grad(set_to_none=True)
+
+
+def _find_line_search_acceptance(
+    normalized_flow_before: float,
+    normalized_repr_before: float,
+    fm_delta_target: float,
+    max_backtracks: int,
+    contraction: float,
+    evaluate_candidate: Callable[[float], tuple[float, float]],
+) -> LineSearchAcceptanceResult:
+    normalized_flow_before = _require_finite_scalar(normalized_flow_before, "normalized_flow_before")
+    normalized_repr_before = _require_finite_scalar(normalized_repr_before, "normalized_repr_before")
+    fm_delta_target = _require_finite_scalar(fm_delta_target, "fm_delta_target", min_value=0.0)
+    max_backtracks = _require_positive_int(max_backtracks, "line_search_max_backtracks")
+    contraction = _require_open_unit_scalar(contraction, "line_search_contraction")
+
+    alpha = 1.0
+    last_flow_delta = math.inf
+    last_repr_delta = math.inf
+    for attempt in range(1, max_backtracks + 1):
+        normalized_flow_after, normalized_repr_after = evaluate_candidate(alpha)
+        normalized_flow_after = _require_finite_scalar(normalized_flow_after, "normalized_flow_after")
+        normalized_repr_after = _require_finite_scalar(normalized_repr_after, "normalized_repr_after")
+        flow_delta = normalized_flow_after - normalized_flow_before
+        repr_delta = normalized_repr_after - normalized_repr_before
+        last_flow_delta = flow_delta
+        last_repr_delta = repr_delta
+        if flow_delta <= fm_delta_target and repr_delta < 0.0:
+            return LineSearchAcceptanceResult(
+                attempts=attempt,
+                alpha=alpha,
+                accepted=True,
+                flow_delta=flow_delta,
+                repr_delta=repr_delta,
+            )
+        alpha *= contraction
+
+    return LineSearchAcceptanceResult(
+        attempts=max_backtracks,
+        alpha=alpha / contraction,
+        accepted=False,
+        flow_delta=last_flow_delta,
+        repr_delta=last_repr_delta,
+    )
 
 
 def _evaluate_model(
@@ -849,6 +1010,11 @@ def _new_stat_window() -> dict[str, list[float]]:
         "fm_delta_target": [],
         "scaled_dot_after": [],
         "repr_step_fm_first_order_effect": [],
+        "line_search_attempts": [],
+        "line_search_alpha": [],
+        "line_search_accepted": [],
+        "line_search_flow_delta": [],
+        "line_search_repr_delta": [],
     }
 
 
@@ -873,6 +1039,11 @@ def _empty_step_stats() -> dict[str, float]:
         "fm_delta_target": 0.0,
         "scaled_dot_after_mean": 0.0,
         "repr_step_fm_first_order_effect": 0.0,
+        "line_search_attempts": 0.0,
+        "line_search_alpha": 0.0,
+        "line_search_accepted": 0.0,
+        "line_search_flow_delta": 0.0,
+        "line_search_repr_delta": 0.0,
     }
 
 
@@ -896,6 +1067,11 @@ def _accumulate_stats(window: dict[str, list[float]], step_stats: dict[str, floa
     window["fm_delta_target"].append(float(step_stats["fm_delta_target"]))
     window["scaled_dot_after"].append(float(step_stats["scaled_dot_after_mean"]))
     window["repr_step_fm_first_order_effect"].append(float(step_stats["repr_step_fm_first_order_effect"]))
+    window["line_search_attempts"].append(float(step_stats["line_search_attempts"]))
+    window["line_search_alpha"].append(float(step_stats["line_search_alpha"]))
+    window["line_search_accepted"].append(float(step_stats["line_search_accepted"]))
+    window["line_search_flow_delta"].append(float(step_stats["line_search_flow_delta"]))
+    window["line_search_repr_delta"].append(float(step_stats["line_search_repr_delta"]))
 
 
 def _summarize_stat_window(window: dict[str, list[float]]) -> dict[str, float]:
@@ -921,6 +1097,11 @@ def _summarize_stat_window(window: dict[str, list[float]]) -> dict[str, float]:
         "fm_delta_target": _mean(window["fm_delta_target"]),
         "scaled_dot_after_mean": _mean(window["scaled_dot_after"]),
         "repr_step_fm_first_order_effect": _mean(window["repr_step_fm_first_order_effect"]),
+        "line_search_attempts": _mean(window["line_search_attempts"]),
+        "line_search_alpha": _mean(window["line_search_alpha"]),
+        "line_search_accepted": _mean(window["line_search_accepted"]),
+        "line_search_flow_delta": _mean(window["line_search_flow_delta"]),
+        "line_search_repr_delta": _mean(window["line_search_repr_delta"]),
     }
 
 
@@ -972,6 +1153,11 @@ def _stats_from_projection(
         "fm_delta_target": float(fm_delta_target),
         "scaled_dot_after_mean": float(scaled_dot_after.detach().cpu()),
         "repr_step_fm_first_order_effect": float(repr_step_fm_first_order_effect.detach().cpu()),
+        "line_search_attempts": 0.0,
+        "line_search_alpha": 0.0,
+        "line_search_accepted": 0.0,
+        "line_search_flow_delta": 0.0,
+        "line_search_repr_delta": 0.0,
     }
 
 
@@ -1004,6 +1190,11 @@ def _stats_from_gradients(
         "fm_delta_target": 0.0,
         "scaled_dot_after_mean": float(dot_after.detach().cpu()),
         "repr_step_fm_first_order_effect": float((-dot_after).detach().cpu()),
+        "line_search_attempts": 0.0,
+        "line_search_alpha": 0.0,
+        "line_search_accepted": 0.0,
+        "line_search_flow_delta": 0.0,
+        "line_search_repr_delta": 0.0,
     }
 
 
@@ -1200,6 +1391,32 @@ def _validate_adaptive_trust_config(config: ToyConfig) -> None:
         raise ValueError("trust_radius_initial must lie within [trust_radius_min, trust_radius_max]")
 
 
+def _validate_line_search_config(config: ToyConfig) -> None:
+    if "line_search_projected" not in config.methods:
+        return
+    if config.methods != ["line_search_projected"]:
+        raise ValueError("line_search_projected requires a standalone config")
+    if config.lambdas != [1.0]:
+        raise ValueError("line_search_projected requires lambdas to equal [1.0]")
+    missing = [
+        name
+        for name, value in {
+            "fm_delta_target": config.fm_delta_target,
+            "line_search_max_backtracks": config.line_search_max_backtracks,
+            "line_search_contraction": config.line_search_contraction,
+        }.items()
+        if value is None
+    ]
+    if missing:
+        raise ValueError(f"line_search_projected requires explicit config fields: {missing}")
+    if config.soft_margins != [0.0]:
+        raise ValueError("line_search_projected requires soft_margins to equal [0.0]")
+
+    _require_finite_scalar(config.fm_delta_target, "fm_delta_target", min_value=0.0)
+    _require_positive_int(config.line_search_max_backtracks, "line_search_max_backtracks")
+    _require_open_unit_scalar(config.line_search_contraction, "line_search_contraction")
+
+
 def _require_finite_scalar(value: float | None, name: str, min_value: float | None = None) -> float:
     if value is None:
         raise ValueError(f"{name} is required")
@@ -1208,6 +1425,21 @@ def _require_finite_scalar(value: float | None, name: str, min_value: float | No
     scalar = float(value)
     if min_value is not None and scalar < min_value:
         raise ValueError(f"{name} must be >= {min_value}")
+    return scalar
+
+
+def _require_positive_int(value: int | None, name: str) -> int:
+    if value is None:
+        raise ValueError(f"{name} is required")
+    if not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _require_open_unit_scalar(value: float | None, name: str) -> float:
+    scalar = _require_finite_scalar(value, name)
+    if scalar <= 0.0 or scalar >= 1.0:
+        raise ValueError(f"{name} must be in (0, 1)")
     return scalar
 
 

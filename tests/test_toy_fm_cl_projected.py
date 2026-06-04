@@ -51,6 +51,39 @@ def _adaptive_trust_payload(tmp_path) -> dict:
     }
 
 
+def _line_search_payload(tmp_path) -> dict:
+    return {
+        "run_name": "line_search_ok",
+        "output_dir": str(tmp_path),
+        "device": "cpu",
+        "seed": 1,
+        "deltas_deg": [0.0],
+        "methods": ["line_search_projected"],
+        "lambdas": [1.0],
+        "soft_margins": [0.0],
+        "steps": 2,
+        "batch_size": 8,
+        "eval_batch_size": 8,
+        "hidden_dim": 8,
+        "layers": 1,
+        "sigma": 0.02,
+        "k_classes": 4,
+        "sample_steps": 2,
+        "learning_rate": 0.001,
+        "fm_learning_rate": 0.001,
+        "repr_learning_rate": 0.001,
+        "weight_decay": 0.0,
+        "repr_relation_weight": 0.0,
+        "normalize_losses": True,
+        "calibration_batches": 1,
+        "eval_interval": 1,
+        "projection_eps": 1e-12,
+        "fm_delta_target": 1.0,
+        "line_search_max_backtracks": 4,
+        "line_search_contraction": 0.5,
+    }
+
+
 def test_toy_config_requires_all_keys(tmp_path) -> None:
     toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
     config_path = tmp_path / "bad_config.json"
@@ -323,6 +356,79 @@ def test_adaptive_trust_projected_load_config_accepts_explicit_fields(tmp_path) 
     assert config.fm_delta_target == pytest.approx(0.01)
     assert config.dual_lr == pytest.approx(0.5)
     assert config.trust_radius_initial == pytest.approx(1.0)
+
+
+def test_line_search_projected_requires_explicit_line_search_fields(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config_path = tmp_path / "line_search_missing_config.json"
+    payload = _line_search_payload(tmp_path)
+    for key in ["fm_delta_target", "line_search_max_backtracks", "line_search_contraction"]:
+        payload.pop(key)
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="line_search_projected requires explicit config fields"):
+        toy.load_config(config_path)
+
+
+def test_line_search_projected_rejects_mixed_method_grid(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config_path = tmp_path / "line_search_mixed_methods.json"
+    payload = _line_search_payload(tmp_path)
+    payload["methods"] = ["weighted_sum", "line_search_projected"]
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="line_search_projected requires a standalone config"):
+        toy.load_config(config_path)
+
+
+def test_line_search_projected_rejects_lambda_sweep(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config_path = tmp_path / "line_search_bad_lambda.json"
+    payload = _line_search_payload(tmp_path)
+    payload["lambdas"] = [0.1, 1.0]
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"line_search_projected requires lambdas to equal \[1\.0\]"):
+        toy.load_config(config_path)
+
+
+@pytest.mark.parametrize("value", [0.0, 1.0, -0.1, 1.1])
+def test_line_search_projected_rejects_invalid_contraction(tmp_path, value: float) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config_path = tmp_path / "line_search_bad_contraction.json"
+    payload = _line_search_payload(tmp_path)
+    payload["line_search_contraction"] = value
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="line_search_contraction must be in \\(0, 1\\)"):
+        toy.load_config(config_path)
+
+
+def test_line_search_helper_shrinks_alpha_after_first_candidate_fails() -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    observed_alphas: list[float] = []
+
+    def evaluate(alpha: float) -> tuple[float, float]:
+        observed_alphas.append(alpha)
+        if alpha == pytest.approx(1.0):
+            return 1.2, 0.8
+        return 1.01, 0.8
+
+    result = toy._find_line_search_acceptance(
+        normalized_flow_before=1.0,
+        normalized_repr_before=1.0,
+        fm_delta_target=0.05,
+        max_backtracks=3,
+        contraction=0.5,
+        evaluate_candidate=evaluate,
+    )
+
+    assert observed_alphas == [1.0, 0.5]
+    assert result.accepted is True
+    assert result.attempts == 2
+    assert result.alpha == pytest.approx(0.5)
+    assert result.flow_delta == pytest.approx(0.01)
+    assert result.repr_delta == pytest.approx(-0.2)
 
 
 @pytest.mark.parametrize(
@@ -678,6 +784,53 @@ def test_adaptive_trust_projected_direct_call_rejects_parameter_mismatch(tmp_pat
             lambda_repr=0.1,
             soft_margin=0.02,
         )
+
+
+def test_line_search_projected_smoke_run_persists_accepted_metrics(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    payload = _line_search_payload(tmp_path)
+    payload.update(
+        {
+            "run_name": "pytest_line_search",
+            "seed": 31,
+            "deltas_deg": [15.0],
+            "steps": 3,
+            "batch_size": 16,
+            "eval_batch_size": 16,
+            "fm_delta_target": 1.0,
+            "repr_learning_rate": 0.001,
+            "eval_interval": 1,
+        }
+    )
+    config = toy.ToyConfig(**payload)
+
+    summary = toy.run_experiment_grid(config)
+    run_dir = tmp_path / "pytest_line_search"
+    rows = [
+        json.loads(line)
+        for line in (run_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    trained_metric = next(row for row in rows if row["step"] > 0)
+
+    assert summary["experiments"][0]["method"] == "line_search_projected"
+    for key in [
+        "line_search_attempts",
+        "line_search_alpha",
+        "line_search_accepted",
+        "line_search_flow_delta",
+        "line_search_repr_delta",
+        "dot_before_mean",
+        "dot_after_mean",
+        "projected_repr_norm_ratio",
+    ]:
+        assert key in summary["experiments"][0]["final"]
+        assert key in trained_metric
+    assert trained_metric["line_search_accepted"] == pytest.approx(1.0)
+    assert trained_metric["line_search_alpha"] > 0.0
+    assert trained_metric["line_search_attempts"] >= 1.0
+    assert trained_metric["line_search_flow_delta"] <= config.fm_delta_target
+    assert trained_metric["line_search_repr_delta"] < 0.0
 
 
 def test_adaptive_margin_projected_ema_mode_records_baseline(tmp_path) -> None:
