@@ -1,0 +1,48 @@
+{
+  "batch_size": 4096,
+  "calibration_batches": 4,
+  "deltas_deg": [
+    0.0,
+    15.0,
+    45.0
+  ],
+  "device": "cuda:0",
+  "eval_batch_size": 1024,
+  "eval_interval": 1000,
+  "fm_learning_rate": 0.001,
+  "hidden_dim": 64,
+  "k_classes": 8,
+  "lambdas": [
+    0.01,
+    0.03,
+    0.1,
+    0.3,
+    1.0
+  ],
+  "layers": 3,
+  "learning_rate": 0.001,
+  "methods": [
+    "fm_only",
+    "repr_only",
+    "weighted_sum",
+    "projected_two_step",
+    "pcgrad",
+    "soft_margin_projected"
+  ],
+  "normalize_losses": true,
+  "output_dir": "artifacts/toy_fm_cl_projected",
+  "projection_eps": 1e-12,
+  "repr_learning_rate": 0.001,
+  "repr_relation_weight": 1.0,
+  "run_name": "main_sweep_gpu0_fast_seed1337",
+  "sample_steps": 16,
+  "seed": 1337,
+  "sigma": 0.05,
+  "soft_margins": [
+    0.0,
+    0.05,
+    0.1
+  ],
+  "steps": 5000,
+  "weight_decay": 0.0
+}
