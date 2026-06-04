@@ -61,6 +61,8 @@ class ToyConfig:
     line_search_max_backtracks: int | None = None
     line_search_contraction: float | None = None
     dual_lr: float | None = None
+    dual_max: float | None = None
+    primal_dual_warmup_steps: int | None = None
     trust_radius_initial: float | None = None
     trust_radius_min: float | None = None
     trust_radius_max: float | None = None
@@ -76,6 +78,7 @@ SUPPORTED_METHODS = {
     "adaptive_margin_projected",
     "adaptive_trust_projected",
     "line_search_projected",
+    "dual_step_projected",
 }
 NORM_EPS = 1.0e-12
 
@@ -189,6 +192,7 @@ def validate_config(config: ToyConfig) -> None:
     _validate_adaptive_margin_config(config)
     _validate_adaptive_trust_config(config)
     _validate_line_search_config(config)
+    _validate_dual_step_config(config)
 
 
 class ToyVectorField(nn.Module):
@@ -285,6 +289,7 @@ def run_single_experiment(
     flow_scale, repr_scale = _calibrate_loss_scales(config, model, delta_deg, device, train_generator)
     adaptive_state = _new_adaptive_margin_state(config) if method == "adaptive_margin_projected" else None
     adaptive_trust_state = _new_adaptive_trust_state(config) if method == "adaptive_trust_projected" else None
+    dual_step_value = 0.0
     initial = _evaluate_model(
         config,
         model,
@@ -365,6 +370,20 @@ def run_single_experiment(
                 lambda_repr,
                 soft_margin=soft_margin,
             )
+        elif method == "dual_step_projected":
+            step_stats = _step_dual_step_projected(
+                config,
+                model,
+                fm_optimizer,
+                batch,
+                flow_scale,
+                repr_scale,
+                lambda_repr,
+                soft_margin=soft_margin,
+                dual_value=dual_step_value,
+                step=step,
+            )
+            dual_step_value = step_stats["dual_value_next"]
         elif method == "pcgrad":
             step_stats = _step_pcgrad(config, model, optimizer, batch, flow_scale, repr_scale, lambda_repr)
         else:
@@ -454,6 +473,8 @@ def _method_parameter_grid(config: ToyConfig, method: str) -> list[tuple[float, 
             raise ValueError(f"{method} requires adaptive_margin_initial")
         return [(1.0, float(config.adaptive_margin_initial))]
     if method == "line_search_projected":
+        return [(1.0, 0.0)]
+    if method == "dual_step_projected":
         return [(1.0, 0.0)]
     return [(lambda_repr, config.soft_margins[0]) for lambda_repr in config.lambdas]
 
@@ -782,6 +803,77 @@ def _step_line_search_projected(
     return stats
 
 
+def _step_dual_step_projected(
+    config: ToyConfig,
+    model: ToyVectorField,
+    fm_optimizer: torch.optim.Optimizer,
+    batch: dict[str, torch.Tensor],
+    flow_scale: torch.Tensor,
+    repr_scale: torch.Tensor,
+    lambda_repr: float,
+    soft_margin: float,
+    dual_value: float,
+    step: int,
+) -> dict[str, float]:
+    if not math.isclose(float(soft_margin), 0.0, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError("dual_step_projected requires soft_margins[0] to equal 0.0")
+    fm_delta_target = _require_finite_scalar(config.fm_delta_target, "fm_delta_target", min_value=0.0)
+    dual_lr = _require_finite_scalar(config.dual_lr, "dual_lr")
+    if dual_lr <= 0.0:
+        raise ValueError("dual_lr must be positive")
+    dual_max = _require_finite_scalar(config.dual_max, "dual_max")
+    if dual_max <= 0.0:
+        raise ValueError("dual_max must be positive")
+    warmup_steps = _require_non_negative_int(config.primal_dual_warmup_steps, "primal_dual_warmup_steps")
+
+    fm_optimizer.zero_grad(set_to_none=True)
+    losses = _compute_losses(config, model, batch)
+    (losses["flow"] / flow_scale).backward()
+    fm_optimizer.step()
+
+    post_losses = _compute_losses(config, model, batch)
+    flow_objective = post_losses["flow"] / flow_scale
+    repr_objective = lambda_repr * post_losses["repr"] / repr_scale
+    flow_guard_value = float(flow_objective.detach().cpu())
+    g_fm, g_repr = _task_gradients(model, flow_objective, repr_objective)
+    projection = project_gradient_onto_fm_feasible_cone(g_repr, g_fm, eps=config.projection_eps)
+
+    dual_value_used = _require_finite_scalar(dual_value, "dual_value", min_value=0.0)
+    if dual_value_used > dual_max:
+        raise ValueError("dual_value must be <= dual_max")
+    effective_repr_lr = float(config.repr_learning_rate) / (1.0 + dual_value_used)
+    _manual_parameter_step(model, projection.projected_gradients, effective_repr_lr)
+
+    after_losses = _compute_losses(config, model, batch)
+    normalized_flow_after = float((after_losses["flow"] / flow_scale).detach().cpu())
+    actual_fm_delta = normalized_flow_after - flow_guard_value
+    violation = actual_fm_delta - fm_delta_target
+    warmup_active = warmup_steps > 0 and step <= warmup_steps
+    if warmup_active:
+        dual_value_next = dual_value_used
+    else:
+        dual_value_next = min(max(dual_value_used + dual_lr * violation, 0.0), dual_max)
+
+    stats = _stats_from_projection(
+        projection,
+        actual_fm_delta=actual_fm_delta,
+        fm_delta_target=fm_delta_target,
+        scaled_dot_after=projection.dot_after,
+        repr_learning_rate=effective_repr_lr,
+    )
+    stats.update(
+        {
+            "dual_value_used": float(dual_value_used),
+            "dual_value_next": float(dual_value_next),
+            "fm_budget_violation": float(violation),
+            "effective_repr_lr": float(effective_repr_lr),
+            "primal_dual_violation": float(violation),
+            "primal_dual_warmup_active": 1.0 if warmup_active else 0.0,
+        }
+    )
+    return stats
+
+
 def _step_pcgrad(
     config: ToyConfig,
     model: ToyVectorField,
@@ -1015,6 +1107,9 @@ def _new_stat_window() -> dict[str, list[float]]:
         "line_search_accepted": [],
         "line_search_flow_delta": [],
         "line_search_repr_delta": [],
+        "effective_repr_lr": [],
+        "primal_dual_violation": [],
+        "primal_dual_warmup_active": [],
     }
 
 
@@ -1044,6 +1139,9 @@ def _empty_step_stats() -> dict[str, float]:
         "line_search_accepted": 0.0,
         "line_search_flow_delta": 0.0,
         "line_search_repr_delta": 0.0,
+        "effective_repr_lr": 0.0,
+        "primal_dual_violation": 0.0,
+        "primal_dual_warmup_active": 0.0,
     }
 
 
@@ -1072,6 +1170,9 @@ def _accumulate_stats(window: dict[str, list[float]], step_stats: dict[str, floa
     window["line_search_accepted"].append(float(step_stats["line_search_accepted"]))
     window["line_search_flow_delta"].append(float(step_stats["line_search_flow_delta"]))
     window["line_search_repr_delta"].append(float(step_stats["line_search_repr_delta"]))
+    window["effective_repr_lr"].append(float(step_stats["effective_repr_lr"]))
+    window["primal_dual_violation"].append(float(step_stats["primal_dual_violation"]))
+    window["primal_dual_warmup_active"].append(float(step_stats["primal_dual_warmup_active"]))
 
 
 def _summarize_stat_window(window: dict[str, list[float]]) -> dict[str, float]:
@@ -1102,6 +1203,9 @@ def _summarize_stat_window(window: dict[str, list[float]]) -> dict[str, float]:
         "line_search_accepted": _mean(window["line_search_accepted"]),
         "line_search_flow_delta": _mean(window["line_search_flow_delta"]),
         "line_search_repr_delta": _mean(window["line_search_repr_delta"]),
+        "effective_repr_lr": _mean(window["effective_repr_lr"]),
+        "primal_dual_violation": _mean(window["primal_dual_violation"]),
+        "primal_dual_warmup_active": _mean(window["primal_dual_warmup_active"]),
     }
 
 
@@ -1158,6 +1262,9 @@ def _stats_from_projection(
         "line_search_accepted": 0.0,
         "line_search_flow_delta": 0.0,
         "line_search_repr_delta": 0.0,
+        "effective_repr_lr": 0.0,
+        "primal_dual_violation": 0.0,
+        "primal_dual_warmup_active": 0.0,
     }
 
 
@@ -1195,6 +1302,9 @@ def _stats_from_gradients(
         "line_search_accepted": 0.0,
         "line_search_flow_delta": 0.0,
         "line_search_repr_delta": 0.0,
+        "effective_repr_lr": 0.0,
+        "primal_dual_violation": 0.0,
+        "primal_dual_warmup_active": 0.0,
     }
 
 
@@ -1417,6 +1527,38 @@ def _validate_line_search_config(config: ToyConfig) -> None:
     _require_open_unit_scalar(config.line_search_contraction, "line_search_contraction")
 
 
+def _validate_dual_step_config(config: ToyConfig) -> None:
+    if "dual_step_projected" not in config.methods:
+        return
+    if config.methods != ["dual_step_projected"]:
+        raise ValueError("dual_step_projected requires a standalone config")
+    if config.lambdas != [1.0]:
+        raise ValueError("dual_step_projected requires lambdas to equal [1.0]")
+    missing = [
+        name
+        for name, value in {
+            "fm_delta_target": config.fm_delta_target,
+            "dual_lr": config.dual_lr,
+            "dual_max": config.dual_max,
+            "primal_dual_warmup_steps": config.primal_dual_warmup_steps,
+        }.items()
+        if value is None
+    ]
+    if missing:
+        raise ValueError(f"dual_step_projected requires explicit config fields: {missing}")
+    if config.soft_margins != [0.0]:
+        raise ValueError("dual_step_projected requires soft_margins to equal [0.0]")
+
+    _require_finite_scalar(config.fm_delta_target, "fm_delta_target", min_value=0.0)
+    dual_lr = _require_finite_scalar(config.dual_lr, "dual_lr")
+    if dual_lr <= 0.0:
+        raise ValueError("dual_lr must be positive")
+    dual_max = _require_finite_scalar(config.dual_max, "dual_max")
+    if dual_max <= 0.0:
+        raise ValueError("dual_max must be positive")
+    _require_non_negative_int(config.primal_dual_warmup_steps, "primal_dual_warmup_steps")
+
+
 def _require_finite_scalar(value: float | None, name: str, min_value: float | None = None) -> float:
     if value is None:
         raise ValueError(f"{name} is required")
@@ -1433,6 +1575,14 @@ def _require_positive_int(value: int | None, name: str) -> int:
         raise ValueError(f"{name} is required")
     if not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _require_non_negative_int(value: int | None, name: str) -> int:
+    if value is None:
+        raise ValueError(f"{name} is required")
+    if not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
     return value
 
 

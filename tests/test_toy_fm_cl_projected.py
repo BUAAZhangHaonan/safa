@@ -84,6 +84,40 @@ def _line_search_payload(tmp_path) -> dict:
     }
 
 
+def _dual_step_payload(tmp_path) -> dict:
+    return {
+        "run_name": "dual_step_ok",
+        "output_dir": str(tmp_path),
+        "device": "cpu",
+        "seed": 1,
+        "deltas_deg": [0.0],
+        "methods": ["dual_step_projected"],
+        "lambdas": [1.0],
+        "soft_margins": [0.0],
+        "steps": 2,
+        "batch_size": 8,
+        "eval_batch_size": 8,
+        "hidden_dim": 8,
+        "layers": 1,
+        "sigma": 0.02,
+        "k_classes": 4,
+        "sample_steps": 2,
+        "learning_rate": 0.001,
+        "fm_learning_rate": 0.001,
+        "repr_learning_rate": 0.001,
+        "weight_decay": 0.0,
+        "repr_relation_weight": 0.0,
+        "normalize_losses": True,
+        "calibration_batches": 1,
+        "eval_interval": 1,
+        "projection_eps": 1e-12,
+        "fm_delta_target": 0.01,
+        "dual_lr": 10.0,
+        "dual_max": 100.0,
+        "primal_dual_warmup_steps": 1,
+    }
+
+
 def test_toy_config_requires_all_keys(tmp_path) -> None:
     toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
     config_path = tmp_path / "bad_config.json"
@@ -429,6 +463,61 @@ def test_line_search_helper_shrinks_alpha_after_first_candidate_fails() -> None:
     assert result.alpha == pytest.approx(0.5)
     assert result.flow_delta == pytest.approx(0.01)
     assert result.repr_delta == pytest.approx(-0.2)
+
+
+def test_dual_step_projected_requires_explicit_fields(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config_path = tmp_path / "dual_step_missing_config.json"
+    payload = _dual_step_payload(tmp_path)
+    for key in ["fm_delta_target", "dual_lr", "dual_max", "primal_dual_warmup_steps"]:
+        payload.pop(key)
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="dual_step_projected requires explicit config fields"):
+        toy.load_config(config_path)
+
+
+def test_dual_step_projected_rejects_mixed_method_grid(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config_path = tmp_path / "dual_step_mixed_methods.json"
+    payload = _dual_step_payload(tmp_path)
+    payload["methods"] = ["weighted_sum", "dual_step_projected"]
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="dual_step_projected requires a standalone config"):
+        toy.load_config(config_path)
+
+
+def test_dual_step_projected_rejects_lambda_sweep(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config_path = tmp_path / "dual_step_bad_lambda.json"
+    payload = _dual_step_payload(tmp_path)
+    payload["lambdas"] = [0.1, 1.0]
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"dual_step_projected requires lambdas to equal \[1\.0\]"):
+        toy.load_config(config_path)
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "match"),
+    [
+        ("dual_lr", 0.0, "dual_lr must be positive"),
+        ("dual_lr", -1.0, "dual_lr must be positive"),
+        ("dual_max", 0.0, "dual_max must be positive"),
+        ("dual_max", -1.0, "dual_max must be positive"),
+        ("primal_dual_warmup_steps", -1, "primal_dual_warmup_steps must be a non-negative integer"),
+    ],
+)
+def test_dual_step_projected_rejects_invalid_dual_parameters(tmp_path, key: str, value, match: str) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config_path = tmp_path / f"dual_step_bad_{key}.json"
+    payload = _dual_step_payload(tmp_path)
+    payload[key] = value
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=match):
+        toy.load_config(config_path)
 
 
 @pytest.mark.parametrize(
@@ -831,6 +920,47 @@ def test_line_search_projected_smoke_run_persists_accepted_metrics(tmp_path) -> 
     assert trained_metric["line_search_attempts"] >= 1.0
     assert trained_metric["line_search_flow_delta"] <= config.fm_delta_target
     assert trained_metric["line_search_repr_delta"] < 0.0
+
+
+def test_dual_step_projected_smoke_run_persists_dual_metrics(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    payload = _dual_step_payload(tmp_path)
+    payload.update(
+        {
+            "run_name": "pytest_dual_step",
+            "seed": 41,
+            "deltas_deg": [15.0],
+            "steps": 3,
+            "batch_size": 16,
+            "eval_batch_size": 16,
+            "eval_interval": 1,
+        }
+    )
+    config = toy.ToyConfig(**payload)
+
+    summary = toy.run_experiment_grid(config)
+    run_dir = tmp_path / "pytest_dual_step"
+    rows = [
+        json.loads(line)
+        for line in (run_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    trained_metric = next(row for row in rows if row["step"] > 0)
+
+    assert summary["experiments"][0]["method"] == "dual_step_projected"
+    for key in [
+        "dual_value_used",
+        "dual_value_next",
+        "effective_repr_lr",
+        "primal_dual_violation",
+        "primal_dual_warmup_active",
+        "actual_fm_delta_after_repr_step",
+        "fm_budget_violation",
+    ]:
+        assert key in summary["experiments"][0]["final"]
+        assert key in trained_metric
+    assert trained_metric["effective_repr_lr"] > 0.0
+    assert trained_metric["primal_dual_warmup_active"] >= 0.0
 
 
 def test_adaptive_margin_projected_ema_mode_records_baseline(tmp_path) -> None:
