@@ -41,6 +41,8 @@ def _toy_config(toy, tmp_path, **overrides):
         "dual_max": 100.0,
         "primal_dual_warmup_steps": 1,
         "cagrad_c": None,
+        "fm_descent_floor_fraction": None,
+        "fm_budget_fraction": None,
         "uncertainty_log_var_lr": None,
         "uncertainty_log_var_init_fm": None,
         "uncertainty_log_var_init_cl": None,
@@ -129,6 +131,47 @@ def test_cagrad_config_requires_explicit_c_value(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="cagrad requires cagrad_c"):
         toy.validate_config(config)
+
+
+def test_fm_anchored_cagrad_raises_fm_weight_when_cagrad_degenerates() -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    g_fm = [torch.tensor([6.0, 1.0, 1.0])]
+    g_cl = [torch.tensor([-4.0, 1.0, 1.0])]
+
+    raw = toy.aggregate_two_task_cagrad(g_fm, g_cl, c=0.5, eps=1e-12)
+    anchored = toy.aggregate_two_task_fm_anchored_cagrad(
+        g_fm,
+        g_cl,
+        c=0.5,
+        fm_descent_floor_fraction=0.5,
+        eps=1e-12,
+    )
+
+    assert raw.fm_weight == pytest.approx(0.0)
+    assert anchored.anchor_active is True
+    assert anchored.fm_weight > raw.fm_weight
+    assert anchored.cl_weight < raw.cl_weight
+    assert anchored.fm_descent_after_anchor >= anchored.fm_descent_floor - 1e-6
+
+
+def test_fm_anchored_cagrad_keeps_direction_when_floor_is_already_met() -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    g_fm = [torch.tensor([1.0, 0.0])]
+    g_cl = [torch.tensor([1.0, 0.0])]
+
+    raw = toy.aggregate_two_task_cagrad(g_fm, g_cl, c=0.5, eps=1e-12)
+    anchored = toy.aggregate_two_task_fm_anchored_cagrad(
+        g_fm,
+        g_cl,
+        c=0.5,
+        fm_descent_floor_fraction=0.5,
+        eps=1e-12,
+    )
+
+    assert anchored.anchor_active is False
+    assert anchored.fm_weight == pytest.approx(raw.fm_weight)
+    assert anchored.cl_weight == pytest.approx(raw.cl_weight)
+    assert torch.allclose(anchored.combined_gradients[0], raw.combined_gradients[0])
 
 
 def test_uncertainty_weighted_config_requires_explicit_log_var_fields(tmp_path) -> None:
@@ -309,6 +352,45 @@ def test_toy_grid_runs_cagrad_and_logs_required_metrics(tmp_path) -> None:
         assert key in non_initial
     assert non_initial["combined_grad_norm"] > 0.0
     assert non_initial["cagrad_fm_weight"] + non_initial["cagrad_cl_weight"] == pytest.approx(1.0)
+
+
+def test_toy_grid_runs_fm_anchored_cagrad_and_logs_floor_metrics(tmp_path) -> None:
+    toy = importlib.import_module("scripts.run_toy_fm_cl_projected")
+    config = _toy_config(
+        toy,
+        tmp_path,
+        run_name="pytest_fm_anchored_cagrad",
+        methods=["fm_anchored_cagrad"],
+        cagrad_c=0.5,
+        fm_descent_floor_fraction=0.25,
+        primal_dual_warmup_steps=0,
+    )
+
+    summary = toy.run_experiment_grid(config)
+    run_dir = tmp_path / "pytest_fm_anchored_cagrad"
+    rows = [
+        json.loads(line)
+        for line in (run_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    non_initial = next(row for row in rows if row["step"] > 0)
+
+    assert summary["experiments"][0]["method"] == "fm_anchored_cagrad"
+    for key in [
+        "cagrad_fm_weight",
+        "cagrad_cl_weight",
+        "cagrad_raw_fm_weight",
+        "cagrad_raw_cl_weight",
+        "fm_descent_floor",
+        "fm_descent_after_cagrad",
+        "fm_descent_after_anchor",
+        "fm_anchor_active",
+        "gradient_cosine_mean",
+        "combined_grad_norm",
+    ]:
+        assert key in non_initial
+    assert non_initial["cagrad_fm_weight"] + non_initial["cagrad_cl_weight"] == pytest.approx(1.0)
+    assert non_initial["fm_descent_after_anchor"] >= non_initial["fm_descent_floor"] - 1e-6
 
 
 def test_toy_grid_runs_uncertainty_weighted_and_logs_formula_metrics(tmp_path) -> None:

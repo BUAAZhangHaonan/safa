@@ -46,6 +46,8 @@ class ToyConfig:
     dual_max: float
     primal_dual_warmup_steps: int
     cagrad_c: float | None = None
+    fm_descent_floor_fraction: float | None = None
+    fm_budget_fraction: float | None = None
     uncertainty_log_var_lr: float | None = None
     uncertainty_log_var_init_fm: float | None = None
     uncertainty_log_var_init_cl: float | None = None
@@ -60,6 +62,37 @@ class CAGradResult:
     combined_gradients: list[torch.Tensor]
 
 
+@dataclass(frozen=True)
+class FMAnchoredCAGradResult:
+    fm_weight: float
+    cl_weight: float
+    raw_fm_weight: float
+    raw_cl_weight: float
+    gradient_cosine: float
+    combined_norm: float
+    fm_descent_floor: float
+    fm_descent_after_cagrad: float
+    fm_descent_after_anchor: float
+    anchor_active: bool
+    combined_gradients: list[torch.Tensor]
+
+
+@dataclass(frozen=True)
+class BudgetedCAGradResult:
+    fm_weight: float
+    cl_weight: float
+    raw_fm_weight: float
+    raw_cl_weight: float
+    gradient_cosine: float
+    combined_norm: float
+    fm_budget: float
+    fm_descent_after_cagrad: float
+    fm_descent_after_budget: float
+    budget_active: bool
+    budget_scale: float
+    combined_gradients: list[torch.Tensor]
+
+
 SUPPORTED_METHODS = {
     "fm_only",
     "repr_only",
@@ -69,6 +102,8 @@ SUPPORTED_METHODS = {
     "pcgrad",
     "soft_margin_projected",
     "cagrad",
+    "fm_anchored_cagrad",
+    "budgeted_cagrad",
     "uncertainty_weighted",
 }
 NORM_EPS = 1.0e-12
@@ -172,14 +207,32 @@ def validate_config(config: ToyConfig) -> None:
             raise ValueError("primal_dual_projected must be standalone in methods")
         if len(config.lambdas) != 1 or float(config.lambdas[0]) != 1.0:
             raise ValueError("primal_dual_projected lambdas must be [1.0]")
-    if "cagrad" in config.methods:
-        if config.methods != ["cagrad"]:
-            raise ValueError("cagrad must be standalone in methods")
+    cagrad_methods = [method for method in ("cagrad", "fm_anchored_cagrad", "budgeted_cagrad") if method in config.methods]
+    if cagrad_methods:
+        if len(cagrad_methods) != 1:
+            raise ValueError("CAGrad methods must be standalone in methods")
+        method = cagrad_methods[0]
+        if config.methods != [method]:
+            raise ValueError(f"{method} must be standalone in methods")
         if len(config.lambdas) != 1 or float(config.lambdas[0]) != 1.0:
-            raise ValueError("cagrad lambdas must be [1.0]")
-        cagrad_c = _require_optional_scalar(config.cagrad_c, "cagrad requires cagrad_c", min_value=0.0)
+            raise ValueError(f"{method} lambdas must be [1.0]")
+        cagrad_c = _require_optional_scalar(config.cagrad_c, f"{method} requires cagrad_c", min_value=0.0)
         if cagrad_c >= 1.0:
             raise ValueError("cagrad_c must be < 1.0")
+        if method == "fm_anchored_cagrad":
+            floor_fraction = _require_optional_scalar(
+                config.fm_descent_floor_fraction,
+                "fm_anchored_cagrad requires fm_descent_floor_fraction",
+                min_value=0.0,
+            )
+            if floor_fraction > 1.0:
+                raise ValueError("fm_descent_floor_fraction must be <= 1.0")
+        if method == "budgeted_cagrad":
+            _require_optional_scalar(
+                config.fm_budget_fraction,
+                "budgeted_cagrad requires fm_budget_fraction",
+                min_value=0.0,
+            )
     if "uncertainty_weighted" in config.methods:
         if config.methods != ["uncertainty_weighted"]:
             raise ValueError("uncertainty_weighted must be standalone in methods")
@@ -370,6 +423,10 @@ def run_single_experiment(
             step_stats = _step_pcgrad(config, model, optimizer, batch, flow_scale, repr_scale, lambda_repr)
         elif method == "cagrad":
             step_stats = _step_cagrad(config, model, optimizer, batch, flow_scale, repr_scale)
+        elif method == "fm_anchored_cagrad":
+            step_stats = _step_fm_anchored_cagrad(config, model, optimizer, batch, flow_scale, repr_scale)
+        elif method == "budgeted_cagrad":
+            step_stats = _step_budgeted_cagrad(config, model, optimizer, batch, flow_scale, repr_scale)
         elif method == "uncertainty_weighted":
             if uncertainty_optimizer is None or uncertainty_log_vars is None:
                 raise RuntimeError("uncertainty_weighted state was not initialized")
@@ -464,6 +521,8 @@ def _method_parameter_grid(config: ToyConfig, method: str) -> list[tuple[float, 
     if method in {"fm_only", "repr_only"}:
         return [(config.lambdas[0], config.soft_margins[0])]
     if method == "primal_dual_projected":
+        return [(1.0, config.soft_margins[0])]
+    if method in {"cagrad", "fm_anchored_cagrad", "budgeted_cagrad"}:
         return [(1.0, config.soft_margins[0])]
     if method == "soft_margin_projected":
         return [(lambda_repr, margin) for lambda_repr in config.lambdas for margin in config.soft_margins]
@@ -777,8 +836,115 @@ def _step_cagrad(
         {
             "cagrad_fm_weight": result.fm_weight,
             "cagrad_cl_weight": result.cl_weight,
+            "cagrad_raw_fm_weight": result.fm_weight,
+            "cagrad_raw_cl_weight": result.cl_weight,
             "gradient_cosine_mean": result.gradient_cosine,
             "combined_grad_norm": result.combined_norm,
+        }
+    )
+    return stats
+
+
+def _step_fm_anchored_cagrad(
+    config: ToyConfig,
+    model: ToyVectorField,
+    optimizer: torch.optim.Optimizer,
+    batch: dict[str, torch.Tensor],
+    flow_scale: torch.Tensor,
+    repr_scale: torch.Tensor,
+) -> dict[str, float]:
+    if config.fm_descent_floor_fraction is None:
+        raise ValueError("fm_anchored_cagrad requires fm_descent_floor_fraction")
+    losses = _compute_losses(config, model, batch)
+    flow_objective = losses["flow"] / flow_scale
+    repr_objective = losses["repr"] / repr_scale
+    flow_before = float(flow_objective.detach().cpu())
+    g_fm, g_repr = _task_gradients(model, flow_objective, repr_objective)
+    result = aggregate_two_task_fm_anchored_cagrad(
+        g_fm,
+        g_repr,
+        c=float(config.cagrad_c),
+        fm_descent_floor_fraction=float(config.fm_descent_floor_fraction),
+        eps=config.projection_eps,
+    )
+    _assign_gradients(model, result.combined_gradients)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    after_losses = _compute_losses(config, model, batch)
+    actual_fm_delta = float((after_losses["flow"] / flow_scale).detach().cpu()) - flow_before
+    stats = _stats_from_gradients(
+        g_repr,
+        g_fm,
+        _dot(g_repr, g_fm),
+        _dot(result.combined_gradients, result.combined_gradients),
+        actual_fm_delta=actual_fm_delta,
+        combined_gradients=result.combined_gradients,
+    )
+    stats.update(
+        {
+            "cagrad_fm_weight": result.fm_weight,
+            "cagrad_cl_weight": result.cl_weight,
+            "cagrad_raw_fm_weight": result.raw_fm_weight,
+            "cagrad_raw_cl_weight": result.raw_cl_weight,
+            "gradient_cosine_mean": result.gradient_cosine,
+            "combined_grad_norm": result.combined_norm,
+            "fm_descent_floor": result.fm_descent_floor,
+            "fm_descent_after_cagrad": result.fm_descent_after_cagrad,
+            "fm_descent_after_anchor": result.fm_descent_after_anchor,
+            "fm_anchor_active": 1.0 if result.anchor_active else 0.0,
+        }
+    )
+    return stats
+
+
+def _step_budgeted_cagrad(
+    config: ToyConfig,
+    model: ToyVectorField,
+    optimizer: torch.optim.Optimizer,
+    batch: dict[str, torch.Tensor],
+    flow_scale: torch.Tensor,
+    repr_scale: torch.Tensor,
+) -> dict[str, float]:
+    if config.fm_budget_fraction is None:
+        raise ValueError("budgeted_cagrad requires fm_budget_fraction")
+    losses = _compute_losses(config, model, batch)
+    flow_objective = losses["flow"] / flow_scale
+    repr_objective = losses["repr"] / repr_scale
+    flow_before = float(flow_objective.detach().cpu())
+    g_fm, g_repr = _task_gradients(model, flow_objective, repr_objective)
+    result = aggregate_two_task_budgeted_cagrad(
+        g_fm,
+        g_repr,
+        c=float(config.cagrad_c),
+        fm_budget_fraction=float(config.fm_budget_fraction),
+        eps=config.projection_eps,
+    )
+    _assign_gradients(model, result.combined_gradients)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    after_losses = _compute_losses(config, model, batch)
+    actual_fm_delta = float((after_losses["flow"] / flow_scale).detach().cpu()) - flow_before
+    stats = _stats_from_gradients(
+        g_repr,
+        g_fm,
+        _dot(g_repr, g_fm),
+        _dot(result.combined_gradients, result.combined_gradients),
+        actual_fm_delta=actual_fm_delta,
+        combined_gradients=result.combined_gradients,
+    )
+    stats.update(
+        {
+            "cagrad_fm_weight": result.fm_weight,
+            "cagrad_cl_weight": result.cl_weight,
+            "cagrad_raw_fm_weight": result.raw_fm_weight,
+            "cagrad_raw_cl_weight": result.raw_cl_weight,
+            "gradient_cosine_mean": result.gradient_cosine,
+            "combined_grad_norm": result.combined_norm,
+            "fm_budget": result.fm_budget,
+            "fm_descent_after_cagrad": result.fm_descent_after_cagrad,
+            "fm_descent_after_budget": result.fm_descent_after_budget,
+            "fm_budget_active": 1.0 if result.budget_active else 0.0,
+            "fm_budget_scale": result.budget_scale,
         }
     )
     return stats
@@ -893,6 +1059,159 @@ def aggregate_two_task_cagrad(
         combined_norm=float(combined_norm.detach().cpu()),
         combined_gradients=combined,
     )
+
+
+def aggregate_two_task_fm_anchored_cagrad(
+    g_fm: list[torch.Tensor],
+    g_cl: list[torch.Tensor],
+    c: float,
+    fm_descent_floor_fraction: float,
+    eps: float,
+) -> FMAnchoredCAGradResult:
+    _validate_gradient_lists(g_fm, g_cl)
+    floor_fraction = _validate_fraction(fm_descent_floor_fraction, "fm_descent_floor_fraction")
+    raw = aggregate_two_task_cagrad(g_fm, g_cl, c=c, eps=eps)
+    fm_norm_squared = _squared_norm(g_fm)
+    if bool((fm_norm_squared <= eps).item()):
+        raise FloatingPointError("FM-anchored CAGrad received a near-zero FM gradient")
+    floor_tensor = floor_fraction * fm_norm_squared
+    raw_descent_tensor = _dot(g_fm, raw.combined_gradients)
+
+    if bool((raw_descent_tensor + _eps_tensor(raw_descent_tensor, eps) >= floor_tensor).item()):
+        combined = [gradient.clone() for gradient in raw.combined_gradients]
+        fm_weight = raw.fm_weight
+        cl_weight = raw.cl_weight
+        anchor_active = False
+    else:
+        fm_cl_dot = _dot(g_fm, g_cl)
+        fm_weight = _closest_fm_weight_for_floor(
+            current_fm_weight=raw.fm_weight,
+            fm_norm_squared=float(fm_norm_squared.detach().cpu()),
+            fm_cl_dot=float(fm_cl_dot.detach().cpu()),
+            floor=float(floor_tensor.detach().cpu()),
+            eps=float(eps),
+        )
+        cl_weight = 1.0 - fm_weight
+        combined = [fm_weight * fm_grad + cl_weight * cl_grad for fm_grad, cl_grad in zip(g_fm, g_cl)]
+        anchor_active = True
+
+    anchored_descent_tensor = _dot(g_fm, combined)
+    tolerance = _eps_tensor(anchored_descent_tensor, eps)
+    if bool((anchored_descent_tensor + tolerance < floor_tensor).item()):
+        raise RuntimeError("FM-anchored CAGrad did not satisfy the FM descent floor")
+    combined_norm = torch.sqrt(_squared_norm(combined))
+    return FMAnchoredCAGradResult(
+        fm_weight=float(fm_weight),
+        cl_weight=float(cl_weight),
+        raw_fm_weight=float(raw.fm_weight),
+        raw_cl_weight=float(raw.cl_weight),
+        gradient_cosine=raw.gradient_cosine,
+        combined_norm=float(combined_norm.detach().cpu()),
+        fm_descent_floor=float(floor_tensor.detach().cpu()),
+        fm_descent_after_cagrad=float(raw_descent_tensor.detach().cpu()),
+        fm_descent_after_anchor=float(anchored_descent_tensor.detach().cpu()),
+        anchor_active=anchor_active,
+        combined_gradients=combined,
+    )
+
+
+def aggregate_two_task_budgeted_cagrad(
+    g_fm: list[torch.Tensor],
+    g_cl: list[torch.Tensor],
+    c: float,
+    fm_budget_fraction: float,
+    eps: float,
+) -> BudgetedCAGradResult:
+    _validate_gradient_lists(g_fm, g_cl)
+    budget_fraction = _validate_nonnegative_scalar(fm_budget_fraction, "fm_budget_fraction")
+    raw = aggregate_two_task_cagrad(g_fm, g_cl, c=c, eps=eps)
+    fm_norm_squared = _squared_norm(g_fm)
+    if bool((fm_norm_squared <= eps).item()):
+        raise FloatingPointError("Budgeted CAGrad received a near-zero FM gradient")
+    budget_tensor = budget_fraction * fm_norm_squared
+    lower_bound_tensor = -budget_tensor
+    raw_descent_tensor = _dot(g_fm, raw.combined_gradients)
+
+    if bool((raw_descent_tensor + _eps_tensor(raw_descent_tensor, eps) >= lower_bound_tensor).item()):
+        budget_scale = 1.0
+        combined = [gradient.clone() for gradient in raw.combined_gradients]
+        budget_active = False
+    else:
+        fm_descent_tensor = fm_norm_squared
+        denominator = fm_descent_tensor - raw_descent_tensor
+        if bool((denominator <= _eps_tensor(denominator, eps)).item()):
+            raise RuntimeError("Budgeted CAGrad cannot interpolate to the FM budget")
+        scale_tensor = (fm_descent_tensor - lower_bound_tensor) / denominator
+        scale_tensor = torch.clamp(scale_tensor, min=0.0, max=1.0)
+        budget_scale = float(scale_tensor.detach().cpu())
+        combined = [
+            budget_scale * raw_gradient + (1.0 - budget_scale) * fm_gradient
+            for raw_gradient, fm_gradient in zip(raw.combined_gradients, g_fm)
+        ]
+        budget_active = True
+
+    budgeted_descent_tensor = _dot(g_fm, combined)
+    tolerance = _eps_tensor(budgeted_descent_tensor, eps)
+    if bool((budgeted_descent_tensor + tolerance < lower_bound_tensor).item()):
+        raise RuntimeError("Budgeted CAGrad exceeded the FM descent budget")
+    combined_norm = torch.sqrt(_squared_norm(combined))
+    fm_weight = (1.0 - budget_scale) + budget_scale * raw.fm_weight
+    cl_weight = budget_scale * raw.cl_weight
+    return BudgetedCAGradResult(
+        fm_weight=float(fm_weight),
+        cl_weight=float(cl_weight),
+        raw_fm_weight=float(raw.fm_weight),
+        raw_cl_weight=float(raw.cl_weight),
+        gradient_cosine=raw.gradient_cosine,
+        combined_norm=float(combined_norm.detach().cpu()),
+        fm_budget=float(budget_tensor.detach().cpu()),
+        fm_descent_after_cagrad=float(raw_descent_tensor.detach().cpu()),
+        fm_descent_after_budget=float(budgeted_descent_tensor.detach().cpu()),
+        budget_active=budget_active,
+        budget_scale=budget_scale,
+        combined_gradients=combined,
+    )
+
+
+def _closest_fm_weight_for_floor(
+    current_fm_weight: float,
+    fm_norm_squared: float,
+    fm_cl_dot: float,
+    floor: float,
+    eps: float,
+) -> float:
+    denominator = fm_norm_squared - fm_cl_dot
+    if abs(denominator) <= eps:
+        if fm_cl_dot + eps >= floor:
+            return min(max(float(current_fm_weight), 0.0), 1.0)
+        raise RuntimeError("No two-task convex CAGrad weight can satisfy the FM descent floor")
+    threshold = (floor - fm_cl_dot) / denominator
+    if denominator > 0.0:
+        lower = min(max(threshold, 0.0), 1.0)
+        upper = 1.0
+    else:
+        lower = 0.0
+        upper = min(max(threshold, 0.0), 1.0)
+    if lower > upper + eps:
+        raise RuntimeError("FM descent floor is infeasible inside the two-task simplex")
+    return min(max(float(current_fm_weight), lower), upper)
+
+
+def _validate_fraction(value: float, name: str) -> float:
+    scalar = _validate_nonnegative_scalar(value, name)
+    if scalar > 1.0:
+        raise ValueError(f"{name} must be <= 1.0")
+    return scalar
+
+
+def _validate_nonnegative_scalar(value: float, name: str) -> float:
+    if not isinstance(value, (float, int)) or not math.isfinite(float(value)) or float(value) < 0.0:
+        raise ValueError(f"{name} must be finite and non-negative")
+    return float(value)
+
+
+def _eps_tensor(reference: torch.Tensor, eps: float) -> torch.Tensor:
+    return torch.as_tensor(max(float(eps), 1.0e-6), dtype=reference.dtype, device=reference.device)
 
 
 def _task_gradients(
@@ -1027,6 +1346,16 @@ def _new_stat_window() -> dict[str, list[float]]:
         "combined_grad_norm": [],
         "cagrad_fm_weight": [],
         "cagrad_cl_weight": [],
+        "cagrad_raw_fm_weight": [],
+        "cagrad_raw_cl_weight": [],
+        "fm_descent_floor": [],
+        "fm_descent_after_cagrad": [],
+        "fm_descent_after_anchor": [],
+        "fm_anchor_active": [],
+        "fm_budget": [],
+        "fm_descent_after_budget": [],
+        "fm_budget_active": [],
+        "fm_budget_scale": [],
         "uncertainty_fm_log_var": [],
         "uncertainty_cl_log_var": [],
         "uncertainty_fm_weight": [],
@@ -1051,6 +1380,16 @@ def _empty_step_stats() -> dict[str, float]:
         "combined_grad_norm": 0.0,
         "cagrad_fm_weight": 0.0,
         "cagrad_cl_weight": 0.0,
+        "cagrad_raw_fm_weight": 0.0,
+        "cagrad_raw_cl_weight": 0.0,
+        "fm_descent_floor": 0.0,
+        "fm_descent_after_cagrad": 0.0,
+        "fm_descent_after_anchor": 0.0,
+        "fm_anchor_active": 0.0,
+        "fm_budget": 0.0,
+        "fm_descent_after_budget": 0.0,
+        "fm_budget_active": 0.0,
+        "fm_budget_scale": 0.0,
         "uncertainty_fm_log_var": 0.0,
         "uncertainty_cl_log_var": 0.0,
         "uncertainty_fm_weight": 0.0,
@@ -1074,6 +1413,16 @@ def _accumulate_stats(window: dict[str, list[float]], step_stats: dict[str, floa
     window["combined_grad_norm"].append(float(step_stats["combined_grad_norm"]))
     window["cagrad_fm_weight"].append(float(step_stats["cagrad_fm_weight"]))
     window["cagrad_cl_weight"].append(float(step_stats["cagrad_cl_weight"]))
+    window["cagrad_raw_fm_weight"].append(float(step_stats["cagrad_raw_fm_weight"]))
+    window["cagrad_raw_cl_weight"].append(float(step_stats["cagrad_raw_cl_weight"]))
+    window["fm_descent_floor"].append(float(step_stats["fm_descent_floor"]))
+    window["fm_descent_after_cagrad"].append(float(step_stats["fm_descent_after_cagrad"]))
+    window["fm_descent_after_anchor"].append(float(step_stats["fm_descent_after_anchor"]))
+    window["fm_anchor_active"].append(float(step_stats["fm_anchor_active"]))
+    window["fm_budget"].append(float(step_stats["fm_budget"]))
+    window["fm_descent_after_budget"].append(float(step_stats["fm_descent_after_budget"]))
+    window["fm_budget_active"].append(float(step_stats["fm_budget_active"]))
+    window["fm_budget_scale"].append(float(step_stats["fm_budget_scale"]))
     window["uncertainty_fm_log_var"].append(float(step_stats["uncertainty_fm_log_var"]))
     window["uncertainty_cl_log_var"].append(float(step_stats["uncertainty_cl_log_var"]))
     window["uncertainty_fm_weight"].append(float(step_stats["uncertainty_fm_weight"]))
@@ -1099,6 +1448,16 @@ def _summarize_stat_window(window: dict[str, list[float]]) -> dict[str, float]:
         "combined_grad_norm": _mean(window["combined_grad_norm"]),
         "cagrad_fm_weight": window["cagrad_fm_weight"][-1],
         "cagrad_cl_weight": window["cagrad_cl_weight"][-1],
+        "cagrad_raw_fm_weight": window["cagrad_raw_fm_weight"][-1],
+        "cagrad_raw_cl_weight": window["cagrad_raw_cl_weight"][-1],
+        "fm_descent_floor": _mean(window["fm_descent_floor"]),
+        "fm_descent_after_cagrad": _mean(window["fm_descent_after_cagrad"]),
+        "fm_descent_after_anchor": _mean(window["fm_descent_after_anchor"]),
+        "fm_anchor_active": _mean(window["fm_anchor_active"]),
+        "fm_budget": _mean(window["fm_budget"]),
+        "fm_descent_after_budget": _mean(window["fm_descent_after_budget"]),
+        "fm_budget_active": _mean(window["fm_budget_active"]),
+        "fm_budget_scale": _mean(window["fm_budget_scale"]),
         "uncertainty_fm_log_var": window["uncertainty_fm_log_var"][-1],
         "uncertainty_cl_log_var": window["uncertainty_cl_log_var"][-1],
         "uncertainty_fm_weight": window["uncertainty_fm_weight"][-1],
@@ -1130,6 +1489,16 @@ def _stats_from_projection(projection: ProjectionResult, actual_fm_delta: float)
         "combined_grad_norm": float(projection.projected_repr_norm.detach().cpu()),
         "cagrad_fm_weight": 0.0,
         "cagrad_cl_weight": 0.0,
+        "cagrad_raw_fm_weight": 0.0,
+        "cagrad_raw_cl_weight": 0.0,
+        "fm_descent_floor": 0.0,
+        "fm_descent_after_cagrad": 0.0,
+        "fm_descent_after_anchor": 0.0,
+        "fm_anchor_active": 0.0,
+        "fm_budget": 0.0,
+        "fm_descent_after_budget": 0.0,
+        "fm_budget_active": 0.0,
+        "fm_budget_scale": 0.0,
         "uncertainty_fm_log_var": 0.0,
         "uncertainty_cl_log_var": 0.0,
         "uncertainty_fm_weight": 0.0,
@@ -1165,6 +1534,16 @@ def _stats_from_gradients(
         "combined_grad_norm": float(combined_norm.detach().cpu()),
         "cagrad_fm_weight": 0.0,
         "cagrad_cl_weight": 0.0,
+        "cagrad_raw_fm_weight": 0.0,
+        "cagrad_raw_cl_weight": 0.0,
+        "fm_descent_floor": 0.0,
+        "fm_descent_after_cagrad": 0.0,
+        "fm_descent_after_anchor": 0.0,
+        "fm_anchor_active": 0.0,
+        "fm_budget": 0.0,
+        "fm_descent_after_budget": 0.0,
+        "fm_budget_active": 0.0,
+        "fm_budget_scale": 0.0,
         "uncertainty_fm_log_var": 0.0,
         "uncertainty_cl_log_var": 0.0,
         "uncertainty_fm_weight": 0.0,
