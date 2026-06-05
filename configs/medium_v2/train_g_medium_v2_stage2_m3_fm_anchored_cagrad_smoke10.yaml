@@ -3,8 +3,8 @@ seed: 1337
 sampling_seed: 1337
 device: cuda:0
 num_workers: 8
-global_batch_size: 96
-per_device_batch_size: 48
+global_batch_size: 48
+per_device_batch_size: 24
 amp: false
 learning_rate: 0.0003
 weight_decay: 0.0

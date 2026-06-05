@@ -45,8 +45,8 @@ def test_medium_v2_stage2_configs_use_explicit_paths_batches_and_objectives() ->
         },
         "train_g_medium_v2_stage2_m3_fm_anchored_cagrad_smoke10.yaml": {
             "objective": "fm_anchored_cagrad",
-            "global_batch_size": 96,
-            "per_device_batch_size": 48,
+            "global_batch_size": 48,
+            "per_device_batch_size": 24,
             "epochs": 10,
             "gradient_monitor": {"enabled": True, "interval": 20, "max_samples": 8},
             "flow_condition": "embedding",
