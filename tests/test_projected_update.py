@@ -9,7 +9,10 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from safa.training.projected_update import (
+    FMAnchoredCAGradResult,
     ProjectionResult,
+    aggregate_two_task_cagrad,
+    aggregate_two_task_fm_anchored_cagrad,
     project_gradient_onto_fm_feasible_cone,
     project_gradient_to_dot_lower_bound,
 )
@@ -124,3 +127,53 @@ def test_project_gradient_rejects_invalid_inputs(g_repr, g_fm, eps: float, error
 def test_lower_bound_projection_rejects_invalid_controls(lower_bound, eps: float, error, match: str) -> None:
     with pytest.raises(error, match=match):
         project_gradient_to_dot_lower_bound([torch.ones(1)], [torch.ones(1)], lower_bound=lower_bound, eps=eps)
+
+
+def test_cagrad_two_task_aggregation_matches_toy_reference_example() -> None:
+    g_fm = [torch.tensor([1.0, 0.0])]
+    g_repr = [torch.tensor([0.0, 1.0])]
+
+    result = aggregate_two_task_cagrad(g_fm, g_repr, c=0.5, eps=1e-12)
+
+    assert result.fm_weight == pytest.approx(0.5)
+    assert result.cl_weight == pytest.approx(0.5)
+    assert result.gradient_cosine == pytest.approx(0.0)
+    assert torch.allclose(result.combined_gradients[0], torch.tensor([0.75, 0.75]), atol=1e-6)
+    assert result.combined_norm == pytest.approx(float(torch.sqrt(torch.tensor(1.125))))
+
+
+def test_fm_anchored_cagrad_raises_fm_weight_to_descent_floor() -> None:
+    g_fm = [torch.tensor([6.0, 1.0, 1.0])]
+    g_repr = [torch.tensor([-4.0, 1.0, 1.0])]
+
+    raw = aggregate_two_task_cagrad(g_fm, g_repr, c=0.5, eps=1e-12)
+    result = aggregate_two_task_fm_anchored_cagrad(
+        g_fm,
+        g_repr,
+        c=0.5,
+        fm_descent_floor_fraction=0.5,
+        eps=1e-12,
+    )
+
+    assert isinstance(result, FMAnchoredCAGradResult)
+    assert result.raw_fm_weight == pytest.approx(raw.fm_weight)
+    assert result.raw_cl_weight == pytest.approx(raw.cl_weight)
+    assert result.fm_descent_floor == pytest.approx(19.0)
+    assert result.fm_descent_after_cagrad < result.fm_descent_floor
+    assert result.fm_descent_after_anchor + 1e-6 >= result.fm_descent_floor
+    assert result.fm_weight > raw.fm_weight
+    assert result.cl_weight < raw.cl_weight
+    assert result.anchor_active is True
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"c": None, "eps": 1e-12}, "c"),
+        ({"c": 1.0, "eps": 1e-12}, "c"),
+        ({"c": 0.5, "eps": 0.0}, "eps"),
+    ],
+)
+def test_cagrad_rejects_invalid_controls(kwargs, match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        aggregate_two_task_cagrad([torch.ones(1)], [torch.ones(1)], **kwargs)

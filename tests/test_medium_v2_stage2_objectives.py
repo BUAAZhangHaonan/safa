@@ -43,6 +43,14 @@ def test_medium_v2_stage2_configs_use_explicit_paths_batches_and_objectives() ->
             "gradient_monitor": {"enabled": True, "interval": 20, "max_samples": 8},
             "flow_condition": "embedding",
         },
+        "train_g_medium_v2_stage2_m3_fm_anchored_cagrad_smoke10.yaml": {
+            "objective": "fm_anchored_cagrad",
+            "global_batch_size": 96,
+            "per_device_batch_size": 48,
+            "epochs": 10,
+            "gradient_monitor": {"enabled": True, "interval": 20, "max_samples": 8},
+            "flow_condition": "embedding",
+        },
         "train_g_medium_v2_stage2_fm_only_probe.yaml": {
             "objective": "fm_only_probe",
             "global_batch_size": 24,
@@ -86,7 +94,7 @@ def test_medium_v2_stage2_configs_use_explicit_paths_batches_and_objectives() ->
         assert config["e0_checkpoint"] == "artifacts/checkpoints/e0_medium_v1/best.pt"
         assert config["resume_from"] == "artifacts/checkpoints/g_medium_v1_stage1_long200_v4/best_stage1.pt"
         assert config["global_batch_size"] == expected_config["global_batch_size"]
-        assert config["per_device_batch_size"] == 24
+        assert config["per_device_batch_size"] == expected_config.get("per_device_batch_size", 24)
         assert "batch_size" not in config
         assert config["stages"]["stage2"]["epochs"] == expected_config["epochs"]
         assert config["stages"]["stage2"]["gradient_monitor"] == expected_config["gradient_monitor"]
@@ -107,6 +115,18 @@ def test_medium_v2_stage2_configs_use_explicit_paths_batches_and_objectives() ->
             assert objective["point_weight"] == 1.0
             assert objective["repr_learning_rate"] > 0.0
             assert "grad_clip_norm" not in config
+        if expected_config["objective"] == "fm_anchored_cagrad":
+            for forbidden in ("relation_weight", "offdiag_only", "repr_learning_rate"):
+                assert forbidden not in objective
+            assert objective["lambda_repr"] == 1.0
+            assert objective["point_weight"] == 1.0
+            assert objective["cagrad_c"] == 0.5
+            assert objective["fm_descent_floor_fraction"] == 0.1
+            assert config["out_dir"] == "artifacts/checkpoints/g_medium_v2_stage2_m3_fm_anchored_cagrad_smoke10"
+            assert (
+                config["stages"]["stage2"]["quality_eval"]["output_dir"]
+                == "artifacts/eval/g_medium_v2_stage2_m3_fm_anchored_cagrad_smoke10/quality"
+            )
         if expected_config["objective"] == "point_descent_credit_projected":
             assert config["out_dir"] == "artifacts/checkpoints/g_medium_v2_stage2_m3_point_descent_credit_projected_smoke10"
             assert (
@@ -457,6 +477,60 @@ def test_point_projected_objective_requires_point_only_contract(objective_type: 
             )
 
 
+def test_fm_anchored_cagrad_objective_requires_point_only_unit_lambda_contract() -> None:
+    from safa.training import g_loop
+
+    objective = g_loop._stage2_objective_from_config(
+        {
+            "stage1": {"epochs": 0},
+            "stage2": {
+                "epochs": 1,
+                "stage2_objective": {
+                    "type": "fm_anchored_cagrad",
+                    "flow_condition": "embedding",
+                    "lambda_repr": 1.0,
+                    "point_weight": 1.0,
+                    "cagrad_c": 0.5,
+                    "fm_descent_floor_fraction": 0.1,
+                    "projection_eps": 1e-12,
+                },
+            },
+        }
+    )
+
+    assert objective.type == "fm_anchored_cagrad"
+    assert objective.lambda_repr == 1.0
+    assert objective.point_weight == 1.0
+    assert objective.relation_weight == 0.0
+    assert objective.offdiag_only is False
+    assert objective.cagrad_c == 0.5
+    assert objective.fm_descent_floor_fraction == 0.1
+
+    invalid_payloads = [
+        ({"lambda_repr": 0.5}, "lambda_repr"),
+        ({"relation_weight": 0.0}, "relation_weight"),
+        ({"offdiag_only": False}, "offdiag_only"),
+        ({"repr_learning_rate": 0.00003}, "repr_learning_rate"),
+        ({"cagrad_c": 1.0}, "cagrad_c"),
+        ({"fm_descent_floor_fraction": 1.5}, "fm_descent_floor_fraction"),
+    ]
+    for override, match in invalid_payloads:
+        payload = {
+            "type": "fm_anchored_cagrad",
+            "flow_condition": "embedding",
+            "lambda_repr": 1.0,
+            "point_weight": 1.0,
+            "cagrad_c": 0.5,
+            "fm_descent_floor_fraction": 0.1,
+            "projection_eps": 1e-12,
+            **override,
+        }
+        with pytest.raises(ValueError, match=match):
+            g_loop._stage2_objective_from_config(
+                {"stage1": {"epochs": 0}, "stage2": {"epochs": 1, "stage2_objective": payload}}
+            )
+
+
 def test_generator_training_step_gram_repr_only_probe_does_not_compute_flow_loss(monkeypatch) -> None:
     from torch import nn
 
@@ -662,6 +736,114 @@ def test_descent_credit_projected_batch_records_credit_budget_metrics() -> None:
     assert metrics["dot_after"] == pytest.approx(metrics["credit_dot_lower_bound"])
     assert metrics["credit_budget_used_fraction"] == pytest.approx(1.0)
     assert metrics["projection_applied_fraction"] == 1.0
+
+
+def test_fm_anchored_cagrad_batch_uses_single_optimizer_step_and_logs_metrics() -> None:
+    from contextlib import nullcontext
+    from torch import nn
+
+    from safa.training import g_loop
+
+    class DummyGenerator(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(1.0))
+
+    class DummyTrainingModule(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.generator = DummyGenerator()
+            self.last_loss_metrics = {}
+
+        def forward(self, images, z, sample_ids, include_repr, lambda_cycle, flow_condition):
+            del images, z, sample_ids, lambda_cycle, flow_condition
+            flow_loss = self.generator.weight.square()
+            flow_mse = flow_loss.detach()
+            if include_repr:
+                repr_loss = -0.5 * self.generator.weight
+                self.last_loss_metrics = {
+                    "flow_loss_raw": float(flow_loss.detach().cpu()),
+                    "cycle_loss_raw": 0.0,
+                    "repr_loss": float(repr_loss.detach().cpu()),
+                    "repr_point_loss": float(repr_loss.detach().cpu()),
+                    "repr_relation_loss": 0.0,
+                    "stage2_objective_type": "fm_anchored_cagrad",
+                    "lambda_repr": 1.0,
+                    "effective_flow_loss_weight": 1.0,
+                    "effective_repr_loss_weight": 1.0,
+                    "effective_cycle_loss_weight": 0.0,
+                    "flow_condition": "embedding",
+                }
+                return repr_loss, flow_mse, repr_loss.detach(), flow_loss, repr_loss
+            return flow_loss, flow_mse, flow_loss.new_tensor(0.0), flow_loss, flow_loss.new_tensor(0.0)
+
+    class CountingSGD(torch.optim.SGD):
+        def __init__(self, params) -> None:
+            super().__init__(params, lr=0.1)
+            self.step_calls = 0
+
+        def step(self, closure=None):
+            self.step_calls += 1
+            return super().step(closure)
+
+    objective = g_loop._stage2_objective_from_config(
+        {
+            "stage1": {"epochs": 0},
+            "stage2": {
+                "epochs": 1,
+                "stage2_objective": {
+                    "type": "fm_anchored_cagrad",
+                    "flow_condition": "embedding",
+                    "lambda_repr": 1.0,
+                    "point_weight": 1.0,
+                    "cagrad_c": 0.5,
+                    "fm_descent_floor_fraction": 0.1,
+                    "projection_eps": 1e-12,
+                },
+            },
+        }
+    )
+    module = DummyTrainingModule()
+    optimizer = CountingSGD(module.generator.parameters())
+
+    _, _, _, _, _, batch_grad_norm, metrics = g_loop._run_fm_anchored_cagrad_stage2_batch(
+        training_module=module,
+        optimizer=optimizer,
+        images=torch.zeros(1, 3, 4, 4),
+        z=torch.zeros(1, 2),
+        sample_ids=["sample"],
+        lambda_cycle=0.0,
+        amp_ctx=nullcontext(),
+        grad_clip_norm=None,
+        ema=None,
+        stage2_objective=objective,
+        flow_condition="embedding",
+    )
+
+    assert optimizer.step_calls == 1
+    assert batch_grad_norm == pytest.approx(metrics["combined_grad_norm"])
+    for key in (
+        "cagrad_fm_weight",
+        "cagrad_cl_weight",
+        "cagrad_raw_fm_weight",
+        "cagrad_raw_cl_weight",
+        "fm_descent_floor_fraction",
+        "fm_descent_floor_value",
+        "gradient_cosine_fm_repr",
+        "combined_grad_norm",
+        "fm_descent_after_cagrad",
+        "fm_descent_after_anchor",
+        "fm_anchor_active",
+    ):
+        assert key in metrics
+    assert metrics["cagrad_fm_weight"] + metrics["cagrad_cl_weight"] == pytest.approx(1.0)
+    assert metrics["fm_descent_after_anchor"] + 1e-6 >= metrics["fm_descent_floor_value"]
+
+    source = inspect.getsource(g_loop._run_fm_anchored_cagrad_stage2_batch)
+    assert "optimizer.step()" in source
+    assert source.count("optimizer.step()") == 1
+    assert "torch.autograd.grad" not in source
+    assert "_gradient_vector_for_loss" not in source
 
 
 def test_generator_training_step_prefers_spec_repr_metric_fields(monkeypatch) -> None:
