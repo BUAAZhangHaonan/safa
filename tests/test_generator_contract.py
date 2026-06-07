@@ -211,7 +211,7 @@ class GeneratorContractTests(unittest.TestCase):
                 },
                 path,
             )
-            loaded = _load_generator(str(path), {"image_size": 64}, "cpu")
+            loaded = _load_generator(str(path), {"image_size": 64, "checkpoint_model": "raw"}, "cpu")
         output = loaded(torch.randn(1, 128))
         self.assertEqual(tuple(output.shape), (1, 3, 64, 64))
 

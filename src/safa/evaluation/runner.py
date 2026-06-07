@@ -25,11 +25,11 @@ class PrivacyProtocolError(RuntimeError):
 
 def run_eval_from_config(config: dict) -> dict:
     import torch
-    import torch.nn.functional as F
     from torch.utils.data import DataLoader
     from torchvision.utils import save_image
 
     privacy_cfg, face_detection_cfg, anti_cfg = _eval_monitor_configs(config)
+    candidate_rerank_cfg = _candidate_rerank_config(config)
     set_seed(int(config["seed"]))
     device = require_cuda_device(str(config["device"]))
     e0, e0_checkpoint = load_e0_checkpoint(config["e0_checkpoint"], device=str(device))
@@ -64,15 +64,33 @@ def run_eval_from_config(config: dict) -> dict:
             z = batch["z"].to(device, non_blocking=True)
             labels = batch["label"].to(device, non_blocking=True)
             sample_ids = list(batch["sample_id"])
-            generated = _sample_generated_for_eval(generator, z, sample_ids, sampling_seed, int(config["image_size"]))
-            assert_finite_tensor("eval_generated", generated)
+            source_out = e0(normalize_for_e0(source))
+            selected_face_counts = None
+            candidate_rerank_rows = None
+            if candidate_rerank_cfg["enabled"]:
+                generated, generated_out, candidate_rerank_rows, selected_face_counts = _sample_reranked_generated_for_eval(
+                    generator,
+                    e0,
+                    z,
+                    sample_ids,
+                    sampling_seed,
+                    int(config["image_size"]),
+                    candidate_rerank_cfg,
+                    detector,
+                )
+            else:
+                generated = _sample_generated_for_eval(generator, z, sample_ids, sampling_seed, int(config["image_size"]))
+                assert_finite_tensor("eval_generated", generated)
+                generated_out = e0(normalize_for_e0(generated))
             if generated_chunks is not None:
                 generated_chunks.append(generated.detach().cpu())
-            source_out = e0(normalize_for_e0(source))
-            generated_out = e0(normalize_for_e0(generated))
             batch_rows = _make_affective_rows(sample_ids, labels, source_out, generated_out, z)
+            if candidate_rerank_rows is not None:
+                _attach_candidate_rerank_rows(batch_rows, candidate_rerank_rows)
             if detector is not None:
-                _attach_face_detection_rows(batch_rows, detector.detect_counts(generated))
+                counts = selected_face_counts if selected_face_counts is not None else detector.detect_counts(generated)
+                _attach_face_detection_rows(batch_rows, counts)
+                _attach_candidate_rerank_selected_face_counts(batch_rows, counts)
             rows.extend(batch_rows)
             row_start = len(rows) - len(batch_rows)
             if generated_image_dir is not None:
@@ -112,6 +130,7 @@ def run_eval_from_config(config: dict) -> dict:
         generated_image_dir,
         generated_image_count,
         sampling_seed,
+        candidate_rerank_cfg,
     )
     _write_eval_outputs(config, result, rows, len(dataset))
     if privacy_cfg["enabled"] and guard["passed"]:
@@ -135,6 +154,7 @@ def run_eval_from_config(config: dict) -> dict:
                 generated_image_dir,
                 generated_image_count,
                 sampling_seed,
+                candidate_rerank_cfg,
             )
             _write_eval_outputs(config, result, rows, len(dataset))
             raise
@@ -154,6 +174,7 @@ def run_eval_from_config(config: dict) -> dict:
             generated_image_dir,
             generated_image_count,
             sampling_seed,
+            candidate_rerank_cfg,
         )
         _write_eval_outputs(config, result, rows, len(dataset))
     return result
@@ -173,7 +194,11 @@ def _build_eval_result(
     generated_image_dir: Path | None,
     generated_image_count: int,
     sampling_seed: int,
+    candidate_rerank_cfg: dict | None = None,
 ) -> dict:
+    sampling = {"base_seed": sampling_seed, "stable_x_init": True}
+    if candidate_rerank_cfg is not None and candidate_rerank_cfg["enabled"]:
+        sampling["candidate_rerank"] = _candidate_rerank_result_metadata(candidate_rerank_cfg)
     return {
         "run_id": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -197,7 +222,7 @@ def _build_eval_result(
             "generated_image_dir": str(generated_image_dir) if generated_image_dir is not None else None,
             "generated_image_count": generated_image_count,
         },
-        "sampling": {"base_seed": sampling_seed, "stable_x_init": True},
+        "sampling": sampling,
     }
 
 
@@ -286,6 +311,161 @@ def _positive_int_metadata(value, field: str) -> int:
 def _sample_generated_for_eval(generator, z, sample_ids, sampling_seed: int, image_size: int):
     x_init = make_x_init_for_sample_ids(sample_ids, sampling_seed, image_size, z.device, z.dtype)
     return generator.sample(z, x_init=x_init)
+
+
+def _candidate_rerank_config(config: dict) -> dict:
+    block = config.get("candidate_rerank")
+    if block is None:
+        return _disabled_candidate_rerank_config()
+    if not isinstance(block, dict):
+        raise ValueError("candidate_rerank block must be a mapping")
+    if not _require_enabled_flag(block, "candidate_rerank"):
+        return _disabled_candidate_rerank_config()
+    num_candidates = _positive_int_metadata(block.get("num_candidates", 1), "candidate_rerank.num_candidates")
+    selection_metric = str(block.get("selection_metric", "latent_cosine"))
+    if selection_metric != "latent_cosine":
+        raise ValueError("candidate_rerank.selection_metric must be 'latent_cosine'")
+    single_face_priority = block.get("single_face_priority", False)
+    if not isinstance(single_face_priority, bool):
+        raise ValueError("candidate_rerank.single_face_priority must be true or false")
+    return {
+        "enabled": True,
+        "num_candidates": num_candidates,
+        "single_face_priority": single_face_priority,
+        "selection_metric": selection_metric,
+    }
+
+
+def _disabled_candidate_rerank_config() -> dict:
+    return {
+        "enabled": False,
+        "num_candidates": 1,
+        "single_face_priority": False,
+        "selection_metric": "latent_cosine",
+    }
+
+
+def _candidate_rerank_result_metadata(config: dict) -> dict:
+    return {
+        "enabled": bool(config["enabled"]),
+        "num_candidates": int(config["num_candidates"]),
+        "single_face_priority": bool(config["single_face_priority"]),
+        "selection_metric": str(config["selection_metric"]),
+    }
+
+
+def _candidate_sample_ids(sample_ids, candidate_index: int) -> list[str]:
+    return [f"{sample_id}::candidate::{int(candidate_index)}" for sample_id in sample_ids]
+
+
+def _sample_reranked_generated_for_eval(
+    generator,
+    e0,
+    z,
+    sample_ids,
+    sampling_seed: int,
+    image_size: int,
+    candidate_rerank_cfg: dict,
+    detector,
+):
+    import torch
+    import torch.nn.functional as F
+
+    num_candidates = int(candidate_rerank_cfg["num_candidates"])
+    candidate_images = []
+    candidate_outs = []
+    candidate_cosines = []
+    candidate_face_counts = [] if detector is not None and candidate_rerank_cfg["single_face_priority"] else None
+    for candidate_index in range(num_candidates):
+        candidate_ids = _candidate_sample_ids(sample_ids, candidate_index)
+        generated = _sample_generated_for_eval(generator, z, candidate_ids, sampling_seed, image_size)
+        assert_finite_tensor(f"eval_generated_candidate_{candidate_index}", generated)
+        generated_out = e0(normalize_for_e0(generated))
+        cosine = F.cosine_similarity(generated_out["embedding"], z, dim=1).clamp(-1, 1)
+        candidate_images.append(generated)
+        candidate_outs.append(generated_out)
+        candidate_cosines.append(cosine)
+        if candidate_face_counts is not None:
+            counts = detector.detect_counts(generated)
+            if len(counts) != generated.shape[0]:
+                raise RuntimeError(f"Candidate face detection count mismatch: images={generated.shape[0]} counts={len(counts)}")
+            candidate_face_counts.append([int(count) for count in counts])
+
+    selected_indices = []
+    metadata_rows = []
+    selected_images = []
+    for sample_index, _sample_id in enumerate(sample_ids):
+        summaries = []
+        for candidate_index in range(num_candidates):
+            summary = {
+                "index": int(candidate_index),
+                "latent_cosine": float(candidate_cosines[candidate_index][sample_index].detach().cpu()),
+            }
+            if candidate_face_counts is not None:
+                summary["face_count"] = int(candidate_face_counts[candidate_index][sample_index])
+            summaries.append(summary)
+        selected_index = _select_candidate_rerank_index(summaries, candidate_rerank_cfg["single_face_priority"])
+        selected_summary = summaries[selected_index]
+        selected_indices.append(selected_index)
+        selected_images.append(candidate_images[selected_index][sample_index])
+        metadata_rows.append(
+            {
+                "enabled": True,
+                "num_candidates": num_candidates,
+                "single_face_priority": bool(candidate_rerank_cfg["single_face_priority"]),
+                "selection_metric": str(candidate_rerank_cfg["selection_metric"]),
+                "selected_candidate_index": int(selected_index),
+                "selected_latent_cosine": float(selected_summary["latent_cosine"]),
+                "selected_face_count": selected_summary.get("face_count"),
+                "candidates": summaries,
+            }
+        )
+
+    generated = torch.stack(selected_images, dim=0)
+    selected_out = {
+        "embedding": torch.stack(
+            [candidate_outs[selected_index]["embedding"][sample_index] for sample_index, selected_index in enumerate(selected_indices)],
+            dim=0,
+        ),
+        "logits": torch.stack(
+            [candidate_outs[selected_index]["logits"][sample_index] for sample_index, selected_index in enumerate(selected_indices)],
+            dim=0,
+        ),
+    }
+    selected_face_counts = None
+    if candidate_face_counts is not None:
+        selected_face_counts = [
+            int(candidate_face_counts[selected_index][sample_index])
+            for sample_index, selected_index in enumerate(selected_indices)
+        ]
+    return generated, selected_out, metadata_rows, selected_face_counts
+
+
+def _select_candidate_rerank_index(candidates: list[dict], single_face_priority: bool) -> int:
+    if not candidates:
+        raise ValueError("candidate rerank requires at least one candidate")
+    pool = candidates
+    if single_face_priority and all("face_count" in candidate for candidate in candidates):
+        single_face = [candidate for candidate in candidates if int(candidate["face_count"]) == 1]
+        if single_face:
+            pool = single_face
+    selected = max(pool, key=lambda candidate: float(candidate["latent_cosine"]))
+    return int(selected["index"])
+
+
+def _attach_candidate_rerank_rows(rows: list[dict], metadata_rows: list[dict]) -> None:
+    if len(rows) != len(metadata_rows):
+        raise RuntimeError(f"Candidate rerank metadata mismatch: rows={len(rows)} metadata={len(metadata_rows)}")
+    for row, metadata in zip(rows, metadata_rows):
+        row["candidate_rerank"] = metadata
+
+
+def _attach_candidate_rerank_selected_face_counts(rows: list[dict], counts: list[int]) -> None:
+    if len(rows) != len(counts):
+        raise RuntimeError(f"Candidate rerank selected face count mismatch: rows={len(rows)} counts={len(counts)}")
+    for row, count in zip(rows, counts):
+        if "candidate_rerank" in row and row["candidate_rerank"].get("selected_face_count") is None:
+            row["candidate_rerank"]["selected_face_count"] = int(count)
 
 
 _SAFE_SAMPLE_ID_RE = re.compile(r"[^A-Za-z0-9._-]+")
