@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
 from datetime import datetime, timezone
 import json
@@ -996,6 +997,75 @@ def _privacy_roc_metrics(same_values, impostor_values) -> dict[str, float]:
     }
 
 
+def _candidate_rerank_positive_count(value, context: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{context} must be a positive integer, got {value!r}")
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f"{context} must be a positive integer, got {value!r}")
+    return parsed
+
+
+def _candidate_rerank_cost_summary(rows: list[dict]) -> dict | None:
+    metadata_rows = [row["candidate_rerank"] for row in rows if "candidate_rerank" in row]
+    if not metadata_rows:
+        return None
+    if len(metadata_rows) != len(rows):
+        raise ValueError("Candidate rerank summary requires candidate_rerank metadata on every eval row")
+
+    evaluated_counts = []
+    configured_counts = []
+    threshold_passed_count = 0
+    threshold_seen = False
+    stop_reasons = []
+    for index, metadata in enumerate(metadata_rows):
+        if not isinstance(metadata, dict):
+            raise ValueError(f"candidate_rerank metadata row {index} must be a mapping")
+        configured = _candidate_rerank_positive_count(
+            metadata.get("num_candidates"),
+            f"candidate_rerank row {index}.num_candidates",
+        )
+        if "num_candidates_evaluated" in metadata:
+            evaluated = _candidate_rerank_positive_count(
+                metadata["num_candidates_evaluated"],
+                f"candidate_rerank row {index}.num_candidates_evaluated",
+            )
+        elif isinstance(metadata.get("candidates"), list):
+            evaluated = _candidate_rerank_positive_count(
+                len(metadata["candidates"]),
+                f"candidate_rerank row {index}.candidates",
+            )
+        else:
+            evaluated = configured
+        if evaluated > configured:
+            raise ValueError(f"candidate_rerank row {index} evaluated {evaluated} candidates but configured {configured}")
+        evaluated_counts.append(evaluated)
+        configured_counts.append(configured)
+        if "threshold_passed" in metadata:
+            threshold_seen = True
+            threshold_passed_count += int(bool(metadata["threshold_passed"]))
+        if "stop_reason" in metadata:
+            stop_reasons.append(str(metadata["stop_reason"]))
+
+    evaluated_summary = summarize(float(count) for count in evaluated_counts)
+    evaluated_total = int(sum(evaluated_counts))
+    configured_total = int(sum(configured_counts))
+    summary = {
+        "num_samples": int(len(metadata_rows)),
+        "num_candidates_evaluated_mean": evaluated_summary["mean"],
+        "num_candidates_evaluated_median": evaluated_summary["p50"],
+        "num_candidates_evaluated_p90": evaluated_summary["p90"],
+        "num_candidates_evaluated_total": evaluated_total,
+        "num_candidates_configured_total": configured_total,
+        "candidate_compute_saved_ratio": float(1.0 - (evaluated_total / configured_total)),
+    }
+    if threshold_seen:
+        summary["threshold_passed_rate"] = float(threshold_passed_count / len(metadata_rows))
+    if stop_reasons:
+        summary["stop_reason_counts"] = dict(sorted(Counter(stop_reasons).items()))
+    return summary
+
+
 def _summarize_rows(rows: list[dict]) -> dict:
     if not rows:
         raise ValueError("Cannot summarize zero eval rows")
@@ -1035,6 +1105,9 @@ def _summarize_rows(rows: list[dict]) -> dict:
                 f"Privacy ROC metrics for {recognizer_name} require both same_similarity and impostor_similarity"
             ) from exc
         summarized["privacy"][recognizer_name].update(_privacy_roc_metrics(same_values, impostor_values))
+    candidate_rerank_summary = _candidate_rerank_cost_summary(rows)
+    if candidate_rerank_summary is not None:
+        summarized["candidate_rerank"] = candidate_rerank_summary
     return summarized
 
 

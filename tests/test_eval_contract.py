@@ -1002,6 +1002,16 @@ class EvalContractTests(unittest.TestCase):
             [(2, 3, 4, 4), (2, 3, 4, 4), (1, 3, 4, 4), (1, 3, 4, 4)],
         )
 
+        cost_summary = result["metrics"]["candidate_rerank"]
+        self.assertAlmostEqual(cost_summary["num_candidates_evaluated_mean"], 3.0)
+        self.assertAlmostEqual(cost_summary["num_candidates_evaluated_median"], 3.0)
+        self.assertAlmostEqual(cost_summary["num_candidates_evaluated_p90"], 3.8)
+        self.assertEqual(cost_summary["num_candidates_evaluated_total"], 6)
+        self.assertEqual(cost_summary["num_candidates_configured_total"], 8)
+        self.assertAlmostEqual(cost_summary["candidate_compute_saved_ratio"], 0.25)
+        self.assertAlmostEqual(cost_summary["threshold_passed_rate"], 0.5)
+        self.assertEqual(cost_summary["stop_reason_counts"], {"max_k_no_threshold_passed": 1, "threshold_passed": 1})
+
         first = rows[0]["candidate_rerank"]
         self.assertEqual(first["num_candidates"], 4)
         self.assertEqual(first["num_candidates_evaluated"], 2)
