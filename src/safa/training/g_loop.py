@@ -64,6 +64,9 @@ _CAGRAD_STAGE2_OBJECTIVES = (_FM_ANCHORED_CAGRAD, _FM_PRIMARY_CONSTRAINED_FAMO)
 _GENERATOR_TRAINABLE_FULL = "full"
 _GENERATOR_TRAINABLE_CONDITIONING_ONLY = "conditioning_only"
 _GENERATOR_TRAINABLE_MODES = (_GENERATOR_TRAINABLE_FULL, _GENERATOR_TRAINABLE_CONDITIONING_ONLY)
+_RESUME_MODE_TRAINING_STATE = "training_state"
+_RESUME_MODE_MODEL_WEIGHTS_ONLY = "model_weights_only"
+_RESUME_MODES = (_RESUME_MODE_TRAINING_STATE, _RESUME_MODE_MODEL_WEIGHTS_ONLY)
 
 
 @dataclass(frozen=True)
@@ -839,6 +842,16 @@ def _generator_trainable_mode(config: dict) -> str:
     return mode
 
 
+def _resume_mode(config: dict) -> str:
+    mode = str(config.get("resume_mode", _RESUME_MODE_TRAINING_STATE))
+    if mode not in _RESUME_MODES:
+        raise ValueError(
+            "train_g config.resume_mode must be "
+            f"{_RESUME_MODE_TRAINING_STATE!r} or {_RESUME_MODE_MODEL_WEIGHTS_ONLY!r}, got {mode!r}"
+        )
+    return mode
+
+
 def _apply_generator_trainable_mode(generator, mode: str) -> None:
     if mode == _GENERATOR_TRAINABLE_FULL:
         for param in generator.parameters():
@@ -1070,6 +1083,7 @@ def train_g_from_config(config: dict) -> dict:
     audit_no_identity_supervision(config, DEFAULT_NO_IDENTITY_SOURCE_PATHS)
     _validate_train_g_config(config)
     generator_trainable_mode = _generator_trainable_mode(config)
+    resume_mode = _resume_mode(config)
     distributed = init_distributed(config)
     try:
         batch_config = _training_batch_config(config, world_size=distributed.world_size)
@@ -1115,24 +1129,28 @@ def train_g_from_config(config: dict) -> dict:
             raise FileNotFoundError(f"resume_from checkpoint not found: {resume_path}")
         ckpt = torch.load(resume_path, map_location=device, weights_only=True)
         generator.load_state_dict(ckpt["model_state_dict"])
-        if "history" in ckpt:
-            resume_history = _resume_history_for_checkpoint_selection(ckpt["history"], str(resume_path), config, stages)
-        resume_progress = _resume_stage_progress_from_metrics(ckpt.get("metrics"), str(resume_path))
-        if "ema_model_state_dict" in ckpt:
-            resume_ema_state_dict = ckpt["ema_model_state_dict"]
-        if "optimizer_state_dict" in ckpt:
-            resume_optimizer_state_dict = ckpt["optimizer_state_dict"]
-        if "loss_weighting_state" in ckpt:
-            resume_loss_weighting_state = ckpt["loss_weighting_state"]
+        if resume_mode == _RESUME_MODE_TRAINING_STATE:
+            if "history" in ckpt:
+                resume_history = _resume_history_for_checkpoint_selection(ckpt["history"], str(resume_path), config, stages)
+            resume_progress = _resume_stage_progress_from_metrics(ckpt.get("metrics"), str(resume_path))
+            if "ema_model_state_dict" in ckpt:
+                resume_ema_state_dict = ckpt["ema_model_state_dict"]
+            if "optimizer_state_dict" in ckpt:
+                resume_optimizer_state_dict = ckpt["optimizer_state_dict"]
+            if "loss_weighting_state" in ckpt:
+                resume_loss_weighting_state = ckpt["loss_weighting_state"]
         if distributed.is_main:
             restored = ["model_state_dict"]
-            if resume_history is not None:
-                restored.append("history")
-            restored.append(f"progress={resume_progress.stage}:{resume_progress.stage_epoch}")
-            if resume_ema_state_dict is not None:
-                restored.append("ema_model_state_dict")
-            if resume_loss_weighting_state is not None:
-                restored.append("loss_weighting_state")
+            if resume_mode == _RESUME_MODE_TRAINING_STATE:
+                if resume_history is not None:
+                    restored.append("history")
+                restored.append(f"progress={resume_progress.stage}:{resume_progress.stage_epoch}")
+                if resume_ema_state_dict is not None:
+                    restored.append("ema_model_state_dict")
+                if resume_loss_weighting_state is not None:
+                    restored.append("loss_weighting_state")
+            else:
+                restored.append(f"resume_mode={_RESUME_MODE_MODEL_WEIGHTS_ONLY}")
             sep = ", ".join(restored)
             print(f"Resumed generator from {resume_path} (restored: {sep})")
     _apply_generator_trainable_mode(generator, generator_trainable_mode)
@@ -1187,7 +1205,7 @@ def train_g_from_config(config: dict) -> dict:
         _optimizer_param_groups(unwrap_model(training_module), config, loss_weighting_runtime),
     )
     optimizer_resumed = False
-    if config.get("resume_from"):
+    if config.get("resume_from") and resume_mode == _RESUME_MODE_TRAINING_STATE:
         _assert_required_resume_optimizer_state(
             config, stages, resume_progress, resume_optimizer_state_dict, str(config["resume_from"])
         )
@@ -1934,6 +1952,7 @@ def _distributed_manifest(distributed: DistributedContext) -> dict:
 
 def _validate_train_g_config(config: dict) -> None:
     _generator_trainable_mode(config)
+    _resume_mode(config)
     _generator_config_from_train_config(config)
     _require_bool(config, "allow_stage2_without_stage1_gate", "train_g config")
     stages = _stage_config(config)

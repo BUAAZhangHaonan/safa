@@ -524,6 +524,226 @@ def test_train_g_applies_generator_trainable_after_resume_before_ddp_and_optimiz
     assert events == ["load_resume", "apply_generator_trainable", "ddp_wrap", "optimizer_param_groups"]
 
 
+
+
+def test_train_g_model_weights_only_resume_skips_training_state_and_initializes_ema_from_loaded_model(monkeypatch, tmp_path) -> None:
+    from torch import nn
+
+    from safa.training import g_loop
+    from safa.utils.distributed import DistributedContext
+
+    events: list[str] = []
+    resume_path = tmp_path / "resume.pt"
+    resume_path.write_bytes(b"checkpoint")
+
+    class StopAfterOptimizerResume(RuntimeError):
+        pass
+
+    class FakeGenerator(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(1.0))
+
+        def load_state_dict(self, state_dict):
+            with torch.no_grad():
+                self.weight.copy_(state_dict["weight"])
+            events.append(f"load_resume:{float(self.weight.detach())}")
+
+    class FakeEMA:
+        def __init__(self, model, decay: float) -> None:
+            del decay
+            events.append(f"ema_init:{float(model.weight.detach())}")
+
+        def load_state_dict(self, state_dict) -> None:
+            del state_dict
+            events.append("ema_load_old")
+
+    class FakeTrainingModule(nn.Module):
+        def __init__(self, generator, *args, **kwargs) -> None:
+            super().__init__()
+            del args, kwargs
+            self.generator = generator
+            self.uncertainty_loss = nn.Linear(1, 1)
+
+    generator = FakeGenerator()
+    generator_config = g_loop.FlowGeneratorConfig(embedding_dim=2, image_size=4, sample_steps=1, train_cycle_steps=1)
+    distributed = DistributedContext(
+        enabled=False,
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        is_main=True,
+        device=torch.device("cpu"),
+        backend="gloo",
+    )
+
+    monkeypatch.setattr(g_loop, "set_seed", lambda seed: None)
+    monkeypatch.setattr(g_loop, "audit_no_identity_supervision", lambda config, paths: None)
+    monkeypatch.setattr(g_loop, "_validate_train_g_config", lambda config: None)
+    monkeypatch.setattr(g_loop, "init_distributed", lambda config: distributed)
+    monkeypatch.setattr(g_loop, "cleanup_distributed", lambda distributed: None)
+    monkeypatch.setattr(g_loop, "barrier", lambda distributed: None)
+    monkeypatch.setattr(g_loop, "load_e0_checkpoint", lambda path, device: (nn.Identity(), {}))
+    monkeypatch.setattr(g_loop, "freeze_e0", lambda e0: None)
+    monkeypatch.setattr(g_loop, "_generator_config_from_train_config", lambda config: generator_config)
+    monkeypatch.setattr(g_loop, "_stage_config", lambda config: {"stage1": {"epochs": 0}, "stage2": {"epochs": 3}})
+    monkeypatch.setattr(
+        g_loop,
+        "_ema_config",
+        lambda config: {
+            "enabled": True,
+            "decay": 0.999,
+            "evaluate_raw": True,
+            "evaluate_ema": True,
+            "save_ema_checkpoint": True,
+        },
+    )
+    monkeypatch.setattr(g_loop, "ExponentialMovingAverage", FakeEMA)
+    monkeypatch.setattr(g_loop, "_best_model", lambda config, ema_config: "raw")
+    monkeypatch.setattr(
+        g_loop,
+        "_loss_weighting_runtime_from_config",
+        lambda config: g_loop._LossWeightingRuntime(
+            type="uncertainty",
+            calibration_batches=1,
+            log_var_lr=0.001,
+            log_var_weight_decay=0.0,
+        ),
+    )
+    monkeypatch.setattr(g_loop, "_stage2_objective_from_config", lambda stages: None)
+    monkeypatch.setattr(g_loop, "sampling_base_seed_from_config", lambda config: 123)
+    monkeypatch.setattr(g_loop, "build_generator", lambda payload: generator)
+    monkeypatch.setattr(
+        torch,
+        "load",
+        lambda path, map_location, weights_only: {
+            "model_state_dict": {"weight": torch.tensor(7.0)},
+            "history": [{"stage": "stage2"}],
+            "metrics": {"stage": "stage2", "stage_epoch": 2},
+            "ema_model_state_dict": {"weight": torch.tensor(3.0)},
+            "optimizer_state_dict": {"state": {}, "param_groups": []},
+            "loss_weighting_state": {"type": "uncertainty"},
+        },
+    )
+    monkeypatch.setattr(
+        g_loop,
+        "_resume_history_for_checkpoint_selection",
+        lambda history, path, config, stages: events.append("resume_history") or list(history),
+    )
+    monkeypatch.setattr(
+        g_loop,
+        "_resume_stage_progress_from_metrics",
+        lambda metrics, path: events.append("resume_progress") or g_loop._ResumeProgress("stage2", 2),
+    )
+
+    def fake_apply_generator_trainable_mode(actual_generator, mode):
+        assert actual_generator is generator
+        assert mode == "conditioning_only"
+        events.append("apply_generator_trainable")
+
+    monkeypatch.setattr(g_loop, "_apply_generator_trainable_mode", fake_apply_generator_trainable_mode)
+    monkeypatch.setattr(g_loop, "_GeneratorTrainingStep", FakeTrainingModule)
+    monkeypatch.setattr(g_loop, "_verify_e0_feature_cache_consistency", lambda config: None)
+    monkeypatch.setattr(g_loop, "FeatureAlignedAffectNet", lambda *args, **kwargs: [object()])
+    monkeypatch.setattr(g_loop, "_build_train_loader", lambda train_set, *, train_sampler, batch_config, num_workers: [])
+    monkeypatch.setattr(g_loop, "_build_validation_loader", lambda config: None)
+    monkeypatch.setattr(g_loop, "_build_detector", lambda config, device: None)
+    monkeypatch.setattr(g_loop, "_stage2_gradient_conflict_config", lambda stages: g_loop._GradientConflictConfig(enabled=False))
+
+    def fake_restore_or_calibrate_uncertainty_loss(
+        training_module,
+        train_loader,
+        device,
+        *,
+        use_amp,
+        calibration_batches,
+        distributed,
+        resume_progress,
+        resume_loss_weighting_state,
+        resume_path,
+    ):
+        del training_module, train_loader, device, use_amp, calibration_batches, distributed, resume_progress, resume_path
+        state = "None" if resume_loss_weighting_state is None else "present"
+        events.append(f"loss_weighting_state:{state}")
+        return "calibrated"
+
+    monkeypatch.setattr(g_loop, "_restore_or_calibrate_uncertainty_loss", fake_restore_or_calibrate_uncertainty_loss)
+
+    def fake_optimizer_param_groups(training_module, config, loss_weighting):
+        del config, loss_weighting
+        assert training_module.generator is generator
+        events.append("optimizer_param_groups")
+        return [{"params": [training_module.generator.weight], "lr": 0.001, "weight_decay": 0.0}]
+
+    monkeypatch.setattr(g_loop, "_optimizer_param_groups", fake_optimizer_param_groups)
+    monkeypatch.setattr(
+        g_loop,
+        "_assert_required_resume_optimizer_state",
+        lambda config, stages, resume_progress, resume_optimizer_state_dict, resume_path: events.append("assert_optimizer_state"),
+    )
+    monkeypatch.setattr(
+        g_loop,
+        "_load_resume_optimizer_state",
+        lambda optimizer, resume_optimizer_state_dict, *, generator_trainable_mode, is_main: events.append("load_optimizer_state") or True,
+    )
+
+    def fake_assert_e0_frozen(e0, optimizer):
+        del e0, optimizer
+        events.append("assert_e0_frozen")
+        raise StopAfterOptimizerResume
+
+    monkeypatch.setattr(g_loop, "assert_e0_frozen", fake_assert_e0_frozen)
+
+    config = {
+        "seed": 1,
+        "out_dir": str(tmp_path / "out"),
+        "num_workers": 1,
+        "e0_checkpoint": "e0.pt",
+        "train_index": "train.csv",
+        "train_features": "features",
+        "image_size": 4,
+        "global_batch_size": 1,
+        "per_device_batch_size": 1,
+        "learning_rate": 0.001,
+        "weight_decay": 0.0,
+        "resume_from": str(resume_path),
+        "resume_mode": "model_weights_only",
+        "generator_trainable": "conditioning_only",
+    }
+
+    with pytest.raises(StopAfterOptimizerResume):
+        g_loop.train_g_from_config(config)
+
+    assert events == [
+        "load_resume:7.0",
+        "apply_generator_trainable",
+        "ema_init:7.0",
+        "loss_weighting_state:None",
+        "optimizer_param_groups",
+        "assert_e0_frozen",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        ({}, "training_state"),
+        ({"resume_mode": "training_state"}, "training_state"),
+        ({"resume_mode": "model_weights_only"}, "model_weights_only"),
+    ],
+)
+def test_resume_mode_defaults_to_training_state_and_accepts_known_values(config, expected) -> None:
+    from safa.training import g_loop
+
+    assert g_loop._resume_mode(config) == expected
+
+
+def test_validate_train_g_config_rejects_bad_resume_mode() -> None:
+    from safa.training import g_loop
+
+    with pytest.raises(ValueError, match="resume_mode.*bad"):
+        g_loop._validate_train_g_config({"resume_mode": "bad"})
+
 def test_generator_trainable_rejects_unknown_value() -> None:
     from safa.training import g_loop
 
