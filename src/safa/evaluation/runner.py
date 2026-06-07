@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from datetime import datetime, timezone
 import json
+import math
 import re
 
 from safa.data.feature_dataset import FeatureAlignedAffectNet
@@ -308,6 +309,18 @@ def _positive_int_metadata(value, field: str) -> int:
     return parsed
 
 
+def _finite_float_metadata(value, field: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a finite number, got bool")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a finite number, got {value!r}") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"{field} must be a finite number, got {value!r}")
+    return parsed
+
+
 def _sample_generated_for_eval(generator, z, sample_ids, sampling_seed: int, image_size: int):
     x_init = make_x_init_for_sample_ids(sample_ids, sampling_seed, image_size, z.device, z.dtype)
     return generator.sample(z, x_init=x_init)
@@ -328,12 +341,40 @@ def _candidate_rerank_config(config: dict) -> dict:
     single_face_priority = block.get("single_face_priority", False)
     if not isinstance(single_face_priority, bool):
         raise ValueError("candidate_rerank.single_face_priority must be true or false")
-    return {
+    parsed = {
         "enabled": True,
         "num_candidates": num_candidates,
         "single_face_priority": single_face_priority,
         "selection_metric": selection_metric,
     }
+    adaptive_k = block.get("adaptive_k")
+    if adaptive_k is None:
+        return parsed
+    if not isinstance(adaptive_k, dict):
+        raise ValueError("candidate_rerank.adaptive_k must be a mapping")
+    if not _require_enabled_flag(adaptive_k, "candidate_rerank.adaptive_k"):
+        return parsed
+    _require_fields(
+        adaptive_k,
+        ("min_candidates", "accept_latent_cosine_threshold", "require_single_face"),
+        "candidate_rerank.adaptive_k",
+    )
+    min_candidates = _positive_int_metadata(adaptive_k["min_candidates"], "candidate_rerank.adaptive_k.min_candidates")
+    if min_candidates > num_candidates:
+        raise ValueError("candidate_rerank.adaptive_k.min_candidates must be <= candidate_rerank.num_candidates")
+    require_single_face = adaptive_k["require_single_face"]
+    if not isinstance(require_single_face, bool):
+        raise ValueError("candidate_rerank.adaptive_k.require_single_face must be true or false")
+    parsed["adaptive_k"] = {
+        "enabled": True,
+        "min_candidates": min_candidates,
+        "accept_latent_cosine_threshold": _finite_float_metadata(
+            adaptive_k["accept_latent_cosine_threshold"],
+            "candidate_rerank.adaptive_k.accept_latent_cosine_threshold",
+        ),
+        "require_single_face": require_single_face,
+    }
+    return parsed
 
 
 def _disabled_candidate_rerank_config() -> dict:
@@ -346,12 +387,21 @@ def _disabled_candidate_rerank_config() -> dict:
 
 
 def _candidate_rerank_result_metadata(config: dict) -> dict:
-    return {
+    metadata = {
         "enabled": bool(config["enabled"]),
         "num_candidates": int(config["num_candidates"]),
         "single_face_priority": bool(config["single_face_priority"]),
         "selection_metric": str(config["selection_metric"]),
     }
+    adaptive_k = config.get("adaptive_k")
+    if isinstance(adaptive_k, dict) and adaptive_k.get("enabled", False):
+        metadata["adaptive_k"] = {
+            "enabled": True,
+            "min_candidates": int(adaptive_k["min_candidates"]),
+            "accept_latent_cosine_threshold": float(adaptive_k["accept_latent_cosine_threshold"]),
+            "require_single_face": bool(adaptive_k["require_single_face"]),
+        }
+    return metadata
 
 
 def _candidate_sample_ids(sample_ids, candidate_index: int) -> list[str]:
@@ -370,6 +420,18 @@ def _sample_reranked_generated_for_eval(
 ):
     import torch
     import torch.nn.functional as F
+
+    if _candidate_rerank_adaptive_enabled(candidate_rerank_cfg):
+        return _sample_adaptive_reranked_generated_for_eval(
+            generator,
+            e0,
+            z,
+            sample_ids,
+            sampling_seed,
+            image_size,
+            candidate_rerank_cfg,
+            detector,
+        )
 
     num_candidates = int(candidate_rerank_cfg["num_candidates"])
     candidate_images = []
@@ -439,6 +501,149 @@ def _sample_reranked_generated_for_eval(
             for sample_index, selected_index in enumerate(selected_indices)
         ]
     return generated, selected_out, metadata_rows, selected_face_counts
+
+
+def _candidate_rerank_adaptive_enabled(candidate_rerank_cfg: dict) -> bool:
+    adaptive_k = candidate_rerank_cfg.get("adaptive_k")
+    return isinstance(adaptive_k, dict) and bool(adaptive_k.get("enabled", False))
+
+
+def _sample_adaptive_reranked_generated_for_eval(
+    generator,
+    e0,
+    z,
+    sample_ids,
+    sampling_seed: int,
+    image_size: int,
+    candidate_rerank_cfg: dict,
+    detector,
+):
+    import torch
+    import torch.nn.functional as F
+
+    adaptive_k = candidate_rerank_cfg["adaptive_k"]
+    num_candidates = int(candidate_rerank_cfg["num_candidates"])
+    min_candidates = int(adaptive_k["min_candidates"])
+    collect_face_counts = detector is not None and (
+        bool(candidate_rerank_cfg["single_face_priority"]) or bool(adaptive_k["require_single_face"])
+    )
+    sample_ids = list(sample_ids)
+    active_indices = list(range(len(sample_ids)))
+    summaries_by_sample: list[list[dict]] = [[] for _sample_id in sample_ids]
+    images_by_sample: list[dict[int, object]] = [{} for _sample_id in sample_ids]
+    embeddings_by_sample: list[dict[int, object]] = [{} for _sample_id in sample_ids]
+    logits_by_sample: list[dict[int, object]] = [{} for _sample_id in sample_ids]
+
+    for candidate_index in range(num_candidates):
+        if not active_indices:
+            break
+        active_sample_ids = [sample_ids[sample_index] for sample_index in active_indices]
+        active_z = z[active_indices]
+        candidate_ids = _candidate_sample_ids(active_sample_ids, candidate_index)
+        generated = _sample_generated_for_eval(generator, active_z, candidate_ids, sampling_seed, image_size)
+        assert_finite_tensor(f"eval_generated_candidate_{candidate_index}", generated)
+        generated_out = e0(normalize_for_e0(generated))
+        cosine = F.cosine_similarity(generated_out["embedding"], active_z, dim=1).clamp(-1, 1)
+        face_counts = None
+        if collect_face_counts:
+            counts = detector.detect_counts(generated)
+            if len(counts) != generated.shape[0]:
+                raise RuntimeError(f"Candidate face detection count mismatch: images={generated.shape[0]} counts={len(counts)}")
+            face_counts = [int(count) for count in counts]
+
+        for local_index, sample_index in enumerate(active_indices):
+            summary = {
+                "index": int(candidate_index),
+                "latent_cosine": float(cosine[local_index].detach().cpu()),
+            }
+            if face_counts is not None:
+                summary["face_count"] = int(face_counts[local_index])
+            summaries_by_sample[sample_index].append(summary)
+            images_by_sample[sample_index][candidate_index] = generated[local_index]
+            embeddings_by_sample[sample_index][candidate_index] = generated_out["embedding"][local_index]
+            logits_by_sample[sample_index][candidate_index] = generated_out["logits"][local_index]
+
+        next_active_indices = []
+        for sample_index in active_indices:
+            summaries = summaries_by_sample[sample_index]
+            threshold_passed, _missing_metric = _adaptive_k_threshold_status(summaries, adaptive_k)
+            if len(summaries) >= min_candidates and threshold_passed:
+                continue
+            next_active_indices.append(sample_index)
+        active_indices = next_active_indices
+
+    metadata_rows = []
+    selected_images = []
+    selected_embeddings = []
+    selected_logits = []
+    for sample_index, _sample_id in enumerate(sample_ids):
+        summaries = summaries_by_sample[sample_index]
+        selected_index = _select_candidate_rerank_index(summaries, candidate_rerank_cfg["single_face_priority"])
+        selected_summary = summaries[selected_index]
+        threshold_passed, missing_metric = _adaptive_k_threshold_status(summaries, adaptive_k)
+        selected_images.append(images_by_sample[sample_index][selected_index])
+        selected_embeddings.append(embeddings_by_sample[sample_index][selected_index])
+        selected_logits.append(logits_by_sample[sample_index][selected_index])
+        metadata_rows.append(
+            {
+                "enabled": True,
+                "num_candidates": num_candidates,
+                "single_face_priority": bool(candidate_rerank_cfg["single_face_priority"]),
+                "selection_metric": str(candidate_rerank_cfg["selection_metric"]),
+                "adaptive_k": {
+                    "enabled": True,
+                    "min_candidates": min_candidates,
+                    "accept_latent_cosine_threshold": float(adaptive_k["accept_latent_cosine_threshold"]),
+                    "require_single_face": bool(adaptive_k["require_single_face"]),
+                },
+                "num_candidates_evaluated": len(summaries),
+                "stop_reason": _adaptive_k_stop_reason(threshold_passed, missing_metric),
+                "selected_candidate_index": int(selected_index),
+                "selected_latent_cosine": float(selected_summary["latent_cosine"]),
+                "selected_face_count": selected_summary.get("face_count"),
+                "best_score": float(selected_summary["latent_cosine"]),
+                "threshold_passed": bool(threshold_passed),
+                "candidates": summaries,
+            }
+        )
+
+    generated = torch.stack(selected_images, dim=0)
+    selected_out = {
+        "embedding": torch.stack(selected_embeddings, dim=0),
+        "logits": torch.stack(selected_logits, dim=0),
+    }
+    selected_face_counts = None
+    if collect_face_counts:
+        selected_face_counts = [int(row["selected_face_count"]) for row in metadata_rows]
+    return generated, selected_out, metadata_rows, selected_face_counts
+
+
+def _adaptive_k_threshold_status(candidates: list[dict], adaptive_k: dict) -> tuple[bool, bool]:
+    threshold = float(adaptive_k["accept_latent_cosine_threshold"])
+    require_single_face = bool(adaptive_k["require_single_face"])
+    missing_metric = False
+    for candidate in candidates:
+        if "latent_cosine" not in candidate:
+            missing_metric = True
+            continue
+        if float(candidate["latent_cosine"]) < threshold:
+            continue
+        if require_single_face:
+            if "face_count" not in candidate:
+                missing_metric = True
+                continue
+            if int(candidate["face_count"]) != 1:
+                continue
+        return True, missing_metric
+    return False, missing_metric
+
+
+def _adaptive_k_stop_reason(threshold_passed: bool, missing_metric: bool) -> str:
+    if threshold_passed:
+        return "threshold_passed"
+    if missing_metric:
+        return "max_k_missing_metric"
+    return "max_k_no_threshold_passed"
 
 
 def _select_candidate_rerank_index(candidates: list[dict], single_face_priority: bool) -> int:

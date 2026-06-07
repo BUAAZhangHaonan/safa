@@ -827,6 +827,192 @@ class EvalContractTests(unittest.TestCase):
         self.assertAlmostEqual(metadata["candidates"][0]["latent_cosine"], 0.7)
         self.assertAlmostEqual(metadata["candidates"][1]["latent_cosine"], 0.85)
 
+    def test_candidate_rerank_parses_adaptive_k_config(self) -> None:
+        from safa.evaluation import runner
+
+        config = runner._candidate_rerank_config(
+            {
+                "candidate_rerank": {
+                    "enabled": True,
+                    "num_candidates": 48,
+                    "single_face_priority": True,
+                    "selection_metric": "latent_cosine",
+                    "adaptive_k": {
+                        "enabled": True,
+                        "min_candidates": 8,
+                        "accept_latent_cosine_threshold": 0.95,
+                        "require_single_face": True,
+                    },
+                }
+            }
+        )
+
+        self.assertEqual(
+            config["adaptive_k"],
+            {
+                "enabled": True,
+                "min_candidates": 8,
+                "accept_latent_cosine_threshold": 0.95,
+                "require_single_face": True,
+            },
+        )
+        self.assertEqual(
+            runner._candidate_rerank_result_metadata(config)["adaptive_k"],
+            {
+                "enabled": True,
+                "min_candidates": 8,
+                "accept_latent_cosine_threshold": 0.95,
+                "require_single_face": True,
+            },
+        )
+
+    def test_candidate_rerank_rejects_invalid_adaptive_k_config(self) -> None:
+        from safa.evaluation import runner
+
+        def parse_adaptive(adaptive_k: dict):
+            return runner._candidate_rerank_config(
+                {
+                    "candidate_rerank": {
+                        "enabled": True,
+                        "num_candidates": 4,
+                        "single_face_priority": True,
+                        "selection_metric": "latent_cosine",
+                        "adaptive_k": adaptive_k,
+                    }
+                }
+            )
+
+        cases = [
+            ({}, "candidate_rerank.adaptive_k.enabled"),
+            (
+                {"enabled": True, "min_candidates": 0, "accept_latent_cosine_threshold": 0.95, "require_single_face": True},
+                "candidate_rerank.adaptive_k.min_candidates",
+            ),
+            (
+                {"enabled": True, "min_candidates": 5, "accept_latent_cosine_threshold": 0.95, "require_single_face": True},
+                "min_candidates.*num_candidates",
+            ),
+            (
+                {"enabled": True, "min_candidates": 2, "accept_latent_cosine_threshold": math.nan, "require_single_face": True},
+                "candidate_rerank.adaptive_k.accept_latent_cosine_threshold",
+            ),
+            (
+                {"enabled": True, "min_candidates": 2, "accept_latent_cosine_threshold": 0.95, "require_single_face": "yes"},
+                "candidate_rerank.adaptive_k.require_single_face",
+            ),
+        ]
+        for adaptive_k, message in cases:
+            with self.subTest(adaptive_k=adaptive_k):
+                with self.assertRaisesRegex(ValueError, message):
+                    parse_adaptive(adaptive_k)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for candidate rerank tests")
+    def test_candidate_rerank_adaptive_stops_each_sample_independently(self) -> None:
+        cosines = [
+            [0.1, 0.95, 0.99, 0.99],
+            [0.1, 0.2, 0.3, 0.4],
+        ]
+
+        result, rows, generator = self._run_candidate_rerank_eval(
+            candidate_rerank={
+                "enabled": True,
+                "num_candidates": 4,
+                "single_face_priority": False,
+                "selection_metric": "latent_cosine",
+                "adaptive_k": {
+                    "enabled": True,
+                    "min_candidates": 2,
+                    "accept_latent_cosine_threshold": 0.9,
+                    "require_single_face": False,
+                },
+            },
+            cosines=cosines,
+            face_counts=None,
+            face_detection_enabled=False,
+            dataset_len=2,
+            batch_size=2,
+        )
+
+        self.assertEqual(result["sampling"]["candidate_rerank"]["adaptive_k"]["enabled"], True)
+        self.assertEqual(
+            [tuple(x_init.shape) for x_init in generator.x_inits],
+            [(2, 3, 4, 4), (2, 3, 4, 4), (1, 3, 4, 4), (1, 3, 4, 4)],
+        )
+
+        first = rows[0]["candidate_rerank"]
+        self.assertEqual(first["num_candidates"], 4)
+        self.assertEqual(first["num_candidates_evaluated"], 2)
+        self.assertEqual(first["stop_reason"], "threshold_passed")
+        self.assertEqual(first["selected_candidate_index"], 1)
+        self.assertAlmostEqual(first["best_score"], 0.95)
+        self.assertTrue(first["threshold_passed"])
+        self.assertEqual([candidate["index"] for candidate in first["candidates"]], [0, 1])
+
+        second = rows[1]["candidate_rerank"]
+        self.assertEqual(second["num_candidates_evaluated"], 4)
+        self.assertEqual(second["stop_reason"], "max_k_no_threshold_passed")
+        self.assertEqual(second["selected_candidate_index"], 3)
+        self.assertAlmostEqual(second["best_score"], 0.4)
+        self.assertFalse(second["threshold_passed"])
+        self.assertEqual([candidate["index"] for candidate in second["candidates"]], [0, 1, 2, 3])
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for candidate rerank tests")
+    def test_candidate_rerank_adaptive_respects_min_candidates_before_stopping(self) -> None:
+        _, rows, generator = self._run_candidate_rerank_eval(
+            candidate_rerank={
+                "enabled": True,
+                "num_candidates": 5,
+                "single_face_priority": False,
+                "selection_metric": "latent_cosine",
+                "adaptive_k": {
+                    "enabled": True,
+                    "min_candidates": 3,
+                    "accept_latent_cosine_threshold": 0.9,
+                    "require_single_face": False,
+                },
+            },
+            cosines=[0.99, 0.91, 0.2, 0.1, 0.1],
+            face_counts=None,
+            face_detection_enabled=False,
+        )
+
+        metadata = rows[0]["candidate_rerank"]
+        self.assertEqual(len(generator.x_inits), 3)
+        self.assertEqual(metadata["num_candidates_evaluated"], 3)
+        self.assertEqual(metadata["stop_reason"], "threshold_passed")
+        self.assertEqual(metadata["selected_candidate_index"], 0)
+        self.assertAlmostEqual(metadata["best_score"], 0.99)
+        self.assertTrue(metadata["threshold_passed"])
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for candidate rerank tests")
+    def test_candidate_rerank_adaptive_requires_single_face_for_threshold(self) -> None:
+        _, rows, generator = self._run_candidate_rerank_eval(
+            candidate_rerank={
+                "enabled": True,
+                "num_candidates": 4,
+                "single_face_priority": True,
+                "selection_metric": "latent_cosine",
+                "adaptive_k": {
+                    "enabled": True,
+                    "min_candidates": 2,
+                    "accept_latent_cosine_threshold": 0.9,
+                    "require_single_face": True,
+                },
+            },
+            cosines=[0.1, 0.96, 0.94, 0.2],
+            face_counts=[1, 2, 1, 1],
+            face_detection_enabled=True,
+        )
+
+        metadata = rows[0]["candidate_rerank"]
+        self.assertEqual(len(generator.x_inits), 3)
+        self.assertEqual(metadata["num_candidates_evaluated"], 3)
+        self.assertEqual(metadata["stop_reason"], "threshold_passed")
+        self.assertEqual(metadata["selected_candidate_index"], 2)
+        self.assertAlmostEqual(metadata["best_score"], 0.94)
+        self.assertTrue(metadata["threshold_passed"])
+        self.assertEqual(metadata["selected_face_count"], 1)
+
     def test_candidate_rerank_rejects_invalid_config(self) -> None:
         from safa.evaluation import runner
 
