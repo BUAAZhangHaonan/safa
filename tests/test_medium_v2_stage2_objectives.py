@@ -188,6 +188,11 @@ def test_probe_configs_use_distinct_outputs_and_raw_quality_device() -> None:
             "artifacts/eval/g_medium_v2_stage2_gram_only_probe/quality",
             "gram_repr_only_probe",
         ),
+        "train_g_medium_v2_stage2_frozen_fm_conditioning_only_probe_gpu0_bs24_weights_only_20260608.yaml": (
+            "artifacts/checkpoints/g_medium_v2_stage2_frozen_fm_conditioning_only_probe_gpu0_bs24_weights_only_20260608",
+            "artifacts/eval/g_medium_v2_stage2_frozen_fm_conditioning_only_probe_gpu0_bs24_weights_only_20260608/quality",
+            "point_projected_two_step",
+        ),
     }
     for filename, (out_dir, eval_dir, objective_type) in expected.items():
         config = yaml.safe_load((REPO_ROOT / "configs" / "medium_v2" / filename).read_text(encoding="utf-8"))
@@ -195,6 +200,10 @@ def test_probe_configs_use_distinct_outputs_and_raw_quality_device() -> None:
         assert config["stages"]["stage2"]["quality_eval"]["output_dir"] == eval_dir
         assert "distribution_cuda_visible_devices" not in config["stages"]["stage2"]["quality_eval"]
         assert config["stages"]["stage2"]["stage2_objective"]["type"] == objective_type
+        if "weights_only" in filename:
+            assert config["resume_mode"] == "model_weights_only"
+            assert config["device"] == "cuda:0"
+            assert config["generator_trainable"] == "conditioning_only"
 
 
 def test_medium_v2_stage1_long1000_continue_config_extends_pure_fm_stage1() -> None:
