@@ -30,6 +30,24 @@ class CAGradResult:
 
 
 @dataclass(frozen=True)
+class FAMOWeightResult:
+    weights: torch.Tensor
+    probabilities: torch.Tensor
+    distances: torch.Tensor
+    log_distances: torch.Tensor
+    fm_weight: float
+    cl_weight: float
+
+
+@dataclass(frozen=True)
+class FAMOLogitUpdateResult:
+    updated_logits: torch.Tensor
+    delta_logits: torch.Tensor
+    delta_log_distances: torch.Tensor
+    probabilities: torch.Tensor
+
+
+@dataclass(frozen=True)
 class FMAnchoredCAGradResult:
     fm_weight: float
     cl_weight: float
@@ -41,6 +59,23 @@ class FMAnchoredCAGradResult:
     fm_descent_after_cagrad: float
     fm_descent_after_anchor: float
     anchor_active: bool
+    combined_gradients: list[torch.Tensor]
+
+
+@dataclass(frozen=True)
+class FMPrimaryConstrainedFAMOResult:
+    famo_weight_fm: float
+    famo_weight_cl: float
+    cagrad_fm_weight: float
+    cagrad_cl_weight: float
+    gradient_cosine: float
+    combined_norm: float
+    fm_descent_floor: float
+    fm_descent_after_cagrad: float
+    fm_descent_after_constraint: float
+    fm_floor_ratio: float
+    fm_floor_active: bool
+    cl_gate_scale: float
     combined_gradients: list[torch.Tensor]
 
 
@@ -257,6 +292,146 @@ def aggregate_two_task_fm_anchored_cagrad(
     )
 
 
+def compute_two_task_famo_weights(
+    *,
+    loss_fm,
+    loss_cl,
+    logits: torch.Tensor,
+    min_loss_fm: float = 0.0,
+    min_loss_cl: float = 0.0,
+    eps: float = 1.0e-8,
+) -> FAMOWeightResult:
+    _validate_positive_eps(eps)
+    logits = _validate_two_task_vector(logits, "logits").detach()
+    dtype = logits.dtype
+    device = logits.device
+    losses = torch.stack(
+        (
+            _as_finite_scalar_tensor(loss_fm, dtype=dtype, device=device, name="loss_fm"),
+            _as_finite_scalar_tensor(loss_cl, dtype=dtype, device=device, name="loss_cl"),
+        )
+    )
+    min_losses = torch.stack(
+        (
+            _as_finite_scalar_tensor(min_loss_fm, dtype=dtype, device=device, name="min_loss_fm"),
+            _as_finite_scalar_tensor(min_loss_cl, dtype=dtype, device=device, name="min_loss_cl"),
+        )
+    )
+    eps_tensor = torch.as_tensor(float(eps), dtype=dtype, device=device)
+    distances = torch.maximum(losses - min_losses + eps_tensor, eps_tensor)
+    probabilities = torch.softmax(logits, dim=0)
+    normalizer = 1.0 / torch.sum(probabilities / distances)
+    weights = normalizer * probabilities / distances
+    log_distances = torch.log(distances)
+    return FAMOWeightResult(
+        weights=weights,
+        probabilities=probabilities,
+        distances=distances,
+        log_distances=log_distances,
+        fm_weight=float(weights[0].detach().cpu()),
+        cl_weight=float(weights[1].detach().cpu()),
+    )
+
+
+def aggregate_two_task_fm_primary_constrained_famo(
+    g_fm: list[torch.Tensor],
+    g_cl: list[torch.Tensor],
+    *,
+    famo_weight_fm: float,
+    famo_weight_cl: float,
+    c: float,
+    fm_descent_floor_fraction: float,
+    eps: float,
+) -> FMPrimaryConstrainedFAMOResult:
+    _validate_gradient_lists(g_fm, g_cl)
+    _validate_cagrad_c(c)
+    floor_fraction = _validate_fraction(fm_descent_floor_fraction, "fm_descent_floor_fraction")
+    _validate_positive_eps(eps)
+    weight_fm = _validate_nonnegative_scalar(famo_weight_fm, "famo_weight_fm")
+    weight_cl = _validate_nonnegative_scalar(famo_weight_cl, "famo_weight_cl")
+    weight_sum = weight_fm + weight_cl
+    if abs(weight_sum - 1.0) > 1.0e-5:
+        raise ValueError(f"FAMO weights must sum to 1.0, got {weight_sum!r}")
+
+    fm_norm_squared = _squared_norm(g_fm)
+    if bool((fm_norm_squared <= float(eps)).item()):
+        raise FloatingPointError("FM-primary constrained FAMO received a near-zero FM gradient")
+
+    scaled_fm = [weight_fm * grad for grad in g_fm]
+    scaled_cl = [weight_cl * grad for grad in g_cl]
+    raw = aggregate_two_task_cagrad(scaled_fm, scaled_cl, c=c, eps=eps)
+    floor_tensor = floor_fraction * fm_norm_squared
+    raw_descent_tensor = _dot(g_fm, raw.combined_gradients)
+    tolerance = _eps_tensor(raw_descent_tensor, eps)
+    if bool((raw_descent_tensor + tolerance >= floor_tensor).item()):
+        combined = [gradient.clone() for gradient in raw.combined_gradients]
+        cl_gate_scale = 1.0
+        floor_active = False
+    else:
+        denominator = fm_norm_squared - raw_descent_tensor
+        if bool((denominator <= _eps_tensor(denominator, eps)).item()):
+            raise RuntimeError("FM floor cannot be satisfied by gating the CL contribution")
+        gate_tensor = (fm_norm_squared - floor_tensor) / denominator
+        cl_gate_scale = min(max(float(gate_tensor.detach().cpu()), 0.0), 1.0)
+        combined = [
+            (1.0 - cl_gate_scale) * fm_grad + cl_gate_scale * raw_grad
+            for fm_grad, raw_grad in zip(g_fm, raw.combined_gradients)
+        ]
+        floor_active = True
+
+    constrained_descent_tensor = _dot(g_fm, combined)
+    if bool((constrained_descent_tensor + _eps_tensor(constrained_descent_tensor, eps) < floor_tensor).item()):
+        raise RuntimeError("FM-primary constrained FAMO did not satisfy the FM descent floor")
+    combined_norm = torch.sqrt(_squared_norm(combined))
+    fm_floor_ratio = constrained_descent_tensor / fm_norm_squared
+    return FMPrimaryConstrainedFAMOResult(
+        famo_weight_fm=weight_fm,
+        famo_weight_cl=weight_cl,
+        cagrad_fm_weight=raw.fm_weight,
+        cagrad_cl_weight=raw.cl_weight,
+        gradient_cosine=float(_gradient_cosine(g_fm, g_cl, eps).detach().cpu()),
+        combined_norm=float(combined_norm.detach().cpu()),
+        fm_descent_floor=float(floor_tensor.detach().cpu()),
+        fm_descent_after_cagrad=float(raw_descent_tensor.detach().cpu()),
+        fm_descent_after_constraint=float(constrained_descent_tensor.detach().cpu()),
+        fm_floor_ratio=float(fm_floor_ratio.detach().cpu()),
+        fm_floor_active=floor_active,
+        cl_gate_scale=cl_gate_scale,
+        combined_gradients=combined,
+    )
+
+
+def update_two_task_famo_logits(
+    logits: torch.Tensor,
+    previous_log_distances: torch.Tensor,
+    current_log_distances: torch.Tensor,
+    *,
+    beta: float,
+    gamma: float,
+) -> FAMOLogitUpdateResult:
+    beta_value = _validate_nonnegative_scalar(beta, "beta")
+    gamma_value = _validate_nonnegative_scalar(gamma, "gamma")
+    logits = _validate_two_task_vector(logits, "logits").detach()
+    previous = _validate_two_task_vector(previous_log_distances, "previous_log_distances").to(
+        dtype=logits.dtype,
+        device=logits.device,
+    )
+    current = _validate_two_task_vector(current_log_distances, "current_log_distances").to(
+        dtype=logits.dtype,
+        device=logits.device,
+    )
+    delta = previous - current
+    probabilities = torch.softmax(logits, dim=0)
+    delta_logits = probabilities * (delta - torch.sum(probabilities * delta))
+    updated_logits = logits - beta_value * (delta_logits + gamma_value * logits)
+    return FAMOLogitUpdateResult(
+        updated_logits=updated_logits,
+        delta_logits=delta_logits,
+        delta_log_distances=delta,
+        probabilities=probabilities,
+    )
+
+
 def _validate_gradient_lists(g_repr: list[torch.Tensor], g_fm: list[torch.Tensor]) -> None:
     if not isinstance(g_repr, list) or not isinstance(g_fm, list):
         raise TypeError("g_repr and g_fm must be list[Tensor]")
@@ -309,6 +484,29 @@ def _validate_nonnegative_scalar(value: float, name: str) -> float:
     if not isinstance(value, (float, int)) or not math.isfinite(float(value)) or float(value) < 0.0:
         raise ValueError(f"{name} must be finite and non-negative")
     return float(value)
+
+
+def _validate_two_task_vector(value: torch.Tensor, name: str) -> torch.Tensor:
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if value.shape != (2,):
+        raise ValueError(f"{name} must have shape (2,)")
+    if not value.is_floating_point():
+        raise TypeError(f"{name} must be floating point")
+    if not torch.isfinite(value).all():
+        raise FloatingPointError(f"{name} must be finite")
+    return value
+
+
+def _as_finite_scalar_tensor(value, *, dtype: torch.dtype, device: torch.device, name: str) -> torch.Tensor:
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be a real scalar")
+    tensor = torch.as_tensor(value, dtype=dtype, device=device)
+    if tensor.shape != ():
+        raise ValueError(f"{name} must be a scalar")
+    if not torch.isfinite(tensor):
+        raise FloatingPointError(f"{name} must be finite")
+    return tensor.detach()
 
 
 def _closest_fm_weight_for_floor(

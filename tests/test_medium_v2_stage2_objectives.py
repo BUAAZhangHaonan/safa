@@ -11,6 +11,20 @@ torch = pytest.importorskip("torch")
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _small_generator_payload() -> dict:
+    return {
+        "embedding_dim": 8,
+        "image_size": 8,
+        "base_channels": 4,
+        "channel_multipliers": [1],
+        "time_embedding_dim": 8,
+        "condition_dim": 8,
+        "sample_steps": 1,
+        "train_cycle_steps": 1,
+        "sampler": "euler",
+    }
+
+
 def test_medium_v2_stage2_configs_use_explicit_paths_batches_and_objectives() -> None:
     from safa.training import g_loop
 
@@ -45,6 +59,14 @@ def test_medium_v2_stage2_configs_use_explicit_paths_batches_and_objectives() ->
         },
         "train_g_medium_v2_stage2_m3_fm_anchored_cagrad_smoke10.yaml": {
             "objective": "fm_anchored_cagrad",
+            "global_batch_size": 48,
+            "per_device_batch_size": 24,
+            "epochs": 10,
+            "gradient_monitor": {"enabled": True, "interval": 20, "max_samples": 8},
+            "flow_condition": "embedding",
+        },
+        "train_g_medium_v2_stage2_m3_fm_primary_constrained_famo_smoke10.yaml": {
+            "objective": "fm_primary_constrained_famo",
             "global_batch_size": 48,
             "per_device_batch_size": 24,
             "epochs": 10,
@@ -127,6 +149,23 @@ def test_medium_v2_stage2_configs_use_explicit_paths_batches_and_objectives() ->
                 config["stages"]["stage2"]["quality_eval"]["output_dir"]
                 == "artifacts/eval/g_medium_v2_stage2_m3_fm_anchored_cagrad_smoke10/quality"
             )
+        if expected_config["objective"] == "fm_primary_constrained_famo":
+            for forbidden in ("relation_weight", "offdiag_only", "repr_learning_rate", "projection_eps"):
+                assert forbidden not in objective
+            assert objective["lambda_repr"] == 1.0
+            assert objective["point_weight"] == 1.0
+            assert objective["cagrad_c"] == 0.5
+            assert objective["fm_descent_floor_fraction"] == 0.2
+            assert objective["famo_beta"] > 0.0
+            assert objective["famo_gamma"] >= 0.0
+            assert objective["famo_eps"] > 0.0
+            assert "famo_min_loss_fm" not in objective
+            assert "famo_min_loss_cl" not in objective
+            assert config["out_dir"] == "artifacts/checkpoints/g_medium_v2_stage2_m3_fm_primary_constrained_famo_smoke10"
+            assert (
+                config["stages"]["stage2"]["quality_eval"]["output_dir"]
+                == "artifacts/eval/g_medium_v2_stage2_m3_fm_primary_constrained_famo_smoke10/quality"
+            )
         if expected_config["objective"] == "point_descent_credit_projected":
             assert config["out_dir"] == "artifacts/checkpoints/g_medium_v2_stage2_m3_point_descent_credit_projected_smoke10"
             assert (
@@ -208,6 +247,339 @@ def test_flow_objective_requires_explicit_flow_condition() -> None:
 
     with pytest.raises(ValueError, match="flow_condition"):
         g_loop._stage2_objective_from_config(config)
+
+
+def test_generator_trainable_defaults_to_full() -> None:
+    from safa.models.generator import ConditionalFlowGenerator
+    from safa.training import g_loop
+
+    generator = ConditionalFlowGenerator(_small_generator_payload())
+
+    mode = g_loop._generator_trainable_mode({})
+    g_loop._apply_generator_trainable_mode(generator, mode)
+
+    assert mode == "full"
+    assert all(param.requires_grad for param in generator.parameters())
+
+
+def test_generator_trainable_conditioning_only_keeps_only_z_mlp_and_film_condition() -> None:
+    from safa.models.generator import ConditionalFlowGenerator
+    from safa.training import g_loop
+
+    generator = ConditionalFlowGenerator(_small_generator_payload())
+    mode = g_loop._generator_trainable_mode({"generator_trainable": "conditioning_only"})
+
+    g_loop._apply_generator_trainable_mode(generator, mode)
+
+    trainable_names = {name for name, param in generator.named_parameters() if param.requires_grad}
+    expected_trainable_names = {
+        "vector_field.z_mlp.0.weight",
+        "vector_field.z_mlp.0.bias",
+        "vector_field.z_mlp.2.weight",
+        "vector_field.z_mlp.2.bias",
+        "vector_field.down_blocks.0.condition.weight",
+        "vector_field.down_blocks.0.condition.bias",
+        "vector_field.mid.condition.weight",
+        "vector_field.mid.condition.bias",
+        "vector_field.up_blocks.0.condition.weight",
+        "vector_field.up_blocks.0.condition.bias",
+    }
+    assert trainable_names == expected_trainable_names
+
+    parameters_by_name = dict(generator.named_parameters())
+    expected_frozen_names = {
+        "vector_field.input.weight",
+        "vector_field.input.bias",
+        "vector_field.time_mlp.0.weight",
+        "vector_field.time_mlp.0.bias",
+        "vector_field.down_blocks.0.in_conv.weight",
+        "vector_field.down_blocks.0.out_conv.bias",
+        "vector_field.mid.in_norm.weight",
+        "vector_field.mid.in_conv.weight",
+        "vector_field.up_blocks.0.skip.weight",
+        "vector_field.upsamplers.0.bias",
+        "vector_field.output.2.weight",
+    }
+    assert expected_frozen_names <= set(parameters_by_name)
+    for name in expected_frozen_names:
+        assert not parameters_by_name[name].requires_grad, name
+
+
+def test_optimizer_param_groups_filter_frozen_generator_params() -> None:
+    from torch import nn
+
+    from safa.training import g_loop
+
+    class DummyGenerator(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.trainable = nn.Parameter(torch.tensor(1.0))
+            self.frozen = nn.Parameter(torch.tensor(2.0))
+
+    class DummyTrainingModule(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.generator = DummyGenerator()
+            self.uncertainty_loss = None
+
+    module = DummyTrainingModule()
+    module.generator.frozen.requires_grad_(False)
+    groups = g_loop._optimizer_param_groups(
+        module,
+        {"learning_rate": 0.01, "weight_decay": 0.0},
+        g_loop._LossWeightingRuntime(type="legacy"),
+    )
+
+    generator_params = list(groups[0]["params"])
+    assert [id(param) for param in generator_params] == [id(module.generator.trainable)]
+    assert all(param.requires_grad for group in groups for param in group["params"])
+
+    module.generator.trainable.requires_grad_(False)
+    with pytest.raises(RuntimeError, match="trainable generator"):
+        g_loop._optimizer_param_groups(
+            module,
+            {"learning_rate": 0.01, "weight_decay": 0.0},
+            g_loop._LossWeightingRuntime(type="legacy"),
+        )
+
+
+def test_optimizer_resume_skips_full_state_for_conditioning_only_param_group_mismatch(capsys) -> None:
+    from safa.models.generator import ConditionalFlowGenerator
+    from safa.training import g_loop
+
+    generator = ConditionalFlowGenerator(_small_generator_payload())
+    full_optimizer = torch.optim.AdamW(generator.parameters(), lr=0.001)
+    full_optimizer_state = full_optimizer.state_dict()
+
+    g_loop._apply_generator_trainable_mode(generator, "conditioning_only")
+    conditioning_params = [param for param in generator.parameters() if param.requires_grad]
+    optimizer = torch.optim.AdamW(conditioning_params, lr=0.001)
+
+    resumed = g_loop._load_resume_optimizer_state(
+        optimizer,
+        full_optimizer_state,
+        generator_trainable_mode="conditioning_only",
+        is_main=True,
+    )
+
+    assert resumed is False
+    assert "optimizer_resumed: false" in capsys.readouterr().out
+    assert len(optimizer.param_groups[0]["params"]) == len(conditioning_params)
+    assert len(optimizer.param_groups[0]["params"]) < len(full_optimizer_state["param_groups"][0]["params"])
+    assert optimizer.state_dict()["state"] == {}
+
+
+def test_optimizer_resume_full_mode_keeps_pytorch_param_group_mismatch_error() -> None:
+    from torch import nn
+
+    from safa.training import g_loop
+
+    source_model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 1))
+    full_optimizer_state = torch.optim.AdamW(source_model.parameters(), lr=0.001).state_dict()
+    optimizer = torch.optim.AdamW(source_model[0].parameters(), lr=0.001)
+
+    with pytest.raises(ValueError, match="parameter group"):
+        g_loop._load_resume_optimizer_state(
+            optimizer,
+            full_optimizer_state,
+            generator_trainable_mode="full",
+            is_main=False,
+        )
+
+
+def test_optimizer_resume_conditioning_only_does_not_swallow_malformed_state() -> None:
+    from torch import nn
+
+    from safa.training import g_loop
+
+    optimizer = torch.optim.AdamW(nn.Linear(2, 2).parameters(), lr=0.001)
+
+    with pytest.raises(KeyError):
+        g_loop._load_resume_optimizer_state(
+            optimizer,
+            {"state": {}},
+            generator_trainable_mode="conditioning_only",
+            is_main=False,
+        )
+
+
+def test_train_g_applies_generator_trainable_after_resume_before_ddp_and_optimizer_groups(monkeypatch, tmp_path) -> None:
+    from torch import nn
+
+    from safa.training import g_loop
+    from safa.utils.distributed import DistributedContext
+
+    events: list[str] = []
+    resume_path = tmp_path / "resume.pt"
+    resume_path.write_bytes(b"checkpoint")
+
+    class StopAtOptimizerGroups(RuntimeError):
+        pass
+
+    class FakeGenerator(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(1.0))
+
+        def load_state_dict(self, state_dict):
+            del state_dict
+            events.append("load_resume")
+
+    class FakeTrainingModule(nn.Module):
+        def __init__(self, generator, *args, **kwargs) -> None:
+            super().__init__()
+            del args, kwargs
+            self.generator = generator
+            self.uncertainty_loss = None
+
+    generator = FakeGenerator()
+    generator_config = g_loop.FlowGeneratorConfig(embedding_dim=2, image_size=4, sample_steps=1, train_cycle_steps=1)
+    distributed = DistributedContext(
+        enabled=True,
+        rank=0,
+        local_rank=0,
+        world_size=2,
+        is_main=True,
+        device=torch.device("cpu"),
+        backend="gloo",
+    )
+
+    monkeypatch.setattr(g_loop, "set_seed", lambda seed: None)
+    monkeypatch.setattr(g_loop, "audit_no_identity_supervision", lambda config, paths: None)
+    monkeypatch.setattr(g_loop, "_validate_train_g_config", lambda config: None)
+    monkeypatch.setattr(g_loop, "init_distributed", lambda config: distributed)
+    monkeypatch.setattr(g_loop, "barrier", lambda distributed: None)
+    monkeypatch.setattr(g_loop, "load_e0_checkpoint", lambda path, device: (nn.Identity(), {}))
+    monkeypatch.setattr(g_loop, "freeze_e0", lambda e0: None)
+    monkeypatch.setattr(g_loop, "_generator_config_from_train_config", lambda config: generator_config)
+    monkeypatch.setattr(g_loop, "_stage_config", lambda config: {"stage1": {"epochs": 0}, "stage2": {"epochs": 0}})
+    monkeypatch.setattr(
+        g_loop,
+        "_ema_config",
+        lambda config: {
+            "enabled": False,
+            "decay": 0.999,
+            "evaluate_raw": True,
+            "evaluate_ema": False,
+            "save_ema_checkpoint": False,
+        },
+    )
+    monkeypatch.setattr(g_loop, "_best_model", lambda config, ema_config: "raw")
+    monkeypatch.setattr(g_loop, "_loss_weighting_runtime_from_config", lambda config: g_loop._LossWeightingRuntime(type="legacy"))
+    monkeypatch.setattr(g_loop, "_stage2_objective_from_config", lambda stages: None)
+    monkeypatch.setattr(g_loop, "sampling_base_seed_from_config", lambda config: 123)
+    monkeypatch.setattr(g_loop, "build_generator", lambda payload: generator)
+    monkeypatch.setattr(torch, "load", lambda path, map_location, weights_only: {"model_state_dict": {}, "metrics": {}})
+    monkeypatch.setattr(g_loop, "_resume_stage_progress_from_metrics", lambda metrics, path: g_loop._ResumeProgress("stage1", 0))
+
+    def fake_apply_generator_trainable_mode(actual_generator, mode):
+        assert actual_generator is generator
+        assert mode == "conditioning_only"
+        events.append("apply_generator_trainable")
+
+    monkeypatch.setattr(g_loop, "_apply_generator_trainable_mode", fake_apply_generator_trainable_mode)
+    monkeypatch.setattr(g_loop, "_GeneratorTrainingStep", FakeTrainingModule)
+    monkeypatch.setattr(g_loop, "_verify_e0_feature_cache_consistency", lambda config: None)
+    monkeypatch.setattr(g_loop, "FeatureAlignedAffectNet", lambda *args, **kwargs: [object()])
+    monkeypatch.setattr(g_loop, "_build_train_loader", lambda train_set, *, train_sampler, batch_config, num_workers: [])
+    monkeypatch.setattr(g_loop, "_build_validation_loader", lambda config: None)
+    monkeypatch.setattr(g_loop, "_build_detector", lambda config, device: None)
+    monkeypatch.setattr(g_loop, "_stage2_gradient_conflict_config", lambda stages: g_loop._GradientConflictConfig(enabled=False))
+
+    class FakeDDP:
+        def __init__(self, module, *, device_ids, output_device) -> None:
+            del device_ids, output_device
+            events.append("ddp_wrap")
+            self.module = module
+
+    monkeypatch.setattr(torch.nn.parallel, "DistributedDataParallel", FakeDDP)
+
+    def fake_optimizer_param_groups(training_module, config, loss_weighting):
+        del config, loss_weighting
+        assert training_module.generator is generator
+        events.append("optimizer_param_groups")
+        raise StopAtOptimizerGroups
+
+    monkeypatch.setattr(g_loop, "_optimizer_param_groups", fake_optimizer_param_groups)
+
+    config = {
+        "seed": 1,
+        "out_dir": str(tmp_path / "out"),
+        "num_workers": 1,
+        "e0_checkpoint": "e0.pt",
+        "train_index": "train.csv",
+        "train_features": "features",
+        "image_size": 4,
+        "global_batch_size": 2,
+        "per_device_batch_size": 1,
+        "learning_rate": 0.001,
+        "weight_decay": 0.0,
+        "resume_from": str(resume_path),
+        "generator_trainable": "conditioning_only",
+    }
+
+    with pytest.raises(StopAtOptimizerGroups):
+        g_loop.train_g_from_config(config)
+
+    assert events == ["load_resume", "apply_generator_trainable", "ddp_wrap", "optimizer_param_groups"]
+
+
+def test_generator_trainable_rejects_unknown_value() -> None:
+    from safa.training import g_loop
+
+    with pytest.raises(ValueError, match="generator_trainable"):
+        g_loop._generator_trainable_mode({"generator_trainable": "adapter"})
+
+
+def test_validate_train_g_config_rejects_bad_generator_trainable() -> None:
+    from safa.training import g_loop
+
+    with pytest.raises(ValueError, match="generator_trainable.*bad"):
+        g_loop._validate_train_g_config({"generator_trainable": "bad"})
+
+
+@pytest.mark.parametrize(
+    ("train_config", "expected_mode"),
+    [
+        ({"generator_trainable": "conditioning_only"}, "conditioning_only"),
+        ({}, "full"),
+    ],
+)
+def test_save_generator_records_generator_trainable_explicit_and_default(tmp_path, train_config, expected_mode) -> None:
+    from torch import nn
+
+    from safa.training import g_loop
+
+    generator = nn.Linear(2, 2)
+    generator_config = g_loop.FlowGeneratorConfig(embedding_dim=2, image_size=4, sample_steps=1, train_cycle_steps=1)
+    checkpoint_path = tmp_path / "generator.pt"
+    metrics = {
+        "stage": "stage2",
+        "loss": 1.0,
+        "validation_latent_cosine_mean": 0.9,
+        "validation_single_face_eq1_rate": 0.8,
+    }
+    ema_config = {
+        "enabled": False,
+        "decay": 0.999,
+        "evaluate_raw": True,
+        "evaluate_ema": False,
+        "save_ema_checkpoint": False,
+    }
+
+    g_loop._save_generator(
+        checkpoint_path,
+        generator,
+        generator_config,
+        {"stages": {}, "validation": {}, **train_config},
+        metrics,
+        [],
+        ema_config=ema_config,
+        best_model="raw",
+    )
+
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    assert payload["training_config"]["generator_trainable"] == expected_mode
 
 
 def test_gram_weighted_sum_config_validation_allows_relation_weight_two() -> None:
@@ -531,6 +903,73 @@ def test_fm_anchored_cagrad_objective_requires_point_only_unit_lambda_contract()
             )
 
 
+def test_fm_primary_constrained_famo_objective_requires_point_only_unit_lambda_contract() -> None:
+    from safa.training import g_loop
+
+    objective = g_loop._stage2_objective_from_config(
+        {
+            "stage1": {"epochs": 0},
+            "stage2": {
+                "epochs": 1,
+                "stage2_objective": {
+                    "type": "fm_primary_constrained_famo",
+                    "flow_condition": "embedding",
+                    "lambda_repr": 1.0,
+                    "point_weight": 1.0,
+                    "cagrad_c": 0.5,
+                    "fm_descent_floor_fraction": 0.2,
+                    "famo_beta": 0.05,
+                    "famo_gamma": 0.01,
+                    "famo_eps": 1e-8,
+                },
+            },
+        }
+    )
+
+    assert objective.type == "fm_primary_constrained_famo"
+    assert objective.lambda_repr == 1.0
+    assert objective.point_weight == 1.0
+    assert objective.relation_weight == 0.0
+    assert objective.offdiag_only is False
+    assert objective.cagrad_c == 0.5
+    assert objective.fm_descent_floor_fraction == 0.2
+    assert objective.famo_beta == 0.05
+    assert objective.famo_gamma == 0.01
+    assert objective.famo_eps == 1e-8
+    assert objective.famo_min_loss_fm == 0.0
+    assert objective.famo_min_loss_cl == 0.0
+
+    invalid_payloads = [
+        ({"lambda_repr": 0.5}, "lambda_repr"),
+        ({"relation_weight": 0.0}, "relation_weight"),
+        ({"offdiag_only": False}, "offdiag_only"),
+        ({"repr_learning_rate": 0.00003}, "repr_learning_rate"),
+        ({"projection_eps": 1e-12}, "projection_eps"),
+        ({"cagrad_c": 1.0}, "cagrad_c"),
+        ({"fm_descent_floor_fraction": 1.5}, "fm_descent_floor_fraction"),
+        ({"famo_beta": -0.1}, "famo_beta"),
+        ({"famo_gamma": -0.1}, "famo_gamma"),
+        ({"famo_eps": 0.0}, "famo_eps"),
+    ]
+    for override, match in invalid_payloads:
+        payload = {
+            "type": "fm_primary_constrained_famo",
+            "flow_condition": "embedding",
+            "lambda_repr": 1.0,
+            "point_weight": 1.0,
+            "cagrad_c": 0.5,
+            "fm_descent_floor_fraction": 0.2,
+            "famo_beta": 0.05,
+            "famo_gamma": 0.01,
+            "famo_eps": 1e-8,
+            **override,
+        }
+        with pytest.raises(ValueError, match=match):
+            g_loop._stage2_objective_from_config(
+                {"stage1": {"epochs": 0}, "stage2": {"epochs": 1, "stage2_objective": payload}}
+            )
+
+
 def test_generator_training_step_gram_repr_only_probe_does_not_compute_flow_loss(monkeypatch) -> None:
     from torch import nn
 
@@ -840,6 +1279,120 @@ def test_fm_anchored_cagrad_batch_uses_single_optimizer_step_and_logs_metrics() 
     assert metrics["fm_descent_after_anchor"] + 1e-6 >= metrics["fm_descent_floor_value"]
 
     source = inspect.getsource(g_loop._run_fm_anchored_cagrad_stage2_batch)
+    assert "optimizer.step()" in source
+    assert source.count("optimizer.step()") == 1
+    assert "torch.autograd.grad" not in source
+    assert "_gradient_vector_for_loss" not in source
+
+
+def test_fm_primary_constrained_famo_batch_logs_weights_floor_and_gate_metrics() -> None:
+    from contextlib import nullcontext
+    from torch import nn
+
+    from safa.training import g_loop
+
+    class DummyGenerator(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(1.0))
+
+    class DummyTrainingModule(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.generator = DummyGenerator()
+            self.last_loss_metrics = {}
+
+        def forward(self, images, z, sample_ids, include_repr, lambda_cycle, flow_condition):
+            del images, z, sample_ids, lambda_cycle, flow_condition
+            flow_loss = self.generator.weight.square()
+            flow_mse = flow_loss.detach()
+            if include_repr:
+                repr_loss = 7.0 - 6.0 * self.generator.weight
+                self.last_loss_metrics = {
+                    "flow_loss_raw": float(flow_loss.detach().cpu()),
+                    "cycle_loss_raw": 0.0,
+                    "repr_loss": float(repr_loss.detach().cpu()),
+                    "repr_point_loss": float(repr_loss.detach().cpu()),
+                    "repr_relation_loss": 0.0,
+                    "stage2_objective_type": "fm_primary_constrained_famo",
+                    "lambda_repr": 1.0,
+                    "effective_flow_loss_weight": 1.0,
+                    "effective_repr_loss_weight": 1.0,
+                    "effective_cycle_loss_weight": 0.0,
+                    "flow_condition": "embedding",
+                }
+                return repr_loss, flow_mse, repr_loss.detach(), flow_loss, repr_loss
+            return flow_loss, flow_mse, flow_loss.new_tensor(0.0), flow_loss, flow_loss.new_tensor(0.0)
+
+    class CountingSGD(torch.optim.SGD):
+        def __init__(self, params) -> None:
+            super().__init__(params, lr=0.1)
+            self.step_calls = 0
+
+        def step(self, closure=None):
+            self.step_calls += 1
+            return super().step(closure)
+
+    objective = g_loop._stage2_objective_from_config(
+        {
+            "stage1": {"epochs": 0},
+            "stage2": {
+                "epochs": 1,
+                "stage2_objective": {
+                    "type": "fm_primary_constrained_famo",
+                    "flow_condition": "embedding",
+                    "lambda_repr": 1.0,
+                    "point_weight": 1.0,
+                    "cagrad_c": 0.5,
+                    "fm_descent_floor_fraction": 0.2,
+                    "famo_beta": 0.05,
+                    "famo_gamma": 0.01,
+                    "famo_eps": 1e-8,
+                },
+            },
+        }
+    )
+    module = DummyTrainingModule()
+    optimizer = CountingSGD(module.generator.parameters())
+
+    _, _, _, _, _, batch_grad_norm, metrics = g_loop._run_fm_primary_constrained_famo_stage2_batch(
+        training_module=module,
+        optimizer=optimizer,
+        images=torch.zeros(1, 3, 4, 4),
+        z=torch.zeros(1, 2),
+        sample_ids=["sample"],
+        lambda_cycle=0.0,
+        amp_ctx=nullcontext(),
+        grad_clip_norm=None,
+        ema=None,
+        stage2_objective=objective,
+        flow_condition="embedding",
+    )
+
+    assert optimizer.step_calls == 1
+    assert batch_grad_norm == pytest.approx(metrics["combined_grad_norm"])
+    for key in (
+        "famo_weight_fm",
+        "famo_weight_cl",
+        "famo_logit_fm",
+        "famo_logit_cl",
+        "famo_delta_log_loss_fm",
+        "famo_delta_log_loss_cl",
+        "fm_floor_ratio",
+        "fm_floor_active",
+        "cl_gate_scale",
+        "gradient_cosine_fm_cl",
+        "combined_grad_norm",
+    ):
+        assert key in metrics
+    assert metrics["stage2_objective_type"] == "fm_primary_constrained_famo"
+    assert metrics["famo_weight_fm"] + metrics["famo_weight_cl"] == pytest.approx(1.0)
+    assert metrics["gradient_cosine_fm_cl"] == pytest.approx(-1.0)
+    assert metrics["fm_floor_ratio"] + 1e-6 >= objective.fm_descent_floor_fraction
+    assert metrics["fm_floor_active"] == 1.0
+    assert 0.0 <= metrics["cl_gate_scale"] < 1.0
+
+    source = inspect.getsource(g_loop._run_fm_primary_constrained_famo_stage2_batch)
     assert "optimizer.step()" in source
     assert source.count("optimizer.step()") == 1
     assert "torch.autograd.grad" not in source

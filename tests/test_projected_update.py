@@ -9,17 +9,82 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from safa.training.projected_update import (
+    FAMOLogitUpdateResult,
+    FAMOWeightResult,
     FMAnchoredCAGradResult,
     ProjectionResult,
     aggregate_two_task_cagrad,
     aggregate_two_task_fm_anchored_cagrad,
+    compute_two_task_famo_weights,
     project_gradient_onto_fm_feasible_cone,
     project_gradient_to_dot_lower_bound,
+    update_two_task_famo_logits,
 )
 
 
 def _dot(left: list["torch.Tensor"], right: list["torch.Tensor"]):
     return sum((a * b).sum() for a, b in zip(left, right))
+
+
+def test_famo_weights_use_softmax_logits_and_loss_distance_inverse_normalization() -> None:
+    logits = torch.tensor([0.0, 0.0], dtype=torch.float64)
+
+    result = compute_two_task_famo_weights(
+        loss_fm=torch.tensor(4.0, dtype=torch.float64),
+        loss_cl=torch.tensor(1.0, dtype=torch.float64),
+        logits=logits,
+        min_loss_fm=0.0,
+        min_loss_cl=0.0,
+        eps=1e-6,
+    )
+
+    assert is_dataclass(FAMOWeightResult)
+    assert isinstance(result, FAMOWeightResult)
+    assert torch.allclose(result.probabilities, torch.tensor([0.5, 0.5], dtype=torch.float64))
+    assert torch.allclose(result.distances, torch.tensor([4.000001, 1.000001], dtype=torch.float64))
+    assert torch.allclose(result.weights.sum(), torch.tensor(1.0, dtype=torch.float64), atol=1e-12)
+    assert result.fm_weight == pytest.approx(0.2, abs=1e-6)
+    assert result.cl_weight == pytest.approx(0.8, abs=1e-6)
+
+
+def test_famo_weights_floor_loss_distance_at_eps_after_min_loss_shift() -> None:
+    result = compute_two_task_famo_weights(
+        loss_fm=torch.tensor(0.5, dtype=torch.float64),
+        loss_cl=torch.tensor(2.0, dtype=torch.float64),
+        logits=torch.tensor([0.0, 0.0], dtype=torch.float64),
+        min_loss_fm=1.0,
+        min_loss_cl=0.0,
+        eps=0.1,
+    )
+
+    assert torch.allclose(result.distances, torch.tensor([0.1, 2.1], dtype=torch.float64))
+    assert result.fm_weight == pytest.approx(21.0 / 22.0)
+    assert result.cl_weight == pytest.approx(1.0 / 22.0)
+    assert torch.allclose(result.log_distances, result.distances.log())
+
+
+def test_famo_logit_update_uses_softmax_jacobian_transpose_delta() -> None:
+    logits = torch.tensor([0.2, -0.1], dtype=torch.float64)
+    previous_log_distances = torch.log(torch.tensor([4.0, 1.0], dtype=torch.float64))
+    current_log_distances = torch.log(torch.tensor([2.0, 2.0], dtype=torch.float64))
+    probabilities = torch.softmax(logits, dim=0)
+    delta = previous_log_distances - current_log_distances
+    expected_delta_xi = probabilities * (delta - torch.sum(probabilities * delta))
+    expected_logits = logits - 0.5 * (expected_delta_xi + 0.01 * logits)
+
+    result = update_two_task_famo_logits(
+        logits,
+        previous_log_distances,
+        current_log_distances,
+        beta=0.5,
+        gamma=0.01,
+    )
+
+    assert is_dataclass(FAMOLogitUpdateResult)
+    assert isinstance(result, FAMOLogitUpdateResult)
+    assert torch.allclose(result.delta_log_distances, delta)
+    assert torch.allclose(result.delta_logits, expected_delta_xi)
+    assert torch.allclose(result.updated_logits, expected_logits)
 
 
 def test_negative_repr_fm_dot_projects_gradient_to_fm_boundary() -> None:

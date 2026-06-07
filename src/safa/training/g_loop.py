@@ -22,8 +22,11 @@ from safa.training.audit import audit_no_identity_supervision
 from safa.training.losses import cosine_cycle_loss, normalize_for_e0
 from safa.training.projected_update import (
     aggregate_two_task_fm_anchored_cagrad,
+    aggregate_two_task_fm_primary_constrained_famo,
+    compute_two_task_famo_weights,
     project_gradient_onto_fm_feasible_cone,
     project_gradient_to_dot_lower_bound,
+    update_two_task_famo_logits,
 )
 from safa.training.representation_losses import hyperspherical_gram_loss, hyperspherical_point_cosine_loss
 from safa.training.multitask_loss import UncertaintyWeightedLoss
@@ -55,8 +58,12 @@ _GRAM_PROJECTED_TWO_STEP = "gram_projected_two_step"
 _POINT_PROJECTED_TWO_STEP = "point_projected_two_step"
 _POINT_DESCENT_CREDIT_PROJECTED = "point_descent_credit_projected"
 _FM_ANCHORED_CAGRAD = "fm_anchored_cagrad"
+_FM_PRIMARY_CONSTRAINED_FAMO = "fm_primary_constrained_famo"
 _PROJECTED_STAGE2_OBJECTIVES = (_GRAM_PROJECTED_TWO_STEP, _POINT_PROJECTED_TWO_STEP, _POINT_DESCENT_CREDIT_PROJECTED)
-_CAGRAD_STAGE2_OBJECTIVES = (_FM_ANCHORED_CAGRAD,)
+_CAGRAD_STAGE2_OBJECTIVES = (_FM_ANCHORED_CAGRAD, _FM_PRIMARY_CONSTRAINED_FAMO)
+_GENERATOR_TRAINABLE_FULL = "full"
+_GENERATOR_TRAINABLE_CONDITIONING_ONLY = "conditioning_only"
+_GENERATOR_TRAINABLE_MODES = (_GENERATOR_TRAINABLE_FULL, _GENERATOR_TRAINABLE_CONDITIONING_ONLY)
 
 
 @dataclass(frozen=True)
@@ -88,6 +95,11 @@ class _Stage2ObjectiveRuntime:
     projection_eps: float | None = None
     cagrad_c: float | None = None
     fm_descent_floor_fraction: float | None = None
+    famo_beta: float | None = None
+    famo_gamma: float | None = None
+    famo_eps: float | None = None
+    famo_min_loss_fm: float = 0.0
+    famo_min_loss_cl: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -141,6 +153,13 @@ class _GeneratorTrainingStep:
 
                 self.register_buffer("_flow_loss_initial", torch.tensor(float("nan"), dtype=torch.float64), persistent=True)
                 self.register_buffer("_cycle_loss_initial", torch.tensor(float("nan"), dtype=torch.float64), persistent=True)
+                if self.stage2_objective is not None and self.stage2_objective.type == _FM_PRIMARY_CONSTRAINED_FAMO:
+                    self.register_buffer("_famo_logits", torch.zeros(2, dtype=torch.float64), persistent=True)
+                    self.register_buffer(
+                        "_famo_prev_log_distances",
+                        torch.full((2,), float("nan"), dtype=torch.float64),
+                        persistent=True,
+                    )
 
             def reset_batch_idx(self):
                 self._batch_idx = 0
@@ -307,7 +326,11 @@ class _GeneratorTrainingStep:
                 e0_out = self.e0(normalize_for_e0(generated))
                 if "embedding" not in e0_out:
                     raise RuntimeError("E0 output missing embedding for stage2 representation loss")
-                if self.stage2_objective.type in {_POINT_PROJECTED_TWO_STEP, _POINT_DESCENT_CREDIT_PROJECTED, _FM_ANCHORED_CAGRAD} or self.stage2_objective.relation_weight == 0.0:
+                if (
+                    self.stage2_objective.type
+                    in {_POINT_PROJECTED_TWO_STEP, _POINT_DESCENT_CREDIT_PROJECTED, _FM_ANCHORED_CAGRAD, _FM_PRIMARY_CONSTRAINED_FAMO}
+                    or self.stage2_objective.relation_weight == 0.0
+                ):
                     losses = hyperspherical_point_cosine_loss(
                         e0_out["embedding"],
                         z,
@@ -504,6 +527,7 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
         _POINT_PROJECTED_TWO_STEP,
         _POINT_DESCENT_CREDIT_PROJECTED,
         _FM_ANCHORED_CAGRAD,
+        _FM_PRIMARY_CONSTRAINED_FAMO,
         "fm_only_probe",
         "gram_repr_only_probe",
     )
@@ -534,13 +558,56 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
     if point_weight < 0.0:
         raise ValueError(f"{context}.point_weight must be non-negative, got {point_weight!r}")
 
-    if objective_type in {_POINT_PROJECTED_TWO_STEP, _POINT_DESCENT_CREDIT_PROJECTED, _FM_ANCHORED_CAGRAD}:
+    if objective_type in {_POINT_PROJECTED_TWO_STEP, _POINT_DESCENT_CREDIT_PROJECTED, _FM_ANCHORED_CAGRAD, _FM_PRIMARY_CONSTRAINED_FAMO}:
         forbidden_fields = ("relation_weight", "offdiag_only")
         if objective_type == _FM_ANCHORED_CAGRAD:
             forbidden_fields = ("relation_weight", "offdiag_only", "repr_learning_rate")
+        if objective_type == _FM_PRIMARY_CONSTRAINED_FAMO:
+            forbidden_fields = ("relation_weight", "offdiag_only", "repr_learning_rate", "projection_eps")
         for field in forbidden_fields:
             if field in payload:
                 raise ValueError(f"{context}.{field} is not valid for {objective_type}")
+        if objective_type == _FM_PRIMARY_CONSTRAINED_FAMO:
+            if lambda_repr != 1.0:
+                raise ValueError(f"{context}.lambda_repr must be exactly 1.0 for {_FM_PRIMARY_CONSTRAINED_FAMO}")
+            if point_weight != 1.0:
+                raise ValueError(f"{context}.point_weight must be exactly 1.0 for {_FM_PRIMARY_CONSTRAINED_FAMO}")
+            cagrad_c = _require_numeric(payload, "cagrad_c", context)
+            if cagrad_c < 0.0 or cagrad_c >= 1.0:
+                raise ValueError(f"{context}.cagrad_c must be in [0, 1), got {cagrad_c!r}")
+            floor_fraction = _require_numeric(payload, "fm_descent_floor_fraction", context)
+            if floor_fraction < 0.0 or floor_fraction > 1.0:
+                raise ValueError(f"{context}.fm_descent_floor_fraction must be in [0, 1], got {floor_fraction!r}")
+            famo_beta = _require_numeric(payload, "famo_beta", context)
+            if famo_beta <= 0.0:
+                raise ValueError(f"{context}.famo_beta must be positive, got {famo_beta!r}")
+            famo_gamma = _require_numeric(payload, "famo_gamma", context)
+            if famo_gamma < 0.0:
+                raise ValueError(f"{context}.famo_gamma must be non-negative, got {famo_gamma!r}")
+            famo_eps = _require_numeric(payload, "famo_eps", context)
+            if famo_eps <= 0.0:
+                raise ValueError(f"{context}.famo_eps must be positive, got {famo_eps!r}")
+            famo_min_loss_fm = _optional_numeric(payload, "famo_min_loss_fm", context, default=0.0)
+            if famo_min_loss_fm < 0.0:
+                raise ValueError(f"{context}.famo_min_loss_fm must be non-negative, got {famo_min_loss_fm!r}")
+            famo_min_loss_cl = _optional_numeric(payload, "famo_min_loss_cl", context, default=0.0)
+            if famo_min_loss_cl < 0.0:
+                raise ValueError(f"{context}.famo_min_loss_cl must be non-negative, got {famo_min_loss_cl!r}")
+            return _Stage2ObjectiveRuntime(
+                type=str(objective_type),
+                lambda_repr=float(lambda_repr),
+                point_weight=float(point_weight),
+                relation_weight=0.0,
+                offdiag_only=False,
+                flow_condition=flow_condition,
+                cagrad_c=float(cagrad_c),
+                fm_descent_floor_fraction=float(floor_fraction),
+                famo_beta=float(famo_beta),
+                famo_gamma=float(famo_gamma),
+                famo_eps=float(famo_eps),
+                famo_min_loss_fm=float(famo_min_loss_fm),
+                famo_min_loss_cl=float(famo_min_loss_cl),
+            )
         projection_eps = _require_numeric(payload, "projection_eps", context)
         if projection_eps < 0.0:
             raise ValueError(f"{context}.projection_eps must be non-negative, got {projection_eps!r}")
@@ -762,10 +829,39 @@ def _verify_e0_feature_cache_consistency(config: dict) -> None:
         )
 
 
+def _generator_trainable_mode(config: dict) -> str:
+    mode = str(config.get("generator_trainable", _GENERATOR_TRAINABLE_FULL))
+    if mode not in _GENERATOR_TRAINABLE_MODES:
+        raise ValueError(
+            "train_g config.generator_trainable must be "
+            f"{_GENERATOR_TRAINABLE_FULL!r} or {_GENERATOR_TRAINABLE_CONDITIONING_ONLY!r}, got {mode!r}"
+        )
+    return mode
+
+
+def _apply_generator_trainable_mode(generator, mode: str) -> None:
+    if mode == _GENERATOR_TRAINABLE_FULL:
+        for param in generator.parameters():
+            param.requires_grad_(True)
+        return
+    if mode == _GENERATOR_TRAINABLE_CONDITIONING_ONLY:
+        for name, param in generator.named_parameters():
+            trainable = name.startswith("vector_field.z_mlp.") or ".condition." in name
+            param.requires_grad_(trainable)
+        return
+    raise ValueError(
+        "generator_trainable mode must be "
+        f"{_GENERATOR_TRAINABLE_FULL!r} or {_GENERATOR_TRAINABLE_CONDITIONING_ONLY!r}, got {mode!r}"
+    )
+
+
 def _optimizer_param_groups(training_module, config: dict, loss_weighting: _LossWeightingRuntime) -> list[dict]:
+    generator_params = [param for param in training_module.generator.parameters() if param.requires_grad]
+    if not generator_params:
+        raise RuntimeError("Cannot build optimizer without trainable generator parameters")
     groups = [
         {
-            "params": training_module.generator.parameters(),
+            "params": generator_params,
             "lr": float(config["learning_rate"]),
             "weight_decay": float(config["weight_decay"]),
         }
@@ -773,14 +869,46 @@ def _optimizer_param_groups(training_module, config: dict, loss_weighting: _Loss
     if loss_weighting.type == "uncertainty":
         if training_module.uncertainty_loss is None:
             raise RuntimeError("loss_weighting.type='uncertainty' requires uncertainty_loss parameters")
+        uncertainty_params = [param for param in training_module.uncertainty_loss.parameters() if param.requires_grad]
         groups.append(
             {
-                "params": training_module.uncertainty_loss.parameters(),
+                "params": uncertainty_params,
                 "lr": float(loss_weighting.log_var_lr),
                 "weight_decay": float(loss_weighting.log_var_weight_decay),
             }
         )
     return groups
+
+
+def _optimizer_state_param_groups_match_current_optimizer(optimizer, optimizer_state_dict: dict) -> bool:
+    saved_groups = optimizer_state_dict["param_groups"]
+    current_groups = optimizer.param_groups
+    if len(saved_groups) != len(current_groups):
+        return False
+    return all(len(saved_group["params"]) == len(current_group["params"]) for saved_group, current_group in zip(saved_groups, current_groups))
+
+
+def _load_resume_optimizer_state(
+    optimizer,
+    resume_optimizer_state_dict: dict,
+    *,
+    generator_trainable_mode: str,
+    is_main: bool,
+) -> bool:
+    if (
+        generator_trainable_mode != _GENERATOR_TRAINABLE_FULL
+        and not _optimizer_state_param_groups_match_current_optimizer(optimizer, resume_optimizer_state_dict)
+    ):
+        if is_main:
+            print(
+                "Resume optimizer_state_dict parameter groups do not match current trainable parameters; "
+                "reinitialized optimizer; optimizer_resumed: false"
+            )
+        return False
+    optimizer.load_state_dict(resume_optimizer_state_dict)
+    if is_main:
+        print("Resumed optimizer state from checkpoint; optimizer_resumed: true")
+    return True
 
 
 def _stage2_lambda_schedule(
@@ -941,6 +1069,7 @@ def train_g_from_config(config: dict) -> dict:
     torch.backends.cudnn.benchmark = True
     audit_no_identity_supervision(config, DEFAULT_NO_IDENTITY_SOURCE_PATHS)
     _validate_train_g_config(config)
+    generator_trainable_mode = _generator_trainable_mode(config)
     distributed = init_distributed(config)
     try:
         batch_config = _training_batch_config(config, world_size=distributed.world_size)
@@ -1006,6 +1135,7 @@ def train_g_from_config(config: dict) -> dict:
                 restored.append("loss_weighting_state")
             sep = ", ".join(restored)
             print(f"Resumed generator from {resume_path} (restored: {sep})")
+    _apply_generator_trainable_mode(generator, generator_trainable_mode)
     ema = None
     if ema_config["enabled"]:
         ema = ExponentialMovingAverage(generator, decay=float(ema_config["decay"]))
@@ -1065,10 +1195,12 @@ def train_g_from_config(config: dict) -> dict:
             if distributed.is_main:
                 print("Resume checkpoint has no optimizer_state_dict; optimizer_resumed: false")
         else:
-            optimizer.load_state_dict(resume_optimizer_state_dict)
-            optimizer_resumed = True
-            if distributed.is_main:
-                print("Resumed optimizer state from checkpoint; optimizer_resumed: true")
+            optimizer_resumed = _load_resume_optimizer_state(
+                optimizer,
+                resume_optimizer_state_dict,
+                generator_trainable_mode=generator_trainable_mode,
+                is_main=distributed.is_main,
+            )
     assert_e0_frozen(e0, optimizer)
     lambda_cycle, lambda_max, lambda_growth = _stage2_lambda_schedule(stages, loss_weighting_runtime, stage2_objective)
     baseline_detection_rate = None
@@ -1218,6 +1350,20 @@ def train_g_from_config(config: dict) -> dict:
                     totals["dot_after_abs_max"] = max(totals["dot_after_abs_max"], float(projection_metrics["dot_after_abs_max"]))
                 elif stage_name == "stage2" and stage2_objective is not None and stage2_objective.type == _FM_ANCHORED_CAGRAD:
                     loss, flow_mse, cycle, flow_loss, cycle_loss, batch_grad_norm, _ = _run_fm_anchored_cagrad_stage2_batch(
+                        training_module=training_module,
+                        optimizer=optimizer,
+                        images=images,
+                        z=z,
+                        sample_ids=sample_ids,
+                        lambda_cycle=lambda_cycle,
+                        amp_ctx=amp_ctx,
+                        grad_clip_norm=config.get("grad_clip_norm"),
+                        ema=ema,
+                        stage2_objective=stage2_objective,
+                        flow_condition=stage_flow_condition,
+                    )
+                elif stage_name == "stage2" and stage2_objective is not None and stage2_objective.type == _FM_PRIMARY_CONSTRAINED_FAMO:
+                    loss, flow_mse, cycle, flow_loss, cycle_loss, batch_grad_norm, _ = _run_fm_primary_constrained_famo_stage2_batch(
                         training_module=training_module,
                         optimizer=optimizer,
                         images=images,
@@ -1787,6 +1933,7 @@ def _distributed_manifest(distributed: DistributedContext) -> dict:
 
 
 def _validate_train_g_config(config: dict) -> None:
+    _generator_trainable_mode(config)
     _generator_config_from_train_config(config)
     _require_bool(config, "allow_stage2_without_stage1_gate", "train_g config")
     stages = _stage_config(config)
@@ -1900,6 +2047,12 @@ def _require_numeric(config: dict, field: str, context: str) -> float:
     if not math.isfinite(numeric):
         raise ValueError(f"{context}.{field} must be finite, got {value!r}")
     return numeric
+
+
+def _optional_numeric(config: dict, field: str, context: str, *, default: float) -> float:
+    if field not in config:
+        return float(default)
+    return _require_numeric(config, field, context)
 
 
 def _validate_stage1_gate_config(stage1: dict) -> None:
@@ -2381,6 +2534,192 @@ def _projection_result_metrics(result) -> dict[str, float]:
         "projection_removed_norm_mean": float(result.projection_removed_norm.detach().cpu()),
         "projected_repr_norm_mean": float(result.projected_repr_norm.detach().cpu()),
     }
+
+
+def _ensure_famo_runtime_state(training_state, device) -> tuple:
+    import torch
+
+    if not hasattr(training_state, "_famo_logits"):
+        training_state.register_buffer("_famo_logits", torch.zeros(2, dtype=torch.float64, device=device), persistent=True)
+    if not hasattr(training_state, "_famo_prev_log_distances"):
+        training_state.register_buffer(
+            "_famo_prev_log_distances",
+            torch.full((2,), float("nan"), dtype=torch.float64, device=device),
+            persistent=True,
+        )
+    logits = training_state._famo_logits
+    previous = training_state._famo_prev_log_distances
+    if not isinstance(logits, torch.Tensor) or logits.shape != (2,):
+        raise RuntimeError("FAMO runtime logits must be a tensor with shape (2,)")
+    if not isinstance(previous, torch.Tensor) or previous.shape != (2,):
+        raise RuntimeError("FAMO previous log distances must be a tensor with shape (2,)")
+    if logits.device != device or logits.dtype != torch.float64:
+        training_state._famo_logits = logits.to(device=device, dtype=torch.float64)
+    if previous.device != device or previous.dtype != torch.float64:
+        training_state._famo_prev_log_distances = previous.to(device=device, dtype=torch.float64)
+    if not torch.isfinite(training_state._famo_logits).all():
+        raise RuntimeError("FAMO runtime logits must be finite")
+    return training_state._famo_logits, training_state._famo_prev_log_distances
+
+
+def _distributed_mean_famo_loss_values(flow_loss, repr_loss):
+    import torch
+
+    values = torch.stack(
+        (
+            flow_loss.detach().to(dtype=torch.float64),
+            repr_loss.detach().to(dtype=torch.float64),
+        )
+    )
+    if not torch.isfinite(values).all():
+        raise RuntimeError("FAMO loss values must be finite")
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(values, op=torch.distributed.ReduceOp.SUM)
+        values = values / float(torch.distributed.get_world_size())
+    return values
+
+
+def _run_fm_primary_constrained_famo_stage2_batch(
+    *,
+    training_module,
+    optimizer,
+    images,
+    z,
+    sample_ids: list[str],
+    lambda_cycle: float,
+    amp_ctx,
+    grad_clip_norm,
+    ema,
+    stage2_objective: _Stage2ObjectiveRuntime,
+    flow_condition: str,
+) -> tuple:
+    import torch
+
+    if stage2_objective.type != _FM_PRIMARY_CONSTRAINED_FAMO:
+        raise RuntimeError("_run_fm_primary_constrained_famo_stage2_batch requires fm_primary_constrained_famo")
+    if stage2_objective.lambda_repr != 1.0:
+        raise RuntimeError("fm_primary_constrained_famo requires lambda_repr == 1.0")
+    if (
+        stage2_objective.cagrad_c is None
+        or stage2_objective.fm_descent_floor_fraction is None
+        or stage2_objective.famo_beta is None
+        or stage2_objective.famo_gamma is None
+        or stage2_objective.famo_eps is None
+    ):
+        raise RuntimeError("fm_primary_constrained_famo requires cagrad_c, fm_descent_floor_fraction, and FAMO controls")
+
+    training_state = unwrap_model(training_module)
+    params = _trainable_parameter_list(training_state.generator.parameters())
+
+    optimizer.zero_grad(set_to_none=True)
+    with amp_ctx:
+        flow_loss, flow_mse, _, flow_loss_raw, _ = training_module(
+            images,
+            z,
+            sample_ids,
+            False,
+            lambda_cycle,
+            flow_condition=flow_condition,
+        )
+    _assert_finite_training_scalars(flow_loss, flow_mse, flow_loss_raw)
+    flow_loss.backward()
+    _assert_finite_parameter_gradients("FM-primary constrained FAMO flow matching", params)
+    fm_gradients = _synced_gradients_from_parameters("FM-primary constrained FAMO flow matching", params)
+
+    optimizer.zero_grad(set_to_none=True)
+    with amp_ctx:
+        repr_loss, flow_mse_guard, repr_detached, repr_flow_loss, repr_loss_raw = training_module(
+            images,
+            z,
+            sample_ids,
+            True,
+            lambda_cycle,
+            flow_condition=flow_condition,
+        )
+    _assert_finite_training_scalars(repr_loss, flow_mse_guard, repr_detached)
+    repr_loss.backward()
+    _assert_finite_parameter_gradients("FM-primary constrained FAMO representation", params)
+    repr_gradients = _synced_gradients_from_parameters("FM-primary constrained FAMO representation", params)
+
+    loss_values = _distributed_mean_famo_loss_values(flow_loss_raw, repr_loss_raw)
+    famo_logits, previous_log_distances = _ensure_famo_runtime_state(training_state, loss_values.device)
+    weights = compute_two_task_famo_weights(
+        loss_fm=loss_values[0],
+        loss_cl=loss_values[1],
+        logits=famo_logits,
+        min_loss_fm=stage2_objective.famo_min_loss_fm,
+        min_loss_cl=stage2_objective.famo_min_loss_cl,
+        eps=stage2_objective.famo_eps,
+    )
+    if torch.isfinite(previous_log_distances).all():
+        logit_update = update_two_task_famo_logits(
+            famo_logits,
+            previous_log_distances,
+            weights.log_distances,
+            beta=stage2_objective.famo_beta,
+            gamma=stage2_objective.famo_gamma,
+        )
+        updated_logits = logit_update.updated_logits
+        delta_log_distances = logit_update.delta_log_distances
+    else:
+        updated_logits = famo_logits.clone()
+        delta_log_distances = torch.zeros_like(famo_logits)
+    famo_logits.copy_(updated_logits.to(dtype=famo_logits.dtype, device=famo_logits.device))
+    previous_log_distances.copy_(weights.log_distances.to(dtype=previous_log_distances.dtype, device=previous_log_distances.device))
+
+    weighted_repr_gradients = [stage2_objective.lambda_repr * grad for grad in repr_gradients]
+    aggregate = aggregate_two_task_fm_primary_constrained_famo(
+        fm_gradients,
+        weighted_repr_gradients,
+        famo_weight_fm=weights.fm_weight,
+        famo_weight_cl=weights.cl_weight,
+        c=stage2_objective.cagrad_c,
+        fm_descent_floor_fraction=stage2_objective.fm_descent_floor_fraction,
+        eps=stage2_objective.famo_eps,
+    )
+    optimizer.zero_grad(set_to_none=True)
+    _assign_parameter_gradients(params, aggregate.combined_gradients)
+
+    batch_grad_norm = float(aggregate.combined_norm)
+    if grad_clip_norm is not None:
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            training_state.generator.parameters(),
+            grad_clip_norm,
+            error_if_nonfinite=True,
+        )
+        batch_grad_norm = float(grad_norm) if isinstance(grad_norm, float) else float(grad_norm.detach().cpu())
+    optimizer.step()
+    if ema is not None:
+        ema.update(training_state.generator)
+
+    metrics = dict(training_state.last_loss_metrics)
+    metrics.update(
+        {
+            "famo_weight_fm": weights.fm_weight,
+            "famo_weight_cl": weights.cl_weight,
+            "famo_logit_fm": float(famo_logits[0].detach().cpu()),
+            "famo_logit_cl": float(famo_logits[1].detach().cpu()),
+            "famo_delta_log_loss_fm": float(delta_log_distances[0].detach().cpu()),
+            "famo_delta_log_loss_cl": float(delta_log_distances[1].detach().cpu()),
+            "famo_loss_distance_fm": float(weights.distances[0].detach().cpu()),
+            "famo_loss_distance_cl": float(weights.distances[1].detach().cpu()),
+            "cagrad_fm_weight": aggregate.cagrad_fm_weight,
+            "cagrad_cl_weight": aggregate.cagrad_cl_weight,
+            "fm_descent_floor_fraction": float(stage2_objective.fm_descent_floor_fraction),
+            "fm_descent_floor_value": aggregate.fm_descent_floor,
+            "fm_descent_after_cagrad": aggregate.fm_descent_after_cagrad,
+            "fm_descent_after_constraint": aggregate.fm_descent_after_constraint,
+            "fm_floor_ratio": aggregate.fm_floor_ratio,
+            "fm_floor_active": 1.0 if aggregate.fm_floor_active else 0.0,
+            "cl_gate_scale": aggregate.cl_gate_scale,
+            "gradient_cosine_fm_cl": aggregate.gradient_cosine,
+            "combined_grad_norm": aggregate.combined_norm,
+            "stage2_objective_type": stage2_objective.type,
+        }
+    )
+    training_state.last_loss_metrics = metrics
+    logged_loss = flow_loss_raw.detach() + repr_loss_raw.detach()
+    return logged_loss, flow_mse_guard.detach(), repr_detached.detach(), repr_flow_loss.detach(), repr_loss_raw.detach(), batch_grad_norm, metrics
 
 
 def _run_fm_anchored_cagrad_stage2_batch(
@@ -3502,6 +3841,7 @@ def _save_generator(
         "validation": train_config.get("validation"),
         "ema": ema_config,
         "best_model": best_model,
+        "generator_trainable": _generator_trainable_mode(train_config),
     }
     for field in ("global_batch_size", "per_device_batch_size", "world_size", "gradient_accumulation_steps"):
         if field in metrics:
