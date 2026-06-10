@@ -432,6 +432,100 @@ def update_two_task_famo_logits(
     )
 
 
+
+
+def project_gradient_onto_fm_feasible_cone_adam(
+    g_repr: list[torch.Tensor],
+    g_fm: list[torch.Tensor],
+    preconditioner_weights: list[torch.Tensor],
+    eps: float,
+) -> ProjectionResult:
+    """Project g_repr onto FM-feasible half-space using Adam's preconditioner metric.
+
+    Uses Q-weighted inner products where Q = diag(w) and w = preconditioner_weights.
+    Mathematically equivalent to: whiten with diag(sqrt(w)), project in Euclidean, unwhiten.
+
+    The projected gradient g_repr_proj satisfies: <g_fm, g_repr_proj>_Q >= 0,
+    ensuring the subsequent preconditioned update diag(w)*g_repr_proj does not
+    increase FM loss to first order.
+    """
+    _validate_gradient_lists(g_repr, g_fm)
+    _validate_eps(eps)
+    if not isinstance(preconditioner_weights, list) or len(preconditioner_weights) != len(g_repr):
+        raise ValueError("preconditioner_weights must be a list with same length as gradient lists")
+    for idx, w in enumerate(preconditioner_weights):
+        if not isinstance(w, torch.Tensor):
+            raise TypeError(f"preconditioner_weights[{idx}] must be a torch.Tensor")
+        if w.shape != g_repr[idx].shape:
+            raise ValueError(f"preconditioner_weights[{idx}] shape must match gradient shape")
+
+    dot_before = _dot_weighted(g_repr, g_fm, preconditioner_weights)
+    fm_norm_squared = _squared_norm_weighted(g_fm, preconditioner_weights)
+    fm_norm = torch.sqrt(fm_norm_squared)
+    repr_norm = torch.sqrt(_squared_norm_weighted(g_repr, preconditioner_weights))
+    eps_tensor = torch.as_tensor(eps, dtype=fm_norm.dtype, device=fm_norm.device)
+
+    projection_applied = bool((dot_before < 0).item() and (fm_norm > eps_tensor).item())
+    if projection_applied:
+        coefficient = dot_before / fm_norm_squared
+        projected_gradients = [repr_grad - coefficient * fm_grad
+                               for repr_grad, fm_grad in zip(g_repr, g_fm)]
+    else:
+        projected_gradients = [repr_grad.clone() for repr_grad in g_repr]
+
+    dot_after = _dot_weighted(projected_gradients, g_fm, preconditioner_weights)
+    if projection_applied:
+        zero = torch.zeros((), dtype=dot_after.dtype, device=dot_after.device)
+        if not torch.allclose(dot_after, zero, rtol=1e-3, atol=1e-3):
+            raise RuntimeError(
+                "Projected representation gradient is not orthogonal to FM gradient in Adam metric"
+            )
+
+    projected_repr_norm = torch.sqrt(_squared_norm_weighted(projected_gradients, preconditioner_weights))
+    removed_gradients = [r - p for r, p in zip(g_repr, projected_gradients)]
+    projection_removed_norm = torch.sqrt(_squared_norm_weighted(removed_gradients, preconditioner_weights))
+    repr_descent_inner_product = _dot_weighted(g_repr, projected_gradients, preconditioner_weights)
+    fm_first_order_effect = -dot_after
+    return ProjectionResult(
+        dot_before=dot_before,
+        dot_after=dot_after,
+        fm_norm=fm_norm,
+        repr_norm=repr_norm,
+        projected_repr_norm=projected_repr_norm,
+        projection_applied=projection_applied,
+        projection_removed_norm=projection_removed_norm,
+        repr_descent_inner_product=repr_descent_inner_product,
+        fm_first_order_effect=fm_first_order_effect,
+        projected_gradients=projected_gradients,
+    )
+
+
+def _dot_weighted(
+    left: list[torch.Tensor],
+    right: list[torch.Tensor],
+    weights: list[torch.Tensor],
+) -> torch.Tensor:
+    total = None
+    for left_item, right_item, w in zip(left, right, weights):
+        item = (w * left_item * right_item).sum()
+        total = item if total is None else total + item
+    if total is None:
+        raise RuntimeError("Cannot compute weighted dot product for an empty gradient list")
+    return total
+
+
+def _squared_norm_weighted(
+    gradients: list[torch.Tensor],
+    weights: list[torch.Tensor],
+) -> torch.Tensor:
+    total = None
+    for gradient, w in zip(gradients, weights):
+        item = (w * gradient * gradient).sum()
+        total = item if total is None else total + item
+    if total is None:
+        raise RuntimeError("Cannot compute weighted norm for an empty gradient list")
+    return total
+
 def _validate_gradient_lists(g_repr: list[torch.Tensor], g_fm: list[torch.Tensor]) -> None:
     if not isinstance(g_repr, list) or not isinstance(g_fm, list):
         raise TypeError("g_repr and g_fm must be list[Tensor]")
