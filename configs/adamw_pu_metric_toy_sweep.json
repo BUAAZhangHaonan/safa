@@ -1,0 +1,49 @@
+{
+  "run_name": "adamw_pu_metric_delta45_gpu5",
+  "output_dir": "artifacts/toy_adamw_pu_metric",
+  "device": "cuda:5",
+  "seed": 1337,
+  "deltas_deg": [
+    45.0
+  ],
+  "methods": [
+    "fm_only",
+    "projected_two_step",
+    "pcgrad"
+  ],
+  "lambdas": [
+    0.01,
+    0.03,
+    0.1,
+    0.3,
+    1.0
+  ],
+  "soft_margins": [
+    0.0
+  ],
+  "steps": 5000,
+  "batch_size": 512,
+  "eval_batch_size": 1024,
+  "hidden_dim": 64,
+  "layers": 3,
+  "sigma": 0.05,
+  "k_classes": 8,
+  "sample_steps": 16,
+  "learning_rate": 0.001,
+  "fm_learning_rate": 0.001,
+  "repr_learning_rate": 0.001,
+  "weight_decay": 0.0,
+  "repr_relation_weight": 1.0,
+  "normalize_losses": true,
+  "calibration_batches": 8,
+  "eval_interval": 250,
+  "projection_eps": 1e-12,
+  "fm_delta_target": 0.01,
+  "dual_lr": 10.0,
+  "dual_max": 100.0,
+  "primal_dual_warmup_steps": 100,
+  "optimizer_type": "adamw",
+  "pu_gradient_normalization": true,
+  "pu_backtrack_max_retries": 3,
+  "pu_fm_increase_budget": 0.0
+}
