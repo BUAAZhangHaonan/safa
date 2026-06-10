@@ -11,6 +11,7 @@ torch = pytest.importorskip("torch")
 from safa.training.projected_update import (
     AdaptiveMarginAdjustment,
     DualBudgetControlResult,
+    FMPrimaryConstrainedFAMOResult,
     FAMOLogitUpdateResult,
     FAMOWeightResult,
     FMAnchoredCAGradResult,
@@ -18,10 +19,12 @@ from safa.training.projected_update import (
     TrustRegionScaleResult,
     aggregate_two_task_cagrad,
     aggregate_two_task_fm_anchored_cagrad,
+    aggregate_two_task_fm_primary_constrained_famo,
     apply_fm_anchor_trust_region_scaling,
     compute_adaptive_margin_adjustment,
     compute_two_task_famo_weights,
     project_gradient_onto_fm_feasible_cone,
+    project_gradient_onto_fm_feasible_cone_adam,
     project_gradient_to_dot_lower_bound,
     update_dual_budget_controller,
     update_two_task_famo_logits,
@@ -416,3 +419,96 @@ def test_trust_and_dual_helpers_reject_invalid_inputs(kwargs, error, match: str)
     else:
         with pytest.raises(error, match=match):
             update_dual_budget_controller(**kwargs)
+
+
+# --- Adam Q-weighted projection tests ---
+
+
+def test_adam_q_weighted_projection_removes_fm_conflict_component() -> None:
+    g_repr = [torch.tensor([1.0, 0.0], dtype=torch.float64)]
+    g_fm = [torch.tensor([-1.0, 0.0], dtype=torch.float64)]
+    weights = [torch.tensor([1.0, 1.0], dtype=torch.float64)]  # uniform weights
+
+    result = project_gradient_onto_fm_feasible_cone_adam(g_repr, g_fm, weights, eps=1e-12)
+
+    assert isinstance(result, ProjectionResult)
+    assert result.projection_applied is True
+    assert torch.allclose(result.dot_before, torch.tensor(-1.0, dtype=torch.float64))
+    assert torch.allclose(result.dot_after, torch.tensor(0.0, dtype=torch.float64), atol=1e-6)
+    assert torch.allclose(result.projected_gradients[0], torch.tensor([0.0, 0.0], dtype=torch.float64), atol=1e-6)
+
+
+def test_adam_q_weighted_projection_differs_from_euclidean() -> None:
+    g_repr = [torch.tensor([2.0, 1.0], dtype=torch.float64)]
+    g_fm = [torch.tensor([-1.0, 1.0], dtype=torch.float64)]
+    # Non-uniform preconditioner weights: emphasize the first component heavily
+    weights = [torch.tensor([10.0, 1.0], dtype=torch.float64)]
+
+    adam_result = project_gradient_onto_fm_feasible_cone_adam(g_repr, g_fm, weights, eps=1e-12)
+    eucl_result = project_gradient_onto_fm_feasible_cone(g_repr, g_fm, eps=1e-12)
+
+    assert adam_result.projection_applied is True
+    assert eucl_result.projection_applied is True
+    # With non-uniform weights, the Q-weighted projection should differ from Euclidean
+    assert not torch.allclose(adam_result.projected_gradients[0], eucl_result.projected_gradients[0], atol=1e-8)
+
+
+def test_adam_q_weighted_projection_skips_tiny_fm_gradient() -> None:
+    g_repr = [torch.tensor([1.0, 0.0], dtype=torch.float64)]
+    g_fm = [torch.tensor([-1e-8, 0.0], dtype=torch.float64)]
+    weights = [torch.tensor([1.0, 1.0], dtype=torch.float64)]
+
+    result = project_gradient_onto_fm_feasible_cone_adam(g_repr, g_fm, weights, eps=1e-6)
+
+    assert result.projection_applied is False
+    assert torch.allclose(result.projected_gradients[0], g_repr[0])
+
+
+# --- FM-primary constrained FAMO tests ---
+
+
+def test_fm_primary_constrained_famo_no_conflict_keeps_gate_open() -> None:
+    g_fm = [torch.tensor([1.0, 0.0], dtype=torch.float64)]
+    g_cl = [torch.tensor([0.0, 1.0], dtype=torch.float64)]
+
+    result = aggregate_two_task_fm_primary_constrained_famo(
+        g_fm, g_cl,
+        famo_weight_fm=0.5, famo_weight_cl=0.5,
+        c=0.5, fm_descent_floor_fraction=0.3, eps=1e-12,
+    )
+
+    assert isinstance(result, FMPrimaryConstrainedFAMOResult)
+    assert result.fm_floor_active is False
+    assert result.cl_gate_scale == pytest.approx(1.0)
+    assert result.famo_weight_fm == pytest.approx(0.5)
+    assert result.famo_weight_cl == pytest.approx(0.5)
+
+
+def test_fm_primary_constrained_famo_conflict_activates_gate() -> None:
+    g_fm = [torch.tensor([6.0, 1.0, 1.0], dtype=torch.float64)]
+    g_cl = [torch.tensor([-4.0, 1.0, 1.0], dtype=torch.float64)]
+
+    result = aggregate_two_task_fm_primary_constrained_famo(
+        g_fm, g_cl,
+        famo_weight_fm=0.2, famo_weight_cl=0.8,
+        c=0.5, fm_descent_floor_fraction=0.5, eps=1e-12,
+    )
+
+    assert isinstance(result, FMPrimaryConstrainedFAMOResult)
+    assert result.fm_floor_active is True
+    assert result.cl_gate_scale < 1.0
+    # Verify floor constraint: dot(g_fm, combined) >= floor_fraction * |g_fm|^2
+    fm_norm_sq = sum((g * g).sum() for g in g_fm)
+    floor = 0.5 * fm_norm_sq
+    actual_descent = sum((fm * c).sum() for fm, c in zip(g_fm, result.combined_gradients))
+    assert float(actual_descent) + 1e-6 >= float(floor)
+
+
+def test_fm_primary_constrained_famo_rejects_non_unit_weights() -> None:
+    with pytest.raises(ValueError, match="sum to 1.0"):
+        aggregate_two_task_fm_primary_constrained_famo(
+            [torch.ones(1, dtype=torch.float64)],
+            [torch.ones(1, dtype=torch.float64)],
+            famo_weight_fm=0.5, famo_weight_cl=0.6,
+            c=0.5, fm_descent_floor_fraction=0.3, eps=1e-12,
+        )
