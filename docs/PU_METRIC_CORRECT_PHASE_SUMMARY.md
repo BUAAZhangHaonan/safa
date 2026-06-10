@@ -1,7 +1,7 @@
 # PU Metric-Correct Implementation: Phase Summary
 
 **Date**: 2026-06-10
-**Branch**: `codex/point-gram-cl-diagnostics`
+**Branch**: `master`
 
 ---
 
