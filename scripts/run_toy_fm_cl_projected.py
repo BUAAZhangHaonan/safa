@@ -16,8 +16,6 @@ from safa.training.projected_update import (
     DualBudgetControlResult,
     ProjectionResult,
     TrustRegionScaleResult,
-    _dot,
-    _squared_norm,
     apply_fm_anchor_trust_region_scaling,
     compute_adaptive_margin_adjustment,
     project_gradient_onto_fm_feasible_cone,
@@ -269,7 +267,7 @@ def validate_config(config: ToyConfig) -> None:
     if "primal_dual_projected" in config.methods:
         if config.methods != ["primal_dual_projected"]:
             raise ValueError("primal_dual_projected must be standalone in methods")
-        if len(config.lambdas) != 1 or float(config.lambdas[0]) != 1.0:
+        if len(config.lambdas) != 1 or not math.isclose(float(config.lambdas[0]), 1.0, rel_tol=0.0, abs_tol=1e-12):
             raise ValueError("primal_dual_projected lambdas must be [1.0]")
     cagrad_methods = [method for method in ("cagrad", "fm_anchored_cagrad", "budgeted_cagrad") if method in config.methods]
     if cagrad_methods:
@@ -278,7 +276,7 @@ def validate_config(config: ToyConfig) -> None:
         method = cagrad_methods[0]
         if config.methods != [method]:
             raise ValueError(f"{method} must be standalone in methods")
-        if len(config.lambdas) != 1 or float(config.lambdas[0]) != 1.0:
+        if len(config.lambdas) != 1 or not math.isclose(float(config.lambdas[0]), 1.0, rel_tol=0.0, abs_tol=1e-12):
             raise ValueError(f"{method} lambdas must be [1.0]")
         cagrad_c = _require_optional_scalar(config.cagrad_c, f"{method} requires cagrad_c", min_value=0.0)
         if cagrad_c >= 1.0:
@@ -300,7 +298,7 @@ def validate_config(config: ToyConfig) -> None:
     if "uncertainty_weighted" in config.methods:
         if config.methods != ["uncertainty_weighted"]:
             raise ValueError("uncertainty_weighted must be standalone in methods")
-        if len(config.lambdas) != 1 or float(config.lambdas[0]) != 1.0:
+        if len(config.lambdas) != 1 or not math.isclose(float(config.lambdas[0]), 1.0, rel_tol=0.0, abs_tol=1e-12):
             raise ValueError("uncertainty_weighted lambdas must be [1.0]")
         _require_optional_scalar(
             config.uncertainty_log_var_lr,
@@ -361,7 +359,7 @@ class ToyVectorField(nn.Module):
         return self.net(torch.cat([x_t, t, z], dim=1))
 
 
-def run_experiment_grid(config: ToyConfig) -> dict[str, Any]:
+def run_experiment_grid(config: ToyConfig, metrics_callback=None) -> dict[str, Any]:
     validate_config(config)
     run_dir = Path(config.output_dir) / config.run_name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -380,6 +378,7 @@ def run_experiment_grid(config: ToyConfig) -> dict[str, Any]:
                     method=method,
                     lambda_repr=float(lambda_repr),
                     soft_margin=float(soft_margin),
+                    metrics_callback=metrics_callback,
                 )
                 experiments.append(result)
                 final_points.append(result["final"])
@@ -660,7 +659,7 @@ def project_gradient_with_soft_margin(
     _validate_gradient_lists(g_repr, g_fm)
     if not isinstance(epsilon, (float, int)) or not math.isfinite(float(epsilon)) or float(epsilon) < 0.0:
         raise ValueError("epsilon must be finite and non-negative")
-    if float(epsilon) == 0.0:
+    if math.isclose(float(epsilon), 0.0, rel_tol=0.0, abs_tol=1e-12):
         return project_gradient_onto_fm_feasible_cone(g_repr, g_fm, eps=eps)
 
     dot_before = _dot(g_repr, g_fm)
@@ -921,7 +920,7 @@ def _step_projected_two_step(
 
     if adaptive_trust_state is not None:
         # Trust region path: Euclidean projection with trust region scaling
-        if effective_margin == 0.0:
+        if math.isclose(effective_margin, 0.0, rel_tol=0.0, abs_tol=1e-12):
             projection = project_gradient_onto_fm_feasible_cone(g_repr, g_fm, eps=config.projection_eps)
         else:
             projection = project_gradient_with_soft_margin(
@@ -940,10 +939,6 @@ def _step_projected_two_step(
         after_losses = _compute_losses(config, model, batch)
         actual_fm_delta = float((after_losses["flow"] / flow_scale).detach().cpu()) - flow_guard_value
 
-        if config.fm_delta_target is None:
-            raise ValueError("adaptive_trust_projected requires fm_delta_target")
-        if config.dual_lr is None:
-            raise ValueError("adaptive_trust_projected requires dual_lr")
         if config.trust_radius_min is None or config.trust_radius_max is None:
             raise ValueError("adaptive_trust_projected requires trust_radius_min and trust_radius_max")
         dual_update = update_dual_budget_controller(
@@ -967,14 +962,14 @@ def _step_projected_two_step(
             adaptive_margin_direction=adaptive_margin_direction,
             trust_result=trust_result,
             dual_update=dual_update,
-            fm_delta_target=0.0 if config.fm_delta_target is None else float(config.fm_delta_target),
+            fm_delta_target=float(config.fm_delta_target),
             scaled_dot_after=scaled_dot_after,
             repr_learning_rate=config.repr_learning_rate,
         )
 
     elif adaptive_state is not None:
         # Adaptive margin only path: Euclidean projection with adaptive margin
-        if effective_margin == 0.0:
+        if math.isclose(effective_margin, 0.0, rel_tol=0.0, abs_tol=1e-12):
             projection = project_gradient_onto_fm_feasible_cone(g_repr, g_fm, eps=config.projection_eps)
         else:
             projection = project_gradient_with_soft_margin(
@@ -992,7 +987,7 @@ def _step_projected_two_step(
             adaptive_normalized_fm_loss=adaptive_normalized_fm_loss,
             adaptive_margin_baseline=adaptive_margin_baseline,
             adaptive_margin_direction=adaptive_margin_direction,
-            fm_delta_target=0.0 if config.fm_delta_target is None else float(config.fm_delta_target),
+            fm_delta_target=float(config.fm_delta_target),
             scaled_dot_after=projection.dot_after,
             repr_learning_rate=config.repr_learning_rate,
         )
@@ -1059,7 +1054,7 @@ def _step_projected_two_step(
             g_repr_for_proj = g_repr
 
         # Euclidean projection
-        if soft_margin == 0.0:
+        if math.isclose(soft_margin, 0.0, rel_tol=0.0, abs_tol=1e-12):
             projection = project_gradient_onto_fm_feasible_cone(
                 g_repr_for_proj, g_fm, eps=config.projection_eps,
             )
@@ -1123,12 +1118,26 @@ def _step_primal_dual_projected(
     repr_objective = lambda_repr * post_losses["repr"] / repr_scale
     flow_guard_value = float(flow_objective.detach().cpu())
     g_fm, g_repr = _task_gradients(model, flow_objective, repr_objective)
-    projection = project_gradient_onto_fm_feasible_cone(g_repr, g_fm, eps=config.projection_eps)
+    if config.optimizer_type == "adamw":
+        # === Adam metric path: Q-weighted projection ===
+        preconditioner_weights = _extract_adam_preconditioner_weights(fm_optimizer, model)
 
-    # This is dual step-control projected training, not a full augmented Lagrangian.
-    dual_value_used = float(dual_value)
-    effective_repr_lr = float(config.repr_learning_rate) / (1.0 + dual_value_used)
-    _manual_parameter_step(model, projection.projected_gradients, effective_repr_lr)
+        projection = project_gradient_onto_fm_feasible_cone_adam(
+            g_repr, g_fm, preconditioner_weights, eps=config.projection_eps,
+        )
+
+        # This is dual step-control projected training, not a full augmented Lagrangian.
+        dual_value_used = float(dual_value)
+        effective_repr_lr = float(config.repr_learning_rate) / (1.0 + dual_value_used)
+        _preconditioned_parameter_step(model, projection.projected_gradients, preconditioner_weights, effective_repr_lr)
+    else:
+        # === SGD Euclidean path ===
+        projection = project_gradient_onto_fm_feasible_cone(g_repr, g_fm, eps=config.projection_eps)
+
+        # This is dual step-control projected training, not a full augmented Lagrangian.
+        dual_value_used = float(dual_value)
+        effective_repr_lr = float(config.repr_learning_rate) / (1.0 + dual_value_used)
+        _manual_parameter_step(model, projection.projected_gradients, effective_repr_lr)
 
     after_losses = _compute_losses(config, model, batch)
     normalized_flow_after = float((after_losses["flow"] / flow_scale).detach().cpu())
@@ -1207,7 +1216,7 @@ def _step_cagrad(
         g_repr,
         g_fm,
         _dot(g_repr, g_fm),
-        _dot(result.combined_gradients, result.combined_gradients),
+        _dot(result.combined_gradients, g_fm),
         actual_fm_delta=actual_fm_delta,
         combined_gradients=result.combined_gradients,
     )
@@ -1255,7 +1264,7 @@ def _step_fm_anchored_cagrad(
         g_repr,
         g_fm,
         _dot(g_repr, g_fm),
-        _dot(result.combined_gradients, result.combined_gradients),
+        _dot(result.combined_gradients, g_fm),
         actual_fm_delta=actual_fm_delta,
         combined_gradients=result.combined_gradients,
     )
@@ -1307,7 +1316,7 @@ def _step_budgeted_cagrad(
         g_repr,
         g_fm,
         _dot(g_repr, g_fm),
-        _dot(result.combined_gradients, result.combined_gradients),
+        _dot(result.combined_gradients, g_fm),
         actual_fm_delta=actual_fm_delta,
         combined_gradients=result.combined_gradients,
     )
@@ -1616,7 +1625,7 @@ def _step_descent_credit_projected(
     lambda_repr: float,
     soft_margin: float,
 ) -> dict[str, float]:
-    if lambda_repr != 1.0:
+    if not math.isclose(lambda_repr, 1.0, rel_tol=0.0, abs_tol=1e-12):
         raise ValueError("descent_credit_projected uses fixed lambda_repr=1.0")
     if not math.isclose(float(soft_margin), 0.0, rel_tol=0.0, abs_tol=1e-12):
         raise ValueError("descent_credit_projected requires soft_margin=0.0")
@@ -1682,7 +1691,7 @@ def _step_descent_credit_scaled(
     lambda_repr: float,
     soft_margin: float,
 ) -> dict[str, float]:
-    if lambda_repr != 1.0:
+    if not math.isclose(lambda_repr, 1.0, rel_tol=0.0, abs_tol=1e-12):
         raise ValueError("descent_credit_scaled uses fixed lambda_repr=1.0")
     if not math.isclose(float(soft_margin), 0.0, rel_tol=0.0, abs_tol=1e-12):
         raise ValueError("descent_credit_scaled requires soft_margin=0.0")
@@ -2275,13 +2284,6 @@ def _empty_step_stats() -> dict[str, float]:
     }
 
 
-def _initial_step_stats(method: str, soft_margin: float) -> dict[str, float]:
-    stats = _empty_step_stats()
-    if method in {"adaptive_margin_projected", "adaptive_trust_projected"}:
-        stats["adaptive_margin"] = float(soft_margin)
-    return stats
-
-
 def _accumulate_stats(window: dict[str, list[float]], step_stats: dict[str, float]) -> None:
     window["conflict"].append(float(step_stats["conflict_fraction"]))
     window["dot_before"].append(float(step_stats["dot_before_mean"]))
@@ -2313,33 +2315,33 @@ def _accumulate_stats(window: dict[str, list[float]], step_stats: dict[str, floa
     window["uncertainty_fm_weight"].append(float(step_stats["uncertainty_fm_weight"]))
     window["uncertainty_cl_weight"].append(float(step_stats["uncertainty_cl_weight"]))
     window["uncertainty_formula_total"].append(float(step_stats["uncertainty_formula_total"]))
-    window["pu_norm_ratio"].append(float(step_stats.get("pu_norm_ratio", 0.0)))
-    window["pu_backtrack_count"].append(float(step_stats.get("pu_backtrack_count", 0.0)))
-    window["pu_effective_repr_lr"].append(float(step_stats.get("pu_effective_repr_lr", 0.0)))
+    window["pu_norm_ratio"].append(float(step_stats["pu_norm_ratio"]))
+    window["pu_backtrack_count"].append(float(step_stats["pu_backtrack_count"]))
+    window["pu_effective_repr_lr"].append(float(step_stats["pu_effective_repr_lr"]))
     # Master keys
-    window["adaptive_margin"].append(float(step_stats.get("adaptive_margin", 0.0)))
-    window["adaptive_normalized_fm_loss"].append(float(step_stats.get("adaptive_normalized_fm_loss", 0.0)))
-    window["adaptive_margin_baseline"].append(float(step_stats.get("adaptive_margin_baseline", 0.0)))
-    window["adaptive_margin_direction"].append(float(step_stats.get("adaptive_margin_direction", 0.0)))
-    window["trust_radius_used"].append(float(step_stats.get("trust_radius_used", 0.0)))
-    window["trust_radius_next"].append(float(step_stats.get("trust_radius_next", 0.0)))
-    window["trust_scale"].append(float(step_stats.get("trust_scale", 0.0)))
-    window["trust_region_active"].append(float(step_stats.get("trust_region_active", 0.0)))
-    window["fm_budget_violation"].append(float(step_stats.get("fm_budget_violation", 0.0)))
-    window["fm_delta_target"].append(float(step_stats.get("fm_delta_target", 0.0)))
-    window["scaled_dot_after"].append(float(step_stats.get("scaled_dot_after_mean", 0.0)))
-    window["repr_step_fm_first_order_effect"].append(float(step_stats.get("repr_step_fm_first_order_effect", 0.0)))
-    window["line_search_attempts"].append(float(step_stats.get("line_search_attempts", 0.0)))
-    window["line_search_alpha"].append(float(step_stats.get("line_search_alpha", 0.0)))
-    window["line_search_accepted"].append(float(step_stats.get("line_search_accepted", 0.0)))
-    window["line_search_flow_delta"].append(float(step_stats.get("line_search_flow_delta", 0.0)))
-    window["line_search_repr_delta"].append(float(step_stats.get("line_search_repr_delta", 0.0)))
-    window["budgeted_direction_norm_ratio"].append(float(step_stats.get("budgeted_direction_norm_ratio", 0.0)))
-    window["fm_descent_credit"].append(float(step_stats.get("fm_descent_credit", 0.0)))
-    window["credit_dot_lower_bound"].append(float(step_stats.get("credit_dot_lower_bound", 0.0)))
-    window["credit_budget_used_fraction"].append(float(step_stats.get("credit_budget_used_fraction", 0.0)))
-    window["net_fm_delta_after_two_step"].append(float(step_stats.get("net_fm_delta_after_two_step", 0.0)))
-    window["credit_scale"].append(float(step_stats.get("credit_scale", 0.0)))
+    window["adaptive_margin"].append(float(step_stats["adaptive_margin"]))
+    window["adaptive_normalized_fm_loss"].append(float(step_stats["adaptive_normalized_fm_loss"]))
+    window["adaptive_margin_baseline"].append(float(step_stats["adaptive_margin_baseline"]))
+    window["adaptive_margin_direction"].append(float(step_stats["adaptive_margin_direction"]))
+    window["trust_radius_used"].append(float(step_stats["trust_radius_used"]))
+    window["trust_radius_next"].append(float(step_stats["trust_radius_next"]))
+    window["trust_scale"].append(float(step_stats["trust_scale"]))
+    window["trust_region_active"].append(float(step_stats["trust_region_active"]))
+    window["fm_budget_violation"].append(float(step_stats["fm_budget_violation"]))
+    window["fm_delta_target"].append(float(step_stats["fm_delta_target"]))
+    window["scaled_dot_after"].append(float(step_stats["scaled_dot_after_mean"]))
+    window["repr_step_fm_first_order_effect"].append(float(step_stats["repr_step_fm_first_order_effect"]))
+    window["line_search_attempts"].append(float(step_stats["line_search_attempts"]))
+    window["line_search_alpha"].append(float(step_stats["line_search_alpha"]))
+    window["line_search_accepted"].append(float(step_stats["line_search_accepted"]))
+    window["line_search_flow_delta"].append(float(step_stats["line_search_flow_delta"]))
+    window["line_search_repr_delta"].append(float(step_stats["line_search_repr_delta"]))
+    window["budgeted_direction_norm_ratio"].append(float(step_stats["budgeted_direction_norm_ratio"]))
+    window["fm_descent_credit"].append(float(step_stats["fm_descent_credit"]))
+    window["credit_dot_lower_bound"].append(float(step_stats["credit_dot_lower_bound"]))
+    window["credit_budget_used_fraction"].append(float(step_stats["credit_budget_used_fraction"]))
+    window["net_fm_delta_after_two_step"].append(float(step_stats["net_fm_delta_after_two_step"]))
+    window["credit_scale"].append(float(step_stats["credit_scale"]))
 
 
 def _summarize_stat_window(window: dict[str, list[float]]) -> dict[str, float]:
@@ -2576,10 +2578,16 @@ def _validate_gradient_lists(g_repr: list[torch.Tensor], g_fm: list[torch.Tensor
     if len(g_repr) != len(g_fm):
         raise ValueError("g_repr and g_fm must have the same length")
     for index, (repr_grad, fm_grad) in enumerate(zip(g_repr, g_fm)):
+        if not isinstance(repr_grad, torch.Tensor):
+            raise TypeError(f"g_repr[{index}] must be a torch.Tensor")
+        if not isinstance(fm_grad, torch.Tensor):
+            raise TypeError(f"g_fm[{index}] must be a torch.Tensor")
         if repr_grad.shape != fm_grad.shape:
             raise ValueError(f"g_repr[{index}] and g_fm[{index}] must have the same shape")
         if repr_grad.device != fm_grad.device:
             raise ValueError(f"g_repr[{index}] and g_fm[{index}] must be on the same device")
+        if not repr_grad.is_floating_point() or not fm_grad.is_floating_point():
+            raise TypeError("gradient tensors must be floating point")
         if not torch.isfinite(repr_grad).all() or not torch.isfinite(fm_grad).all():
             raise FloatingPointError("gradient tensors must be finite")
 
