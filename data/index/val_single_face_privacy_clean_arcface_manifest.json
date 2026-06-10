@@ -1,0 +1,39 @@
+{
+  "artifact": "privacy_clean_arcface_index",
+  "blocker_hash": "8c848d7c02aca66ed4b8ece717ea08d410e6b62cfe89876ca992f3e0",
+  "blocker_hash_absent_from_output_sample_ids": true,
+  "blocker_report": "artifacts/reports/privacy_clean_source_arcface_blockers_20260607.jsonl",
+  "blocker_report_sha256": "5baccb2721e8f11db757d768e40057577bebc3df667ecc645bfe6093b165e6bf",
+  "created_for": "remove ArcFace privacy source blocker from val_single_face without changing training code",
+  "num_output": 3968,
+  "num_removed": 1,
+  "num_source": 3969,
+  "ordered_sample_id_sha256": "686534e4284ccc985faa9aa316f7c0ffde9cae9716aed2b9a66d3903dc33718f",
+  "ordered_sample_id_sha256_algorithm": "sha256 of UTF-8 sample_id values joined by LF, with trailing LF",
+  "output_index": "data/index/val_single_face_privacy_clean_arcface.jsonl",
+  "output_index_sha256": "c425eedb7e2939bf89782d9a0ecbb9fa896208a55546f895e673354b16432354",
+  "removed": [
+    {
+      "error_message": "Recognizer arcface expected exactly one face, detected 2",
+      "face_count": 2,
+      "feature_row_index": 954,
+      "image_path": "/home/hdd3/zhanghaonan/AffectNet/Manually_Annotated_Images/377/8c848d7c02aca66ed4b8ece717ea08d410e6b62cfe89876ca992f3e0.jpg",
+      "input_pipeline": "FeatureAlignedAffectNet -> load_rgb_image_strict(PIL RGB) -> generator_image_transform(Resize(224,224), ToTensor()) -> cuda:0 -> InsightFaceRecognizer tensor clamp/uint8/BGR -> FaceAnalysis.get(det_size=(224,224))",
+      "label": 6,
+      "recognizer": "arcface",
+      "recognizer_type": "insightface",
+      "role": "source",
+      "sample_id": "val:Manually_Annotated_Images/377/8c848d7c02aca66ed4b8ece717ea08d410e6b62cfe89876ca992f3e0.jpg",
+      "source_line_number": 955,
+      "source_row_index": 954,
+      "variant": "clean"
+    }
+  ],
+  "source_cache": "artifacts/e0_features/val_single_face_e0_medium_v1",
+  "source_cache_manifest_sha256": "064e511c90ce936aecaa1e52ffa9fb6c967707a723abf88896557e2261406452",
+  "source_index": "data/index/val_single_face.jsonl",
+  "source_index_manifest": "data/index/val_single_face_manifest.json",
+  "source_index_manifest_sha256": "004956b285a1e958cbd7182ae7e67a5e50aaa9ab3f886e935538a807c2b5f167",
+  "source_index_sha256": "da14e23eacefecbc2948d1374fb93961a13d017a9183aa1fe2a2f62b33a4b4ea",
+  "source_ordered_sample_id_sha256": "000eee4cf38b4c80d6e2850bbe9df7ca656d6be4b7826607852e35844a72dca6"
+}

@@ -25,6 +25,164 @@ TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
 
 
 class EvalContractTests(unittest.TestCase):
+    def _run_candidate_rerank_eval(
+        self,
+        *,
+        candidate_rerank: dict | None,
+        cosines: list[float] | list[list[float]],
+        face_counts: list[int] | list[list[int]] | None,
+        face_detection_enabled: bool,
+        dataset_len: int = 1,
+        batch_size: int = 1,
+        save_generated_images: bool = False,
+    ):
+        import torch
+
+        from safa.evaluation import runner
+
+        def candidate_value(values, sample_index: int, candidate_index: int):
+            first = values[0]
+            if isinstance(first, list):
+                return values[sample_index][candidate_index]
+            return values[candidate_index]
+
+        dataset_len = int(dataset_len)
+        batch_size = int(batch_size)
+        num_candidates = 1
+        if candidate_rerank is not None and candidate_rerank.get("enabled", False):
+            num_candidates = int(candidate_rerank.get("num_candidates", 1))
+
+        class DummyDataset(torch.utils.data.Dataset):
+            manifest = SimpleNamespace(feature_dim=2, l2_normalized=True)
+
+            def __len__(self):
+                return dataset_len
+
+            def __getitem__(self, index):
+                return {
+                    "image": torch.full((3, 4, 4), -1.0),
+                    "z": torch.tensor([1.0, float(index)]),
+                    "label": torch.tensor(index % 2),
+                    "sample_id": f"sample-{index}",
+                }
+
+        class DummyE0(torch.nn.Module):
+            def forward(self, images):
+                embeddings = []
+                for image in images.detach().cpu():
+                    marker = float(image[0, 0, 0])
+                    if marker < 0:
+                        embeddings.append([1.0, 0.0])
+                        continue
+                    candidate_index = int(round(marker))
+                    sample_index = int(round(float(image[0, 0, 1])))
+                    cosine = float(candidate_value(cosines, sample_index, candidate_index))
+                    z_unit = torch.tensor([1.0, float(sample_index)], dtype=torch.float64)
+                    z_unit = z_unit / z_unit.norm()
+                    perpendicular = torch.tensor([-z_unit[1], z_unit[0]], dtype=torch.float64)
+                    sine = math.sqrt(max(0.0, 1.0 - cosine * cosine))
+                    embedding = cosine * z_unit + sine * perpendicular
+                    embeddings.append([float(embedding[0]), float(embedding[1])])
+                embedding = torch.tensor(embeddings, device=images.device, dtype=images.dtype)
+                logits = torch.tensor([[1.0, 0.0]], device=images.device, dtype=images.dtype).repeat(images.shape[0], 1)
+                return {"embedding": embedding, "logits": logits}
+
+        class DummyGenerator(torch.nn.Module):
+            config = SimpleNamespace(embedding_dim=2)
+
+            def __init__(self):
+                super().__init__()
+                self.x_inits = []
+                self.saved_images = []
+
+            def sample(self, z, **kwargs):
+                call_index = len(self.x_inits)
+                self.x_inits.append(kwargs["x_init"].detach().clone())
+                candidate_index = call_index % num_candidates
+                generated = torch.zeros((z.shape[0], 3, 4, 4), device=z.device, dtype=z.dtype)
+                generated[:, 0, 0, 0] = float(candidate_index)
+                generated[:, 0, 0, 1] = z[:, 1]
+                return generated
+
+        class DummyDetector:
+            def detect_counts(self, images):
+                counts = []
+                for image in images.detach().cpu():
+                    candidate_index = int(round(float(image[0, 0, 0])))
+                    sample_index = int(round(float(image[0, 0, 1])))
+                    counts.append(int(candidate_value(face_counts, sample_index, candidate_index)))
+                return counts
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            e0_path = root / "e0.pt"
+            g_path = root / "g.pt"
+            e0_path.write_bytes(b"e0")
+            g_path.write_bytes(b"g")
+            config = {
+                "seed": 1337,
+                "sampling_seed": 1337,
+                "device": "cuda:0",
+                "num_workers": 0,
+                "batch_size": batch_size,
+                "image_size": 4,
+                "index": "dummy-index",
+                "features": "dummy-features",
+                "e0_checkpoint": str(e0_path),
+                "g_checkpoint": str(g_path),
+                "out_json": str(root / "result.json"),
+                "per_sample_jsonl": str(root / "per_sample.jsonl"),
+                "sample_dir": str(root / "samples"),
+                "face_detection": {"enabled": False},
+                "privacy": {"enabled": False},
+                "anti_steg": {"enabled": False},
+            }
+            if face_detection_enabled:
+                config["face_detection"] = {
+                    "enabled": True,
+                    "model_name": "buffalo_l",
+                    "threshold": 0.95,
+                    "single_face_eq1_threshold": 0.0,
+                    "latent_cosine_threshold": 0.0,
+                }
+            if candidate_rerank is not None:
+                config["candidate_rerank"] = candidate_rerank
+            if save_generated_images:
+                config["save_generated_images"] = True
+
+            generator = DummyGenerator()
+            detector = DummyDetector() if face_counts is not None else None
+
+            def fake_save_generated_image_for_eval(image, output_dir, *, global_index: int, sample_id, row: dict):
+                generator.saved_images.append(
+                    {
+                        "image": image.detach().clone(),
+                        "global_index": int(global_index),
+                        "sample_id": str(sample_id),
+                    }
+                )
+                path = Path(output_dir) / f"{int(global_index):08d}.png"
+                row.setdefault("artifacts", {})["generated_image_path"] = str(path)
+                return path
+
+            with (
+                patch.object(runner, "require_cuda_device", return_value=torch.device("cpu")),
+                patch.object(runner, "FeatureAlignedAffectNet", return_value=DummyDataset()),
+                patch.object(runner, "load_e0_checkpoint", return_value=(DummyE0(), {"model_config": {"embedding_dim": 2}})),
+                patch.object(runner, "_load_generator", return_value=generator),
+                patch.object(runner, "_build_face_detector", return_value=detector),
+                patch.object(runner, "normalize_for_e0", side_effect=lambda images: images),
+                patch.object(runner, "_save_generated_image_for_eval", side_effect=fake_save_generated_image_for_eval),
+            ):
+                result = runner.run_eval_from_config(config)
+
+            rows = [
+                json.loads(line)
+                for line in Path(config["per_sample_jsonl"]).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            return result, rows, generator
+
     def test_summarize_rejects_nan(self) -> None:
         with self.assertRaises(ValueError):
             summarize([1.0, math.nan])
@@ -471,6 +629,567 @@ class EvalContractTests(unittest.TestCase):
         self.assertIsNotNone(generator.sample_kwargs)
         expected = make_x_init_for_sample_ids(["sample-a", "sample-b"], 1337, 4, z.device, z.dtype)
         self.assertTrue(torch.equal(generator.sample_kwargs["x_init"], expected))
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for candidate rerank tests")
+    def test_candidate_rerank_disabled_preserves_single_candidate_sampling(self) -> None:
+        import torch
+
+        from safa.utils.sampling import make_x_init_for_sample_ids
+
+        _, rows, generator = self._run_candidate_rerank_eval(
+            candidate_rerank=None,
+            cosines=[0.8],
+            face_counts=None,
+            face_detection_enabled=False,
+        )
+
+        self.assertEqual(len(generator.x_inits), 1)
+        expected = make_x_init_for_sample_ids(["sample-0"], 1337, 4, torch.device("cpu"), torch.float32)
+        self.assertTrue(torch.equal(generator.x_inits[0], expected))
+        self.assertNotIn("candidate_rerank", rows[0])
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for candidate rerank tests")
+    def test_candidate_rerank_adaptive_disabled_matches_fixed_k(self) -> None:
+        import torch
+
+        cosines = [
+            [0.50, 0.80, 0.70],
+            [0.20, 0.10, 0.95],
+        ]
+        fixed_config = {
+            "enabled": True,
+            "num_candidates": 3,
+            "single_face_priority": False,
+            "selection_metric": "latent_cosine",
+        }
+        disabled_adaptive_config = {
+            **fixed_config,
+            "adaptive_k": {
+                "enabled": False,
+                "min_candidates": 1,
+                "accept_latent_cosine_threshold": 0.99,
+                "require_single_face": True,
+            },
+        }
+
+        fixed_result, fixed_rows, fixed_generator = self._run_candidate_rerank_eval(
+            candidate_rerank=fixed_config,
+            cosines=cosines,
+            face_counts=None,
+            face_detection_enabled=False,
+            dataset_len=2,
+            batch_size=2,
+        )
+        disabled_result, disabled_rows, disabled_generator = self._run_candidate_rerank_eval(
+            candidate_rerank=disabled_adaptive_config,
+            cosines=cosines,
+            face_counts=None,
+            face_detection_enabled=False,
+            dataset_len=2,
+            batch_size=2,
+        )
+
+        self.assertEqual(
+            disabled_result["sampling"]["candidate_rerank"],
+            fixed_result["sampling"]["candidate_rerank"],
+        )
+        self.assertNotIn("adaptive_k", disabled_result["sampling"]["candidate_rerank"])
+        self.assertEqual(len(disabled_generator.x_inits), len(fixed_generator.x_inits))
+        self.assertEqual(len(disabled_generator.x_inits), 3)
+        for disabled_x_init, fixed_x_init in zip(disabled_generator.x_inits, fixed_generator.x_inits):
+            self.assertTrue(torch.equal(disabled_x_init, fixed_x_init))
+
+        for disabled_row, fixed_row in zip(disabled_rows, fixed_rows):
+            self.assertEqual(disabled_row["candidate_rerank"], fixed_row["candidate_rerank"])
+            self.assertEqual(disabled_row["candidate_rerank"]["num_candidates"], 3)
+            self.assertNotIn("adaptive_k", disabled_row["candidate_rerank"])
+            self.assertNotIn("num_candidates_evaluated", disabled_row["candidate_rerank"])
+            self.assertNotIn("stop_reason", disabled_row["candidate_rerank"])
+            self.assertAlmostEqual(
+                disabled_row["affective"]["latent_cosine"],
+                fixed_row["affective"]["latent_cosine"],
+                places=6,
+            )
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for candidate rerank tests")
+    def test_candidate_rerank_prefers_single_face_before_cosine(self) -> None:
+        _, rows, generator = self._run_candidate_rerank_eval(
+            candidate_rerank={
+                "enabled": True,
+                "num_candidates": 3,
+                "single_face_priority": True,
+                "selection_metric": "latent_cosine",
+            },
+            cosines=[0.95, 0.8, 0.7],
+            face_counts=[2, 1, 1],
+            face_detection_enabled=True,
+        )
+
+        self.assertEqual(len(generator.x_inits), 3)
+        self.assertEqual(rows[0]["candidate_rerank"]["selected_candidate_index"], 1)
+        self.assertAlmostEqual(rows[0]["affective"]["latent_cosine"], 0.8)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for candidate rerank tests")
+    def test_candidate_rerank_uses_latent_cosine_after_single_face_gate(self) -> None:
+        _, rows, _ = self._run_candidate_rerank_eval(
+            candidate_rerank={
+                "enabled": True,
+                "num_candidates": 3,
+                "single_face_priority": True,
+                "selection_metric": "latent_cosine",
+            },
+            cosines=[0.6, 0.9, 0.99],
+            face_counts=[1, 1, 2],
+            face_detection_enabled=True,
+        )
+
+        self.assertEqual(rows[0]["candidate_rerank"]["selected_candidate_index"], 1)
+        self.assertAlmostEqual(rows[0]["candidate_rerank"]["selected_latent_cosine"], 0.9)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for candidate rerank tests")
+    def test_candidate_rerank_falls_back_to_latent_cosine_without_face_detector(self) -> None:
+        result, rows, generator = self._run_candidate_rerank_eval(
+            candidate_rerank={
+                "enabled": True,
+                "num_candidates": 3,
+                "single_face_priority": True,
+                "selection_metric": "latent_cosine",
+            },
+            cosines=[0.55, 0.92, 0.8],
+            face_counts=None,
+            face_detection_enabled=False,
+        )
+
+        self.assertEqual(len(generator.x_inits), 3)
+        self.assertEqual(result["sampling"]["candidate_rerank"]["enabled"], True)
+        self.assertEqual(rows[0]["face_detection"], {})
+        metadata = rows[0]["candidate_rerank"]
+        self.assertEqual(metadata["selected_candidate_index"], 1)
+        self.assertAlmostEqual(metadata["selected_latent_cosine"], 0.92)
+        self.assertIsNone(metadata["selected_face_count"])
+        self.assertNotIn("face_count", metadata["candidates"][0])
+        self.assertAlmostEqual(rows[0]["affective"]["latent_cosine"], 0.92)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for candidate rerank tests")
+    def test_candidate_rerank_selects_independently_per_sample_in_batch(self) -> None:
+        import torch
+
+        from safa.utils.sampling import make_x_init_for_sample_ids
+
+        cosines = [
+            [0.95, 0.20, 0.10],
+            [0.15, 0.91, 0.25],
+            [0.30, 0.35, 0.93],
+        ]
+
+        result, rows, generator = self._run_candidate_rerank_eval(
+            candidate_rerank={
+                "enabled": True,
+                "num_candidates": 3,
+                "single_face_priority": False,
+                "selection_metric": "latent_cosine",
+            },
+            cosines=cosines,
+            face_counts=None,
+            face_detection_enabled=False,
+            dataset_len=3,
+            batch_size=3,
+            save_generated_images=True,
+        )
+
+        sample_ids = ["sample-0", "sample-1", "sample-2"]
+        selected_indices = [0, 1, 2]
+        self.assertEqual(result["dataset"]["num_samples"], 3)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(len(generator.x_inits), 3)
+        self.assertEqual(len(generator.saved_images), 3)
+        self.assertEqual([row["sample_id"] for row in rows], sample_ids)
+
+        for candidate_index, x_init in enumerate(generator.x_inits):
+            self.assertEqual(tuple(x_init.shape), (3, 3, 4, 4))
+            expected = make_x_init_for_sample_ids(
+                [f"{sample_id}::candidate::{candidate_index}" for sample_id in sample_ids],
+                1337,
+                4,
+                x_init.device,
+                x_init.dtype,
+            )
+            self.assertTrue(torch.equal(x_init, expected))
+
+        for sample_index, row in enumerate(rows):
+            selected_index = selected_indices[sample_index]
+            metadata = row["candidate_rerank"]
+            self.assertEqual(metadata["enabled"], True)
+            self.assertEqual(metadata["num_candidates"], 3)
+            self.assertEqual(metadata["single_face_priority"], False)
+            self.assertEqual(metadata["selection_metric"], "latent_cosine")
+            self.assertEqual(metadata["selected_candidate_index"], selected_index)
+            self.assertAlmostEqual(
+                metadata["selected_latent_cosine"],
+                cosines[sample_index][selected_index],
+                places=6,
+            )
+            self.assertIsNone(metadata["selected_face_count"])
+            self.assertEqual([candidate["index"] for candidate in metadata["candidates"]], [0, 1, 2])
+            self.assertFalse(any("face_count" in candidate for candidate in metadata["candidates"]))
+            for candidate_index, candidate in enumerate(metadata["candidates"]):
+                self.assertAlmostEqual(
+                    candidate["latent_cosine"],
+                    cosines[sample_index][candidate_index],
+                    places=6,
+                )
+            self.assertAlmostEqual(
+                row["affective"]["latent_cosine"],
+                cosines[sample_index][selected_index],
+                places=6,
+            )
+
+            saved = generator.saved_images[sample_index]
+            self.assertEqual(saved["global_index"], sample_index)
+            self.assertEqual(saved["sample_id"], sample_ids[sample_index])
+            self.assertEqual(tuple(saved["image"].shape), (3, 4, 4))
+            self.assertEqual(int(saved["image"][0, 0, 0].item()), selected_index)
+            self.assertEqual(int(saved["image"][0, 0, 1].item()), sample_index)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for candidate rerank tests")
+    def test_candidate_rerank_records_selection_metadata(self) -> None:
+        import torch
+
+        from safa.utils.sampling import make_x_init_for_sample_ids
+
+        result, rows, generator = self._run_candidate_rerank_eval(
+            candidate_rerank={
+                "enabled": True,
+                "num_candidates": 2,
+                "single_face_priority": True,
+                "selection_metric": "latent_cosine",
+            },
+            cosines=[0.7, 0.85],
+            face_counts=[0, 1],
+            face_detection_enabled=True,
+        )
+
+        self.assertEqual(result["sampling"]["candidate_rerank"]["enabled"], True)
+        self.assertEqual(result["sampling"]["candidate_rerank"]["num_candidates"], 2)
+        expected_candidate_0 = make_x_init_for_sample_ids(
+            ["sample-0::candidate::0"],
+            1337,
+            4,
+            generator.x_inits[0].device,
+            generator.x_inits[0].dtype,
+        )
+        self.assertTrue(torch.equal(generator.x_inits[0], expected_candidate_0))
+        metadata = rows[0]["candidate_rerank"]
+        self.assertEqual(metadata["enabled"], True)
+        self.assertEqual(metadata["num_candidates"], 2)
+        self.assertEqual(metadata["selected_candidate_index"], 1)
+        self.assertAlmostEqual(metadata["selected_latent_cosine"], 0.85)
+        self.assertEqual(metadata["selected_face_count"], 1)
+        self.assertEqual([candidate["index"] for candidate in metadata["candidates"]], [0, 1])
+        self.assertEqual([candidate["face_count"] for candidate in metadata["candidates"]], [0, 1])
+        self.assertAlmostEqual(metadata["candidates"][0]["latent_cosine"], 0.7)
+        self.assertAlmostEqual(metadata["candidates"][1]["latent_cosine"], 0.85)
+
+    def test_candidate_rerank_parses_adaptive_k_config(self) -> None:
+        from safa.evaluation import runner
+
+        config = runner._candidate_rerank_config(
+            {
+                "candidate_rerank": {
+                    "enabled": True,
+                    "num_candidates": 48,
+                    "single_face_priority": True,
+                    "selection_metric": "latent_cosine",
+                    "adaptive_k": {
+                        "enabled": True,
+                        "min_candidates": 8,
+                        "accept_latent_cosine_threshold": 0.95,
+                        "require_single_face": True,
+                    },
+                }
+            }
+        )
+
+        self.assertEqual(
+            config["adaptive_k"],
+            {
+                "enabled": True,
+                "min_candidates": 8,
+                "accept_latent_cosine_threshold": 0.95,
+                "require_single_face": True,
+            },
+        )
+        self.assertEqual(
+            runner._candidate_rerank_result_metadata(config)["adaptive_k"],
+            {
+                "enabled": True,
+                "min_candidates": 8,
+                "accept_latent_cosine_threshold": 0.95,
+                "require_single_face": True,
+            },
+        )
+
+    def test_candidate_rerank_rejects_invalid_adaptive_k_config(self) -> None:
+        from safa.evaluation import runner
+
+        def parse_adaptive(adaptive_k: dict):
+            return runner._candidate_rerank_config(
+                {
+                    "candidate_rerank": {
+                        "enabled": True,
+                        "num_candidates": 4,
+                        "single_face_priority": True,
+                        "selection_metric": "latent_cosine",
+                        "adaptive_k": adaptive_k,
+                    }
+                }
+            )
+
+        cases = [
+            ({}, "candidate_rerank.adaptive_k.enabled"),
+            (
+                {"enabled": True, "min_candidates": 0, "accept_latent_cosine_threshold": 0.95, "require_single_face": True},
+                "candidate_rerank.adaptive_k.min_candidates",
+            ),
+            (
+                {"enabled": True, "min_candidates": 5, "accept_latent_cosine_threshold": 0.95, "require_single_face": True},
+                "min_candidates.*num_candidates",
+            ),
+            (
+                {"enabled": True, "min_candidates": 2, "accept_latent_cosine_threshold": math.nan, "require_single_face": True},
+                "candidate_rerank.adaptive_k.accept_latent_cosine_threshold",
+            ),
+            (
+                {"enabled": True, "min_candidates": 2, "accept_latent_cosine_threshold": 0.95, "require_single_face": "yes"},
+                "candidate_rerank.adaptive_k.require_single_face",
+            ),
+        ]
+        for adaptive_k, message in cases:
+            with self.subTest(adaptive_k=adaptive_k):
+                with self.assertRaisesRegex(ValueError, message):
+                    parse_adaptive(adaptive_k)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for candidate rerank tests")
+    def test_candidate_rerank_adaptive_stops_each_sample_independently(self) -> None:
+        cosines = [
+            [0.1, 0.95, 0.99, 0.99],
+            [0.1, 0.2, 0.3, 0.4],
+        ]
+
+        result, rows, generator = self._run_candidate_rerank_eval(
+            candidate_rerank={
+                "enabled": True,
+                "num_candidates": 4,
+                "single_face_priority": False,
+                "selection_metric": "latent_cosine",
+                "adaptive_k": {
+                    "enabled": True,
+                    "min_candidates": 2,
+                    "accept_latent_cosine_threshold": 0.9,
+                    "require_single_face": False,
+                },
+            },
+            cosines=cosines,
+            face_counts=None,
+            face_detection_enabled=False,
+            dataset_len=2,
+            batch_size=2,
+        )
+
+        self.assertEqual(result["sampling"]["candidate_rerank"]["adaptive_k"]["enabled"], True)
+        self.assertEqual(
+            [tuple(x_init.shape) for x_init in generator.x_inits],
+            [(2, 3, 4, 4), (2, 3, 4, 4), (1, 3, 4, 4), (1, 3, 4, 4)],
+        )
+
+        cost_summary = result["metrics"]["candidate_rerank"]
+        self.assertAlmostEqual(cost_summary["num_candidates_evaluated_mean"], 3.0)
+        self.assertAlmostEqual(cost_summary["num_candidates_evaluated_median"], 3.0)
+        self.assertAlmostEqual(cost_summary["num_candidates_evaluated_p90"], 3.8)
+        self.assertEqual(cost_summary["num_candidates_evaluated_total"], 6)
+        self.assertEqual(cost_summary["num_candidates_configured_total"], 8)
+        self.assertAlmostEqual(cost_summary["candidate_compute_saved_ratio"], 0.25)
+        self.assertAlmostEqual(cost_summary["threshold_passed_rate"], 0.5)
+        self.assertEqual(cost_summary["stop_reason_counts"], {"max_k_no_threshold_passed": 1, "threshold_passed": 1})
+
+        first = rows[0]["candidate_rerank"]
+        self.assertEqual(first["num_candidates"], 4)
+        self.assertEqual(first["num_candidates_evaluated"], 2)
+        self.assertEqual(first["stop_reason"], "threshold_passed")
+        self.assertEqual(first["selected_candidate_index"], 1)
+        self.assertAlmostEqual(first["best_score"], 0.95)
+        self.assertTrue(first["threshold_passed"])
+        self.assertEqual([candidate["index"] for candidate in first["candidates"]], [0, 1])
+
+        second = rows[1]["candidate_rerank"]
+        self.assertEqual(second["num_candidates_evaluated"], 4)
+        self.assertEqual(second["stop_reason"], "max_k_no_threshold_passed")
+        self.assertEqual(second["selected_candidate_index"], 3)
+        self.assertAlmostEqual(second["best_score"], 0.4)
+        self.assertFalse(second["threshold_passed"])
+        self.assertEqual([candidate["index"] for candidate in second["candidates"]], [0, 1, 2, 3])
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for candidate rerank tests")
+    def test_candidate_rerank_adaptive_keeps_seed_ids_after_partial_stop(self) -> None:
+        import torch
+
+        from safa.utils.sampling import make_x_init_for_sample_ids
+
+        _, rows, generator = self._run_candidate_rerank_eval(
+            candidate_rerank={
+                "enabled": True,
+                "num_candidates": 4,
+                "single_face_priority": False,
+                "selection_metric": "latent_cosine",
+                "adaptive_k": {
+                    "enabled": True,
+                    "min_candidates": 2,
+                    "accept_latent_cosine_threshold": 0.9,
+                    "require_single_face": False,
+                },
+            },
+            cosines=[
+                [0.1, 0.95, 0.99, 0.99],
+                [0.1, 0.2, 0.3, 0.4],
+            ],
+            face_counts=None,
+            face_detection_enabled=False,
+            dataset_len=2,
+            batch_size=2,
+        )
+
+        expected_ids_by_call = [
+            ["sample-0::candidate::0", "sample-1::candidate::0"],
+            ["sample-0::candidate::1", "sample-1::candidate::1"],
+            ["sample-1::candidate::2"],
+            ["sample-1::candidate::3"],
+        ]
+        self.assertEqual(len(generator.x_inits), len(expected_ids_by_call))
+        for x_init, expected_ids in zip(generator.x_inits, expected_ids_by_call):
+            expected = make_x_init_for_sample_ids(
+                expected_ids,
+                1337,
+                4,
+                x_init.device,
+                x_init.dtype,
+            )
+            self.assertTrue(torch.equal(x_init, expected), expected_ids)
+
+        self.assertEqual([candidate["index"] for candidate in rows[0]["candidate_rerank"]["candidates"]], [0, 1])
+        self.assertEqual([candidate["index"] for candidate in rows[1]["candidate_rerank"]["candidates"]], [0, 1, 2, 3])
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for candidate rerank tests")
+    def test_candidate_rerank_adaptive_respects_min_candidates_before_stopping(self) -> None:
+        _, rows, generator = self._run_candidate_rerank_eval(
+            candidate_rerank={
+                "enabled": True,
+                "num_candidates": 5,
+                "single_face_priority": False,
+                "selection_metric": "latent_cosine",
+                "adaptive_k": {
+                    "enabled": True,
+                    "min_candidates": 3,
+                    "accept_latent_cosine_threshold": 0.9,
+                    "require_single_face": False,
+                },
+            },
+            cosines=[0.99, 0.91, 0.2, 0.1, 0.1],
+            face_counts=None,
+            face_detection_enabled=False,
+        )
+
+        metadata = rows[0]["candidate_rerank"]
+        self.assertEqual(len(generator.x_inits), 3)
+        self.assertEqual(metadata["num_candidates_evaluated"], 3)
+        self.assertEqual(metadata["stop_reason"], "threshold_passed")
+        self.assertEqual(metadata["selected_candidate_index"], 0)
+        self.assertAlmostEqual(metadata["best_score"], 0.99)
+        self.assertTrue(metadata["threshold_passed"])
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for candidate rerank tests")
+    def test_candidate_rerank_adaptive_requires_single_face_for_threshold(self) -> None:
+        _, rows, generator = self._run_candidate_rerank_eval(
+            candidate_rerank={
+                "enabled": True,
+                "num_candidates": 4,
+                "single_face_priority": True,
+                "selection_metric": "latent_cosine",
+                "adaptive_k": {
+                    "enabled": True,
+                    "min_candidates": 2,
+                    "accept_latent_cosine_threshold": 0.9,
+                    "require_single_face": True,
+                },
+            },
+            cosines=[0.1, 0.96, 0.94, 0.2],
+            face_counts=[1, 2, 1, 1],
+            face_detection_enabled=True,
+        )
+
+        metadata = rows[0]["candidate_rerank"]
+        self.assertEqual(len(generator.x_inits), 3)
+        self.assertEqual(metadata["num_candidates_evaluated"], 3)
+        self.assertEqual(metadata["stop_reason"], "threshold_passed")
+        self.assertEqual(metadata["selected_candidate_index"], 2)
+        self.assertAlmostEqual(metadata["best_score"], 0.94)
+        self.assertTrue(metadata["threshold_passed"])
+        self.assertEqual(metadata["selected_face_count"], 1)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for candidate rerank tests")
+    def test_candidate_rerank_adaptive_missing_detector_runs_to_max_k(self) -> None:
+        _, rows, generator = self._run_candidate_rerank_eval(
+            candidate_rerank={
+                "enabled": True,
+                "num_candidates": 3,
+                "single_face_priority": False,
+                "selection_metric": "latent_cosine",
+                "adaptive_k": {
+                    "enabled": True,
+                    "min_candidates": 1,
+                    "accept_latent_cosine_threshold": 0.9,
+                    "require_single_face": True,
+                },
+            },
+            cosines=[0.95, 0.2, 0.1],
+            face_counts=None,
+            face_detection_enabled=False,
+        )
+
+        metadata = rows[0]["candidate_rerank"]
+        self.assertEqual(len(generator.x_inits), 3)
+        self.assertEqual(metadata["num_candidates_evaluated"], 3)
+        self.assertEqual(metadata["stop_reason"], "max_k_missing_metric")
+        self.assertEqual(metadata["selected_candidate_index"], 0)
+        self.assertAlmostEqual(metadata["best_score"], 0.95)
+        self.assertFalse(metadata["threshold_passed"])
+        self.assertIsNone(metadata["selected_face_count"])
+        self.assertFalse(any("face_count" in candidate for candidate in metadata["candidates"]))
+
+    def test_candidate_rerank_rejects_invalid_config(self) -> None:
+        from safa.evaluation import runner
+
+        with self.assertRaisesRegex(ValueError, "candidate_rerank.num_candidates"):
+            runner._candidate_rerank_config(
+                {
+                    "candidate_rerank": {
+                        "enabled": True,
+                        "num_candidates": 0,
+                        "single_face_priority": True,
+                        "selection_metric": "latent_cosine",
+                    }
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "candidate_rerank.selection_metric"):
+            runner._candidate_rerank_config(
+                {
+                    "candidate_rerank": {
+                        "enabled": True,
+                        "num_candidates": 4,
+                        "single_face_priority": True,
+                        "selection_metric": "pixel_mse",
+                    }
+                }
+            )
 
     @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for eval image export tests")
     def test_eval_single_image_export_uses_default_or_explicit_dir_and_rejects_overwrite(self) -> None:

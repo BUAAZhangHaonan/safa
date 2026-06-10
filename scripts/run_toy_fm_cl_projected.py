@@ -16,9 +16,13 @@ from safa.training.projected_update import (
     DualBudgetControlResult,
     ProjectionResult,
     TrustRegionScaleResult,
+    _dot,
+    _squared_norm,
     apply_fm_anchor_trust_region_scaling,
     compute_adaptive_margin_adjustment,
     project_gradient_onto_fm_feasible_cone,
+    project_gradient_onto_fm_feasible_cone_adam,
+    project_gradient_to_dot_lower_bound,
     update_dual_budget_controller,
 )
 
@@ -50,6 +54,20 @@ class ToyConfig:
     calibration_batches: int
     eval_interval: int
     projection_eps: float
+    fm_delta_target: float
+    dual_lr: float
+    dual_max: float
+    primal_dual_warmup_steps: int
+    cagrad_c: float | None = None
+    fm_descent_floor_fraction: float | None = None
+    fm_budget_fraction: float | None = None
+    uncertainty_log_var_lr: float | None = None
+    uncertainty_log_var_init_fm: float | None = None
+    uncertainty_log_var_init_cl: float | None = None
+    optimizer_type: str = "adamw"
+    pu_gradient_normalization: bool = True
+    pu_backtrack_max_retries: int = 3
+    pu_fm_increase_budget: float = 0.0
     adaptive_margin_mode: str | None = None
     adaptive_margin_target: float | None = None
     adaptive_margin_ema_beta: float | None = None
@@ -57,33 +75,51 @@ class ToyConfig:
     adaptive_margin_min: float | None = None
     adaptive_margin_max: float | None = None
     adaptive_margin_initial: float | None = None
-    fm_delta_target: float | None = None
     line_search_max_backtracks: int | None = None
     line_search_contraction: float | None = None
-    dual_lr: float | None = None
-    dual_max: float | None = None
-    primal_dual_warmup_steps: int | None = None
     trust_radius_initial: float | None = None
     trust_radius_min: float | None = None
     trust_radius_max: float | None = None
 
 
-SUPPORTED_METHODS = {
-    "fm_only",
-    "repr_only",
-    "weighted_sum",
-    "projected_two_step",
-    "pcgrad",
-    "soft_margin_projected",
-    "adaptive_margin_projected",
-    "adaptive_trust_projected",
-    "line_search_projected",
-    "dual_step_projected",
-    "budgeted_cl_line_search",
-    "descent_credit_projected",
-    "descent_credit_scaled",
-}
-NORM_EPS = 1.0e-12
+@dataclass(frozen=True)
+class CAGradResult:
+    fm_weight: float
+    cl_weight: float
+    gradient_cosine: float
+    combined_norm: float
+    combined_gradients: list[torch.Tensor]
+
+
+@dataclass(frozen=True)
+class FMAnchoredCAGradResult:
+    fm_weight: float
+    cl_weight: float
+    raw_fm_weight: float
+    raw_cl_weight: float
+    gradient_cosine: float
+    combined_norm: float
+    fm_descent_floor: float
+    fm_descent_after_cagrad: float
+    fm_descent_after_anchor: float
+    anchor_active: bool
+    combined_gradients: list[torch.Tensor]
+
+
+@dataclass(frozen=True)
+class BudgetedCAGradResult:
+    fm_weight: float
+    cl_weight: float
+    raw_fm_weight: float
+    raw_cl_weight: float
+    gradient_cosine: float
+    combined_norm: float
+    fm_budget: float
+    fm_descent_after_cagrad: float
+    fm_descent_after_budget: float
+    budget_active: bool
+    budget_scale: float
+    combined_gradients: list[torch.Tensor]
 
 
 @dataclass
@@ -106,6 +142,29 @@ class LineSearchAcceptanceResult:
     accepted: bool
     flow_delta: float
     repr_delta: float
+
+
+SUPPORTED_METHODS = {
+    "fm_only",
+    "repr_only",
+    "weighted_sum",
+    "projected_two_step",
+    "primal_dual_projected",
+    "pcgrad",
+    "soft_margin_projected",
+    "cagrad",
+    "fm_anchored_cagrad",
+    "budgeted_cagrad",
+    "uncertainty_weighted",
+    "adaptive_margin_projected",
+    "adaptive_trust_projected",
+    "line_search_projected",
+    "dual_step_projected",
+    "budgeted_cl_line_search",
+    "descent_credit_projected",
+    "descent_credit_scaled",
+}
+NORM_EPS = 1.0e-12
 
 
 def load_config(path: str | Path) -> ToyConfig:
@@ -162,6 +221,8 @@ def validate_config(config: ToyConfig) -> None:
     for name, value in positive_fields.items():
         if not isinstance(value, int) or value <= 0:
             raise ValueError(f"{name} must be a positive integer")
+    if not isinstance(config.primal_dual_warmup_steps, int) or config.primal_dual_warmup_steps < 0:
+        raise ValueError("primal_dual_warmup_steps must be a non-negative integer")
     if config.k_classes < 2:
         raise ValueError("k_classes must be at least 2")
     scalar_fields = {
@@ -172,12 +233,21 @@ def validate_config(config: ToyConfig) -> None:
         "weight_decay": config.weight_decay,
         "repr_relation_weight": config.repr_relation_weight,
         "projection_eps": config.projection_eps,
+        "fm_delta_target": config.fm_delta_target,
+        "dual_lr": config.dual_lr,
+        "dual_max": config.dual_max,
     }
     for name, value in scalar_fields.items():
         if not isinstance(value, (float, int)) or not math.isfinite(float(value)):
             raise ValueError(f"{name} must be finite")
     if config.sigma < 0.0:
         raise ValueError("sigma must be non-negative")
+    if config.optimizer_type not in ("adamw", "sgd"):
+        raise ValueError("optimizer_type must be 'adamw' or 'sgd'")
+    if config.pu_backtrack_max_retries < 0:
+        raise ValueError("pu_backtrack_max_retries must be non-negative")
+    if config.pu_fm_increase_budget < 0.0:
+        raise ValueError("pu_fm_increase_budget must be non-negative")
     if config.learning_rate <= 0.0 or config.fm_learning_rate <= 0.0 or config.repr_learning_rate <= 0.0:
         raise ValueError("learning rates must be positive")
     if config.weight_decay < 0.0:
@@ -186,12 +256,66 @@ def validate_config(config: ToyConfig) -> None:
         raise ValueError("repr_relation_weight must be non-negative")
     if config.projection_eps < 0.0:
         raise ValueError("projection_eps must be non-negative")
+    if config.dual_lr <= 0.0:
+        raise ValueError("dual_lr must be positive")
+    if config.dual_max <= 0.0:
+        raise ValueError("dual_max must be positive")
     for value in config.lambdas:
         if not isinstance(value, (float, int)) or not math.isfinite(float(value)) or float(value) <= 0.0:
             raise ValueError("all lambdas must be positive finite numbers")
     for value in config.soft_margins:
         if not isinstance(value, (float, int)) or not math.isfinite(float(value)) or float(value) < 0.0:
             raise ValueError("all soft_margins must be finite non-negative numbers")
+    if "primal_dual_projected" in config.methods:
+        if config.methods != ["primal_dual_projected"]:
+            raise ValueError("primal_dual_projected must be standalone in methods")
+        if len(config.lambdas) != 1 or float(config.lambdas[0]) != 1.0:
+            raise ValueError("primal_dual_projected lambdas must be [1.0]")
+    cagrad_methods = [method for method in ("cagrad", "fm_anchored_cagrad", "budgeted_cagrad") if method in config.methods]
+    if cagrad_methods:
+        if len(cagrad_methods) != 1:
+            raise ValueError("CAGrad methods must be standalone in methods")
+        method = cagrad_methods[0]
+        if config.methods != [method]:
+            raise ValueError(f"{method} must be standalone in methods")
+        if len(config.lambdas) != 1 or float(config.lambdas[0]) != 1.0:
+            raise ValueError(f"{method} lambdas must be [1.0]")
+        cagrad_c = _require_optional_scalar(config.cagrad_c, f"{method} requires cagrad_c", min_value=0.0)
+        if cagrad_c >= 1.0:
+            raise ValueError("cagrad_c must be < 1.0")
+        if method == "fm_anchored_cagrad":
+            floor_fraction = _require_optional_scalar(
+                config.fm_descent_floor_fraction,
+                "fm_anchored_cagrad requires fm_descent_floor_fraction",
+                min_value=0.0,
+            )
+            if floor_fraction > 1.0:
+                raise ValueError("fm_descent_floor_fraction must be <= 1.0")
+        if method == "budgeted_cagrad":
+            _require_optional_scalar(
+                config.fm_budget_fraction,
+                "budgeted_cagrad requires fm_budget_fraction",
+                min_value=0.0,
+            )
+    if "uncertainty_weighted" in config.methods:
+        if config.methods != ["uncertainty_weighted"]:
+            raise ValueError("uncertainty_weighted must be standalone in methods")
+        if len(config.lambdas) != 1 or float(config.lambdas[0]) != 1.0:
+            raise ValueError("uncertainty_weighted lambdas must be [1.0]")
+        _require_optional_scalar(
+            config.uncertainty_log_var_lr,
+            "uncertainty_weighted requires uncertainty_log_var_lr",
+            min_value=0.0,
+            strictly_positive=True,
+        )
+        _require_optional_scalar(
+            config.uncertainty_log_var_init_fm,
+            "uncertainty_weighted requires uncertainty_log_var_init_fm",
+        )
+        _require_optional_scalar(
+            config.uncertainty_log_var_init_cl,
+            "uncertainty_weighted requires uncertainty_log_var_init_cl",
+        )
     _validate_adaptive_margin_config(config)
     _validate_adaptive_trust_config(config)
     _validate_line_search_config(config)
@@ -199,6 +323,23 @@ def validate_config(config: ToyConfig) -> None:
     _validate_budgeted_cl_line_search_config(config)
     _validate_descent_credit_projected_config(config)
     _validate_descent_credit_scaled_config(config)
+
+
+def _require_optional_scalar(
+    value: float | None,
+    message: str,
+    *,
+    min_value: float | None = None,
+    strictly_positive: bool = False,
+) -> float:
+    if value is None or not isinstance(value, (float, int)) or not math.isfinite(float(value)):
+        raise ValueError(message)
+    scalar = float(value)
+    if strictly_positive and scalar <= 0.0:
+        raise ValueError(message)
+    if min_value is not None and scalar < min_value:
+        raise ValueError(message)
+    return scalar
 
 
 class ToyVectorField(nn.Module):
@@ -228,10 +369,6 @@ def run_experiment_grid(config: ToyConfig) -> dict[str, Any]:
     metrics_path = run_dir / "metrics.jsonl"
     metrics_path.write_text("", encoding="utf-8")
 
-    def append_metric(row: dict[str, Any]) -> None:
-        with metrics_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(row, sort_keys=True) + "\n")
-
     experiments: list[dict[str, Any]] = []
     final_points: list[dict[str, Any]] = []
     for delta_deg in config.deltas_deg:
@@ -243,10 +380,12 @@ def run_experiment_grid(config: ToyConfig) -> dict[str, Any]:
                     method=method,
                     lambda_repr=float(lambda_repr),
                     soft_margin=float(soft_margin),
-                    metrics_callback=append_metric,
                 )
                 experiments.append(result)
                 final_points.append(result["final"])
+                with metrics_path.open("a", encoding="utf-8") as handle:
+                    for row in result["metrics"]:
+                        handle.write(json.dumps(row, sort_keys=True) + "\n")
 
     summary = {
         "run_name": config.run_name,
@@ -280,56 +419,43 @@ def run_single_experiment(
     validate_config(config)
     if method not in SUPPORTED_METHODS:
         raise ValueError(f"Unsupported method: {method}")
-    if method in {"adaptive_margin_projected", "adaptive_trust_projected"}:
-        if lambda_repr != 1.0:
-            raise ValueError(f"{method} uses fixed lambda_repr=1.0")
-        if config.adaptive_margin_initial is None:
-            raise ValueError(f"{method} requires adaptive_margin_initial")
-        if not math.isclose(float(soft_margin), float(config.adaptive_margin_initial), rel_tol=0.0, abs_tol=1e-12):
-            raise ValueError(f"{method} soft_margin must equal adaptive_margin_initial")
-    if method == "budgeted_cl_line_search":
-        if lambda_repr != 1.0:
-            raise ValueError("budgeted_cl_line_search uses fixed lambda_repr=1.0")
-        if not math.isclose(float(soft_margin), 0.0, rel_tol=0.0, abs_tol=1e-12):
-            raise ValueError("budgeted_cl_line_search requires soft_margin=0.0")
-    if method == "descent_credit_projected":
-        if lambda_repr != 1.0:
-            raise ValueError("descent_credit_projected uses fixed lambda_repr=1.0")
-        if not math.isclose(float(soft_margin), 0.0, rel_tol=0.0, abs_tol=1e-12):
-            raise ValueError("descent_credit_projected requires soft_margin=0.0")
-    if method == "descent_credit_scaled":
-        if lambda_repr != 1.0:
-            raise ValueError("descent_credit_scaled uses fixed lambda_repr=1.0")
-        if not math.isclose(float(soft_margin), 0.0, rel_tol=0.0, abs_tol=1e-12):
-            raise ValueError("descent_credit_scaled requires soft_margin=0.0")
     device = torch.device(config.device)
     seed_offset = _stable_seed_offset(method, delta_deg, lambda_repr, soft_margin)
     train_generator = torch.Generator(device=device).manual_seed(config.seed + seed_offset)
     eval_generator = torch.Generator(device=device).manual_seed(config.seed + 100_000 + seed_offset)
     model = ToyVectorField(hidden_dim=config.hidden_dim, layers=config.layers).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
-    fm_optimizer = torch.optim.AdamW(model.parameters(), lr=config.fm_learning_rate, weight_decay=config.weight_decay)
+    if config.optimizer_type == "sgd":
+        optimizer = torch.optim.SGD(model.parameters(), lr=config.learning_rate, momentum=0.0, weight_decay=0.0)
+        fm_optimizer = torch.optim.SGD(model.parameters(), lr=config.fm_learning_rate, momentum=0.0, weight_decay=0.0)
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+        fm_optimizer = torch.optim.AdamW(model.parameters(), lr=config.fm_learning_rate, weight_decay=config.weight_decay)
     eval_batch = _sample_batch(config, delta_deg, config.eval_batch_size, device, eval_generator)
     flow_scale, repr_scale = _calibrate_loss_scales(config, model, delta_deg, device, train_generator)
-    adaptive_state = _new_adaptive_margin_state(config) if method == "adaptive_margin_projected" else None
-    adaptive_trust_state = _new_adaptive_trust_state(config) if method == "adaptive_trust_projected" else None
-    dual_step_value = 0.0
-    initial = _evaluate_model(
-        config,
-        model,
-        eval_batch,
-        delta_deg,
-        method,
-        lambda_repr,
-        soft_margin,
-        step=0,
-        train_stats=_initial_step_stats(method, soft_margin),
-    )
+    initial = _evaluate_model(config, model, eval_batch, delta_deg, method, lambda_repr, soft_margin, step=0)
+    uncertainty_optimizer: torch.optim.Optimizer | None = None
+    uncertainty_log_vars: tuple[torch.nn.Parameter, torch.nn.Parameter] | None = None
+    if method == "uncertainty_weighted":
+        fm_log_var = torch.nn.Parameter(
+            torch.tensor(float(config.uncertainty_log_var_init_fm), dtype=torch.float32, device=device)
+        )
+        cl_log_var = torch.nn.Parameter(
+            torch.tensor(float(config.uncertainty_log_var_init_cl), dtype=torch.float32, device=device)
+        )
+        uncertainty_log_vars = (fm_log_var, cl_log_var)
+        uncertainty_optimizer = torch.optim.AdamW(
+            list(uncertainty_log_vars),
+            lr=float(config.uncertainty_log_var_lr),
+            weight_decay=0.0,
+        )
 
-    metrics = [initial]
     if metrics_callback is not None:
         metrics_callback(initial)
+    metrics = [initial]
     stat_window = _new_stat_window()
+    dual_value = 0.0
+    adaptive_margin_state: AdaptiveMarginState | None = None
+    adaptive_trust_state: AdaptiveTrustState | None = None
     for step in range(1, config.steps + 1):
         batch = _sample_batch(config, delta_deg, config.batch_size, device, train_generator)
         if method == "fm_only":
@@ -360,7 +486,47 @@ def run_single_experiment(
                 lambda_repr,
                 soft_margin=soft_margin,
             )
+        elif method == "primal_dual_projected":
+            step_stats = _step_primal_dual_projected(
+                config,
+                model,
+                fm_optimizer,
+                batch,
+                flow_scale,
+                repr_scale,
+                lambda_repr,
+                dual_value=dual_value,
+                step=step,
+            )
+            dual_value = float(step_stats["dual_value_next"])
+        elif method == "pcgrad":
+            step_stats = _step_pcgrad(config, model, optimizer, batch, flow_scale, repr_scale, lambda_repr)
+        elif method == "cagrad":
+            step_stats = _step_cagrad(config, model, optimizer, batch, flow_scale, repr_scale)
+        elif method == "fm_anchored_cagrad":
+            step_stats = _step_fm_anchored_cagrad(config, model, optimizer, batch, flow_scale, repr_scale)
+        elif method == "budgeted_cagrad":
+            step_stats = _step_budgeted_cagrad(config, model, optimizer, batch, flow_scale, repr_scale)
+        elif method == "uncertainty_weighted":
+            if uncertainty_optimizer is None or uncertainty_log_vars is None:
+                raise RuntimeError("uncertainty_weighted state was not initialized")
+            step_stats = _step_uncertainty_weighted(
+                config,
+                model,
+                optimizer,
+                uncertainty_optimizer,
+                uncertainty_log_vars,
+                batch,
+                flow_scale,
+                repr_scale,
+            )
         elif method == "adaptive_margin_projected":
+            if not math.isclose(lambda_repr, 1.0, rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError("adaptive_margin_projected uses fixed lambda_repr=1.0")
+            if not math.isclose(soft_margin, config.adaptive_margin_initial, rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError("adaptive_margin_projected requires soft_margin must equal adaptive_margin_initial")
+            if adaptive_margin_state is None:
+                adaptive_margin_state = _new_adaptive_margin_state(config)
             step_stats = _step_projected_two_step(
                 config,
                 model,
@@ -370,9 +536,13 @@ def run_single_experiment(
                 repr_scale,
                 lambda_repr,
                 soft_margin=soft_margin,
-                adaptive_state=adaptive_state,
+                adaptive_state=adaptive_margin_state,
             )
         elif method == "adaptive_trust_projected":
+            if not math.isclose(lambda_repr, 1.0, rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError("adaptive_trust_projected uses fixed lambda_repr=1.0")
+            if adaptive_trust_state is None:
+                adaptive_trust_state = _new_adaptive_trust_state(config)
             step_stats = _step_projected_two_step(
                 config,
                 model,
@@ -396,7 +566,23 @@ def run_single_experiment(
                 lambda_repr,
                 soft_margin=soft_margin,
             )
+        elif method == "dual_step_projected":
+            step_stats = _step_dual_step_projected(
+                config,
+                model,
+                fm_optimizer,
+                batch,
+                flow_scale,
+                repr_scale,
+                lambda_repr,
+                soft_margin=soft_margin,
+                dual_value=dual_value,
+                step=step,
+            )
+            dual_value = float(step_stats["dual_value_next"])
         elif method == "budgeted_cl_line_search":
+            if not math.isclose(lambda_repr, 1.0, rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError("budgeted_cl_line_search uses fixed lambda_repr=1.0")
             step_stats = _step_budgeted_cl_line_search(
                 config,
                 model,
@@ -408,6 +594,8 @@ def run_single_experiment(
                 soft_margin=soft_margin,
             )
         elif method == "descent_credit_projected":
+            if not math.isclose(lambda_repr, 1.0, rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError("descent_credit_projected uses fixed lambda_repr=1.0")
             step_stats = _step_descent_credit_projected(
                 config,
                 model,
@@ -419,6 +607,8 @@ def run_single_experiment(
                 soft_margin=soft_margin,
             )
         elif method == "descent_credit_scaled":
+            if not math.isclose(lambda_repr, 1.0, rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError("descent_credit_scaled uses fixed lambda_repr=1.0")
             step_stats = _step_descent_credit_scaled(
                 config,
                 model,
@@ -429,40 +619,24 @@ def run_single_experiment(
                 lambda_repr,
                 soft_margin=soft_margin,
             )
-        elif method == "dual_step_projected":
-            step_stats = _step_dual_step_projected(
-                config,
-                model,
-                fm_optimizer,
-                batch,
-                flow_scale,
-                repr_scale,
-                lambda_repr,
-                soft_margin=soft_margin,
-                dual_value=dual_step_value,
-                step=step,
-            )
-            dual_step_value = step_stats["dual_value_next"]
-        elif method == "pcgrad":
-            step_stats = _step_pcgrad(config, model, optimizer, batch, flow_scale, repr_scale, lambda_repr)
         else:
             raise RuntimeError(f"Unhandled method: {method}")
         _accumulate_stats(stat_window, step_stats)
         if step % config.eval_interval == 0 or step == config.steps:
-            metric = _evaluate_model(
-                config,
-                model,
-                eval_batch,
-                delta_deg,
-                method,
-                lambda_repr,
-                soft_margin,
-                step=step,
-                train_stats=_summarize_stat_window(stat_window),
-            )
-            metrics.append(metric)
+            eval_row = _evaluate_model(
+                    config,
+                    model,
+                    eval_batch,
+                    delta_deg,
+                    method,
+                    lambda_repr,
+                    soft_margin,
+                    step=step,
+                    train_stats=_summarize_stat_window(stat_window),
+                )
             if metrics_callback is not None:
-                metrics_callback(metric)
+                metrics_callback(eval_row)
+            metrics.append(eval_row)
             stat_window = _new_stat_window()
 
     final = metrics[-1]
@@ -523,68 +697,25 @@ def project_gradient_with_soft_margin(
     )
 
 
-def project_gradient_to_dot_lower_bound(
-    g_repr: list[torch.Tensor],
-    g_fm: list[torch.Tensor],
-    lower_bound: float,
-    eps: float,
-) -> ProjectionResult:
-    _validate_gradient_lists(g_repr, g_fm)
-    if not isinstance(lower_bound, (float, int)) or not math.isfinite(float(lower_bound)):
-        raise ValueError("lower_bound must be finite")
-    dot_before = _dot(g_repr, g_fm)
-    fm_norm_squared = _squared_norm(g_fm)
-    fm_norm = torch.sqrt(fm_norm_squared)
-    repr_norm = torch.sqrt(_squared_norm(g_repr))
-    eps_tensor = torch.as_tensor(eps, dtype=fm_norm.dtype, device=fm_norm.device)
-    lower_bound_tensor = torch.as_tensor(float(lower_bound), dtype=dot_before.dtype, device=dot_before.device)
-    projection_applied = bool((dot_before < lower_bound_tensor).item() and (fm_norm > eps_tensor).item())
-    if projection_applied:
-        coefficient = (dot_before - lower_bound_tensor) / fm_norm_squared
-        projected_gradients = [repr_grad - coefficient * fm_grad for repr_grad, fm_grad in zip(g_repr, g_fm)]
-    else:
-        projected_gradients = [repr_grad.clone() for repr_grad in g_repr]
-    dot_after = _dot(projected_gradients, g_fm)
-    if projection_applied and not torch.allclose(dot_after, lower_bound_tensor, rtol=1e-5, atol=1e-6):
-        raise RuntimeError("Projected gradient does not satisfy the requested dot-product lower bound")
-    projected_repr_norm = torch.sqrt(_squared_norm(projected_gradients))
-    removed_gradients = [repr_grad - projected_grad for repr_grad, projected_grad in zip(g_repr, projected_gradients)]
-    projection_removed_norm = torch.sqrt(_squared_norm(removed_gradients))
-    repr_descent_inner_product = _dot(g_repr, projected_gradients)
-    fm_first_order_effect = -dot_after
-    return ProjectionResult(
-        dot_before=dot_before,
-        dot_after=dot_after,
-        fm_norm=fm_norm,
-        repr_norm=repr_norm,
-        projected_repr_norm=projected_repr_norm,
-        projection_applied=projection_applied,
-        projection_removed_norm=projection_removed_norm,
-        repr_descent_inner_product=repr_descent_inner_product,
-        fm_first_order_effect=fm_first_order_effect,
-        projected_gradients=projected_gradients,
-    )
-
-
 def _method_parameter_grid(config: ToyConfig, method: str) -> list[tuple[float, float]]:
     if method in {"fm_only", "repr_only"}:
         return [(config.lambdas[0], config.soft_margins[0])]
+    if method == "primal_dual_projected":
+        return [(1.0, config.soft_margins[0])]
+    if method in {"cagrad", "fm_anchored_cagrad", "budgeted_cagrad"}:
+        return [(1.0, config.soft_margins[0])]
+    if method in {
+        "adaptive_margin_projected",
+        "adaptive_trust_projected",
+        "line_search_projected",
+        "dual_step_projected",
+        "budgeted_cl_line_search",
+        "descent_credit_projected",
+        "descent_credit_scaled",
+    }:
+        return [(1.0, config.soft_margins[0])]
     if method == "soft_margin_projected":
         return [(lambda_repr, margin) for lambda_repr in config.lambdas for margin in config.soft_margins]
-    if method in {"adaptive_margin_projected", "adaptive_trust_projected"}:
-        if config.adaptive_margin_initial is None:
-            raise ValueError(f"{method} requires adaptive_margin_initial")
-        return [(1.0, float(config.adaptive_margin_initial))]
-    if method == "line_search_projected":
-        return [(1.0, 0.0)]
-    if method == "dual_step_projected":
-        return [(1.0, 0.0)]
-    if method == "budgeted_cl_line_search":
-        return [(1.0, 0.0)]
-    if method == "descent_credit_projected":
-        return [(1.0, 0.0)]
-    if method == "descent_credit_scaled":
-        return [(1.0, 0.0)]
     return [(lambda_repr, config.soft_margins[0]) for lambda_repr in config.lambdas]
 
 
@@ -759,16 +890,20 @@ def _step_projected_two_step(
     adaptive_state: AdaptiveMarginState | None = None,
     adaptive_trust_state: AdaptiveTrustState | None = None,
 ) -> dict[str, float]:
+    # --- FM step ---
     fm_optimizer.zero_grad(set_to_none=True)
     losses = _compute_losses(config, model, batch)
     (losses["flow"] / flow_scale).backward()
     fm_optimizer.step()
 
+    # --- Guard: recompute losses after FM step ---
     post_losses = _compute_losses(config, model, batch)
     flow_objective = post_losses["flow"] / flow_scale
     repr_objective = lambda_repr * post_losses["repr"] / repr_scale
     flow_guard_value = float(flow_objective.detach().cpu())
     g_fm, g_repr = _task_gradients(model, flow_objective, repr_objective)
+
+    # --- Adaptive margin handling ---
     effective_margin = soft_margin
     adaptive_normalized_fm_loss = 0.0
     adaptive_margin_baseline = 0.0
@@ -779,17 +914,19 @@ def _step_projected_two_step(
         adaptive_normalized_fm_loss = adjustment.normalized_fm_loss
         adaptive_margin_baseline = adjustment.baseline
         adaptive_margin_direction = _adaptive_margin_direction_value(adjustment.direction)
-    if effective_margin == 0.0:
-        projection = project_gradient_onto_fm_feasible_cone(g_repr, g_fm, eps=config.projection_eps)
-    else:
-        projection = project_gradient_with_soft_margin(
-            g_repr,
-            g_fm,
-            epsilon=effective_margin,
-            eps=config.projection_eps,
-        )
+
+    # --- Trust region handling ---
     trust_result = None
+    dual_update = None
+
     if adaptive_trust_state is not None:
+        # Trust region path: Euclidean projection with trust region scaling
+        if effective_margin == 0.0:
+            projection = project_gradient_onto_fm_feasible_cone(g_repr, g_fm, eps=config.projection_eps)
+        else:
+            projection = project_gradient_with_soft_margin(
+                g_repr, g_fm, epsilon=effective_margin, eps=config.projection_eps,
+            )
         trust_result = apply_fm_anchor_trust_region_scaling(
             projected_gradients=projection.projected_gradients,
             g_fm=g_fm,
@@ -797,14 +934,12 @@ def _step_projected_two_step(
             eps=config.projection_eps,
         )
         step_gradients = trust_result.scaled_gradients
-    else:
-        step_gradients = projection.projected_gradients
-    scaled_dot_after = _dot(step_gradients, g_fm)
-    _manual_parameter_step(model, step_gradients, config.repr_learning_rate)
-    after_losses = _compute_losses(config, model, batch)
-    actual_fm_delta = float((after_losses["flow"] / flow_scale).detach().cpu()) - flow_guard_value
-    dual_update = None
-    if adaptive_trust_state is not None:
+        scaled_dot_after = _dot(step_gradients, g_fm)
+        _manual_parameter_step(model, step_gradients, config.repr_learning_rate)
+
+        after_losses = _compute_losses(config, model, batch)
+        actual_fm_delta = float((after_losses["flow"] / flow_scale).detach().cpu()) - flow_guard_value
+
         if config.fm_delta_target is None:
             raise ValueError("adaptive_trust_projected requires fm_delta_target")
         if config.dual_lr is None:
@@ -822,20 +957,430 @@ def _step_projected_two_step(
         )
         adaptive_trust_state.dual_value = dual_update.next_dual_value
         adaptive_trust_state.trust_radius = dual_update.next_trust_radius
-    return _stats_from_projection(
-        projection,
-        actual_fm_delta=actual_fm_delta,
-        adaptive_margin=effective_margin,
-        adaptive_normalized_fm_loss=adaptive_normalized_fm_loss,
-        adaptive_margin_baseline=adaptive_margin_baseline,
-        adaptive_margin_direction=adaptive_margin_direction,
-        trust_result=trust_result,
-        dual_update=dual_update,
-        fm_delta_target=0.0 if config.fm_delta_target is None else float(config.fm_delta_target),
-        scaled_dot_after=scaled_dot_after,
-        repr_learning_rate=config.repr_learning_rate,
-    )
 
+        return _stats_from_projection(
+            projection,
+            actual_fm_delta=actual_fm_delta,
+            adaptive_margin=effective_margin,
+            adaptive_normalized_fm_loss=adaptive_normalized_fm_loss,
+            adaptive_margin_baseline=adaptive_margin_baseline,
+            adaptive_margin_direction=adaptive_margin_direction,
+            trust_result=trust_result,
+            dual_update=dual_update,
+            fm_delta_target=0.0 if config.fm_delta_target is None else float(config.fm_delta_target),
+            scaled_dot_after=scaled_dot_after,
+            repr_learning_rate=config.repr_learning_rate,
+        )
+
+    elif adaptive_state is not None:
+        # Adaptive margin only path: Euclidean projection with adaptive margin
+        if effective_margin == 0.0:
+            projection = project_gradient_onto_fm_feasible_cone(g_repr, g_fm, eps=config.projection_eps)
+        else:
+            projection = project_gradient_with_soft_margin(
+                g_repr, g_fm, epsilon=effective_margin, eps=config.projection_eps,
+            )
+        _manual_parameter_step(model, projection.projected_gradients, config.repr_learning_rate)
+
+        after_losses = _compute_losses(config, model, batch)
+        actual_fm_delta = float((after_losses["flow"] / flow_scale).detach().cpu()) - flow_guard_value
+
+        return _stats_from_projection(
+            projection,
+            actual_fm_delta=actual_fm_delta,
+            adaptive_margin=effective_margin,
+            adaptive_normalized_fm_loss=adaptive_normalized_fm_loss,
+            adaptive_margin_baseline=adaptive_margin_baseline,
+            adaptive_margin_direction=adaptive_margin_direction,
+            fm_delta_target=0.0 if config.fm_delta_target is None else float(config.fm_delta_target),
+            scaled_dot_after=projection.dot_after,
+            repr_learning_rate=config.repr_learning_rate,
+        )
+
+    elif config.optimizer_type == "adamw":
+        # === Adam metric path: Q-weighted projection ===
+        weights = _extract_adam_preconditioner_weights(fm_optimizer, model)
+
+        # Q-weighted gradient normalization
+        fm_norm_q = math.sqrt(sum((w * g * g).sum().item() for w, g in zip(weights, g_fm)))
+        repr_norm_q = math.sqrt(sum((w * g * g).sum().item() for w, g in zip(weights, g_repr)))
+        norm_ratio = repr_norm_q / fm_norm_q if fm_norm_q > NORM_EPS else 1.0
+
+        if config.pu_gradient_normalization and fm_norm_q > NORM_EPS and repr_norm_q > NORM_EPS:
+            scale = fm_norm_q / repr_norm_q
+            g_repr_for_proj = [g * scale for g in g_repr]
+        else:
+            g_repr_for_proj = g_repr
+
+        # Q-weighted projection
+        projection = project_gradient_onto_fm_feasible_cone_adam(
+            g_repr_for_proj, g_fm, weights, eps=config.projection_eps,
+        )
+
+        # Un-normalize projected gradients
+        if config.pu_gradient_normalization and fm_norm_q > NORM_EPS and repr_norm_q > NORM_EPS:
+            un_scale = repr_norm_q / fm_norm_q
+            projected_gradients = [g * un_scale for g in projection.projected_gradients]
+        else:
+            projected_gradients = projection.projected_gradients
+
+        # Backtracking line search with preconditioned update
+        effective_lr = config.repr_learning_rate
+        backtrack_count = 0
+        saved_params = _save_parameters(model)
+
+        for retry in range(config.pu_backtrack_max_retries + 1):
+            _preconditioned_parameter_step(model, projected_gradients, weights, effective_lr)
+            after_losses = _compute_losses(config, model, batch)
+            actual_fm_delta = float((after_losses["flow"] / flow_scale).detach().cpu()) - flow_guard_value
+
+            if actual_fm_delta <= config.pu_fm_increase_budget:
+                break
+
+            _restore_parameters(model, saved_params)
+            effective_lr *= 0.5
+            backtrack_count += 1
+        else:
+            _restore_parameters(model, saved_params)
+            actual_fm_delta = 0.0
+
+    else:
+        # === SGD Euclidean path (existing logic) ===
+        fm_norm_sq = sum(g.pow(2).sum().item() for g in g_fm)
+        repr_norm_sq = sum(g.pow(2).sum().item() for g in g_repr)
+        fm_norm = math.sqrt(fm_norm_sq)
+        repr_norm = math.sqrt(repr_norm_sq)
+        norm_ratio = repr_norm / fm_norm if fm_norm > NORM_EPS else 1.0
+
+        if config.pu_gradient_normalization and fm_norm > NORM_EPS and repr_norm > NORM_EPS:
+            scale = fm_norm / repr_norm
+            g_repr_for_proj = [g * scale for g in g_repr]
+        else:
+            g_repr_for_proj = g_repr
+
+        # Euclidean projection
+        if soft_margin == 0.0:
+            projection = project_gradient_onto_fm_feasible_cone(
+                g_repr_for_proj, g_fm, eps=config.projection_eps,
+            )
+        else:
+            projection = project_gradient_with_soft_margin(
+                g_repr_for_proj, g_fm, epsilon=soft_margin, eps=config.projection_eps,
+            )
+
+        # Un-normalize projected gradients
+        if config.pu_gradient_normalization and fm_norm > NORM_EPS and repr_norm > NORM_EPS:
+            un_scale = repr_norm / fm_norm
+            projected_gradients = [g * un_scale for g in projection.projected_gradients]
+        else:
+            projected_gradients = projection.projected_gradients
+
+        # Backtracking line search
+        effective_lr = config.repr_learning_rate
+        backtrack_count = 0
+        saved_params = _save_parameters(model)
+
+        for retry in range(config.pu_backtrack_max_retries + 1):
+            _manual_parameter_step(model, projected_gradients, effective_lr)
+            after_losses = _compute_losses(config, model, batch)
+            actual_fm_delta = float((after_losses["flow"] / flow_scale).detach().cpu()) - flow_guard_value
+
+            if actual_fm_delta <= config.pu_fm_increase_budget:
+                break
+
+            _restore_parameters(model, saved_params)
+            effective_lr *= 0.5
+            backtrack_count += 1
+        else:
+            _restore_parameters(model, saved_params)
+            actual_fm_delta = 0.0
+
+    stats = _stats_from_projection(projection, actual_fm_delta=actual_fm_delta)
+    stats["pu_norm_ratio"] = norm_ratio
+    stats["pu_backtrack_count"] = float(backtrack_count)
+    stats["pu_effective_repr_lr"] = effective_lr
+    return stats
+
+
+def _step_primal_dual_projected(
+    config: ToyConfig,
+    model: ToyVectorField,
+    fm_optimizer: torch.optim.Optimizer,
+    batch: dict[str, torch.Tensor],
+    flow_scale: torch.Tensor,
+    repr_scale: torch.Tensor,
+    lambda_repr: float,
+    dual_value: float,
+    step: int,
+) -> dict[str, float]:
+    fm_optimizer.zero_grad(set_to_none=True)
+    losses = _compute_losses(config, model, batch)
+    (losses["flow"] / flow_scale).backward()
+    fm_optimizer.step()
+
+    post_losses = _compute_losses(config, model, batch)
+    flow_objective = post_losses["flow"] / flow_scale
+    repr_objective = lambda_repr * post_losses["repr"] / repr_scale
+    flow_guard_value = float(flow_objective.detach().cpu())
+    g_fm, g_repr = _task_gradients(model, flow_objective, repr_objective)
+    projection = project_gradient_onto_fm_feasible_cone(g_repr, g_fm, eps=config.projection_eps)
+
+    # This is dual step-control projected training, not a full augmented Lagrangian.
+    dual_value_used = float(dual_value)
+    effective_repr_lr = float(config.repr_learning_rate) / (1.0 + dual_value_used)
+    _manual_parameter_step(model, projection.projected_gradients, effective_repr_lr)
+
+    after_losses = _compute_losses(config, model, batch)
+    normalized_flow_after = float((after_losses["flow"] / flow_scale).detach().cpu())
+    actual_fm_delta = normalized_flow_after - flow_guard_value
+    violation = actual_fm_delta - float(config.fm_delta_target)
+    warmup_active = bool(config.primal_dual_warmup_steps > 0 and step <= config.primal_dual_warmup_steps)
+    if warmup_active:
+        dual_value_next = dual_value_used
+    else:
+        dual_value_next = min(max(dual_value_used + float(config.dual_lr) * violation, 0.0), float(config.dual_max))
+
+    stats = _stats_from_projection(projection, actual_fm_delta=actual_fm_delta)
+    stats.update(
+        {
+            "dual_value_used": dual_value_used,
+            "dual_value_next": dual_value_next,
+            "effective_repr_lr": effective_repr_lr,
+            "primal_dual_violation": float(violation),
+            "primal_dual_warmup_active": 1.0 if warmup_active else 0.0,
+        }
+    )
+    return stats
+
+
+def _step_pcgrad(
+    config: ToyConfig,
+    model: ToyVectorField,
+    optimizer: torch.optim.Optimizer,
+    batch: dict[str, torch.Tensor],
+    flow_scale: torch.Tensor,
+    repr_scale: torch.Tensor,
+    lambda_repr: float,
+) -> dict[str, float]:
+    losses = _compute_losses(config, model, batch)
+    flow_objective = losses["flow"] / flow_scale
+    repr_objective = lambda_repr * losses["repr"] / repr_scale
+    g_fm, g_repr = _task_gradients(model, flow_objective, repr_objective)
+    dot_before = _dot(g_repr, g_fm)
+    pc_fm = [grad.clone() for grad in g_fm]
+    pc_repr = [grad.clone() for grad in g_repr]
+    if bool((dot_before < 0).item()):
+        fm_norm_sq = _squared_norm(g_fm)
+        repr_norm_sq = _squared_norm(g_repr)
+        if fm_norm_sq <= config.projection_eps or repr_norm_sq <= config.projection_eps:
+            raise FloatingPointError("PCGrad received a near-zero task gradient")
+        pc_fm = [fm_grad - dot_before / repr_norm_sq * repr_grad for fm_grad, repr_grad in zip(g_fm, g_repr)]
+        pc_repr = [repr_grad - dot_before / fm_norm_sq * fm_grad for repr_grad, fm_grad in zip(g_repr, g_fm)]
+    combined = [fm_grad + repr_grad for fm_grad, repr_grad in zip(pc_fm, pc_repr)]
+    dot_after = _dot(pc_repr, pc_fm)
+    _assign_gradients(model, combined)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    return _stats_from_gradients(g_repr, g_fm, dot_before, dot_after, actual_fm_delta=0.0)
+
+
+def _step_cagrad(
+    config: ToyConfig,
+    model: ToyVectorField,
+    optimizer: torch.optim.Optimizer,
+    batch: dict[str, torch.Tensor],
+    flow_scale: torch.Tensor,
+    repr_scale: torch.Tensor,
+) -> dict[str, float]:
+    losses = _compute_losses(config, model, batch)
+    flow_objective = losses["flow"] / flow_scale
+    repr_objective = losses["repr"] / repr_scale
+    flow_before = float(flow_objective.detach().cpu())
+    g_fm, g_repr = _task_gradients(model, flow_objective, repr_objective)
+    result = aggregate_two_task_cagrad(g_fm, g_repr, c=float(config.cagrad_c), eps=config.projection_eps)
+    _assign_gradients(model, result.combined_gradients)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    after_losses = _compute_losses(config, model, batch)
+    actual_fm_delta = float((after_losses["flow"] / flow_scale).detach().cpu()) - flow_before
+    stats = _stats_from_gradients(
+        g_repr,
+        g_fm,
+        _dot(g_repr, g_fm),
+        _dot(result.combined_gradients, result.combined_gradients),
+        actual_fm_delta=actual_fm_delta,
+        combined_gradients=result.combined_gradients,
+    )
+    stats.update(
+        {
+            "cagrad_fm_weight": result.fm_weight,
+            "cagrad_cl_weight": result.cl_weight,
+            "cagrad_raw_fm_weight": result.fm_weight,
+            "cagrad_raw_cl_weight": result.cl_weight,
+            "gradient_cosine_mean": result.gradient_cosine,
+            "combined_grad_norm": result.combined_norm,
+        }
+    )
+    return stats
+
+
+def _step_fm_anchored_cagrad(
+    config: ToyConfig,
+    model: ToyVectorField,
+    optimizer: torch.optim.Optimizer,
+    batch: dict[str, torch.Tensor],
+    flow_scale: torch.Tensor,
+    repr_scale: torch.Tensor,
+) -> dict[str, float]:
+    if config.fm_descent_floor_fraction is None:
+        raise ValueError("fm_anchored_cagrad requires fm_descent_floor_fraction")
+    losses = _compute_losses(config, model, batch)
+    flow_objective = losses["flow"] / flow_scale
+    repr_objective = losses["repr"] / repr_scale
+    flow_before = float(flow_objective.detach().cpu())
+    g_fm, g_repr = _task_gradients(model, flow_objective, repr_objective)
+    result = aggregate_two_task_fm_anchored_cagrad(
+        g_fm,
+        g_repr,
+        c=float(config.cagrad_c),
+        fm_descent_floor_fraction=float(config.fm_descent_floor_fraction),
+        eps=config.projection_eps,
+    )
+    _assign_gradients(model, result.combined_gradients)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    after_losses = _compute_losses(config, model, batch)
+    actual_fm_delta = float((after_losses["flow"] / flow_scale).detach().cpu()) - flow_before
+    stats = _stats_from_gradients(
+        g_repr,
+        g_fm,
+        _dot(g_repr, g_fm),
+        _dot(result.combined_gradients, result.combined_gradients),
+        actual_fm_delta=actual_fm_delta,
+        combined_gradients=result.combined_gradients,
+    )
+    stats.update(
+        {
+            "cagrad_fm_weight": result.fm_weight,
+            "cagrad_cl_weight": result.cl_weight,
+            "cagrad_raw_fm_weight": result.raw_fm_weight,
+            "cagrad_raw_cl_weight": result.raw_cl_weight,
+            "gradient_cosine_mean": result.gradient_cosine,
+            "combined_grad_norm": result.combined_norm,
+            "fm_descent_floor": result.fm_descent_floor,
+            "fm_descent_after_cagrad": result.fm_descent_after_cagrad,
+            "fm_descent_after_anchor": result.fm_descent_after_anchor,
+            "fm_anchor_active": 1.0 if result.anchor_active else 0.0,
+        }
+    )
+    return stats
+
+
+def _step_budgeted_cagrad(
+    config: ToyConfig,
+    model: ToyVectorField,
+    optimizer: torch.optim.Optimizer,
+    batch: dict[str, torch.Tensor],
+    flow_scale: torch.Tensor,
+    repr_scale: torch.Tensor,
+) -> dict[str, float]:
+    if config.fm_budget_fraction is None:
+        raise ValueError("budgeted_cagrad requires fm_budget_fraction")
+    losses = _compute_losses(config, model, batch)
+    flow_objective = losses["flow"] / flow_scale
+    repr_objective = losses["repr"] / repr_scale
+    flow_before = float(flow_objective.detach().cpu())
+    g_fm, g_repr = _task_gradients(model, flow_objective, repr_objective)
+    result = aggregate_two_task_budgeted_cagrad(
+        g_fm,
+        g_repr,
+        c=float(config.cagrad_c),
+        fm_budget_fraction=float(config.fm_budget_fraction),
+        eps=config.projection_eps,
+    )
+    _assign_gradients(model, result.combined_gradients)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    after_losses = _compute_losses(config, model, batch)
+    actual_fm_delta = float((after_losses["flow"] / flow_scale).detach().cpu()) - flow_before
+    stats = _stats_from_gradients(
+        g_repr,
+        g_fm,
+        _dot(g_repr, g_fm),
+        _dot(result.combined_gradients, result.combined_gradients),
+        actual_fm_delta=actual_fm_delta,
+        combined_gradients=result.combined_gradients,
+    )
+    stats.update(
+        {
+            "cagrad_fm_weight": result.fm_weight,
+            "cagrad_cl_weight": result.cl_weight,
+            "cagrad_raw_fm_weight": result.raw_fm_weight,
+            "cagrad_raw_cl_weight": result.raw_cl_weight,
+            "gradient_cosine_mean": result.gradient_cosine,
+            "combined_grad_norm": result.combined_norm,
+            "fm_budget": result.fm_budget,
+            "fm_descent_after_cagrad": result.fm_descent_after_cagrad,
+            "fm_descent_after_budget": result.fm_descent_after_budget,
+            "fm_budget_active": 1.0 if result.budget_active else 0.0,
+            "fm_budget_scale": result.budget_scale,
+        }
+    )
+    return stats
+
+
+def _step_uncertainty_weighted(
+    config: ToyConfig,
+    model: ToyVectorField,
+    optimizer: torch.optim.Optimizer,
+    uncertainty_optimizer: torch.optim.Optimizer,
+    uncertainty_log_vars: tuple[torch.nn.Parameter, torch.nn.Parameter],
+    batch: dict[str, torch.Tensor],
+    flow_scale: torch.Tensor,
+    repr_scale: torch.Tensor,
+) -> dict[str, float]:
+    fm_log_var, cl_log_var = uncertainty_log_vars
+    losses = _compute_losses(config, model, batch)
+    flow_objective = losses["flow"] / flow_scale
+    repr_objective = losses["repr"] / repr_scale
+    flow_before = float(flow_objective.detach().cpu())
+    fm_weight = 0.5 * torch.exp(-fm_log_var)
+    cl_weight = 0.5 * torch.exp(-cl_log_var)
+    total = fm_weight * flow_objective + 0.5 * fm_log_var + cl_weight * repr_objective + 0.5 * cl_log_var
+    g_fm, g_repr = _task_gradients(model, flow_objective, repr_objective)
+    combined = [fm_weight.detach() * fm_grad + cl_weight.detach() * repr_grad for fm_grad, repr_grad in zip(g_fm, g_repr)]
+    optimizer.zero_grad(set_to_none=True)
+    uncertainty_optimizer.zero_grad(set_to_none=True)
+    total.backward()
+    optimizer.step()
+    uncertainty_optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    uncertainty_optimizer.zero_grad(set_to_none=True)
+    after_losses = _compute_losses(config, model, batch)
+    actual_fm_delta = float((after_losses["flow"] / flow_scale).detach().cpu()) - flow_before
+    stats = _stats_from_gradients(
+        g_repr,
+        g_fm,
+        _dot(g_repr, g_fm),
+        _dot(combined, combined),
+        actual_fm_delta=actual_fm_delta,
+        combined_gradients=combined,
+    )
+    stats.update(
+        {
+            "uncertainty_fm_log_var": float(fm_log_var.detach().cpu()),
+            "uncertainty_cl_log_var": float(cl_log_var.detach().cpu()),
+            "uncertainty_fm_weight": float(fm_weight.detach().cpu()),
+            "uncertainty_cl_weight": float(cl_weight.detach().cpu()),
+            "uncertainty_formula_total": float(total.detach().cpu()),
+        }
+    )
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Master branch step functions
+# ---------------------------------------------------------------------------
 
 def _step_line_search_projected(
     config: ToyConfig,
@@ -907,6 +1452,77 @@ def _step_line_search_projected(
             "line_search_accepted": 1.0,
             "line_search_flow_delta": float(line_search.flow_delta),
             "line_search_repr_delta": float(line_search.repr_delta),
+        }
+    )
+    return stats
+
+
+def _step_dual_step_projected(
+    config: ToyConfig,
+    model: ToyVectorField,
+    fm_optimizer: torch.optim.Optimizer,
+    batch: dict[str, torch.Tensor],
+    flow_scale: torch.Tensor,
+    repr_scale: torch.Tensor,
+    lambda_repr: float,
+    soft_margin: float,
+    dual_value: float,
+    step: int,
+) -> dict[str, float]:
+    if not math.isclose(float(soft_margin), 0.0, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError("dual_step_projected requires soft_margins[0] to equal 0.0")
+    fm_delta_target = _require_finite_scalar(config.fm_delta_target, "fm_delta_target", min_value=0.0)
+    dual_lr = _require_finite_scalar(config.dual_lr, "dual_lr")
+    if dual_lr <= 0.0:
+        raise ValueError("dual_lr must be positive")
+    dual_max = _require_finite_scalar(config.dual_max, "dual_max")
+    if dual_max <= 0.0:
+        raise ValueError("dual_max must be positive")
+    warmup_steps = _require_non_negative_int(config.primal_dual_warmup_steps, "primal_dual_warmup_steps")
+
+    fm_optimizer.zero_grad(set_to_none=True)
+    losses = _compute_losses(config, model, batch)
+    (losses["flow"] / flow_scale).backward()
+    fm_optimizer.step()
+
+    post_losses = _compute_losses(config, model, batch)
+    flow_objective = post_losses["flow"] / flow_scale
+    repr_objective = lambda_repr * post_losses["repr"] / repr_scale
+    flow_guard_value = float(flow_objective.detach().cpu())
+    g_fm, g_repr = _task_gradients(model, flow_objective, repr_objective)
+    projection = project_gradient_onto_fm_feasible_cone(g_repr, g_fm, eps=config.projection_eps)
+
+    dual_value_used = _require_finite_scalar(dual_value, "dual_value", min_value=0.0)
+    if dual_value_used > dual_max:
+        raise ValueError("dual_value must be <= dual_max")
+    effective_repr_lr = float(config.repr_learning_rate) / (1.0 + dual_value_used)
+    _manual_parameter_step(model, projection.projected_gradients, effective_repr_lr)
+
+    after_losses = _compute_losses(config, model, batch)
+    normalized_flow_after = float((after_losses["flow"] / flow_scale).detach().cpu())
+    actual_fm_delta = normalized_flow_after - flow_guard_value
+    violation = actual_fm_delta - fm_delta_target
+    warmup_active = warmup_steps > 0 and step <= warmup_steps
+    if warmup_active:
+        dual_value_next = dual_value_used
+    else:
+        dual_value_next = min(max(dual_value_used + dual_lr * violation, 0.0), dual_max)
+
+    stats = _stats_from_projection(
+        projection,
+        actual_fm_delta=actual_fm_delta,
+        fm_delta_target=fm_delta_target,
+        scaled_dot_after=projection.dot_after,
+        repr_learning_rate=effective_repr_lr,
+    )
+    stats.update(
+        {
+            "dual_value_used": float(dual_value_used),
+            "dual_value_next": float(dual_value_next),
+            "fm_budget_violation": float(violation),
+            "effective_repr_lr": float(effective_repr_lr),
+            "primal_dual_violation": float(violation),
+            "primal_dual_warmup_active": 1.0 if warmup_active else 0.0,
         }
     )
     return stats
@@ -1137,106 +1753,223 @@ def _step_descent_credit_scaled(
     return stats
 
 
-def _step_dual_step_projected(
-    config: ToyConfig,
-    model: ToyVectorField,
-    fm_optimizer: torch.optim.Optimizer,
-    batch: dict[str, torch.Tensor],
-    flow_scale: torch.Tensor,
-    repr_scale: torch.Tensor,
-    lambda_repr: float,
-    soft_margin: float,
-    dual_value: float,
-    step: int,
-) -> dict[str, float]:
-    if not math.isclose(float(soft_margin), 0.0, rel_tol=0.0, abs_tol=1e-12):
-        raise ValueError("dual_step_projected requires soft_margins[0] to equal 0.0")
-    fm_delta_target = _require_finite_scalar(config.fm_delta_target, "fm_delta_target", min_value=0.0)
-    dual_lr = _require_finite_scalar(config.dual_lr, "dual_lr")
-    if dual_lr <= 0.0:
-        raise ValueError("dual_lr must be positive")
-    dual_max = _require_finite_scalar(config.dual_max, "dual_max")
-    if dual_max <= 0.0:
-        raise ValueError("dual_max must be positive")
-    warmup_steps = _require_non_negative_int(config.primal_dual_warmup_steps, "primal_dual_warmup_steps")
+# ---------------------------------------------------------------------------
+# CAGrad aggregation functions
+# ---------------------------------------------------------------------------
 
-    fm_optimizer.zero_grad(set_to_none=True)
-    losses = _compute_losses(config, model, batch)
-    (losses["flow"] / flow_scale).backward()
-    fm_optimizer.step()
+def aggregate_two_task_cagrad(
+    g_fm: list[torch.Tensor],
+    g_cl: list[torch.Tensor],
+    c: float,
+    eps: float,
+) -> CAGradResult:
+    _validate_gradient_lists(g_fm, g_cl)
+    if not isinstance(c, (float, int)) or not math.isfinite(float(c)) or float(c) < 0.0 or float(c) >= 1.0:
+        raise ValueError("c must be finite and in [0, 1)")
+    if not isinstance(eps, (float, int)) or not math.isfinite(float(eps)) or float(eps) <= 0.0:
+        raise ValueError("eps must be finite and positive")
+    c_value = float(c)
+    g0 = [0.5 * (fm_grad + cl_grad) for fm_grad, cl_grad in zip(g_fm, g_cl)]
+    g0_norm = torch.sqrt(_squared_norm(g0))
+    if bool((g0_norm <= eps).item()):
+        raise FloatingPointError("CAGrad received a near-zero mean task gradient")
 
-    post_losses = _compute_losses(config, model, batch)
-    flow_objective = post_losses["flow"] / flow_scale
-    repr_objective = lambda_repr * post_losses["repr"] / repr_scale
-    flow_guard_value = float(flow_objective.detach().cpu())
-    g_fm, g_repr = _task_gradients(model, flow_objective, repr_objective)
-    projection = project_gradient_onto_fm_feasible_cone(g_repr, g_fm, eps=config.projection_eps)
+    def weighted_gradient(alpha: float) -> list[torch.Tensor]:
+        return [float(alpha) * fm_grad + (1.0 - float(alpha)) * cl_grad for fm_grad, cl_grad in zip(g_fm, g_cl)]
 
-    dual_value_used = _require_finite_scalar(dual_value, "dual_value", min_value=0.0)
-    if dual_value_used > dual_max:
-        raise ValueError("dual_value must be <= dual_max")
-    effective_repr_lr = float(config.repr_learning_rate) / (1.0 + dual_value_used)
-    _manual_parameter_step(model, projection.projected_gradients, effective_repr_lr)
+    def objective_derivative(alpha: float) -> torch.Tensor:
+        weighted = weighted_gradient(alpha)
+        direction = [fm_grad - cl_grad for fm_grad, cl_grad in zip(g_fm, g_cl)]
+        weighted_norm = torch.sqrt(_squared_norm(weighted))
+        if bool((weighted_norm <= eps).item()):
+            raise FloatingPointError("CAGrad simplex solve reached a near-zero weighted gradient")
+        return _dot(direction, g0) + c_value * g0_norm * _dot(direction, weighted) / weighted_norm
 
-    after_losses = _compute_losses(config, model, batch)
-    normalized_flow_after = float((after_losses["flow"] / flow_scale).detach().cpu())
-    actual_fm_delta = normalized_flow_after - flow_guard_value
-    violation = actual_fm_delta - fm_delta_target
-    warmup_active = warmup_steps > 0 and step <= warmup_steps
-    if warmup_active:
-        dual_value_next = dual_value_used
+    left_derivative = float(objective_derivative(0.0).detach().cpu())
+    right_derivative = float(objective_derivative(1.0).detach().cpu())
+    if left_derivative >= 0.0:
+        fm_weight = 0.0
+    elif right_derivative <= 0.0:
+        fm_weight = 1.0
     else:
-        dual_value_next = min(max(dual_value_used + dual_lr * violation, 0.0), dual_max)
-
-    stats = _stats_from_projection(
-        projection,
-        actual_fm_delta=actual_fm_delta,
-        fm_delta_target=fm_delta_target,
-        scaled_dot_after=projection.dot_after,
-        repr_learning_rate=effective_repr_lr,
+        low = 0.0
+        high = 1.0
+        for _ in range(80):
+            middle = 0.5 * (low + high)
+            middle_derivative = float(objective_derivative(middle).detach().cpu())
+            if middle_derivative < 0.0:
+                low = middle
+            else:
+                high = middle
+        fm_weight = 0.5 * (low + high)
+    cl_weight = 1.0 - fm_weight
+    weighted = weighted_gradient(fm_weight)
+    weighted_norm = torch.sqrt(_squared_norm(weighted))
+    if bool((weighted_norm <= eps).item()):
+        raise FloatingPointError("CAGrad selected a near-zero weighted gradient")
+    scale = c_value * g0_norm / weighted_norm
+    combined = [g0_grad + scale * weighted_grad for g0_grad, weighted_grad in zip(g0, weighted)]
+    combined_norm = torch.sqrt(_squared_norm(combined))
+    return CAGradResult(
+        fm_weight=float(fm_weight),
+        cl_weight=float(cl_weight),
+        gradient_cosine=float(_gradient_cosine(g_fm, g_cl, eps).detach().cpu()),
+        combined_norm=float(combined_norm.detach().cpu()),
+        combined_gradients=combined,
     )
-    stats.update(
-        {
-            "dual_value_used": float(dual_value_used),
-            "dual_value_next": float(dual_value_next),
-            "fm_budget_violation": float(violation),
-            "effective_repr_lr": float(effective_repr_lr),
-            "primal_dual_violation": float(violation),
-            "primal_dual_warmup_active": 1.0 if warmup_active else 0.0,
-        }
+
+
+def aggregate_two_task_fm_anchored_cagrad(
+    g_fm: list[torch.Tensor],
+    g_cl: list[torch.Tensor],
+    c: float,
+    fm_descent_floor_fraction: float,
+    eps: float,
+) -> FMAnchoredCAGradResult:
+    _validate_gradient_lists(g_fm, g_cl)
+    floor_fraction = _validate_fraction(fm_descent_floor_fraction, "fm_descent_floor_fraction")
+    raw = aggregate_two_task_cagrad(g_fm, g_cl, c=c, eps=eps)
+    fm_norm_squared = _squared_norm(g_fm)
+    if bool((fm_norm_squared <= eps).item()):
+        raise FloatingPointError("FM-anchored CAGrad received a near-zero FM gradient")
+    floor_tensor = floor_fraction * fm_norm_squared
+    raw_descent_tensor = _dot(g_fm, raw.combined_gradients)
+
+    if bool((raw_descent_tensor + _eps_tensor(raw_descent_tensor, eps) >= floor_tensor).item()):
+        combined = [gradient.clone() for gradient in raw.combined_gradients]
+        fm_weight = raw.fm_weight
+        cl_weight = raw.cl_weight
+        anchor_active = False
+    else:
+        fm_cl_dot = _dot(g_fm, g_cl)
+        fm_weight = _closest_fm_weight_for_floor(
+            current_fm_weight=raw.fm_weight,
+            fm_norm_squared=float(fm_norm_squared.detach().cpu()),
+            fm_cl_dot=float(fm_cl_dot.detach().cpu()),
+            floor=float(floor_tensor.detach().cpu()),
+            eps=float(eps),
+        )
+        cl_weight = 1.0 - fm_weight
+        combined = [fm_weight * fm_grad + cl_weight * cl_grad for fm_grad, cl_grad in zip(g_fm, g_cl)]
+        anchor_active = True
+
+    anchored_descent_tensor = _dot(g_fm, combined)
+    tolerance = _eps_tensor(anchored_descent_tensor, eps)
+    if bool((anchored_descent_tensor + tolerance < floor_tensor).item()):
+        raise RuntimeError("FM-anchored CAGrad did not satisfy the FM descent floor")
+    combined_norm = torch.sqrt(_squared_norm(combined))
+    return FMAnchoredCAGradResult(
+        fm_weight=float(fm_weight),
+        cl_weight=float(cl_weight),
+        raw_fm_weight=float(raw.fm_weight),
+        raw_cl_weight=float(raw.cl_weight),
+        gradient_cosine=raw.gradient_cosine,
+        combined_norm=float(combined_norm.detach().cpu()),
+        fm_descent_floor=float(floor_tensor.detach().cpu()),
+        fm_descent_after_cagrad=float(raw_descent_tensor.detach().cpu()),
+        fm_descent_after_anchor=float(anchored_descent_tensor.detach().cpu()),
+        anchor_active=anchor_active,
+        combined_gradients=combined,
     )
-    return stats
 
 
-def _step_pcgrad(
-    config: ToyConfig,
-    model: ToyVectorField,
-    optimizer: torch.optim.Optimizer,
-    batch: dict[str, torch.Tensor],
-    flow_scale: torch.Tensor,
-    repr_scale: torch.Tensor,
-    lambda_repr: float,
-) -> dict[str, float]:
-    losses = _compute_losses(config, model, batch)
-    flow_objective = losses["flow"] / flow_scale
-    repr_objective = lambda_repr * losses["repr"] / repr_scale
-    g_fm, g_repr = _task_gradients(model, flow_objective, repr_objective)
-    dot_before = _dot(g_repr, g_fm)
-    pc_fm = [grad.clone() for grad in g_fm]
-    pc_repr = [grad.clone() for grad in g_repr]
-    if bool((dot_before < 0).item()):
-        fm_norm_sq = _squared_norm(g_fm)
-        repr_norm_sq = _squared_norm(g_repr)
-        if fm_norm_sq <= config.projection_eps or repr_norm_sq <= config.projection_eps:
-            raise FloatingPointError("PCGrad received a near-zero task gradient")
-        pc_fm = [fm_grad - dot_before / repr_norm_sq * repr_grad for fm_grad, repr_grad in zip(g_fm, g_repr)]
-        pc_repr = [repr_grad - dot_before / fm_norm_sq * fm_grad for repr_grad, fm_grad in zip(g_repr, g_fm)]
-    combined = [fm_grad + repr_grad for fm_grad, repr_grad in zip(pc_fm, pc_repr)]
-    dot_after = _dot(pc_repr, pc_fm)
-    _assign_gradients(model, combined)
-    optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
-    return _stats_from_gradients(g_repr, g_fm, dot_before, dot_after, actual_fm_delta=0.0)
+def aggregate_two_task_budgeted_cagrad(
+    g_fm: list[torch.Tensor],
+    g_cl: list[torch.Tensor],
+    c: float,
+    fm_budget_fraction: float,
+    eps: float,
+) -> BudgetedCAGradResult:
+    _validate_gradient_lists(g_fm, g_cl)
+    budget_fraction = _validate_nonnegative_scalar(fm_budget_fraction, "fm_budget_fraction")
+    raw = aggregate_two_task_cagrad(g_fm, g_cl, c=c, eps=eps)
+    fm_norm_squared = _squared_norm(g_fm)
+    if bool((fm_norm_squared <= eps).item()):
+        raise FloatingPointError("Budgeted CAGrad received a near-zero FM gradient")
+    budget_tensor = budget_fraction * fm_norm_squared
+    lower_bound_tensor = -budget_tensor
+    raw_descent_tensor = _dot(g_fm, raw.combined_gradients)
+
+    if bool((raw_descent_tensor + _eps_tensor(raw_descent_tensor, eps) >= lower_bound_tensor).item()):
+        budget_scale = 1.0
+        combined = [gradient.clone() for gradient in raw.combined_gradients]
+        budget_active = False
+    else:
+        fm_descent_tensor = fm_norm_squared
+        denominator = fm_descent_tensor - raw_descent_tensor
+        if bool((denominator <= _eps_tensor(denominator, eps)).item()):
+            raise RuntimeError("Budgeted CAGrad cannot interpolate to the FM budget")
+        scale_tensor = (fm_descent_tensor - lower_bound_tensor) / denominator
+        scale_tensor = torch.clamp(scale_tensor, min=0.0, max=1.0)
+        budget_scale = float(scale_tensor.detach().cpu())
+        combined = [
+            budget_scale * raw_gradient + (1.0 - budget_scale) * fm_gradient
+            for raw_gradient, fm_gradient in zip(raw.combined_gradients, g_fm)
+        ]
+        budget_active = True
+
+    budgeted_descent_tensor = _dot(g_fm, combined)
+    tolerance = _eps_tensor(budgeted_descent_tensor, eps)
+    if bool((budgeted_descent_tensor + tolerance < lower_bound_tensor).item()):
+        raise RuntimeError("Budgeted CAGrad exceeded the FM descent budget")
+    combined_norm = torch.sqrt(_squared_norm(combined))
+    fm_weight = (1.0 - budget_scale) + budget_scale * raw.fm_weight
+    cl_weight = budget_scale * raw.cl_weight
+    return BudgetedCAGradResult(
+        fm_weight=float(fm_weight),
+        cl_weight=float(cl_weight),
+        raw_fm_weight=float(raw.fm_weight),
+        raw_cl_weight=float(raw.cl_weight),
+        gradient_cosine=raw.gradient_cosine,
+        combined_norm=float(combined_norm.detach().cpu()),
+        fm_budget=float(budget_tensor.detach().cpu()),
+        fm_descent_after_cagrad=float(raw_descent_tensor.detach().cpu()),
+        fm_descent_after_budget=float(budgeted_descent_tensor.detach().cpu()),
+        budget_active=budget_active,
+        budget_scale=budget_scale,
+        combined_gradients=combined,
+    )
+
+
+def _closest_fm_weight_for_floor(
+    current_fm_weight: float,
+    fm_norm_squared: float,
+    fm_cl_dot: float,
+    floor: float,
+    eps: float,
+) -> float:
+    denominator = fm_norm_squared - fm_cl_dot
+    if abs(denominator) <= eps:
+        if fm_cl_dot + eps >= floor:
+            return min(max(float(current_fm_weight), 0.0), 1.0)
+        raise RuntimeError("No two-task convex CAGrad weight can satisfy the FM descent floor")
+    threshold = (floor - fm_cl_dot) / denominator
+    if denominator > 0.0:
+        lower = min(max(threshold, 0.0), 1.0)
+        upper = 1.0
+    else:
+        lower = 0.0
+        upper = min(max(threshold, 0.0), 1.0)
+    if lower > upper + eps:
+        raise RuntimeError("FM descent floor is infeasible inside the two-task simplex")
+    return min(max(float(current_fm_weight), lower), upper)
+
+
+def _validate_fraction(value: float, name: str) -> float:
+    scalar = _validate_nonnegative_scalar(value, name)
+    if scalar > 1.0:
+        raise ValueError(f"{name} must be <= 1.0")
+    return scalar
+
+
+def _validate_nonnegative_scalar(value: float, name: str) -> float:
+    if not isinstance(value, (float, int)) or not math.isfinite(float(value)) or float(value) < 0.0:
+        raise ValueError(f"{name} must be finite and non-negative")
+    return float(value)
+
+
+def _eps_tensor(reference: torch.Tensor, eps: float) -> torch.Tensor:
+    return torch.as_tensor(max(float(eps), 1.0e-6), dtype=reference.dtype, device=reference.device)
 
 
 def _task_gradients(
@@ -1275,6 +2008,65 @@ def _assign_gradients(model: ToyVectorField, gradients: list[torch.Tensor]) -> N
         parameter.grad = gradient.detach().clone()
 
 
+def _save_parameters(model: ToyVectorField) -> list[torch.Tensor]:
+    return [p.detach().clone() for p in model.parameters()]
+
+
+def _restore_parameters(model: ToyVectorField, saved: list[torch.Tensor]) -> None:
+    with torch.no_grad():
+        for p, s in zip(model.parameters(), saved):
+            p.copy_(s)
+    model.zero_grad(set_to_none=True)
+
+
+def _copy_parameters(model: ToyVectorField) -> list[torch.Tensor]:
+    return [parameter.detach().clone() for parameter in model.parameters()]
+
+
+def _extract_adam_preconditioner_weights(
+    fm_optimizer: torch.optim.Optimizer,
+    model: ToyVectorField,
+) -> list[torch.Tensor]:
+    """Extract w = 1/(sqrt(v_hat) + eps) from Adam optimizer state.
+
+    Must be called AFTER fm_optimizer.step() so state is populated.
+    Uses bias-corrected v_hat = v / (1 - beta2^step).
+    """
+    beta2 = fm_optimizer.defaults.get('betas', (0.9, 0.999))[1]
+    adam_eps = fm_optimizer.defaults.get('eps', 1e-8)
+    weights: list[torch.Tensor] = []
+    for param in model.parameters():
+        state = fm_optimizer.state.get(param)
+        if state is None or 'exp_avg_sq' not in state:
+            # Fallback: uniform weights (identity metric)
+            weights.append(torch.ones_like(param))
+            continue
+        v = state['exp_avg_sq']
+        step = state['step']
+        v_hat = v / (1.0 - beta2 ** step)
+        w = 1.0 / (torch.sqrt(v_hat) + adam_eps)
+        weights.append(w)
+    return weights
+
+
+def _preconditioned_parameter_step(
+    model: ToyVectorField,
+    gradients: list[torch.Tensor],
+    preconditioner_weights: list[torch.Tensor],
+    learning_rate: float,
+) -> None:
+    """Apply preconditioned parameter update: param -= lr * w * gradient."""
+    parameters = list(model.parameters())
+    if len(parameters) != len(gradients) or len(parameters) != len(preconditioner_weights):
+        raise ValueError("Length mismatch between parameters, gradients, and weights")
+    with torch.no_grad():
+        for p, g, w in zip(parameters, gradients, preconditioner_weights):
+            if p.shape != g.shape or p.shape != w.shape:
+                raise ValueError("Shape mismatch between parameter, gradient, and weight")
+            p.add_(w * g, alpha=-learning_rate)
+    model.zero_grad(set_to_none=True)
+
+
 def _manual_parameter_step(model: ToyVectorField, gradients: list[torch.Tensor], learning_rate: float) -> None:
     parameters = list(model.parameters())
     if len(parameters) != len(gradients):
@@ -1285,66 +2077,6 @@ def _manual_parameter_step(model: ToyVectorField, gradients: list[torch.Tensor],
                 raise ValueError("Gradient shape does not match toy model parameter shape")
             parameter.add_(gradient, alpha=-learning_rate)
     model.zero_grad(set_to_none=True)
-
-
-def _copy_parameters(model: ToyVectorField) -> list[torch.Tensor]:
-    return [parameter.detach().clone() for parameter in model.parameters()]
-
-
-def _restore_parameters(model: ToyVectorField, values: list[torch.Tensor]) -> None:
-    parameters = list(model.parameters())
-    if len(parameters) != len(values):
-        raise ValueError("Parameter snapshot length does not match toy model parameters")
-    with torch.no_grad():
-        for parameter, value in zip(parameters, values):
-            if parameter.shape != value.shape:
-                raise ValueError("Parameter snapshot shape does not match toy model parameter shape")
-            parameter.copy_(value)
-    model.zero_grad(set_to_none=True)
-
-
-def _find_line_search_acceptance(
-    normalized_flow_before: float,
-    normalized_repr_before: float,
-    fm_delta_target: float,
-    max_backtracks: int,
-    contraction: float,
-    evaluate_candidate: Callable[[float], tuple[float, float]],
-) -> LineSearchAcceptanceResult:
-    normalized_flow_before = _require_finite_scalar(normalized_flow_before, "normalized_flow_before")
-    normalized_repr_before = _require_finite_scalar(normalized_repr_before, "normalized_repr_before")
-    fm_delta_target = _require_finite_scalar(fm_delta_target, "fm_delta_target", min_value=0.0)
-    max_backtracks = _require_positive_int(max_backtracks, "line_search_max_backtracks")
-    contraction = _require_open_unit_scalar(contraction, "line_search_contraction")
-
-    alpha = 1.0
-    last_flow_delta = math.inf
-    last_repr_delta = math.inf
-    for attempt in range(1, max_backtracks + 1):
-        normalized_flow_after, normalized_repr_after = evaluate_candidate(alpha)
-        normalized_flow_after = _require_finite_scalar(normalized_flow_after, "normalized_flow_after")
-        normalized_repr_after = _require_finite_scalar(normalized_repr_after, "normalized_repr_after")
-        flow_delta = normalized_flow_after - normalized_flow_before
-        repr_delta = normalized_repr_after - normalized_repr_before
-        last_flow_delta = flow_delta
-        last_repr_delta = repr_delta
-        if flow_delta <= fm_delta_target and repr_delta < 0.0:
-            return LineSearchAcceptanceResult(
-                attempts=attempt,
-                alpha=alpha,
-                accepted=True,
-                flow_delta=flow_delta,
-                repr_delta=repr_delta,
-            )
-        alpha *= contraction
-
-    return LineSearchAcceptanceResult(
-        attempts=max_backtracks,
-        alpha=alpha / contraction,
-        accepted=False,
-        flow_delta=last_flow_delta,
-        repr_delta=last_repr_delta,
-    )
 
 
 def _evaluate_model(
@@ -1415,6 +2147,10 @@ def _rbf_mmd(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
     return xx + yy - 2.0 * xy
 
 
+# ---------------------------------------------------------------------------
+# Stat tracking — merged keys from both PGC and master branches
+# ---------------------------------------------------------------------------
+
 def _new_stat_window() -> dict[str, list[float]]:
     return {
         "conflict": [],
@@ -1422,6 +2158,35 @@ def _new_stat_window() -> dict[str, list[float]]:
         "dot_after": [],
         "actual_fm_delta_after_repr_step": [],
         "projected_repr_norm_ratio": [],
+        "dual_value_used": [],
+        "dual_value_next": [],
+        "effective_repr_lr": [],
+        "primal_dual_violation": [],
+        "primal_dual_warmup_active": [],
+        "gradient_cosine": [],
+        "combined_grad_norm": [],
+        # PGC keys
+        "cagrad_fm_weight": [],
+        "cagrad_cl_weight": [],
+        "cagrad_raw_fm_weight": [],
+        "cagrad_raw_cl_weight": [],
+        "fm_descent_floor": [],
+        "fm_descent_after_cagrad": [],
+        "fm_descent_after_anchor": [],
+        "fm_anchor_active": [],
+        "fm_budget": [],
+        "fm_descent_after_budget": [],
+        "fm_budget_active": [],
+        "fm_budget_scale": [],
+        "uncertainty_fm_log_var": [],
+        "uncertainty_cl_log_var": [],
+        "uncertainty_fm_weight": [],
+        "uncertainty_cl_weight": [],
+        "uncertainty_formula_total": [],
+        "pu_norm_ratio": [],
+        "pu_backtrack_count": [],
+        "pu_effective_repr_lr": [],
+        # Master keys
         "adaptive_margin": [],
         "adaptive_normalized_fm_loss": [],
         "adaptive_margin_baseline": [],
@@ -1430,8 +2195,6 @@ def _new_stat_window() -> dict[str, list[float]]:
         "trust_radius_next": [],
         "trust_scale": [],
         "trust_region_active": [],
-        "dual_value_used": [],
-        "dual_value_next": [],
         "fm_budget_violation": [],
         "fm_delta_target": [],
         "scaled_dot_after": [],
@@ -1441,9 +2204,6 @@ def _new_stat_window() -> dict[str, list[float]]:
         "line_search_accepted": [],
         "line_search_flow_delta": [],
         "line_search_repr_delta": [],
-        "effective_repr_lr": [],
-        "primal_dual_violation": [],
-        "primal_dual_warmup_active": [],
         "budgeted_direction_norm_ratio": [],
         "fm_descent_credit": [],
         "credit_dot_lower_bound": [],
@@ -1460,6 +2220,35 @@ def _empty_step_stats() -> dict[str, float]:
         "dot_after_mean": 0.0,
         "actual_fm_delta_after_repr_step": 0.0,
         "projected_repr_norm_ratio": 0.0,
+        "dual_value_used": 0.0,
+        "dual_value_next": 0.0,
+        "effective_repr_lr": 0.0,
+        "primal_dual_violation": 0.0,
+        "primal_dual_warmup_active": 0.0,
+        "gradient_cosine_mean": 0.0,
+        "combined_grad_norm": 0.0,
+        # PGC keys
+        "cagrad_fm_weight": 0.0,
+        "cagrad_cl_weight": 0.0,
+        "cagrad_raw_fm_weight": 0.0,
+        "cagrad_raw_cl_weight": 0.0,
+        "fm_descent_floor": 0.0,
+        "fm_descent_after_cagrad": 0.0,
+        "fm_descent_after_anchor": 0.0,
+        "fm_anchor_active": 0.0,
+        "fm_budget": 0.0,
+        "fm_descent_after_budget": 0.0,
+        "fm_budget_active": 0.0,
+        "fm_budget_scale": 0.0,
+        "uncertainty_fm_log_var": 0.0,
+        "uncertainty_cl_log_var": 0.0,
+        "uncertainty_fm_weight": 0.0,
+        "uncertainty_cl_weight": 0.0,
+        "uncertainty_formula_total": 0.0,
+        "pu_norm_ratio": 0.0,
+        "pu_backtrack_count": 0.0,
+        "pu_effective_repr_lr": 0.0,
+        # Master keys
         "adaptive_margin": 0.0,
         "adaptive_normalized_fm_loss": 0.0,
         "adaptive_margin_baseline": 0.0,
@@ -1468,8 +2257,6 @@ def _empty_step_stats() -> dict[str, float]:
         "trust_radius_next": 0.0,
         "trust_scale": 0.0,
         "trust_region_active": 0.0,
-        "dual_value_used": 0.0,
-        "dual_value_next": 0.0,
         "fm_budget_violation": 0.0,
         "fm_delta_target": 0.0,
         "scaled_dot_after_mean": 0.0,
@@ -1479,9 +2266,6 @@ def _empty_step_stats() -> dict[str, float]:
         "line_search_accepted": 0.0,
         "line_search_flow_delta": 0.0,
         "line_search_repr_delta": 0.0,
-        "effective_repr_lr": 0.0,
-        "primal_dual_violation": 0.0,
-        "primal_dual_warmup_active": 0.0,
         "budgeted_direction_norm_ratio": 0.0,
         "fm_descent_credit": 0.0,
         "credit_dot_lower_bound": 0.0,
@@ -1491,40 +2275,71 @@ def _empty_step_stats() -> dict[str, float]:
     }
 
 
+def _initial_step_stats(method: str, soft_margin: float) -> dict[str, float]:
+    stats = _empty_step_stats()
+    if method in {"adaptive_margin_projected", "adaptive_trust_projected"}:
+        stats["adaptive_margin"] = float(soft_margin)
+    return stats
+
+
 def _accumulate_stats(window: dict[str, list[float]], step_stats: dict[str, float]) -> None:
     window["conflict"].append(float(step_stats["conflict_fraction"]))
     window["dot_before"].append(float(step_stats["dot_before_mean"]))
     window["dot_after"].append(float(step_stats["dot_after_mean"]))
     window["actual_fm_delta_after_repr_step"].append(float(step_stats["actual_fm_delta_after_repr_step"]))
     window["projected_repr_norm_ratio"].append(float(step_stats["projected_repr_norm_ratio"]))
-    window["adaptive_margin"].append(float(step_stats["adaptive_margin"]))
-    window["adaptive_normalized_fm_loss"].append(float(step_stats["adaptive_normalized_fm_loss"]))
-    window["adaptive_margin_baseline"].append(float(step_stats["adaptive_margin_baseline"]))
-    window["adaptive_margin_direction"].append(float(step_stats["adaptive_margin_direction"]))
-    window["trust_radius_used"].append(float(step_stats["trust_radius_used"]))
-    window["trust_radius_next"].append(float(step_stats["trust_radius_next"]))
-    window["trust_scale"].append(float(step_stats["trust_scale"]))
-    window["trust_region_active"].append(float(step_stats["trust_region_active"]))
     window["dual_value_used"].append(float(step_stats["dual_value_used"]))
     window["dual_value_next"].append(float(step_stats["dual_value_next"]))
-    window["fm_budget_violation"].append(float(step_stats["fm_budget_violation"]))
-    window["fm_delta_target"].append(float(step_stats["fm_delta_target"]))
-    window["scaled_dot_after"].append(float(step_stats["scaled_dot_after_mean"]))
-    window["repr_step_fm_first_order_effect"].append(float(step_stats["repr_step_fm_first_order_effect"]))
-    window["line_search_attempts"].append(float(step_stats["line_search_attempts"]))
-    window["line_search_alpha"].append(float(step_stats["line_search_alpha"]))
-    window["line_search_accepted"].append(float(step_stats["line_search_accepted"]))
-    window["line_search_flow_delta"].append(float(step_stats["line_search_flow_delta"]))
-    window["line_search_repr_delta"].append(float(step_stats["line_search_repr_delta"]))
     window["effective_repr_lr"].append(float(step_stats["effective_repr_lr"]))
     window["primal_dual_violation"].append(float(step_stats["primal_dual_violation"]))
     window["primal_dual_warmup_active"].append(float(step_stats["primal_dual_warmup_active"]))
-    window["budgeted_direction_norm_ratio"].append(float(step_stats["budgeted_direction_norm_ratio"]))
-    window["fm_descent_credit"].append(float(step_stats["fm_descent_credit"]))
-    window["credit_dot_lower_bound"].append(float(step_stats["credit_dot_lower_bound"]))
-    window["credit_budget_used_fraction"].append(float(step_stats["credit_budget_used_fraction"]))
-    window["net_fm_delta_after_two_step"].append(float(step_stats["net_fm_delta_after_two_step"]))
-    window["credit_scale"].append(float(step_stats["credit_scale"]))
+    window["gradient_cosine"].append(float(step_stats["gradient_cosine_mean"]))
+    window["combined_grad_norm"].append(float(step_stats["combined_grad_norm"]))
+    # PGC keys
+    window["cagrad_fm_weight"].append(float(step_stats["cagrad_fm_weight"]))
+    window["cagrad_cl_weight"].append(float(step_stats["cagrad_cl_weight"]))
+    window["cagrad_raw_fm_weight"].append(float(step_stats["cagrad_raw_fm_weight"]))
+    window["cagrad_raw_cl_weight"].append(float(step_stats["cagrad_raw_cl_weight"]))
+    window["fm_descent_floor"].append(float(step_stats["fm_descent_floor"]))
+    window["fm_descent_after_cagrad"].append(float(step_stats["fm_descent_after_cagrad"]))
+    window["fm_descent_after_anchor"].append(float(step_stats["fm_descent_after_anchor"]))
+    window["fm_anchor_active"].append(float(step_stats["fm_anchor_active"]))
+    window["fm_budget"].append(float(step_stats["fm_budget"]))
+    window["fm_descent_after_budget"].append(float(step_stats["fm_descent_after_budget"]))
+    window["fm_budget_active"].append(float(step_stats["fm_budget_active"]))
+    window["fm_budget_scale"].append(float(step_stats["fm_budget_scale"]))
+    window["uncertainty_fm_log_var"].append(float(step_stats["uncertainty_fm_log_var"]))
+    window["uncertainty_cl_log_var"].append(float(step_stats["uncertainty_cl_log_var"]))
+    window["uncertainty_fm_weight"].append(float(step_stats["uncertainty_fm_weight"]))
+    window["uncertainty_cl_weight"].append(float(step_stats["uncertainty_cl_weight"]))
+    window["uncertainty_formula_total"].append(float(step_stats["uncertainty_formula_total"]))
+    window["pu_norm_ratio"].append(float(step_stats.get("pu_norm_ratio", 0.0)))
+    window["pu_backtrack_count"].append(float(step_stats.get("pu_backtrack_count", 0.0)))
+    window["pu_effective_repr_lr"].append(float(step_stats.get("pu_effective_repr_lr", 0.0)))
+    # Master keys
+    window["adaptive_margin"].append(float(step_stats.get("adaptive_margin", 0.0)))
+    window["adaptive_normalized_fm_loss"].append(float(step_stats.get("adaptive_normalized_fm_loss", 0.0)))
+    window["adaptive_margin_baseline"].append(float(step_stats.get("adaptive_margin_baseline", 0.0)))
+    window["adaptive_margin_direction"].append(float(step_stats.get("adaptive_margin_direction", 0.0)))
+    window["trust_radius_used"].append(float(step_stats.get("trust_radius_used", 0.0)))
+    window["trust_radius_next"].append(float(step_stats.get("trust_radius_next", 0.0)))
+    window["trust_scale"].append(float(step_stats.get("trust_scale", 0.0)))
+    window["trust_region_active"].append(float(step_stats.get("trust_region_active", 0.0)))
+    window["fm_budget_violation"].append(float(step_stats.get("fm_budget_violation", 0.0)))
+    window["fm_delta_target"].append(float(step_stats.get("fm_delta_target", 0.0)))
+    window["scaled_dot_after"].append(float(step_stats.get("scaled_dot_after_mean", 0.0)))
+    window["repr_step_fm_first_order_effect"].append(float(step_stats.get("repr_step_fm_first_order_effect", 0.0)))
+    window["line_search_attempts"].append(float(step_stats.get("line_search_attempts", 0.0)))
+    window["line_search_alpha"].append(float(step_stats.get("line_search_alpha", 0.0)))
+    window["line_search_accepted"].append(float(step_stats.get("line_search_accepted", 0.0)))
+    window["line_search_flow_delta"].append(float(step_stats.get("line_search_flow_delta", 0.0)))
+    window["line_search_repr_delta"].append(float(step_stats.get("line_search_repr_delta", 0.0)))
+    window["budgeted_direction_norm_ratio"].append(float(step_stats.get("budgeted_direction_norm_ratio", 0.0)))
+    window["fm_descent_credit"].append(float(step_stats.get("fm_descent_credit", 0.0)))
+    window["credit_dot_lower_bound"].append(float(step_stats.get("credit_dot_lower_bound", 0.0)))
+    window["credit_budget_used_fraction"].append(float(step_stats.get("credit_budget_used_fraction", 0.0)))
+    window["net_fm_delta_after_two_step"].append(float(step_stats.get("net_fm_delta_after_two_step", 0.0)))
+    window["credit_scale"].append(float(step_stats.get("credit_scale", 0.0)))
 
 
 def _summarize_stat_window(window: dict[str, list[float]]) -> dict[str, float]:
@@ -1536,6 +2351,35 @@ def _summarize_stat_window(window: dict[str, list[float]]) -> dict[str, float]:
         "dot_after_mean": _mean(window["dot_after"]),
         "actual_fm_delta_after_repr_step": _mean(window["actual_fm_delta_after_repr_step"]),
         "projected_repr_norm_ratio": _mean(window["projected_repr_norm_ratio"]),
+        "dual_value_used": window["dual_value_used"][-1],
+        "dual_value_next": window["dual_value_next"][-1],
+        "effective_repr_lr": _mean(window["effective_repr_lr"]),
+        "primal_dual_violation": _mean(window["primal_dual_violation"]),
+        "primal_dual_warmup_active": _mean(window["primal_dual_warmup_active"]),
+        "gradient_cosine_mean": _mean(window["gradient_cosine"]),
+        "combined_grad_norm": _mean(window["combined_grad_norm"]),
+        # PGC keys
+        "cagrad_fm_weight": window["cagrad_fm_weight"][-1],
+        "cagrad_cl_weight": window["cagrad_cl_weight"][-1],
+        "cagrad_raw_fm_weight": window["cagrad_raw_fm_weight"][-1],
+        "cagrad_raw_cl_weight": window["cagrad_raw_cl_weight"][-1],
+        "fm_descent_floor": _mean(window["fm_descent_floor"]),
+        "fm_descent_after_cagrad": _mean(window["fm_descent_after_cagrad"]),
+        "fm_descent_after_anchor": _mean(window["fm_descent_after_anchor"]),
+        "fm_anchor_active": _mean(window["fm_anchor_active"]),
+        "fm_budget": _mean(window["fm_budget"]),
+        "fm_descent_after_budget": _mean(window["fm_descent_after_budget"]),
+        "fm_budget_active": _mean(window["fm_budget_active"]),
+        "fm_budget_scale": _mean(window["fm_budget_scale"]),
+        "uncertainty_fm_log_var": window["uncertainty_fm_log_var"][-1],
+        "uncertainty_cl_log_var": window["uncertainty_cl_log_var"][-1],
+        "uncertainty_fm_weight": window["uncertainty_fm_weight"][-1],
+        "uncertainty_cl_weight": window["uncertainty_cl_weight"][-1],
+        "uncertainty_formula_total": _mean(window["uncertainty_formula_total"]),
+        "pu_norm_ratio": _mean(window["pu_norm_ratio"]),
+        "pu_backtrack_count": _mean(window["pu_backtrack_count"]),
+        "pu_effective_repr_lr": _mean(window["pu_effective_repr_lr"]),
+        # Master keys
         "adaptive_margin": _mean(window["adaptive_margin"]),
         "adaptive_normalized_fm_loss": _mean(window["adaptive_normalized_fm_loss"]),
         "adaptive_margin_baseline": _mean(window["adaptive_margin_baseline"]),
@@ -1544,8 +2388,6 @@ def _summarize_stat_window(window: dict[str, list[float]]) -> dict[str, float]:
         "trust_radius_next": _mean(window["trust_radius_next"]),
         "trust_scale": _mean(window["trust_scale"]),
         "trust_region_active": _mean(window["trust_region_active"]),
-        "dual_value_used": _mean(window["dual_value_used"]),
-        "dual_value_next": _mean(window["dual_value_next"]),
         "fm_budget_violation": _mean(window["fm_budget_violation"]),
         "fm_delta_target": _mean(window["fm_delta_target"]),
         "scaled_dot_after_mean": _mean(window["scaled_dot_after"]),
@@ -1555,9 +2397,6 @@ def _summarize_stat_window(window: dict[str, list[float]]) -> dict[str, float]:
         "line_search_accepted": _mean(window["line_search_accepted"]),
         "line_search_flow_delta": _mean(window["line_search_flow_delta"]),
         "line_search_repr_delta": _mean(window["line_search_repr_delta"]),
-        "effective_repr_lr": _mean(window["effective_repr_lr"]),
-        "primal_dual_violation": _mean(window["primal_dual_violation"]),
-        "primal_dual_warmup_active": _mean(window["primal_dual_warmup_active"]),
         "budgeted_direction_norm_ratio": _mean(window["budgeted_direction_norm_ratio"]),
         "fm_descent_credit": _mean(window["fm_descent_credit"]),
         "credit_dot_lower_bound": _mean(window["credit_dot_lower_bound"]),
@@ -1599,6 +2438,35 @@ def _stats_from_projection(
         "dot_after_mean": float(projection.dot_after.detach().cpu()),
         "actual_fm_delta_after_repr_step": float(actual_fm_delta),
         "projected_repr_norm_ratio": float(ratio.detach().cpu()),
+        "dual_value_used": 0.0 if dual_update is None else float(dual_update.previous_dual_value),
+        "dual_value_next": 0.0 if dual_update is None else float(dual_update.next_dual_value),
+        "effective_repr_lr": float(repr_learning_rate),
+        "primal_dual_violation": 0.0,
+        "primal_dual_warmup_active": 0.0,
+        "gradient_cosine_mean": 0.0,
+        "combined_grad_norm": float(projection.projected_repr_norm.detach().cpu()),
+        # PGC keys
+        "cagrad_fm_weight": 0.0,
+        "cagrad_cl_weight": 0.0,
+        "cagrad_raw_fm_weight": 0.0,
+        "cagrad_raw_cl_weight": 0.0,
+        "fm_descent_floor": 0.0,
+        "fm_descent_after_cagrad": 0.0,
+        "fm_descent_after_anchor": 0.0,
+        "fm_anchor_active": 0.0,
+        "fm_budget": 0.0,
+        "fm_descent_after_budget": 0.0,
+        "fm_budget_active": 0.0,
+        "fm_budget_scale": 0.0,
+        "uncertainty_fm_log_var": 0.0,
+        "uncertainty_cl_log_var": 0.0,
+        "uncertainty_fm_weight": 0.0,
+        "uncertainty_cl_weight": 0.0,
+        "uncertainty_formula_total": 0.0,
+        "pu_norm_ratio": 0.0,
+        "pu_backtrack_count": 0.0,
+        "pu_effective_repr_lr": 0.0,
+        # Master keys
         "adaptive_margin": float(adaptive_margin),
         "adaptive_normalized_fm_loss": float(adaptive_normalized_fm_loss),
         "adaptive_margin_baseline": float(adaptive_margin_baseline),
@@ -1609,8 +2477,6 @@ def _stats_from_projection(
         "trust_region_active": 0.0
         if trust_result is None
         else float(1.0 if trust_result.trust_region_active else 0.0),
-        "dual_value_used": 0.0 if dual_update is None else float(dual_update.previous_dual_value),
-        "dual_value_next": 0.0 if dual_update is None else float(dual_update.next_dual_value),
         "fm_budget_violation": 0.0 if dual_update is None else float(dual_update.fm_budget_violation),
         "fm_delta_target": float(fm_delta_target),
         "scaled_dot_after_mean": float(scaled_dot_after.detach().cpu()),
@@ -1620,9 +2486,6 @@ def _stats_from_projection(
         "line_search_accepted": 0.0,
         "line_search_flow_delta": 0.0,
         "line_search_repr_delta": 0.0,
-        "effective_repr_lr": 0.0,
-        "primal_dual_violation": 0.0,
-        "primal_dual_warmup_active": 0.0,
         "budgeted_direction_norm_ratio": 0.0,
         "fm_descent_credit": 0.0,
         "credit_dot_lower_bound": 0.0,
@@ -1638,15 +2501,47 @@ def _stats_from_gradients(
     dot_before: torch.Tensor,
     dot_after: torch.Tensor,
     actual_fm_delta: float,
+    combined_gradients: list[torch.Tensor] | None = None,
 ) -> dict[str, float]:
     repr_norm = torch.sqrt(_squared_norm(g_repr))
     projected_norm = repr_norm
+    combined = combined_gradients if combined_gradients is not None else [fm_grad + repr_grad for fm_grad, repr_grad in zip(g_fm, g_repr)]
+    combined_norm = torch.sqrt(_squared_norm(combined))
     return {
         "conflict_fraction": 1.0 if dot_before < 0 else 0.0,
         "dot_before_mean": float(dot_before.detach().cpu()),
         "dot_after_mean": float(dot_after.detach().cpu()),
         "actual_fm_delta_after_repr_step": float(actual_fm_delta),
         "projected_repr_norm_ratio": float((projected_norm / repr_norm).detach().cpu()),
+        "dual_value_used": 0.0,
+        "dual_value_next": 0.0,
+        "effective_repr_lr": 0.0,
+        "primal_dual_violation": 0.0,
+        "primal_dual_warmup_active": 0.0,
+        "gradient_cosine_mean": float(_gradient_cosine(g_fm, g_repr, NORM_EPS).detach().cpu()),
+        "combined_grad_norm": float(combined_norm.detach().cpu()),
+        # PGC keys
+        "cagrad_fm_weight": 0.0,
+        "cagrad_cl_weight": 0.0,
+        "cagrad_raw_fm_weight": 0.0,
+        "cagrad_raw_cl_weight": 0.0,
+        "fm_descent_floor": 0.0,
+        "fm_descent_after_cagrad": 0.0,
+        "fm_descent_after_anchor": 0.0,
+        "fm_anchor_active": 0.0,
+        "fm_budget": 0.0,
+        "fm_descent_after_budget": 0.0,
+        "fm_budget_active": 0.0,
+        "fm_budget_scale": 0.0,
+        "uncertainty_fm_log_var": 0.0,
+        "uncertainty_cl_log_var": 0.0,
+        "uncertainty_fm_weight": 0.0,
+        "uncertainty_cl_weight": 0.0,
+        "uncertainty_formula_total": 0.0,
+        "pu_norm_ratio": 0.0,
+        "pu_backtrack_count": 0.0,
+        "pu_effective_repr_lr": 0.0,
+        # Master keys
         "adaptive_margin": 0.0,
         "adaptive_normalized_fm_loss": 0.0,
         "adaptive_margin_baseline": 0.0,
@@ -1655,8 +2550,6 @@ def _stats_from_gradients(
         "trust_radius_next": 0.0,
         "trust_scale": 0.0,
         "trust_region_active": 0.0,
-        "dual_value_used": 0.0,
-        "dual_value_next": 0.0,
         "fm_budget_violation": 0.0,
         "fm_delta_target": 0.0,
         "scaled_dot_after_mean": float(dot_after.detach().cpu()),
@@ -1666,9 +2559,6 @@ def _stats_from_gradients(
         "line_search_accepted": 0.0,
         "line_search_flow_delta": 0.0,
         "line_search_repr_delta": 0.0,
-        "effective_repr_lr": 0.0,
-        "primal_dual_violation": 0.0,
-        "primal_dual_warmup_active": 0.0,
         "budgeted_direction_norm_ratio": 0.0,
         "fm_descent_credit": 0.0,
         "credit_dot_lower_bound": 0.0,
@@ -1678,11 +2568,69 @@ def _stats_from_gradients(
     }
 
 
-def _initial_step_stats(method: str, soft_margin: float) -> dict[str, float]:
-    stats = _empty_step_stats()
-    if method in {"adaptive_margin_projected", "adaptive_trust_projected"}:
-        stats["adaptive_margin"] = float(soft_margin)
-    return stats
+def _validate_gradient_lists(g_repr: list[torch.Tensor], g_fm: list[torch.Tensor]) -> None:
+    if not isinstance(g_repr, list) or not isinstance(g_fm, list):
+        raise TypeError("g_repr and g_fm must be list[Tensor]")
+    if not g_repr or not g_fm:
+        raise ValueError("g_repr and g_fm must be non-empty")
+    if len(g_repr) != len(g_fm):
+        raise ValueError("g_repr and g_fm must have the same length")
+    for index, (repr_grad, fm_grad) in enumerate(zip(g_repr, g_fm)):
+        if repr_grad.shape != fm_grad.shape:
+            raise ValueError(f"g_repr[{index}] and g_fm[{index}] must have the same shape")
+        if repr_grad.device != fm_grad.device:
+            raise ValueError(f"g_repr[{index}] and g_fm[{index}] must be on the same device")
+        if not torch.isfinite(repr_grad).all() or not torch.isfinite(fm_grad).all():
+            raise FloatingPointError("gradient tensors must be finite")
+
+
+def _dot(left: list[torch.Tensor], right: list[torch.Tensor]) -> torch.Tensor:
+    total = None
+    for left_item, right_item in zip(left, right):
+        item = (left_item * right_item).sum()
+        total = item if total is None else total + item
+    if total is None:
+        raise RuntimeError("Cannot compute dot product for an empty gradient list")
+    return total
+
+
+def _squared_norm(gradients: list[torch.Tensor]) -> torch.Tensor:
+    total = None
+    for gradient in gradients:
+        item = gradient.pow(2).sum()
+        total = item if total is None else total + item
+    if total is None:
+        raise RuntimeError("Cannot compute norm for an empty gradient list")
+    return total
+
+
+def _gradient_cosine(left: list[torch.Tensor], right: list[torch.Tensor], eps: float) -> torch.Tensor:
+    _validate_gradient_lists(left, right)
+    left_norm = torch.sqrt(_squared_norm(left))
+    right_norm = torch.sqrt(_squared_norm(right))
+    if bool((left_norm <= eps).item() or (right_norm <= eps).item()):
+        raise FloatingPointError("Cannot compute cosine for a near-zero gradient")
+    return _dot(left, right) / (left_norm * right_norm)
+
+
+def _stable_seed_offset(method: str, delta_deg: float, lambda_repr: float, soft_margin: float) -> int:
+    text = f"{method}|{delta_deg:.6f}|{lambda_repr:.6f}|{soft_margin:.6f}"
+    value = 0
+    for char in text:
+        value = (value * 131 + ord(char)) % 1_000_000
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Master branch helpers: adaptive margin, trust region, line search
+# ---------------------------------------------------------------------------
+
+def _ema_update(previous: float | None, value: float, beta: float | None) -> float:
+    if beta is None:
+        raise ValueError("adaptive_margin_projected requires adaptive_margin_ema_beta in ema mode")
+    if previous is None:
+        return float(value)
+    return float(beta) * float(previous) + (1.0 - float(beta)) * float(value)
 
 
 def _new_adaptive_margin_state(config: ToyConfig) -> AdaptiveMarginState:
@@ -1760,13 +2708,53 @@ def _adaptive_margin_direction_value(direction: str) -> float:
     raise ValueError(f"Unsupported adaptive margin direction: {direction}")
 
 
-def _ema_update(previous: float | None, value: float, beta: float | None) -> float:
-    if beta is None:
-        raise ValueError("adaptive_margin_projected requires adaptive_margin_ema_beta in ema mode")
-    if previous is None:
-        return float(value)
-    return float(beta) * float(previous) + (1.0 - float(beta)) * float(value)
+def _find_line_search_acceptance(
+    normalized_flow_before: float,
+    normalized_repr_before: float,
+    fm_delta_target: float,
+    max_backtracks: int,
+    contraction: float,
+    evaluate_candidate: Callable[[float], tuple[float, float]],
+) -> LineSearchAcceptanceResult:
+    normalized_flow_before = _require_finite_scalar(normalized_flow_before, "normalized_flow_before")
+    normalized_repr_before = _require_finite_scalar(normalized_repr_before, "normalized_repr_before")
+    fm_delta_target = _require_finite_scalar(fm_delta_target, "fm_delta_target", min_value=0.0)
+    max_backtracks = _require_positive_int(max_backtracks, "line_search_max_backtracks")
+    contraction = _require_open_unit_scalar(contraction, "line_search_contraction")
 
+    alpha = 1.0
+    last_flow_delta = math.inf
+    last_repr_delta = math.inf
+    for attempt in range(1, max_backtracks + 1):
+        normalized_flow_after, normalized_repr_after = evaluate_candidate(alpha)
+        normalized_flow_after = _require_finite_scalar(normalized_flow_after, "normalized_flow_after")
+        normalized_repr_after = _require_finite_scalar(normalized_repr_after, "normalized_repr_after")
+        flow_delta = normalized_flow_after - normalized_flow_before
+        repr_delta = normalized_repr_after - normalized_repr_before
+        last_flow_delta = flow_delta
+        last_repr_delta = repr_delta
+        if flow_delta <= fm_delta_target and repr_delta < 0.0:
+            return LineSearchAcceptanceResult(
+                attempts=attempt,
+                alpha=alpha,
+                accepted=True,
+                flow_delta=flow_delta,
+                repr_delta=repr_delta,
+            )
+        alpha *= contraction
+
+    return LineSearchAcceptanceResult(
+        attempts=max_backtracks,
+        alpha=alpha / contraction,
+        accepted=False,
+        flow_delta=last_flow_delta,
+        repr_delta=last_repr_delta,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Master branch validators
+# ---------------------------------------------------------------------------
 
 def _validate_adaptive_margin_config(config: ToyConfig) -> None:
     adaptive_methods = [method for method in ("adaptive_margin_projected", "adaptive_trust_projected") if method in config.methods]
@@ -1849,7 +2837,6 @@ def _validate_adaptive_trust_config(config: ToyConfig) -> None:
             "trust_radius_initial": config.trust_radius_initial,
             "trust_radius_min": config.trust_radius_min,
             "trust_radius_max": config.trust_radius_max,
-            "fm_delta_target": config.fm_delta_target,
         }.items()
         if value is None
     ]
@@ -1881,7 +2868,6 @@ def _validate_line_search_config(config: ToyConfig) -> None:
     missing = [
         name
         for name, value in {
-            "fm_delta_target": config.fm_delta_target,
             "line_search_max_backtracks": config.line_search_max_backtracks,
             "line_search_contraction": config.line_search_contraction,
         }.items()
@@ -1907,7 +2893,6 @@ def _validate_dual_step_config(config: ToyConfig) -> None:
     missing = [
         name
         for name, value in {
-            "fm_delta_target": config.fm_delta_target,
             "dual_lr": config.dual_lr,
             "dual_max": config.dual_max,
             "primal_dual_warmup_steps": config.primal_dual_warmup_steps,
@@ -1939,7 +2924,6 @@ def _validate_budgeted_cl_line_search_config(config: ToyConfig) -> None:
     missing = [
         name
         for name, value in {
-            "fm_delta_target": config.fm_delta_target,
             "line_search_max_backtracks": config.line_search_max_backtracks,
             "line_search_contraction": config.line_search_contraction,
         }.items()
@@ -1974,12 +2958,8 @@ def _validate_descent_credit_projected_config(config: ToyConfig) -> None:
             "adaptive_margin_min": config.adaptive_margin_min,
             "adaptive_margin_max": config.adaptive_margin_max,
             "adaptive_margin_initial": config.adaptive_margin_initial,
-            "fm_delta_target": config.fm_delta_target,
             "line_search_max_backtracks": config.line_search_max_backtracks,
             "line_search_contraction": config.line_search_contraction,
-            "dual_lr": config.dual_lr,
-            "dual_max": config.dual_max,
-            "primal_dual_warmup_steps": config.primal_dual_warmup_steps,
             "trust_radius_initial": config.trust_radius_initial,
             "trust_radius_min": config.trust_radius_min,
             "trust_radius_max": config.trust_radius_max,
@@ -2009,12 +2989,8 @@ def _validate_descent_credit_scaled_config(config: ToyConfig) -> None:
             "adaptive_margin_min": config.adaptive_margin_min,
             "adaptive_margin_max": config.adaptive_margin_max,
             "adaptive_margin_initial": config.adaptive_margin_initial,
-            "fm_delta_target": config.fm_delta_target,
             "line_search_max_backtracks": config.line_search_max_backtracks,
             "line_search_contraction": config.line_search_contraction,
-            "dual_lr": config.dual_lr,
-            "dual_max": config.dual_max,
-            "primal_dual_warmup_steps": config.primal_dual_warmup_steps,
             "trust_radius_initial": config.trust_radius_initial,
             "trust_radius_min": config.trust_radius_min,
             "trust_radius_max": config.trust_radius_max,
@@ -2057,50 +3033,6 @@ def _require_open_unit_scalar(value: float | None, name: str) -> float:
     if scalar <= 0.0 or scalar >= 1.0:
         raise ValueError(f"{name} must be in (0, 1)")
     return scalar
-
-
-def _validate_gradient_lists(g_repr: list[torch.Tensor], g_fm: list[torch.Tensor]) -> None:
-    if not isinstance(g_repr, list) or not isinstance(g_fm, list):
-        raise TypeError("g_repr and g_fm must be list[Tensor]")
-    if not g_repr or not g_fm:
-        raise ValueError("g_repr and g_fm must be non-empty")
-    if len(g_repr) != len(g_fm):
-        raise ValueError("g_repr and g_fm must have the same length")
-    for index, (repr_grad, fm_grad) in enumerate(zip(g_repr, g_fm)):
-        if repr_grad.shape != fm_grad.shape:
-            raise ValueError(f"g_repr[{index}] and g_fm[{index}] must have the same shape")
-        if repr_grad.device != fm_grad.device:
-            raise ValueError(f"g_repr[{index}] and g_fm[{index}] must be on the same device")
-        if not torch.isfinite(repr_grad).all() or not torch.isfinite(fm_grad).all():
-            raise FloatingPointError("gradient tensors must be finite")
-
-
-def _dot(left: list[torch.Tensor], right: list[torch.Tensor]) -> torch.Tensor:
-    total = None
-    for left_item, right_item in zip(left, right):
-        item = (left_item * right_item).sum()
-        total = item if total is None else total + item
-    if total is None:
-        raise RuntimeError("Cannot compute dot product for an empty gradient list")
-    return total
-
-
-def _squared_norm(gradients: list[torch.Tensor]) -> torch.Tensor:
-    total = None
-    for gradient in gradients:
-        item = gradient.pow(2).sum()
-        total = item if total is None else total + item
-    if total is None:
-        raise RuntimeError("Cannot compute norm for an empty gradient list")
-    return total
-
-
-def _stable_seed_offset(method: str, delta_deg: float, lambda_repr: float, soft_margin: float) -> int:
-    text = f"{method}|{delta_deg:.6f}|{lambda_repr:.6f}|{soft_margin:.6f}"
-    value = 0
-    for char in text:
-        value = (value * 131 + ord(char)) % 1_000_000
-    return value
 
 
 def _plot_curves(metrics_path: Path, output_path: Path) -> None:

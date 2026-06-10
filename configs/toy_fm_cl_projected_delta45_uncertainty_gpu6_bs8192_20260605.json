@@ -1,5 +1,6 @@
 {
   "batch_size": 8192,
+  "cagrad_c": null,
   "calibration_batches": 4,
   "deltas_deg": [
     45.0
@@ -19,15 +20,15 @@
   "layers": 3,
   "learning_rate": 0.001,
   "methods": [
-    "primal_dual_projected"
+    "uncertainty_weighted"
   ],
   "normalize_losses": true,
-  "output_dir": "artifacts/toy_fm_cl_projected",
-  "primal_dual_warmup_steps": 100,
+  "output_dir": "artifacts/toy_fm_cl_projected_adaptive_20260605",
+  "primal_dual_warmup_steps": 0,
   "projection_eps": 1e-12,
   "repr_learning_rate": 0.001,
   "repr_relation_weight": 1.0,
-  "run_name": "delta45_primal_dual_projected_gpu6_bs8192_20260605",
+  "run_name": "delta45_uncertainty_weighted_gpu6_bs8192_20260605",
   "sample_steps": 16,
   "seed": 1337,
   "sigma": 0.05,
@@ -35,5 +36,8 @@
     0.0
   ],
   "steps": 5000,
+  "uncertainty_log_var_init_cl": 0.0,
+  "uncertainty_log_var_init_fm": 0.0,
+  "uncertainty_log_var_lr": 0.01,
   "weight_decay": 0.0
 }

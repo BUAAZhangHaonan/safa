@@ -1,0 +1,49 @@
+seed: 1337
+sampling_seed: 1337
+device: cuda:0
+num_workers: 2
+batch_size: 16
+image_size: 224
+index: data/index/val_single_face.jsonl
+features: artifacts/e0_features/val_single_face_e0_medium_v1
+e0_checkpoint: artifacts/checkpoints/e0_medium_v1/best.pt
+g_checkpoint: artifacts/checkpoints/g_medium_v2_stage2_fm_only_probe_gpu5_6_bs48_20260606/best_stage2_frozen_seed_20260606.pt
+checkpoint_model: raw
+out_json: artifacts/eval/g_medium_v2_stage2_fm_only_probe_gpu5_6_bs48_20260606/formal_candidate_rerank_k16_20260606/result.json
+per_sample_jsonl: artifacts/eval/g_medium_v2_stage2_fm_only_probe_gpu5_6_bs48_20260606/formal_candidate_rerank_k16_20260606/per_sample.jsonl
+sample_dir: artifacts/eval/g_medium_v2_stage2_fm_only_probe_gpu5_6_bs48_20260606/formal_candidate_rerank_k16_20260606/samples
+generated_image_dir: artifacts/eval/g_medium_v2_stage2_fm_only_probe_gpu5_6_bs48_20260606/formal_candidate_rerank_k16_20260606/generated_images
+face_detection:
+  enabled: true
+  model_name: buffalo_l
+  threshold: 0.95
+  single_face_eq1_threshold: 0.98
+  latent_cosine_threshold: 0.95
+privacy:
+  enabled: true
+  recognizers:
+  - name: arcface
+    type: insightface
+    model_name: buffalo_l
+  - name: facenet
+    type: torchscript
+    checkpoint: artifacts/privacy/facenet.pt
+    embedding_dim: 512
+    input_size: 160
+  - name: adaface
+    type: torchscript
+    checkpoint: artifacts/privacy/adaface.pt
+    embedding_dim: 512
+    input_size: 112
+anti_steg:
+  enabled: true
+  jpeg_quality: 75
+  blur_radius: 1.5
+  downsample_scale: 0.5
+  crop_fraction: 0.9
+  noise_std: 0.01
+candidate_rerank:
+  enabled: true
+  num_candidates: 16
+  single_face_priority: true
+  selection_metric: latent_cosine

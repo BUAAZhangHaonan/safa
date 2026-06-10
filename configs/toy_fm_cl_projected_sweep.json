@@ -9,7 +9,10 @@
   "device": "cuda:1",
   "eval_batch_size": 1024,
   "eval_interval": 250,
+  "dual_lr": 10.0,
+  "dual_max": 100.0,
   "fm_learning_rate": 0.001,
+  "fm_delta_target": 0.01,
   "hidden_dim": 64,
   "k_classes": 8,
   "lambdas": [
@@ -32,6 +35,7 @@
   "normalize_losses": true,
   "output_dir": "artifacts/toy_fm_cl_projected",
   "projection_eps": 1e-12,
+  "primal_dual_warmup_steps": 100,
   "repr_learning_rate": 0.001,
   "repr_relation_weight": 1.0,
   "run_name": "main_sweep_seed1337",

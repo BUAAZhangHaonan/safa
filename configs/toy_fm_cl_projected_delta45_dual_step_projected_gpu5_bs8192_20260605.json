@@ -4,7 +4,7 @@
   "deltas_deg": [
     45.0
   ],
-  "device": "cuda:0",
+  "device": "cuda:5",
   "dual_lr": 10.0,
   "dual_max": 100.0,
   "eval_batch_size": 1024,
@@ -19,15 +19,15 @@
   "layers": 3,
   "learning_rate": 0.001,
   "methods": [
-    "dual_step_projected"
+    "primal_dual_projected"
   ],
   "normalize_losses": true,
-  "output_dir": "artifacts/toy_fm_cl_projected_dual_step_20260605",
+  "output_dir": "artifacts/toy_fm_cl_projected",
   "primal_dual_warmup_steps": 100,
   "projection_eps": 1e-12,
   "repr_learning_rate": 0.001,
   "repr_relation_weight": 1.0,
-  "run_name": "delta45_dual_step_projected_gpu5_bs8192_20260605",
+  "run_name": "delta45_primal_dual_projected_gpu5_bs8192_20260605",
   "sample_steps": 16,
   "seed": 1337,
   "sigma": 0.05,

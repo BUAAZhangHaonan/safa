@@ -1,5 +1,6 @@
 {
   "batch_size": 8192,
+  "cagrad_c": 0.5,
   "calibration_batches": 4,
   "deltas_deg": [
     45.0
@@ -9,7 +10,9 @@
   "dual_max": 100.0,
   "eval_batch_size": 1024,
   "eval_interval": 1000,
+  "fm_budget_fraction": 0.1,
   "fm_delta_target": 0.01,
+  "fm_descent_floor_fraction": null,
   "fm_learning_rate": 0.001,
   "hidden_dim": 64,
   "k_classes": 8,
@@ -19,15 +22,15 @@
   "layers": 3,
   "learning_rate": 0.001,
   "methods": [
-    "primal_dual_projected"
+    "budgeted_cagrad"
   ],
   "normalize_losses": true,
-  "output_dir": "artifacts/toy_fm_cl_projected",
-  "primal_dual_warmup_steps": 100,
+  "output_dir": "artifacts/toy_fm_cl_projected_pareto_floor010_budget010_20260605",
+  "primal_dual_warmup_steps": 0,
   "projection_eps": 1e-12,
   "repr_learning_rate": 0.001,
   "repr_relation_weight": 1.0,
-  "run_name": "delta45_primal_dual_projected_gpu6_bs8192_20260605",
+  "run_name": "delta45_budgeted_cagrad_budget010_gpu6_bs8192_20260605",
   "sample_steps": 16,
   "seed": 1337,
   "sigma": 0.05,
@@ -35,5 +38,8 @@
     0.0
   ],
   "steps": 5000,
+  "uncertainty_log_var_init_cl": null,
+  "uncertainty_log_var_init_fm": null,
+  "uncertainty_log_var_lr": null,
   "weight_decay": 0.0
 }
