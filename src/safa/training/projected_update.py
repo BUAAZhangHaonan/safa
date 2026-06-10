@@ -476,7 +476,7 @@ def project_gradient_onto_fm_feasible_cone_adam(
     dot_after = _dot_weighted(projected_gradients, g_fm, preconditioner_weights)
     if projection_applied:
         zero = torch.zeros((), dtype=dot_after.dtype, device=dot_after.device)
-        if not torch.allclose(dot_after, zero, rtol=1e-3, atol=1e-3):
+        if not torch.allclose(dot_after, zero, rtol=1e-5, atol=1e-6):
             raise RuntimeError(
                 "Projected representation gradient is not orthogonal to FM gradient in Adam metric"
             )
