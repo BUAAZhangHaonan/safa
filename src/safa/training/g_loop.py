@@ -25,6 +25,7 @@ from safa.training.projected_update import (
     aggregate_two_task_fm_primary_constrained_famo,
     compute_two_task_famo_weights,
     project_gradient_onto_fm_feasible_cone,
+    project_gradient_onto_fm_feasible_cone_adam,
     project_gradient_to_dot_lower_bound,
     update_two_task_famo_logits,
 )
@@ -103,6 +104,10 @@ class _Stage2ObjectiveRuntime:
     famo_eps: float | None = None
     famo_min_loss_fm: float = 0.0
     famo_min_loss_cl: float = 0.0
+    optimizer_type: str = "adamw"
+    pu_gradient_normalization: bool = False
+    pu_backtrack_max_retries: int = 0
+    pu_fm_increase_budget: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -637,6 +642,14 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
         repr_learning_rate = _require_numeric(payload, "repr_learning_rate", context)
         if repr_learning_rate <= 0.0:
             raise ValueError(f"{context}.repr_learning_rate must be positive, got {repr_learning_rate!r}")
+        # Parse PU-specific fields for projected objectives
+        pu_optimizer_type = str(payload.get("optimizer_type", "adamw"))
+        if pu_optimizer_type not in ("adamw", "sgd"):
+            raise ValueError(f"{context}.optimizer_type must be 'adamw' or 'sgd', got {pu_optimizer_type!r}")
+        pu_gradient_normalization = _optional_bool(payload, "pu_gradient_normalization", context, default=False)
+        pu_backtrack_max_retries = int(payload.get("pu_backtrack_max_retries", 0))
+        pu_fm_increase_budget = float(payload.get("pu_fm_increase_budget", 0.0))
+
         return _Stage2ObjectiveRuntime(
             type=str(objective_type),
             lambda_repr=float(lambda_repr),
@@ -646,6 +659,10 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
             flow_condition=flow_condition,
             repr_learning_rate=float(repr_learning_rate),
             projection_eps=float(projection_eps),
+            optimizer_type=pu_optimizer_type,
+            pu_gradient_normalization=pu_gradient_normalization,
+            pu_backtrack_max_retries=pu_backtrack_max_retries,
+            pu_fm_increase_budget=pu_fm_increase_budget,
         )
 
     relation_weight = _require_numeric(payload, "relation_weight", context)
@@ -666,6 +683,14 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
         for field in ("repr_learning_rate", "projection_eps"):
             if field in payload:
                 raise ValueError(f"{context}.{field} is only valid for projected two-step objectives")
+    # Parse PU-specific fields for gram projected objective
+    pu_optimizer_type = str(payload.get("optimizer_type", "adamw"))
+    if pu_optimizer_type not in ("adamw", "sgd"):
+        raise ValueError(f"{context}.optimizer_type must be 'adamw' or 'sgd', got {pu_optimizer_type!r}")
+    pu_gradient_normalization = _optional_bool(payload, "pu_gradient_normalization", context, default=False)
+    pu_backtrack_max_retries = int(payload.get("pu_backtrack_max_retries", 0))
+    pu_fm_increase_budget = float(payload.get("pu_fm_increase_budget", 0.0))
+
     return _Stage2ObjectiveRuntime(
         type=str(objective_type),
         lambda_repr=float(lambda_repr),
@@ -675,6 +700,10 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
         flow_condition=flow_condition,
         repr_learning_rate=None if repr_learning_rate is None else float(repr_learning_rate),
         projection_eps=None if projection_eps is None else float(projection_eps),
+        optimizer_type=pu_optimizer_type,
+        pu_gradient_normalization=pu_gradient_normalization,
+        pu_backtrack_max_retries=pu_backtrack_max_retries,
+        pu_fm_increase_budget=pu_fm_increase_budget,
     )
 
 
@@ -1201,9 +1230,17 @@ def train_g_from_config(config: dict) -> dict:
             print(f"Uncertainty loss state: {uw_state_action}")
     if distributed.enabled:
         training_module = DistributedDataParallel(training_module, device_ids=[distributed.local_rank], output_device=distributed.local_rank)
-    optimizer = torch.optim.AdamW(
-        _optimizer_param_groups(unwrap_model(training_module), config, loss_weighting_runtime),
-    )
+    _optimizer_type = str(config.get("optimizer_type", "adamw"))
+    if _optimizer_type not in ("adamw", "sgd"):
+        raise ValueError(f"config.optimizer_type must be 'adamw' or 'sgd', got {_optimizer_type!r}")
+    if _optimizer_type == "sgd":
+        optimizer = torch.optim.SGD(
+            _optimizer_param_groups(unwrap_model(training_module), config, loss_weighting_runtime),
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            _optimizer_param_groups(unwrap_model(training_module), config, loss_weighting_runtime),
+        )
     optimizer_resumed = False
     if config.get("resume_from") and resume_mode == _RESUME_MODE_TRAINING_STATE:
         _assert_required_resume_optimizer_state(
@@ -2011,6 +2048,16 @@ def _require_bool(config: dict, field: str, context: str) -> bool:
     return value
 
 
+
+def _optional_bool(payload: dict, field: str, context: str, *, default: bool) -> bool:
+    value = payload.get(field)
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise ValueError(f"{context}.{field} must be a boolean, got {type(value).__name__}")
+    return value
+
+
 def _ema_config(config: dict) -> dict:
     payload = dict(_require_mapping(config, "ema", "train_g config"))
     enabled = _require_bool(payload, "enabled", "ema")
@@ -2509,6 +2556,55 @@ def _synced_gradients_from_parameters(name: str, parameters: list) -> list:
     return gradients
 
 
+
+def _extract_adam_preconditioner_weights(optimizer, params: list) -> list:
+    import torch
+
+    beta2 = optimizer.defaults.get("betas", (0.9, 0.999))[1]
+    adam_eps = optimizer.defaults.get("eps", 1e-8)
+    weights: list = []
+    for param in params:
+        state = optimizer.state.get(param)
+        if state is None or "exp_avg_sq" not in state:
+            weights.append(torch.ones_like(param))
+            continue
+        v = state["exp_avg_sq"]
+        step = state["step"]
+        v_hat = v / (1.0 - beta2 ** step)
+        w = 1.0 / (torch.sqrt(v_hat) + adam_eps)
+        weights.append(w)
+    return weights
+
+
+def _preconditioned_parameter_step(params: list, gradients: list, weights: list, learning_rate: float) -> None:
+    import torch
+
+    if len(params) != len(gradients) or len(params) != len(weights):
+        raise ValueError("Length mismatch between parameters, gradients, and weights")
+    with torch.no_grad():
+        for p, g, w in zip(params, gradients, weights):
+            if p.shape != g.shape or p.shape != w.shape:
+                raise ValueError("Shape mismatch between parameter, gradient, and weight")
+            if not torch.isfinite(w * g).all():
+                raise FloatingPointError("Preconditioned gradient contains non-finite values")
+            p.data.add_(w * g, alpha=-float(learning_rate))
+
+
+def _save_parameters(params: list) -> list:
+    import torch
+
+    return [p.data.detach().clone() for p in params]
+
+
+def _restore_parameters(params: list, saved: list) -> None:
+    import torch
+
+    if len(params) != len(saved):
+        raise ValueError("Length mismatch in parameter restore")
+    with torch.no_grad():
+        for p, s in zip(params, saved):
+            p.data.copy_(s)
+
 def _apply_projected_repr_step(parameters: list, projected_gradients: list, *, repr_learning_rate: float) -> None:
     import torch
 
@@ -2865,6 +2961,7 @@ def _run_projected_stage2_batch(
     training_state = unwrap_model(training_module)
     params = _trainable_parameter_list(training_state.generator.parameters())
 
+    # --- Step 1: FM optimization via optimizer ---
     optimizer.zero_grad(set_to_none=True)
     with amp_ctx:
         flow_loss, flow_mse, _, flow_loss_raw, _ = training_module(
@@ -2889,6 +2986,7 @@ def _run_projected_stage2_batch(
         batch_grad_norm = float(grad_norm) if isinstance(grad_norm, float) else float(grad_norm.detach().cpu())
     optimizer.step()
 
+    # --- Step 2: Compute FM guard gradient ---
     optimizer.zero_grad(set_to_none=True)
     with amp_ctx:
         _, _, _, flow_loss_guard, _ = training_module(
@@ -2904,6 +3002,7 @@ def _run_projected_stage2_batch(
     flow_loss_guard.backward()
     fm_gradients = _synced_gradients_from_parameters("M3 flow guard", params)
 
+    # --- Step 3: Compute representation gradient ---
     optimizer.zero_grad(set_to_none=True)
     with amp_ctx:
         repr_loss, flow_mse_guard, repr_detached, _, repr_loss_raw = training_module(
@@ -2920,24 +3019,139 @@ def _run_projected_stage2_batch(
     optimizer.zero_grad(set_to_none=True)
 
     weighted_repr_gradients = [stage2_objective.lambda_repr * grad for grad in repr_gradients]
+
+    # --- Step 4: Projection and parameter update ---
     fm_descent_credit = 0.0
     credit_dot_lower_bound = 0.0
-    if stage2_objective.type == _POINT_DESCENT_CREDIT_PROJECTED:
-        fm_descent_credit = max(0.0, pre_flow_loss_value - flow_loss_guard_value)
-        credit_dot_lower_bound = -fm_descent_credit / float(stage2_objective.repr_learning_rate)
-        projection = project_gradient_to_dot_lower_bound(
-            weighted_repr_gradients,
-            fm_gradients,
-            lower_bound=credit_dot_lower_bound,
-            eps=stage2_objective.projection_eps,
+    if stage2_objective.optimizer_type == "adamw" and stage2_objective.type != _POINT_DESCENT_CREDIT_PROJECTED:
+        # === AdamW metric-correct path: Q-weighted projection ===
+        weights = _extract_adam_preconditioner_weights(optimizer, params)
+
+        # Q-weighted norm computation
+        fm_norm_q = torch.sqrt(sum((w * g * g).sum() for w, g in zip(weights, fm_gradients)))
+        repr_norm_q = torch.sqrt(sum((w * g * g).sum() for w, g in zip(weights, weighted_repr_gradients)))
+        norm_ratio = float(repr_norm_q / fm_norm_q) if float(fm_norm_q) > 1e-12 else 1.0
+
+        if stage2_objective.pu_gradient_normalization and float(fm_norm_q) > 1e-12 and float(repr_norm_q) > 1e-12:
+            scale = float(fm_norm_q / repr_norm_q)
+            g_repr_for_proj = [g * scale for g in weighted_repr_gradients]
+        else:
+            g_repr_for_proj = weighted_repr_gradients
+
+        # Q-weighted projection
+        projection = project_gradient_onto_fm_feasible_cone_adam(
+            g_repr_for_proj, fm_gradients, weights, eps=stage2_objective.projection_eps,
         )
+
+        # Un-normalize projected gradients
+        if stage2_objective.pu_gradient_normalization and float(fm_norm_q) > 1e-12 and float(repr_norm_q) > 1e-12:
+            un_scale = float(repr_norm_q / fm_norm_q)
+            projected_gradients = [g * un_scale for g in projection.projected_gradients]
+        else:
+            projected_gradients = projection.projected_gradients
+
+        # Backtracking line search with preconditioned update
+        effective_lr = stage2_objective.repr_learning_rate
+        backtrack_count = 0
+        saved_params = _save_parameters(params)
+
+        for _retry in range(stage2_objective.pu_backtrack_max_retries + 1):
+            _preconditioned_parameter_step(params, projected_gradients, weights, effective_lr)
+
+            if stage2_objective.pu_backtrack_max_retries > 0:
+                # Check FM loss after update
+                with amp_ctx:
+                    after_losses = training_module(
+                        images,
+                        z,
+                        sample_ids,
+                        False,
+                        lambda_cycle,
+                        flow_condition=flow_condition,
+                    )
+                    after_flow_loss = float(after_losses[3].detach().cpu())
+                actual_fm_delta = after_flow_loss - flow_loss_guard_value
+
+                if actual_fm_delta <= stage2_objective.pu_fm_increase_budget:
+                    break
+
+                _restore_parameters(params, saved_params)
+                effective_lr *= 0.5
+                backtrack_count += 1
+            else:
+                break
+        else:
+            _restore_parameters(params, saved_params)
+
     else:
-        projection = project_gradient_onto_fm_feasible_cone(
-            weighted_repr_gradients,
-            fm_gradients,
-            eps=stage2_objective.projection_eps,
-        )
-    _apply_projected_repr_step(params, projection.projected_gradients, repr_learning_rate=stage2_objective.repr_learning_rate)
+        # === SGD Euclidean path ===
+        fm_norm_sq = sum(g.pow(2).sum().item() for g in fm_gradients)
+        repr_norm_sq = sum(g.pow(2).sum().item() for g in weighted_repr_gradients)
+        fm_norm = math.sqrt(fm_norm_sq)
+        repr_norm = math.sqrt(repr_norm_sq)
+        norm_ratio = repr_norm / fm_norm if fm_norm > 1e-12 else 1.0
+
+        if stage2_objective.pu_gradient_normalization and fm_norm > 1e-12 and repr_norm > 1e-12:
+            scale = fm_norm / repr_norm
+            g_repr_for_proj = [g * scale for g in weighted_repr_gradients]
+        else:
+            g_repr_for_proj = weighted_repr_gradients
+
+        if stage2_objective.type == _POINT_DESCENT_CREDIT_PROJECTED:
+            fm_descent_credit = max(0.0, pre_flow_loss_value - flow_loss_guard_value)
+            credit_dot_lower_bound = -fm_descent_credit / float(stage2_objective.repr_learning_rate)
+            projection = project_gradient_to_dot_lower_bound(
+                g_repr_for_proj,
+                fm_gradients,
+                lower_bound=credit_dot_lower_bound,
+                eps=stage2_objective.projection_eps,
+            )
+        else:
+            projection = project_gradient_onto_fm_feasible_cone(
+                g_repr_for_proj,
+                fm_gradients,
+                eps=stage2_objective.projection_eps,
+            )
+
+        # Un-normalize projected gradients
+        if stage2_objective.pu_gradient_normalization and fm_norm > 1e-12 and repr_norm > 1e-12:
+            un_scale = repr_norm / fm_norm
+            projected_gradients = [g * un_scale for g in projection.projected_gradients]
+        else:
+            projected_gradients = projection.projected_gradients
+
+        # Backtracking line search with vanilla SGD step
+        effective_lr = stage2_objective.repr_learning_rate
+        backtrack_count = 0
+        saved_params = _save_parameters(params)
+
+        for _retry in range(stage2_objective.pu_backtrack_max_retries + 1):
+            _apply_projected_repr_step(params, projected_gradients, repr_learning_rate=effective_lr)
+
+            if stage2_objective.pu_backtrack_max_retries > 0:
+                with amp_ctx:
+                    after_losses = training_module(
+                        images,
+                        z,
+                        sample_ids,
+                        False,
+                        lambda_cycle,
+                        flow_condition=flow_condition,
+                    )
+                    after_flow_loss = float(after_losses[3].detach().cpu())
+                actual_fm_delta = after_flow_loss - flow_loss_guard_value
+
+                if actual_fm_delta <= stage2_objective.pu_fm_increase_budget:
+                    break
+
+                _restore_parameters(params, saved_params)
+                effective_lr *= 0.5
+                backtrack_count += 1
+            else:
+                break
+        else:
+            _restore_parameters(params, saved_params)
+
     if ema is not None:
         ema.update(training_state.generator)
 
@@ -2956,6 +3170,10 @@ def _run_projected_stage2_batch(
     metrics["pre_flow_loss_before_fm_step"] = float(pre_flow_loss_value)
     metrics["flow_loss_guard"] = float(flow_loss_guard_value)
     metrics["stage2_objective_type"] = stage2_objective.type
+    metrics["pu_optimizer_type"] = stage2_objective.optimizer_type
+    metrics["pu_norm_ratio"] = float(norm_ratio)
+    metrics["pu_backtrack_count"] = float(backtrack_count)
+    metrics["pu_effective_repr_lr"] = float(effective_lr)
     training_state.last_loss_metrics = metrics
     logged_loss = flow_loss_guard.detach() + stage2_objective.lambda_repr * repr_loss_raw.detach()
     return logged_loss, flow_mse_guard.detach(), repr_detached.detach(), flow_loss_guard.detach(), repr_loss_raw.detach(), batch_grad_norm, metrics
