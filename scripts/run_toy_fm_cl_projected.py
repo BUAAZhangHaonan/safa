@@ -11,7 +11,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from safa.training.projected_update import ProjectionResult, project_gradient_onto_fm_feasible_cone
+from safa.training.projected_update import ProjectionResult, _dot, _squared_norm, project_gradient_onto_fm_feasible_cone, project_gradient_onto_fm_feasible_cone_adam
 
 
 @dataclass(frozen=True)
@@ -51,6 +51,10 @@ class ToyConfig:
     uncertainty_log_var_lr: float | None = None
     uncertainty_log_var_init_fm: float | None = None
     uncertainty_log_var_init_cl: float | None = None
+    optimizer_type: str = "adamw"
+    pu_gradient_normalization: bool = True
+    pu_backtrack_max_retries: int = 3
+    pu_fm_increase_budget: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -184,6 +188,12 @@ def validate_config(config: ToyConfig) -> None:
             raise ValueError(f"{name} must be finite")
     if config.sigma < 0.0:
         raise ValueError("sigma must be non-negative")
+    if config.optimizer_type not in ("adamw", "sgd"):
+        raise ValueError("optimizer_type must be 'adamw' or 'sgd'")
+    if config.pu_backtrack_max_retries < 0:
+        raise ValueError("pu_backtrack_max_retries must be non-negative")
+    if config.pu_fm_increase_budget < 0.0:
+        raise ValueError("pu_fm_increase_budget must be non-negative")
     if config.learning_rate <= 0.0 or config.fm_learning_rate <= 0.0 or config.repr_learning_rate <= 0.0:
         raise ValueError("learning rates must be positive")
     if config.weight_decay < 0.0:
@@ -352,8 +362,12 @@ def run_single_experiment(
     train_generator = torch.Generator(device=device).manual_seed(config.seed + seed_offset)
     eval_generator = torch.Generator(device=device).manual_seed(config.seed + 100_000 + seed_offset)
     model = ToyVectorField(hidden_dim=config.hidden_dim, layers=config.layers).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
-    fm_optimizer = torch.optim.AdamW(model.parameters(), lr=config.fm_learning_rate, weight_decay=config.weight_decay)
+    if config.optimizer_type == "sgd":
+        optimizer = torch.optim.SGD(model.parameters(), lr=config.learning_rate, momentum=0.0, weight_decay=0.0)
+        fm_optimizer = torch.optim.SGD(model.parameters(), lr=config.fm_learning_rate, momentum=0.0, weight_decay=0.0)
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+        fm_optimizer = torch.optim.AdamW(model.parameters(), lr=config.fm_learning_rate, weight_decay=config.weight_decay)
     eval_batch = _sample_batch(config, delta_deg, config.eval_batch_size, device, eval_generator)
     flow_scale, repr_scale = _calibrate_loss_scales(config, model, delta_deg, device, train_generator)
     initial = _evaluate_model(config, model, eval_batch, delta_deg, method, lambda_repr, soft_margin, step=0)
@@ -698,29 +712,122 @@ def _step_projected_two_step(
     lambda_repr: float,
     soft_margin: float,
 ) -> dict[str, float]:
+    # --- FM step ---
     fm_optimizer.zero_grad(set_to_none=True)
     losses = _compute_losses(config, model, batch)
     (losses["flow"] / flow_scale).backward()
     fm_optimizer.step()
 
+    # --- Guard: recompute losses after FM step ---
     post_losses = _compute_losses(config, model, batch)
     flow_objective = post_losses["flow"] / flow_scale
     repr_objective = lambda_repr * post_losses["repr"] / repr_scale
     flow_guard_value = float(flow_objective.detach().cpu())
     g_fm, g_repr = _task_gradients(model, flow_objective, repr_objective)
-    if soft_margin == 0.0:
-        projection = project_gradient_onto_fm_feasible_cone(g_repr, g_fm, eps=config.projection_eps)
-    else:
-        projection = project_gradient_with_soft_margin(
-            g_repr,
-            g_fm,
-            epsilon=soft_margin,
-            eps=config.projection_eps,
+
+    if config.optimizer_type == "adamw":
+        # === Adam metric path: Q-weighted projection ===
+        weights = _extract_adam_preconditioner_weights(fm_optimizer, model)
+
+        # Q-weighted gradient normalization
+        fm_norm_q = math.sqrt(sum((w * g * g).sum().item() for w, g in zip(weights, g_fm)))
+        repr_norm_q = math.sqrt(sum((w * g * g).sum().item() for w, g in zip(weights, g_repr)))
+        norm_ratio = repr_norm_q / fm_norm_q if fm_norm_q > NORM_EPS else 1.0
+
+        if config.pu_gradient_normalization and fm_norm_q > NORM_EPS and repr_norm_q > NORM_EPS:
+            scale = fm_norm_q / repr_norm_q
+            g_repr_for_proj = [g * scale for g in g_repr]
+        else:
+            g_repr_for_proj = g_repr
+
+        # Q-weighted projection
+        projection = project_gradient_onto_fm_feasible_cone_adam(
+            g_repr_for_proj, g_fm, weights, eps=config.projection_eps,
         )
-    _manual_parameter_step(model, projection.projected_gradients, config.repr_learning_rate)
-    after_losses = _compute_losses(config, model, batch)
-    actual_fm_delta = float((after_losses["flow"] / flow_scale).detach().cpu()) - flow_guard_value
-    return _stats_from_projection(projection, actual_fm_delta=actual_fm_delta)
+
+        # Un-normalize projected gradients
+        if config.pu_gradient_normalization and fm_norm_q > NORM_EPS and repr_norm_q > NORM_EPS:
+            un_scale = repr_norm_q / fm_norm_q
+            projected_gradients = [g * un_scale for g in projection.projected_gradients]
+        else:
+            projected_gradients = projection.projected_gradients
+
+        # Backtracking line search with preconditioned update
+        effective_lr = config.repr_learning_rate
+        backtrack_count = 0
+        saved_params = _save_parameters(model)
+
+        for retry in range(config.pu_backtrack_max_retries + 1):
+            _preconditioned_parameter_step(model, projected_gradients, weights, effective_lr)
+            after_losses = _compute_losses(config, model, batch)
+            actual_fm_delta = float((after_losses["flow"] / flow_scale).detach().cpu()) - flow_guard_value
+
+            if actual_fm_delta <= config.pu_fm_increase_budget:
+                break
+
+            _restore_parameters(model, saved_params)
+            effective_lr *= 0.5
+            backtrack_count += 1
+        else:
+            _restore_parameters(model, saved_params)
+            actual_fm_delta = 0.0
+
+    else:
+        # === SGD Euclidean path (existing logic) ===
+        fm_norm_sq = sum(g.pow(2).sum().item() for g in g_fm)
+        repr_norm_sq = sum(g.pow(2).sum().item() for g in g_repr)
+        fm_norm = math.sqrt(fm_norm_sq)
+        repr_norm = math.sqrt(repr_norm_sq)
+        norm_ratio = repr_norm / fm_norm if fm_norm > NORM_EPS else 1.0
+
+        if config.pu_gradient_normalization and fm_norm > NORM_EPS and repr_norm > NORM_EPS:
+            scale = fm_norm / repr_norm
+            g_repr_for_proj = [g * scale for g in g_repr]
+        else:
+            g_repr_for_proj = g_repr
+
+        # Euclidean projection
+        if soft_margin == 0.0:
+            projection = project_gradient_onto_fm_feasible_cone(
+                g_repr_for_proj, g_fm, eps=config.projection_eps,
+            )
+        else:
+            projection = project_gradient_with_soft_margin(
+                g_repr_for_proj, g_fm, epsilon=soft_margin, eps=config.projection_eps,
+            )
+
+        # Un-normalize projected gradients
+        if config.pu_gradient_normalization and fm_norm > NORM_EPS and repr_norm > NORM_EPS:
+            un_scale = repr_norm / fm_norm
+            projected_gradients = [g * un_scale for g in projection.projected_gradients]
+        else:
+            projected_gradients = projection.projected_gradients
+
+        # Backtracking line search
+        effective_lr = config.repr_learning_rate
+        backtrack_count = 0
+        saved_params = _save_parameters(model)
+
+        for retry in range(config.pu_backtrack_max_retries + 1):
+            _manual_parameter_step(model, projected_gradients, effective_lr)
+            after_losses = _compute_losses(config, model, batch)
+            actual_fm_delta = float((after_losses["flow"] / flow_scale).detach().cpu()) - flow_guard_value
+
+            if actual_fm_delta <= config.pu_fm_increase_budget:
+                break
+
+            _restore_parameters(model, saved_params)
+            effective_lr *= 0.5
+            backtrack_count += 1
+        else:
+            _restore_parameters(model, saved_params)
+            actual_fm_delta = 0.0
+
+    stats = _stats_from_projection(projection, actual_fm_delta=actual_fm_delta)
+    stats["pu_norm_ratio"] = norm_ratio
+    stats["pu_backtrack_count"] = float(backtrack_count)
+    stats["pu_effective_repr_lr"] = effective_lr
+    return stats
 
 
 def _step_primal_dual_projected(
@@ -1250,6 +1357,63 @@ def _assign_gradients(model: ToyVectorField, gradients: list[torch.Tensor]) -> N
         parameter.grad = gradient.detach().clone()
 
 
+
+def _save_parameters(model: ToyVectorField) -> list[torch.Tensor]:
+    return [p.detach().clone() for p in model.parameters()]
+
+
+def _restore_parameters(model: ToyVectorField, saved: list[torch.Tensor]) -> None:
+    with torch.no_grad():
+        for p, s in zip(model.parameters(), saved):
+            p.copy_(s)
+    model.zero_grad(set_to_none=True)
+
+
+
+def _extract_adam_preconditioner_weights(
+    fm_optimizer: torch.optim.Optimizer,
+    model: ToyVectorField,
+) -> list[torch.Tensor]:
+    """Extract w = 1/(sqrt(v_hat) + eps) from Adam optimizer state.
+
+    Must be called AFTER fm_optimizer.step() so state is populated.
+    Uses bias-corrected v_hat = v / (1 - beta2^step).
+    """
+    beta2 = fm_optimizer.defaults.get('betas', (0.9, 0.999))[1]
+    adam_eps = fm_optimizer.defaults.get('eps', 1e-8)
+    weights: list[torch.Tensor] = []
+    for param in model.parameters():
+        state = fm_optimizer.state.get(param)
+        if state is None or 'exp_avg_sq' not in state:
+            # Fallback: uniform weights (identity metric)
+            weights.append(torch.ones_like(param))
+            continue
+        v = state['exp_avg_sq']
+        step = state['step']
+        v_hat = v / (1.0 - beta2 ** step)
+        w = 1.0 / (torch.sqrt(v_hat) + adam_eps)
+        weights.append(w)
+    return weights
+
+
+def _preconditioned_parameter_step(
+    model: ToyVectorField,
+    gradients: list[torch.Tensor],
+    preconditioner_weights: list[torch.Tensor],
+    learning_rate: float,
+) -> None:
+    """Apply preconditioned parameter update: param -= lr * w * gradient."""
+    parameters = list(model.parameters())
+    if len(parameters) != len(gradients) or len(parameters) != len(preconditioner_weights):
+        raise ValueError("Length mismatch between parameters, gradients, and weights")
+    with torch.no_grad():
+        for p, g, w in zip(parameters, gradients, preconditioner_weights):
+            if p.shape != g.shape or p.shape != w.shape:
+                raise ValueError("Shape mismatch between parameter, gradient, and weight")
+            p.add_(w * g, alpha=-learning_rate)
+    model.zero_grad(set_to_none=True)
+
+
 def _manual_parameter_step(model: ToyVectorField, gradients: list[torch.Tensor], learning_rate: float) -> None:
     parameters = list(model.parameters())
     if len(parameters) != len(gradients):
@@ -1361,6 +1525,9 @@ def _new_stat_window() -> dict[str, list[float]]:
         "uncertainty_fm_weight": [],
         "uncertainty_cl_weight": [],
         "uncertainty_formula_total": [],
+        "pu_norm_ratio": [],
+        "pu_backtrack_count": [],
+        "pu_effective_repr_lr": [],
     }
 
 
@@ -1395,6 +1562,9 @@ def _empty_step_stats() -> dict[str, float]:
         "uncertainty_fm_weight": 0.0,
         "uncertainty_cl_weight": 0.0,
         "uncertainty_formula_total": 0.0,
+        "pu_norm_ratio": 0.0,
+        "pu_backtrack_count": 0.0,
+        "pu_effective_repr_lr": 0.0,
     }
 
 
@@ -1428,6 +1598,9 @@ def _accumulate_stats(window: dict[str, list[float]], step_stats: dict[str, floa
     window["uncertainty_fm_weight"].append(float(step_stats["uncertainty_fm_weight"]))
     window["uncertainty_cl_weight"].append(float(step_stats["uncertainty_cl_weight"]))
     window["uncertainty_formula_total"].append(float(step_stats["uncertainty_formula_total"]))
+    window["pu_norm_ratio"].append(float(step_stats.get("pu_norm_ratio", 0.0)))
+    window["pu_backtrack_count"].append(float(step_stats.get("pu_backtrack_count", 0.0)))
+    window["pu_effective_repr_lr"].append(float(step_stats.get("pu_effective_repr_lr", 0.0)))
 
 
 def _summarize_stat_window(window: dict[str, list[float]]) -> dict[str, float]:
@@ -1463,6 +1636,9 @@ def _summarize_stat_window(window: dict[str, list[float]]) -> dict[str, float]:
         "uncertainty_fm_weight": window["uncertainty_fm_weight"][-1],
         "uncertainty_cl_weight": window["uncertainty_cl_weight"][-1],
         "uncertainty_formula_total": _mean(window["uncertainty_formula_total"]),
+        "pu_norm_ratio": _mean(window["pu_norm_ratio"]),
+        "pu_backtrack_count": _mean(window["pu_backtrack_count"]),
+        "pu_effective_repr_lr": _mean(window["pu_effective_repr_lr"]),
     }
 
 
@@ -1504,6 +1680,9 @@ def _stats_from_projection(projection: ProjectionResult, actual_fm_delta: float)
         "uncertainty_fm_weight": 0.0,
         "uncertainty_cl_weight": 0.0,
         "uncertainty_formula_total": 0.0,
+        "pu_norm_ratio": 0.0,
+        "pu_backtrack_count": 0.0,
+        "pu_effective_repr_lr": 0.0,
     }
 
 
