@@ -3059,9 +3059,9 @@ def _run_projected_stage2_batch(
             _preconditioned_parameter_step(params, projected_gradients, weights, effective_lr)
 
             if stage2_objective.pu_backtrack_max_retries > 0:
-                # Check FM loss after update
-                with amp_ctx:
-                    after_losses = training_module(
+                # Check FM loss after update (bypass DDP to avoid deadlock)
+                with torch.no_grad():
+                    after_losses = training_state(
                         images,
                         z,
                         sample_ids,
@@ -3129,8 +3129,8 @@ def _run_projected_stage2_batch(
             _apply_projected_repr_step(params, projected_gradients, repr_learning_rate=effective_lr)
 
             if stage2_objective.pu_backtrack_max_retries > 0:
-                with amp_ctx:
-                    after_losses = training_module(
+                with torch.no_grad():
+                    after_losses = training_state(
                         images,
                         z,
                         sample_ids,
