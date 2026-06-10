@@ -337,7 +337,7 @@ class _GeneratorTrainingStep:
                 if (
                     self.stage2_objective.type
                     in {_POINT_PROJECTED_TWO_STEP, _POINT_DESCENT_CREDIT_PROJECTED, _FM_ANCHORED_CAGRAD, _FM_PRIMARY_CONSTRAINED_FAMO}
-                    or self.stage2_objective.relation_weight == 0.0
+                    or math.isclose(self.stage2_objective.relation_weight, 0.0, rel_tol=0.0, abs_tol=1e-12)
                 ):
                     losses = hyperspherical_point_cosine_loss(
                         e0_out["embedding"],
@@ -576,9 +576,9 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
             if field in payload:
                 raise ValueError(f"{context}.{field} is not valid for {objective_type}")
         if objective_type == _FM_PRIMARY_CONSTRAINED_FAMO:
-            if lambda_repr != 1.0:
+            if not math.isclose(lambda_repr, 1.0, rel_tol=0.0, abs_tol=1e-12):
                 raise ValueError(f"{context}.lambda_repr must be exactly 1.0 for {_FM_PRIMARY_CONSTRAINED_FAMO}")
-            if point_weight != 1.0:
+            if not math.isclose(point_weight, 1.0, rel_tol=0.0, abs_tol=1e-12):
                 raise ValueError(f"{context}.point_weight must be exactly 1.0 for {_FM_PRIMARY_CONSTRAINED_FAMO}")
             cagrad_c = _require_numeric(payload, "cagrad_c", context)
             if cagrad_c < 0.0 or cagrad_c >= 1.0:
@@ -620,7 +620,7 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
         if projection_eps < 0.0:
             raise ValueError(f"{context}.projection_eps must be non-negative, got {projection_eps!r}")
         if objective_type == _FM_ANCHORED_CAGRAD:
-            if lambda_repr != 1.0:
+            if not math.isclose(lambda_repr, 1.0, rel_tol=0.0, abs_tol=1e-12):
                 raise ValueError(f"{context}.lambda_repr must be exactly 1.0 for {_FM_ANCHORED_CAGRAD}")
             cagrad_c = _require_numeric(payload, "cagrad_c", context)
             if cagrad_c < 0.0 or cagrad_c >= 1.0:
@@ -2712,7 +2712,7 @@ def _run_fm_primary_constrained_famo_stage2_batch(
 
     if stage2_objective.type != _FM_PRIMARY_CONSTRAINED_FAMO:
         raise RuntimeError("_run_fm_primary_constrained_famo_stage2_batch requires fm_primary_constrained_famo")
-    if stage2_objective.lambda_repr != 1.0:
+    if not math.isclose(stage2_objective.lambda_repr, 1.0, rel_tol=0.0, abs_tol=1e-12):
         raise RuntimeError("fm_primary_constrained_famo requires lambda_repr == 1.0")
     if (
         stage2_objective.cagrad_c is None
@@ -2855,7 +2855,7 @@ def _run_fm_anchored_cagrad_stage2_batch(
 
     if stage2_objective.type != _FM_ANCHORED_CAGRAD:
         raise RuntimeError("_run_fm_anchored_cagrad_stage2_batch requires fm_anchored_cagrad")
-    if stage2_objective.lambda_repr != 1.0:
+    if not math.isclose(stage2_objective.lambda_repr, 1.0, rel_tol=0.0, abs_tol=1e-12):
         raise RuntimeError("fm_anchored_cagrad requires lambda_repr == 1.0")
     if stage2_objective.cagrad_c is None or stage2_objective.fm_descent_floor_fraction is None or stage2_objective.projection_eps is None:
         raise RuntimeError("fm_anchored_cagrad requires cagrad_c, fm_descent_floor_fraction, and projection_eps")
@@ -3159,7 +3159,7 @@ def _run_projected_stage2_batch(
     metrics.update(_projection_result_metrics(projection))
     first_order_fm_increase = max(
         0.0,
-        float((-float(stage2_objective.repr_learning_rate) * projection.dot_after).detach().cpu()),
+        float((-float(stage2_objective.repr_learning_rate) * projection.dot_before).detach().cpu()),
     )
     metrics["fm_descent_credit"] = float(fm_descent_credit)
     metrics["credit_dot_lower_bound"] = float(credit_dot_lower_bound)
@@ -3902,7 +3902,7 @@ def _stage1_single_face_score(item: dict) -> tuple[float, float, float, float, f
     face_detect_ge1 = _finite_metric_value(item, "validation_raw_face_detect_ge1_rate", context)
     loss = _finite_metric_value(item, "loss", context)
     epoch = _stage_epoch_index(item, context)
-    multi_face_is_zero = 1.0 if multi_face == 0.0 else 0.0
+    multi_face_is_zero = 1.0 if math.isclose(multi_face, 0.0, rel_tol=0.0, abs_tol=1e-12) else 0.0
     return (multi_face_is_zero, single_face, -multi_face, -zero_face, face_detect_ge1, -loss, -epoch)
 
 
