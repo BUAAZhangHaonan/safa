@@ -2644,6 +2644,44 @@ def _restore_parameters(params: list, saved: list) -> None:
         for p, s in zip(params, saved):
             p.data.copy_(s)
 
+
+def _save_adam_state(optimizer, params: list) -> dict:
+    """Save Adam optimizer state (exp_avg, exp_avg_sq, step) for given params."""
+    import torch
+    saved = {}
+    for p in params:
+        state = optimizer.state.get(p)
+        if state is None:
+            continue
+        p_state = {}
+        if "exp_avg" in state:
+            p_state["exp_avg"] = state["exp_avg"].detach().clone()
+        if "exp_avg_sq" in state:
+            p_state["exp_avg_sq"] = state["exp_avg_sq"].detach().clone()
+        if "step" in state:
+            p_state["step"] = state["step"]
+        saved[id(p)] = p_state
+    return saved
+
+
+def _restore_adam_state(optimizer, params: list, saved: dict) -> None:
+    """Restore Adam optimizer state from saved snapshot."""
+    import torch
+    with torch.no_grad():
+        for p in params:
+            p_state = saved.get(id(p))
+            if p_state is None:
+                continue
+            state = optimizer.state.get(p)
+            if state is None:
+                continue
+            if "exp_avg" in p_state and "exp_avg" in state:
+                state["exp_avg"].copy_(p_state["exp_avg"])
+            if "exp_avg_sq" in p_state and "exp_avg_sq" in state:
+                state["exp_avg_sq"].copy_(p_state["exp_avg_sq"])
+            if "step" in p_state:
+                state["step"] = p_state["step"]
+
 def _apply_projected_repr_step(parameters: list, projected_gradients: list, *, repr_learning_rate: float) -> None:
     import torch
 
@@ -3104,6 +3142,7 @@ def _run_projected_stage2_batch(
         effective_lr = stage2_objective.repr_learning_rate
         backtrack_count = 0
         saved_params = _save_parameters(params)
+        saved_adam_state = _save_adam_state(optimizer, params)
         # Safety clip projected gradients before stepping
         projected_gradients = _clip_projected_gradients(projected_gradients, max_norm=float(grad_clip_norm or 1.0))
 
@@ -3132,12 +3171,14 @@ def _run_projected_stage2_batch(
                     break
 
                 _restore_parameters(params, saved_params)
+                _restore_adam_state(optimizer, params, saved_adam_state)
                 effective_lr *= 0.5
                 backtrack_count += 1
             else:
                 break
         else:
             _restore_parameters(params, saved_params)
+            _restore_adam_state(optimizer, params, saved_adam_state)
 
     else:
         # === SGD Euclidean path ===
@@ -3775,7 +3816,8 @@ def _generate_quality_eval_images(
     from safa.evaluation.runner import _save_generated_image_for_eval
 
     if generated_dir.exists():
-        raise FileExistsError(f"quality_eval generated image directory already exists: {generated_dir}")
+        import shutil
+        shutil.rmtree(generated_dir)
     generated_dir.parent.mkdir(parents=True, exist_ok=True)
     max_samples = int(max_samples)
     if max_samples <= 0:
