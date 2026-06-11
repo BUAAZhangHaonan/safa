@@ -17,6 +17,7 @@ from safa.evaluation.metrics import (
     validate_dense_gram_sample_count,
 )
 from safa.evaluation.recognizers import InsightFaceDetector
+from safa.models.conditioning import fixed_null_condition_like, learned_null_condition_like
 from safa.models.e0 import assert_e0_frozen, freeze_e0, load_e0_checkpoint
 from safa.models.generator import FlowGeneratorConfig, build_generator
 from safa.training.audit import audit_no_identity_supervision
@@ -54,7 +55,8 @@ DEFAULT_NO_IDENTITY_SOURCE_PATHS = (Path(__file__).resolve().parent, _SAFA_PACKA
 
 _FLOW_CONDITION_EMBEDDING = "embedding"
 _FLOW_CONDITION_FIXED_NULL = "fixed_null_condition"
-_FLOW_CONDITIONS = (_FLOW_CONDITION_EMBEDDING, _FLOW_CONDITION_FIXED_NULL)
+_FLOW_CONDITION_LEARNED_NULL = "learned_null_condition"
+_FLOW_CONDITIONS = (_FLOW_CONDITION_EMBEDDING, _FLOW_CONDITION_FIXED_NULL, _FLOW_CONDITION_LEARNED_NULL)
 _NAMED_REPR_WEIGHT_MODES = ((1.0, 0.0), (1.0, 1.0))
 _GRAM_PROJECTED_TWO_STEP = "gram_projected_two_step"
 _POINT_PROJECTED_TWO_STEP = "point_projected_two_step"
@@ -310,8 +312,9 @@ class _GeneratorTrainingStep:
                 if flow_condition == _FLOW_CONDITION_EMBEDDING:
                     return z
                 if flow_condition == _FLOW_CONDITION_FIXED_NULL:
-                    fixed_null_condition = z.new_zeros(z.shape)
-                    return fixed_null_condition
+                    return fixed_null_condition_like(z)
+                if flow_condition == _FLOW_CONDITION_LEARNED_NULL:
+                    return learned_null_condition_like(self.generator, z)
                 raise RuntimeError(f"Unsupported flow_condition {flow_condition!r}")
 
             def _compute_repr_loss(self, z, sample_ids, *, cycle_steps: int):

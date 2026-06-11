@@ -41,6 +41,7 @@ class FlowGeneratorConfig:
     train_cycle_steps: int = 8
     cycle_steps_schedule: tuple[int, ...] = ()
     sampler: str = "heun"
+    learned_null_condition: bool = False
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "FlowGeneratorConfig":
@@ -58,10 +59,11 @@ class FlowGeneratorConfig:
             train_cycle_steps=int(payload["train_cycle_steps"]),
             cycle_steps_schedule=tuple(int(s) for s in payload["cycle_steps_schedule"]) if "cycle_steps_schedule" in payload and payload["cycle_steps_schedule"] else (),
             sampler=str(payload["sampler"]),
+            learned_null_condition=payload.get("learned_null_condition", False),
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "model_type": "conditional_flow_matching",
             "embedding_dim": self.embedding_dim,
             "image_size": self.image_size,
@@ -74,6 +76,9 @@ class FlowGeneratorConfig:
             "sampler": self.sampler,
             **({"cycle_steps_schedule": list(self.cycle_steps_schedule)} if self.cycle_steps_schedule else {}),
         }
+        if self.learned_null_condition:
+            payload["learned_null_condition"] = True
+        return payload
 
 
 def require_generator_model_config(payload: dict[str, Any], checkpoint_path: str) -> dict[str, Any]:
@@ -92,6 +97,8 @@ class ConditionalFlowGenerator:
         import torch
         from torch import nn
         import torch.nn.functional as F
+
+        from safa.models.conditioning import LearnedNullCondition
 
         cfg_payload = {}
         if isinstance(config, FlowGeneratorConfig):
@@ -205,6 +212,7 @@ class ConditionalFlowGenerator:
                 self.embedding_dim = cfg.embedding_dim
                 self.image_size = cfg.image_size
                 self.vector_field = VectorFieldUNet()
+                self.null_condition = LearnedNullCondition(cfg.embedding_dim) if cfg.learned_null_condition else None
 
             def forward(self, z):
                 return self.sample(z, steps=self.config.sample_steps)
@@ -276,6 +284,11 @@ class ConditionalFlowGenerator:
                     "predicted_velocity_abs_mean": predicted_velocity.detach().abs().mean(),
                 }
 
+            def make_null_condition(self, *, batch_size: int, device, dtype):
+                if self.null_condition is None:
+                    raise RuntimeError("learned_null_condition is disabled for this generator")
+                return self.null_condition(batch_size=batch_size, device=device, dtype=dtype)
+
             def _validate_z(self, z):
                 if z.ndim != 2 or z.shape[1] != self.embedding_dim:
                     raise ValueError(f"G expects z with shape [B,{self.embedding_dim}], got {tuple(z.shape)}")
@@ -343,3 +356,5 @@ def _validate_config(config: FlowGeneratorConfig) -> None:
         raise ValueError(f"train_cycle_steps must be positive, got {config.train_cycle_steps}")
     if config.sampler not in {"euler", "heun"}:
         raise ValueError(f"sampler must be euler or heun, got {config.sampler}")
+    if not isinstance(config.learned_null_condition, bool):
+        raise ValueError(f"learned_null_condition must be a bool, got {config.learned_null_condition!r}")

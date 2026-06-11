@@ -982,6 +982,64 @@ def test_generator_training_step_fm_only_probe_uses_configured_fixed_null_condit
     assert module.last_loss_metrics["flow_condition"] == "fixed_null_condition"
 
 
+def test_generator_training_step_fm_only_probe_uses_configured_learned_null_condition() -> None:
+    from torch import nn
+
+    from safa.models.generator import FlowGeneratorConfig
+    from safa.training import g_loop
+
+    class DummyGenerator(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.null_condition = nn.Parameter(torch.tensor([7.0, -5.0]))
+            self.flow_condition_z = None
+            self.flow_condition_requires_grad = None
+
+        def make_null_condition(self, *, batch_size: int, device, dtype):
+            return self.null_condition.to(device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1)
+
+        def flow_matching_loss(self, images, z, generator=None):
+            self.flow_condition_z = z.detach().clone()
+            self.flow_condition_requires_grad = z.requires_grad
+            loss = self.null_condition.square().sum() + images.sum() * 0.0 + z.sum() * 0.0
+            return loss, {"flow_matching_mse": loss.detach()}
+
+        def sample(self, z, **kwargs):
+            raise AssertionError("FM-only probe must not sample for repr or cycle loss")
+
+    class DummyE0(nn.Module):
+        def forward(self, images):
+            raise AssertionError("FM-only probe must not call E0")
+
+    objective = g_loop._stage2_objective_from_config(
+        {
+            "stage1": {"epochs": 0},
+            "stage2": {
+                "epochs": 1,
+                "stage2_objective": {
+                    "type": "fm_only_probe",
+                    "flow_condition": "learned_null_condition",
+                },
+            },
+        }
+    )
+    generator = DummyGenerator()
+    module = g_loop._GeneratorTrainingStep(
+        generator,
+        DummyE0(),
+        FlowGeneratorConfig(embedding_dim=2, image_size=4, train_cycle_steps=1),
+        1337,
+        stage2_objective=objective,
+    )
+
+    loss, _, _, flow_loss, _ = module(torch.zeros(2, 3, 4, 4), torch.eye(2), ["a", "b"], True, 0.0)
+
+    assert torch.allclose(loss, flow_loss)
+    assert torch.equal(generator.flow_condition_z, torch.tensor([[7.0, -5.0], [7.0, -5.0]]))
+    assert generator.flow_condition_requires_grad is True
+    assert module.last_loss_metrics["flow_condition"] == "learned_null_condition"
+
+
 def test_stage1_flow_condition_config_supports_explicit_fixed_null_and_rejects_unknown() -> None:
     from safa.training import g_loop
 
