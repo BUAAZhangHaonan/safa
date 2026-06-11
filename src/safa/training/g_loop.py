@@ -3202,7 +3202,7 @@ def _run_projected_stage2_batch(
     metrics.update(_projection_result_metrics(projection))
     first_order_fm_increase = max(
         0.0,
-        float((-float(stage2_objective.repr_learning_rate) * projection.dot_after).detach().cpu()),
+        float((-float(effective_lr) * projection.dot_after).detach().cpu()),
     )
     metrics["fm_descent_credit"] = float(fm_descent_credit)
     metrics["credit_dot_lower_bound"] = float(credit_dot_lower_bound)
