@@ -3,9 +3,10 @@ seed: 1337
 sampling_seed: 1337
 device: cuda:0
 num_workers: 8
-global_batch_size: 24
-per_device_batch_size: 24
-amp: false
+# MeanFlow JVP fits 24GB GPU6 with lower batch and AMP.
+global_batch_size: 8
+per_device_batch_size: 8
+amp: true
 learning_rate: 0.0003
 weight_decay: 0.0
 image_size: 224
