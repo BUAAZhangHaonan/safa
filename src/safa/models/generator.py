@@ -6,10 +6,14 @@ from typing import Any
 
 GENERATOR_MODEL_TYPE_FLOW = "conditional_flow_matching"
 GENERATOR_MODEL_TYPE_MEANFLOW = "meanflow"
-GENERATOR_MODEL_TYPES = (GENERATOR_MODEL_TYPE_FLOW, GENERATOR_MODEL_TYPE_MEANFLOW)
+GENERATOR_MODEL_TYPE_DDIM = "ddim"
+GENERATOR_MODEL_TYPES = (GENERATOR_MODEL_TYPE_FLOW, GENERATOR_MODEL_TYPE_MEANFLOW, GENERATOR_MODEL_TYPE_DDIM)
 MEANFLOW_JVP_MODE_TORCH_FUNC = "torch_func"
 MEANFLOW_JVP_MODE_FIRST_ORDER = "first_order"
 MEANFLOW_JVP_MODES = (MEANFLOW_JVP_MODE_TORCH_FUNC, MEANFLOW_JVP_MODE_FIRST_ORDER)
+DDIM_BETA_SCHEDULE_LINEAR = "linear"
+DDIM_BETA_SCHEDULE_COSINE = "cosine"
+DDIM_BETA_SCHEDULES = (DDIM_BETA_SCHEDULE_LINEAR, DDIM_BETA_SCHEDULE_COSINE)
 
 GENERATOR_CHECKPOINT_MODEL_CONFIG_FIELDS = (
     "model_type",
@@ -55,6 +59,11 @@ class FlowGeneratorConfig:
     meanflow_norm_p: float = 0.75
     meanflow_norm_eps: float = 1.0e-3
     meanflow_jvp_mode: str = MEANFLOW_JVP_MODE_TORCH_FUNC
+    ddim_num_train_timesteps: int = 1000
+    ddim_beta_schedule: str = DDIM_BETA_SCHEDULE_LINEAR
+    ddim_beta_start: float = 1.0e-4
+    ddim_beta_end: float = 2.0e-2
+    ddim_eta: float = 0.0
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "FlowGeneratorConfig":
@@ -79,6 +88,11 @@ class FlowGeneratorConfig:
             meanflow_norm_p=float(payload.get("meanflow_norm_p", 0.75)),
             meanflow_norm_eps=float(payload.get("meanflow_norm_eps", 1.0e-3)),
             meanflow_jvp_mode=str(payload.get("meanflow_jvp_mode", MEANFLOW_JVP_MODE_TORCH_FUNC)),
+            ddim_num_train_timesteps=int(payload.get("ddim_num_train_timesteps", 1000)),
+            ddim_beta_schedule=str(payload.get("ddim_beta_schedule", DDIM_BETA_SCHEDULE_LINEAR)),
+            ddim_beta_start=float(payload.get("ddim_beta_start", 1.0e-4)),
+            ddim_beta_end=float(payload.get("ddim_beta_end", 2.0e-2)),
+            ddim_eta=float(payload.get("ddim_eta", 0.0)),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -105,6 +119,16 @@ class FlowGeneratorConfig:
                     "meanflow_norm_p": self.meanflow_norm_p,
                     "meanflow_norm_eps": self.meanflow_norm_eps,
                     "meanflow_jvp_mode": self.meanflow_jvp_mode,
+                }
+            )
+        if self.model_type == GENERATOR_MODEL_TYPE_DDIM:
+            payload.update(
+                {
+                    "ddim_num_train_timesteps": self.ddim_num_train_timesteps,
+                    "ddim_beta_schedule": self.ddim_beta_schedule,
+                    "ddim_beta_start": self.ddim_beta_start,
+                    "ddim_beta_end": self.ddim_beta_end,
+                    "ddim_eta": self.ddim_eta,
                 }
             )
         return payload
@@ -594,6 +618,258 @@ class MeanFlowGenerator:
         return _MeanFlowGenerator()
 
 
+class DDIMGenerator:
+    def __new__(cls, config: FlowGeneratorConfig | dict[str, Any] | None = None, **kwargs):
+        import math
+
+        import torch
+        from torch import nn
+        import torch.nn.functional as F
+
+        from safa.models.conditioning import LearnedNullCondition
+
+        cfg_payload = {}
+        if isinstance(config, FlowGeneratorConfig):
+            cfg = config
+        elif config is None and not kwargs:
+            cfg = FlowGeneratorConfig(model_type=GENERATOR_MODEL_TYPE_DDIM, sampler="ddim", sample_steps=1, train_cycle_steps=1)
+        else:
+            if config is not None:
+                cfg_payload.update(config)
+            cfg_payload.update(kwargs)
+            cfg_payload.setdefault("model_type", GENERATOR_MODEL_TYPE_DDIM)
+            cfg_payload.setdefault("sampler", "ddim")
+            cfg = FlowGeneratorConfig.from_dict(cfg_payload)
+        _validate_config(cfg)
+        if cfg.model_type != GENERATOR_MODEL_TYPE_DDIM:
+            raise ValueError(f"DDIMGenerator requires model_type={GENERATOR_MODEL_TYPE_DDIM!r}, got {cfg.model_type!r}")
+
+        def sinusoidal_embedding(timesteps, dim: int):
+            if timesteps.ndim != 1:
+                raise ValueError(f"t must have shape [B], got {tuple(timesteps.shape)}")
+            half = dim // 2
+            frequencies = torch.exp(
+                torch.arange(half, device=timesteps.device, dtype=timesteps.dtype)
+                * (-math.log(10000.0) / max(half - 1, 1))
+            )
+            args = timesteps[:, None] * frequencies[None, :]
+            embedding = torch.cat([torch.sin(args), torch.cos(args)], dim=1)
+            if dim % 2 == 1:
+                embedding = F.pad(embedding, (0, 1))
+            return embedding
+
+        def make_beta_schedule():
+            if cfg.ddim_beta_schedule == DDIM_BETA_SCHEDULE_LINEAR:
+                return torch.linspace(
+                    cfg.ddim_beta_start,
+                    cfg.ddim_beta_end,
+                    cfg.ddim_num_train_timesteps,
+                    dtype=torch.float32,
+                )
+            steps = cfg.ddim_num_train_timesteps + 1
+            t = torch.linspace(0, cfg.ddim_num_train_timesteps, steps, dtype=torch.float64) / cfg.ddim_num_train_timesteps
+            alphas_cumprod = torch.cos((t + 0.008) / 1.008 * math.pi * 0.5).pow(2)
+            alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+            betas = 1.0 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+            return betas.clamp(1.0e-8, 0.999).to(dtype=torch.float32)
+
+        class FiLMResidualBlock(nn.Module):
+            def __init__(self, in_channels: int, out_channels: int, condition_dim: int):
+                super().__init__()
+                groups_in = _groups_for(in_channels)
+                groups_out = _groups_for(out_channels)
+                self.in_norm = nn.GroupNorm(groups_in, in_channels)
+                self.in_conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+                self.out_norm = nn.GroupNorm(groups_out, out_channels)
+                self.out_conv = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+                self.condition = nn.Linear(condition_dim, out_channels * 2)
+                self.skip = nn.Identity() if in_channels == out_channels else nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+            def forward(self, x, condition):
+                hidden = self.in_conv(F.silu(self.in_norm(x)))
+                scale_shift = self.condition(condition).view(condition.shape[0], -1, 1, 1)
+                scale, shift = scale_shift.chunk(2, dim=1)
+                hidden = self.out_norm(hidden)
+                hidden = hidden * (1.0 + scale) + shift
+                hidden = self.out_conv(F.silu(hidden))
+                return hidden + self.skip(x)
+
+        class DDIMDenoiserUNet(nn.Module):
+            def __init__(self):
+                super().__init__()
+                channels = [cfg.base_channels * item for item in cfg.channel_multipliers]
+                self.input = nn.Conv2d(3, channels[0], kernel_size=3, padding=1)
+                self.time_mlp = nn.Sequential(
+                    nn.Linear(cfg.time_embedding_dim, cfg.condition_dim),
+                    nn.SiLU(),
+                    nn.Linear(cfg.condition_dim, cfg.condition_dim),
+                )
+                self.z_mlp = nn.Sequential(
+                    nn.Linear(cfg.embedding_dim, cfg.condition_dim),
+                    nn.SiLU(),
+                    nn.Linear(cfg.condition_dim, cfg.condition_dim),
+                )
+                self.down_blocks = nn.ModuleList()
+                self.downsamplers = nn.ModuleList()
+                current = channels[0]
+                for next_channels in channels:
+                    self.down_blocks.append(FiLMResidualBlock(current, next_channels, cfg.condition_dim))
+                    self.downsamplers.append(nn.Conv2d(next_channels, next_channels, kernel_size=4, stride=2, padding=1))
+                    current = next_channels
+                self.mid = FiLMResidualBlock(current, current, cfg.condition_dim)
+                self.up_blocks = nn.ModuleList()
+                self.upsamplers = nn.ModuleList()
+                for skip_channels in reversed(channels):
+                    self.upsamplers.append(nn.ConvTranspose2d(current, skip_channels, kernel_size=4, stride=2, padding=1))
+                    self.up_blocks.append(FiLMResidualBlock(skip_channels + skip_channels, skip_channels, cfg.condition_dim))
+                    current = skip_channels
+                self.output = nn.Sequential(
+                    nn.GroupNorm(_groups_for(current), current),
+                    nn.SiLU(),
+                    nn.Conv2d(current, 3, kernel_size=3, padding=1),
+                )
+
+            def forward(self, x_t, t, z):
+                if x_t.ndim != 4 or x_t.shape[1:] != (3, cfg.image_size, cfg.image_size):
+                    raise ValueError(f"x_t must have shape [B,3,{cfg.image_size},{cfg.image_size}], got {tuple(x_t.shape)}")
+                if z.ndim != 2 or z.shape[1] != cfg.embedding_dim:
+                    raise ValueError(f"z must have shape [B,{cfg.embedding_dim}], got {tuple(z.shape)}")
+                if t.ndim != 1 or t.shape[0] != z.shape[0]:
+                    raise ValueError(f"t must have shape [B], got {tuple(t.shape)} for batch {z.shape[0]}")
+                condition = self.time_mlp(sinusoidal_embedding(t, cfg.time_embedding_dim)) + self.z_mlp(z)
+                hidden = self.input(x_t)
+                skips = []
+                for block, downsample in zip(self.down_blocks, self.downsamplers):
+                    hidden = block(hidden, condition)
+                    skips.append(hidden)
+                    hidden = downsample(hidden)
+                hidden = self.mid(hidden, condition)
+                for upsample, block, skip in zip(self.upsamplers, self.up_blocks, reversed(skips)):
+                    hidden = upsample(hidden)
+                    if hidden.shape[-2:] != skip.shape[-2:]:
+                        raise RuntimeError(f"U-Net skip shape mismatch: up={tuple(hidden.shape)} skip={tuple(skip.shape)}")
+                    hidden = torch.cat([hidden, skip], dim=1)
+                    hidden = block(hidden, condition)
+                return self.output(hidden)
+
+        class _DDIMGenerator(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = cfg
+                self.embedding_dim = cfg.embedding_dim
+                self.image_size = cfg.image_size
+                self.denoiser = DDIMDenoiserUNet()
+                self.null_condition = LearnedNullCondition(cfg.embedding_dim) if cfg.learned_null_condition else None
+                betas = make_beta_schedule()
+                alphas = 1.0 - betas
+                alphas_cumprod = torch.cumprod(alphas, dim=0)
+                self.register_buffer("betas", betas, persistent=True)
+                self.register_buffer("alphas", alphas, persistent=True)
+                self.register_buffer("alphas_cumprod", alphas_cumprod, persistent=True)
+                self.register_buffer("sqrt_alphas_cumprod", torch.sqrt(alphas_cumprod), persistent=True)
+                self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod), persistent=True)
+
+            def forward(self, z):
+                return self.sample(z, steps=self.config.sample_steps)
+
+            def denoising_loss(self, x_0, z, generator=None):
+                self._validate_z(z)
+                if x_0.ndim != 4 or x_0.shape[1:] != (3, self.image_size, self.image_size):
+                    raise ValueError(f"x_0 must have shape [B,3,{self.image_size},{self.image_size}], got {tuple(x_0.shape)}")
+                x_0_diffusion = x_0.mul(2.0).sub(1.0)
+                timesteps = torch.randint(
+                    0,
+                    self.config.ddim_num_train_timesteps,
+                    (x_0_diffusion.shape[0],),
+                    device=x_0_diffusion.device,
+                    generator=generator,
+                    dtype=torch.long,
+                )
+                noise = torch.randn(x_0_diffusion.shape, device=x_0_diffusion.device, dtype=x_0_diffusion.dtype, generator=generator)
+                sqrt_alpha_bar = self._extract(self.sqrt_alphas_cumprod, timesteps, x_0_diffusion)
+                sqrt_one_minus_alpha_bar = self._extract(self.sqrt_one_minus_alphas_cumprod, timesteps, x_0_diffusion)
+                x_t = sqrt_alpha_bar * x_0_diffusion + sqrt_one_minus_alpha_bar * noise
+                predicted_noise = self.denoiser(x_t, self._normalize_timesteps(timesteps, dtype=x_t.dtype), z)
+                loss = F.mse_loss(predicted_noise, noise)
+                return loss, {
+                    "flow_matching_mse": loss.detach(),
+                    "ddim_denoising_mse": loss.detach(),
+                    "ddim_timestep_mean": timesteps.detach().to(dtype=x_0_diffusion.dtype).mean(),
+                    "target_noise_abs_mean": noise.detach().abs().mean(),
+                    "predicted_noise_abs_mean": predicted_noise.detach().abs().mean(),
+                }
+
+            def flow_matching_loss(self, x_0, z, generator=None):
+                return self.denoising_loss(x_0, z, generator=generator)
+
+            def sample(self, z, steps: int | None = None, checkpoint_steps: bool = False, *, x_init=None, clamp_output: bool = True):
+                del checkpoint_steps
+                self._validate_z(z)
+                steps = int(steps or self.config.sample_steps)
+                if steps <= 0:
+                    raise ValueError(f"sample steps must be positive, got {steps}")
+                if x_init is None:
+                    x = torch.randn(z.shape[0], 3, self.image_size, self.image_size, device=z.device, dtype=z.dtype)
+                else:
+                    self._validate_x_init(x_init, z)
+                    x = x_init
+                timesteps = self.ddim_timesteps(steps).to(device=z.device)
+                for index, timestep in enumerate(timesteps):
+                    next_timestep = timesteps[index + 1] if index + 1 < len(timesteps) else None
+                    t_batch = torch.full((z.shape[0],), int(timestep.item()), device=z.device, dtype=torch.long)
+                    x = self._ddim_step(x, z, t_batch, next_timestep)
+                if clamp_output:
+                    return ((x.clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0)
+                return (x + 1.0) * 0.5
+
+            def ddim_timesteps(self, steps: int):
+                steps = int(steps)
+                if steps <= 0:
+                    raise ValueError(f"sample steps must be positive, got {steps}")
+                max_timestep = self.config.ddim_num_train_timesteps - 1
+                return torch.linspace(max_timestep, 0, steps, dtype=torch.float64).round().to(dtype=torch.long)
+
+            def make_null_condition(self, *, batch_size: int, device, dtype):
+                if self.null_condition is None:
+                    raise RuntimeError("learned_null_condition is disabled for this generator")
+                return self.null_condition(batch_size=batch_size, device=device, dtype=dtype)
+
+            def _ddim_step(self, x_t, z, timesteps, next_timestep):
+                alpha_bar_t = self._extract(self.alphas_cumprod, timesteps, x_t)
+                eps = self.denoiser(x_t, self._normalize_timesteps(timesteps, dtype=x_t.dtype), z)
+                pred_x0 = (x_t - (1.0 - alpha_bar_t).sqrt() * eps) / alpha_bar_t.sqrt().clamp_min(1.0e-12)
+                if next_timestep is None:
+                    return pred_x0
+                next_timesteps = torch.full_like(timesteps, int(next_timestep.item()))
+                alpha_bar_prev = self._extract(self.alphas_cumprod, next_timesteps, x_t)
+                return alpha_bar_prev.sqrt() * pred_x0 + (1.0 - alpha_bar_prev).sqrt() * eps
+
+            def _extract(self, values, timesteps, target):
+                gathered = values.to(device=timesteps.device, dtype=target.dtype).gather(0, timesteps)
+                return gathered.view(-1, 1, 1, 1)
+
+            def _normalize_timesteps(self, timesteps, *, dtype):
+                max_timestep = max(self.config.ddim_num_train_timesteps - 1, 1)
+                return timesteps.to(dtype=dtype) / float(max_timestep)
+
+            def _validate_z(self, z):
+                if z.ndim != 2 or z.shape[1] != self.embedding_dim:
+                    raise ValueError(f"G expects z with shape [B,{self.embedding_dim}], got {tuple(z.shape)}")
+
+            def _validate_x_init(self, x_init, z):
+                if not isinstance(x_init, torch.Tensor):
+                    raise TypeError(f"x_init must be a torch.Tensor, got {type(x_init).__name__}")
+                expected_shape = (z.shape[0], 3, self.image_size, self.image_size)
+                if tuple(x_init.shape) != expected_shape:
+                    raise ValueError(f"x_init must have shape {expected_shape}, got {tuple(x_init.shape)}")
+                if x_init.device != z.device:
+                    raise ValueError(f"x_init device must match z device {z.device}, got {x_init.device}")
+                if x_init.dtype != z.dtype:
+                    raise TypeError(f"x_init dtype must match z dtype {z.dtype}, got {x_init.dtype}")
+
+        return _DDIMGenerator()
+
+
 def build_generator(config: dict[str, Any] | FlowGeneratorConfig | None = None, **kwargs):
     payload: dict[str, Any] = {}
     if isinstance(config, FlowGeneratorConfig):
@@ -601,6 +877,8 @@ def build_generator(config: dict[str, Any] | FlowGeneratorConfig | None = None, 
             return ConditionalFlowGenerator(config)
         if config.model_type == GENERATOR_MODEL_TYPE_MEANFLOW:
             return MeanFlowGenerator(config)
+        if config.model_type == GENERATOR_MODEL_TYPE_DDIM:
+            return DDIMGenerator(config)
         raise ValueError(f"Unsupported generator model_type: {config.model_type}")
     if config is None and not kwargs:
         return ConditionalFlowGenerator()
@@ -612,6 +890,8 @@ def build_generator(config: dict[str, Any] | FlowGeneratorConfig | None = None, 
         return ConditionalFlowGenerator(payload)
     if model_type == GENERATOR_MODEL_TYPE_MEANFLOW:
         return MeanFlowGenerator(payload)
+    if model_type == GENERATOR_MODEL_TYPE_DDIM:
+        return DDIMGenerator(payload)
     raise ValueError(f"Unsupported generator model_type: {model_type}")
 
 
@@ -668,6 +948,25 @@ def _validate_config(config: FlowGeneratorConfig) -> None:
         if config.meanflow_jvp_mode not in MEANFLOW_JVP_MODES:
             allowed = ", ".join(MEANFLOW_JVP_MODES)
             raise ValueError(f"meanflow_jvp_mode must be one of {allowed}, got {config.meanflow_jvp_mode!r}")
+    if config.model_type == GENERATOR_MODEL_TYPE_DDIM:
+        if config.sampler != "ddim":
+            raise ValueError(f"ddim sampler must be 'ddim', got {config.sampler!r}")
+        if config.ddim_num_train_timesteps <= 1:
+            raise ValueError(f"ddim_num_train_timesteps must be greater than 1, got {config.ddim_num_train_timesteps}")
+        if config.ddim_beta_schedule not in DDIM_BETA_SCHEDULES:
+            allowed = ", ".join(DDIM_BETA_SCHEDULES)
+            raise ValueError(f"ddim_beta_schedule must be one of {allowed}, got {config.ddim_beta_schedule!r}")
+        if config.ddim_beta_start <= 0.0 or config.ddim_beta_start >= 1.0:
+            raise ValueError(f"ddim_beta_start must be in (0, 1), got {config.ddim_beta_start}")
+        if config.ddim_beta_end <= 0.0 or config.ddim_beta_end >= 1.0:
+            raise ValueError(f"ddim_beta_end must be in (0, 1), got {config.ddim_beta_end}")
+        if config.ddim_beta_schedule == DDIM_BETA_SCHEDULE_LINEAR and config.ddim_beta_start >= config.ddim_beta_end:
+            raise ValueError(
+                "linear DDIM beta schedule requires ddim_beta_start < ddim_beta_end, "
+                f"got {config.ddim_beta_start} >= {config.ddim_beta_end}"
+            )
+        if config.ddim_eta != 0.0:
+            raise ValueError(f"ddim_eta must be 0.0 for deterministic DDIM sampling, got {config.ddim_eta}")
     if not isinstance(config.learned_null_condition, bool):
         raise ValueError(f"learned_null_condition must be a bool, got {config.learned_null_condition!r}")
     if not isinstance(config.meanflow_adaptive_weighting, bool):
