@@ -109,6 +109,7 @@ class _Stage2ObjectiveRuntime:
     pu_gradient_normalization: bool = False
     pu_backtrack_max_retries: int = 0
     pu_fm_increase_budget: float = 0.0
+    repr_step_ratio_cap: float = 0.25
 
 
 @dataclass(frozen=True)
@@ -650,6 +651,7 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
         pu_gradient_normalization = _optional_bool(payload, "pu_gradient_normalization", context, default=False)
         pu_backtrack_max_retries = int(payload.get("pu_backtrack_max_retries", 0))
         pu_fm_increase_budget = float(payload.get("pu_fm_increase_budget", 0.0))
+        repr_step_ratio_cap = float(payload.get("repr_step_ratio_cap", 0.25))
 
         return _Stage2ObjectiveRuntime(
             type=str(objective_type),
@@ -664,6 +666,7 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
             pu_gradient_normalization=pu_gradient_normalization,
             pu_backtrack_max_retries=pu_backtrack_max_retries,
             pu_fm_increase_budget=pu_fm_increase_budget,
+            repr_step_ratio_cap=repr_step_ratio_cap,
         )
 
     relation_weight = _require_numeric(payload, "relation_weight", context)
@@ -2585,19 +2588,6 @@ def _extract_adam_preconditioner_weights(optimizer, params: list) -> list:
     return weights
 
 
-def _preconditioned_parameter_step(params: list, gradients: list, weights: list, learning_rate: float) -> None:
-    import torch
-
-    if len(params) != len(gradients) or len(params) != len(weights):
-        raise ValueError("Length mismatch between parameters, gradients, and weights")
-    with torch.no_grad():
-        for p, g, w in zip(params, gradients, weights):
-            if p.shape != g.shape or p.shape != w.shape:
-                raise ValueError("Shape mismatch between parameter, gradient, and weight")
-            if not torch.isfinite(w * g).all():
-                raise FloatingPointError("Preconditioned gradient contains non-finite values")
-            p.data.add_(w * g, alpha=-float(learning_rate))
-
 
 def _clip_projected_gradients(projected_gradients: list, max_norm: float) -> list:
     import torch
@@ -2607,26 +2597,6 @@ def _clip_projected_gradients(projected_gradients: list, max_norm: float) -> lis
         return projected_gradients
     scale = max_norm / (float(total_norm) + 1e-6)
     return [g * scale for g in projected_gradients]
-
-
-def _sync_adam_state_after_repr_step(optimizer, params: list, projected_gradients_euclidean: list, effective_lr: float) -> None:
-    import torch
-
-    beta1 = optimizer.defaults.get("betas", (0.9, 0.999))[0]
-    beta2 = optimizer.defaults.get("betas", (0.9, 0.999))[1]
-    for p, grad in zip(params, projected_gradients_euclidean):
-        state = optimizer.state.get(p)
-        if state is None or "exp_avg" not in state:
-            continue
-        state["exp_avg"].mul_(beta1).add_(grad, alpha=1.0 - beta1)
-        state["exp_avg_sq"].mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
-    # Decoupled weight decay: p *= (1 - repr_lr * wd)
-    wd = optimizer.param_groups[0].get("weight_decay", 0.0)
-    if wd > 0.0:
-        decay_factor = 1.0 - effective_lr * wd
-        with torch.no_grad():
-            for p in params:
-                p.data.mul_(decay_factor)
 
 
 def _save_parameters(params: list) -> list:
@@ -2644,43 +2614,6 @@ def _restore_parameters(params: list, saved: list) -> None:
         for p, s in zip(params, saved):
             p.data.copy_(s)
 
-
-def _save_adam_state(optimizer, params: list) -> dict:
-    """Save Adam optimizer state (exp_avg, exp_avg_sq, step) for given params."""
-    import torch
-    saved = {}
-    for p in params:
-        state = optimizer.state.get(p)
-        if state is None:
-            continue
-        p_state = {}
-        if "exp_avg" in state:
-            p_state["exp_avg"] = state["exp_avg"].detach().clone()
-        if "exp_avg_sq" in state:
-            p_state["exp_avg_sq"] = state["exp_avg_sq"].detach().clone()
-        if "step" in state:
-            p_state["step"] = state["step"]
-        saved[id(p)] = p_state
-    return saved
-
-
-def _restore_adam_state(optimizer, params: list, saved: dict) -> None:
-    """Restore Adam optimizer state from saved snapshot."""
-    import torch
-    with torch.no_grad():
-        for p in params:
-            p_state = saved.get(id(p))
-            if p_state is None:
-                continue
-            state = optimizer.state.get(p)
-            if state is None:
-                continue
-            if "exp_avg" in p_state and "exp_avg" in state:
-                state["exp_avg"].copy_(p_state["exp_avg"])
-            if "exp_avg_sq" in p_state and "exp_avg_sq" in state:
-                state["exp_avg_sq"].copy_(p_state["exp_avg_sq"])
-            if "step" in p_state:
-                state["step"] = p_state["step"]
 
 def _apply_projected_repr_step(parameters: list, projected_gradients: list, *, repr_learning_rate: float) -> None:
     import torch
@@ -3068,7 +3001,9 @@ def _run_projected_stage2_batch(
             error_if_nonfinite=True,
         )
         batch_grad_norm = float(grad_norm) if isinstance(grad_norm, float) else float(grad_norm.detach().cpu())
+    pre_fm_params = _save_parameters(params)
     optimizer.step()
+    fm_param_step_norm = float(torch.sqrt(sum((p.data - s).double().square().sum() for p, s in zip(params, pre_fm_params))))
 
     # --- Step 2: Compute FM guard gradient ---
     optimizer.zero_grad(set_to_none=True)
@@ -3112,47 +3047,56 @@ def _run_projected_stage2_batch(
     fm_descent_credit = 0.0
     credit_dot_lower_bound = 0.0
     if stage2_objective.optimizer_type == "adamw" and stage2_objective.type != _POINT_DESCENT_CREDIT_PROJECTED:
-        # === AdamW metric-correct path: Q-weighted projection ===
+        # === AdamW path: Q-weighted projection + trust ratio control ===
         weights = _extract_adam_preconditioner_weights(optimizer, params)
 
-        # Q-weighted norm computation
-        fm_norm_q = torch.sqrt(sum((w * g * g).sum() for w, g in zip(weights, fm_gradients)))
-        repr_norm_q = torch.sqrt(sum((w * g * g).sum() for w, g in zip(weights, weighted_repr_gradients)))
-        norm_ratio = float(repr_norm_q / fm_norm_q) if float(fm_norm_q) > 1e-12 else 1.0
+        # Q-weighted norms for diagnostics
+        repr_norm_q_before = torch.sqrt(sum((w * g * g).sum() for w, g in zip(weights, weighted_repr_gradients)))
+        repr_grad_qnorm_before_proj = float(repr_norm_q_before)
 
-        if stage2_objective.pu_gradient_normalization and float(fm_norm_q) > 1e-12 and float(repr_norm_q) > 1e-12:
-            scale = float(fm_norm_q / repr_norm_q)
+        # Normalize repr grad to FM scale before projection
+        fm_norm_q = torch.sqrt(sum((w * g * g).sum() for w, g in zip(weights, fm_gradients)))
+        norm_ratio = float(repr_norm_q_before / fm_norm_q) if float(fm_norm_q) > 1e-12 else 1.0
+
+        if stage2_objective.pu_gradient_normalization and float(fm_norm_q) > 1e-12 and float(repr_norm_q_before) > 1e-12:
+            scale = float(fm_norm_q / repr_norm_q_before)
             g_repr_for_proj = [g * scale for g in weighted_repr_gradients]
         else:
             g_repr_for_proj = weighted_repr_gradients
 
-        # Q-weighted projection
+        # Q-weighted projection — projected gradients stay in normalized (FM-scale) space
         projection = project_gradient_onto_fm_feasible_cone_adam(
             g_repr_for_proj, fm_gradients, weights, eps=stage2_objective.projection_eps,
         )
+        projected_gradients = projection.projected_gradients
 
-        # Un-normalize projected gradients
-        if stage2_objective.pu_gradient_normalization and float(fm_norm_q) > 1e-12 and float(repr_norm_q) > 1e-12:
-            un_scale = float(repr_norm_q / fm_norm_q)
-            projected_gradients = [g * un_scale for g in projection.projected_gradients]
-        else:
-            projected_gradients = projection.projected_gradients
+        repr_grad_qnorm_after_proj = float(torch.sqrt(sum((w * g * g).sum() for w, g in zip(weights, projected_gradients))))
 
-        # Backtracking line search with preconditioned update
+        # Compute preconditioned repr displacement: w * projected_grad * repr_lr
         effective_lr = stage2_objective.repr_learning_rate
         backtrack_count = 0
         saved_params = _save_parameters(params)
-        saved_adam_state = _save_adam_state(optimizer, params)
-        # Safety clip projected gradients before stepping
-        projected_gradients = _clip_projected_gradients(projected_gradients, max_norm=float(grad_clip_norm or 1.0))
+
+        def _compute_repr_step_norm(lr):
+            return float(torch.sqrt(sum(
+                (w * g * lr).double().square().sum() for w, g in zip(weights, projected_gradients)
+            )))
+
+        # Trust ratio clip: |repr_step| <= cap * |fm_step|
+        repr_step_norm_before_clip = _compute_repr_step_norm(effective_lr)
+        step_cap = stage2_objective.repr_step_ratio_cap * fm_param_step_norm
+        if step_cap > 1e-15 and repr_step_norm_before_clip > step_cap:
+            trust_scale = step_cap / repr_step_norm_before_clip
+            effective_lr *= trust_scale
+        repr_step_norm_after_clip = _compute_repr_step_norm(effective_lr)
 
         for _retry in range(stage2_objective.pu_backtrack_max_retries + 1):
-            _preconditioned_parameter_step(params, projected_gradients, weights, effective_lr)
-            # Sync Adam running averages to reflect the repr step
-            _sync_adam_state_after_repr_step(optimizer, params, projected_gradients, effective_lr)
+            # Apply preconditioned repr step directly — never touch Adam state
+            with torch.no_grad():
+                for p, w, g in zip(params, weights, projected_gradients):
+                    p.data.add_(w * g, alpha=-float(effective_lr))
 
             if stage2_objective.pu_backtrack_max_retries > 0:
-                # Check FM loss after update (bypass DDP to avoid deadlock)
                 with torch.no_grad():
                     noise_gen.manual_seed(batch_seed)
                     after_losses = training_state(
@@ -3171,14 +3115,12 @@ def _run_projected_stage2_batch(
                     break
 
                 _restore_parameters(params, saved_params)
-                _restore_adam_state(optimizer, params, saved_adam_state)
                 effective_lr *= 0.5
                 backtrack_count += 1
             else:
                 break
         else:
             _restore_parameters(params, saved_params)
-            _restore_adam_state(optimizer, params, saved_adam_state)
 
     else:
         # === SGD Euclidean path ===
@@ -3275,6 +3217,15 @@ def _run_projected_stage2_batch(
     metrics["pu_norm_ratio"] = float(norm_ratio)
     metrics["pu_backtrack_count"] = float(backtrack_count)
     metrics["pu_effective_repr_lr"] = float(effective_lr)
+    metrics["fm_param_step_norm"] = float(fm_param_step_norm)
+    # AdamW-specific diagnostics
+    if stage2_objective.optimizer_type == "adamw" and stage2_objective.type != _POINT_DESCENT_CREDIT_PROJECTED:
+        metrics["repr_grad_qnorm_before_proj"] = float(repr_grad_qnorm_before_proj)
+        metrics["repr_grad_qnorm_after_proj"] = float(repr_grad_qnorm_after_proj)
+        metrics["repr_param_step_norm_before_clip"] = float(repr_step_norm_before_clip)
+        metrics["repr_param_step_norm_after_clip"] = float(repr_step_norm_after_clip)
+        metrics["repr_to_fm_param_step_ratio"] = float(repr_step_norm_after_clip / fm_param_step_norm) if fm_param_step_norm > 1e-15 else 0.0
+        metrics["raw_ema_cosine_gap"] = float(metrics.get("cosine_raw", 0.0) - metrics.get("cosine_ema", 0.0))
     training_state.last_loss_metrics = metrics
     logged_loss = flow_loss_guard.detach() + stage2_objective.lambda_repr * repr_loss_raw.detach()
     return logged_loss, flow_mse_guard.detach(), repr_detached.detach(), flow_loss_guard.detach(), repr_loss_raw.detach(), batch_grad_norm, metrics
