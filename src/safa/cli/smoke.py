@@ -104,13 +104,13 @@ def main() -> None:
                 "sampler": "heun",
             },
             "stages": {
-                "stage1": {"epochs": 1, "require_face_detection_gate": False},
+                "stage1": {"epochs": 1, "require_face_detection_gate": False, "flow_condition": "embedding"},
                 "stage2": {
                     "epochs": 1,
                     "lambda_initial": 0.005,
                     "lambda_max": 0.01,
                     "lambda_growth": 0.005,
-                    "gradient_conflict": {"enabled": False},
+                    "gradient_conflict": {"enabled": False}, "flow_condition": "embedding",
                 },
             },
             "validation": {

@@ -368,7 +368,7 @@ class StageGateTests(unittest.TestCase):
                 super().__init__()
                 self.sample_calls = []
 
-            def flow_matching_loss(self, images, z):
+            def flow_matching_loss(self, images, z, generator=None):
                 loss = images.sum() * 0.0 + z.sum() * 0.0
                 return loss, {"flow_matching_mse": loss.detach()}
 

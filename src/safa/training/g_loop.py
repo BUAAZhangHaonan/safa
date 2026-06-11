@@ -4,6 +4,7 @@ from pathlib import Path
 from dataclasses import dataclass
 import math
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -201,7 +202,7 @@ class _GeneratorTrainingStep:
                     )
                 return state
 
-            def forward(self, images, z, sample_ids, use_cycle: bool, lambda_cycle: float, flow_condition: str | None = None):
+            def forward(self, images, z, sample_ids, use_cycle: bool, lambda_cycle: float, flow_condition: str | None = None, noise_generator=None):
                 effective_flow_condition = self._effective_flow_condition(use_cycle=use_cycle, flow_condition=flow_condition)
                 cycle_loss = z.new_tensor(0.0)
                 if use_cycle:
@@ -211,7 +212,7 @@ class _GeneratorTrainingStep:
                         cycle_steps = self.generator_config.train_cycle_steps
                     if self.stage2_objective is not None:
                         if self.stage2_objective.type == "fm_only_probe":
-                            flow_loss, flow_metrics = self._compute_flow_loss(images, z, effective_flow_condition)
+                            flow_loss, flow_metrics = self._compute_flow_loss(images, z, effective_flow_condition, noise_generator=noise_generator)
                             self._batch_idx += 1
                             secondary_loss = flow_loss.new_tensor(0.0)
                             self.last_loss_metrics = self._stage2_probe_loss_metrics(
@@ -226,7 +227,7 @@ class _GeneratorTrainingStep:
                         repr_loss, repr_metrics = self._compute_repr_loss(z, sample_ids, cycle_steps=cycle_steps)
                         self._batch_idx += 1
                         if self.stage2_objective.type == "gram_weighted_sum":
-                            flow_loss, flow_metrics = self._compute_flow_loss(images, z, effective_flow_condition)
+                            flow_loss, flow_metrics = self._compute_flow_loss(images, z, effective_flow_condition, noise_generator=noise_generator)
                             loss = flow_loss + self.stage2_objective.lambda_repr * repr_loss
                             loss_metrics = self._stage2_repr_loss_metrics(
                                 flow_loss,
@@ -253,7 +254,7 @@ class _GeneratorTrainingStep:
                             self.last_loss_metrics = loss_metrics
                             return loss, flow_loss.detach(), repr_loss.detach(), flow_loss, repr_loss
                         if self.stage2_objective.type in _PROJECTED_STAGE2_OBJECTIVES or self.stage2_objective.type in _CAGRAD_STAGE2_OBJECTIVES:
-                            flow_loss, flow_metrics = self._compute_flow_loss(images, z, effective_flow_condition)
+                            flow_loss, flow_metrics = self._compute_flow_loss(images, z, effective_flow_condition, noise_generator=noise_generator)
                             loss_metrics = self._stage2_repr_loss_metrics(
                                 flow_loss,
                                 cycle_loss,
@@ -284,7 +285,7 @@ class _GeneratorTrainingStep:
                     e0_out = self.e0(normalize_for_e0(generated))
                     cycle_loss = cosine_cycle_loss(e0_out["embedding"], z)
                     self._batch_idx += 1
-                flow_loss, flow_metrics = self._compute_flow_loss(images, z, effective_flow_condition)
+                flow_loss, flow_metrics = self._compute_flow_loss(images, z, effective_flow_condition, noise_generator=noise_generator)
                 loss, loss_metrics = self._combine_losses(flow_loss, cycle_loss, use_cycle=use_cycle, lambda_cycle=lambda_cycle)
                 loss_metrics["flow_condition"] = effective_flow_condition
                 self.last_loss_metrics = loss_metrics
@@ -299,9 +300,9 @@ class _GeneratorTrainingStep:
                     return self.stage2_objective.flow_condition
                 return _FLOW_CONDITION_EMBEDDING
 
-            def _compute_flow_loss(self, images, z, flow_condition: str):
+            def _compute_flow_loss(self, images, z, flow_condition: str, noise_generator=None):
                 condition_z = self._flow_condition_z(z, flow_condition)
-                return self.generator.flow_matching_loss(images, condition_z)
+                return self.generator.flow_matching_loss(images, condition_z, generator=noise_generator)
 
             def _flow_condition_z(self, z, flow_condition: str):
                 _validate_flow_condition(flow_condition, "training flow_condition")
@@ -936,7 +937,12 @@ def _load_resume_optimizer_state(
     *,
     generator_trainable_mode: str,
     is_main: bool,
+    skip_optimizer_state: bool = False,
 ) -> bool:
+    if skip_optimizer_state:
+        if is_main:
+            print("Skipping optimizer state resume (resume_optimizer_state: false); optimizer_resumed: false")
+        return False
     if (
         generator_trainable_mode != _GENERATOR_TRAINABLE_FULL
         and not _optimizer_state_param_groups_match_current_optimizer(optimizer, resume_optimizer_state_dict)
@@ -1255,6 +1261,7 @@ def train_g_from_config(config: dict) -> dict:
                 resume_optimizer_state_dict,
                 generator_trainable_mode=generator_trainable_mode,
                 is_main=distributed.is_main,
+                skip_optimizer_state=not config.get("resume_optimizer_state", True),
             )
     assert_e0_frozen(e0, optimizer)
     lambda_cycle, lambda_max, lambda_growth = _stage2_lambda_schedule(stages, loss_weighting_runtime, stage2_objective)
@@ -1526,6 +1533,8 @@ def train_g_from_config(config: dict) -> dict:
 
                 _validate_checkpoint_selection_metrics(metrics, best_model=best_model)
                 history.append(metrics)
+                # Append per-epoch metrics to JSONL for easy analysis
+                _append_metrics_history(out_dir, metrics)
                 checkpoint_kwargs = {
                     "ema_model_state_dict": ema.state_dict() if ema is not None and ema_config["save_ema_checkpoint"] else None,
                     "metrics_raw": raw_validation_metrics,
@@ -2590,6 +2599,36 @@ def _preconditioned_parameter_step(params: list, gradients: list, weights: list,
             p.data.add_(w * g, alpha=-float(learning_rate))
 
 
+def _clip_projected_gradients(projected_gradients: list, max_norm: float) -> list:
+    import torch
+
+    total_norm = torch.sqrt(sum(g.double().square().sum() for g in projected_gradients))
+    if float(total_norm) <= max_norm:
+        return projected_gradients
+    scale = max_norm / (float(total_norm) + 1e-6)
+    return [g * scale for g in projected_gradients]
+
+
+def _sync_adam_state_after_repr_step(optimizer, params: list, projected_gradients_euclidean: list, effective_lr: float) -> None:
+    import torch
+
+    beta1 = optimizer.defaults.get("betas", (0.9, 0.999))[0]
+    beta2 = optimizer.defaults.get("betas", (0.9, 0.999))[1]
+    for p, grad in zip(params, projected_gradients_euclidean):
+        state = optimizer.state.get(p)
+        if state is None or "exp_avg" not in state:
+            continue
+        state["exp_avg"].mul_(beta1).add_(grad, alpha=1.0 - beta1)
+        state["exp_avg_sq"].mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+    # Decoupled weight decay: p *= (1 - repr_lr * wd)
+    wd = optimizer.param_groups[0].get("weight_decay", 0.0)
+    if wd > 0.0:
+        decay_factor = 1.0 - effective_lr * wd
+        with torch.no_grad():
+            for p in params:
+                p.data.mul_(decay_factor)
+
+
 def _save_parameters(params: list) -> list:
     import torch
 
@@ -2961,8 +3000,14 @@ def _run_projected_stage2_batch(
     training_state = unwrap_model(training_module)
     params = _trainable_parameter_list(training_state.generator.parameters())
 
+    # Shared noise generator: reset seed before each forward call so all
+    # forward passes in this batch sample identical (x_0, t).
+    noise_gen = torch.Generator(device=images.device)
+    _seed_hash = hashlib.sha256("|".join(sorted(sample_ids)).encode()).digest()
+    batch_seed = (int.from_bytes(_seed_hash[:4], "big") * 2654435761) & 0xFFFFFFFF
     # --- Step 1: FM optimization via optimizer ---
     optimizer.zero_grad(set_to_none=True)
+    noise_gen.manual_seed(batch_seed)
     with amp_ctx:
         flow_loss, flow_mse, _, flow_loss_raw, _ = training_module(
             images,
@@ -2971,6 +3016,7 @@ def _run_projected_stage2_batch(
             False,
             lambda_cycle,
             flow_condition=flow_condition,
+            noise_generator=noise_gen,
         )
     _assert_finite_training_scalars(flow_loss, flow_mse, flow_loss_raw)
     pre_flow_loss_value = float(flow_loss.detach().cpu())
@@ -2988,6 +3034,7 @@ def _run_projected_stage2_batch(
 
     # --- Step 2: Compute FM guard gradient ---
     optimizer.zero_grad(set_to_none=True)
+    noise_gen.manual_seed(batch_seed)
     with amp_ctx:
         _, _, _, flow_loss_guard, _ = training_module(
             images,
@@ -2996,6 +3043,7 @@ def _run_projected_stage2_batch(
             False,
             lambda_cycle,
             flow_condition=flow_condition,
+            noise_generator=noise_gen,
         )
     assert_finite_tensor("m3_flow_loss_guard", flow_loss_guard)
     flow_loss_guard_value = float(flow_loss_guard.detach().cpu())
@@ -3004,6 +3052,7 @@ def _run_projected_stage2_batch(
 
     # --- Step 3: Compute representation gradient ---
     optimizer.zero_grad(set_to_none=True)
+    noise_gen.manual_seed(batch_seed)
     with amp_ctx:
         repr_loss, flow_mse_guard, repr_detached, _, repr_loss_raw = training_module(
             images,
@@ -3012,6 +3061,7 @@ def _run_projected_stage2_batch(
             True,
             lambda_cycle,
             flow_condition=flow_condition,
+            noise_generator=noise_gen,
         )
     _assert_finite_training_scalars(repr_loss, flow_mse_guard, repr_detached)
     repr_loss.backward()
@@ -3054,13 +3104,18 @@ def _run_projected_stage2_batch(
         effective_lr = stage2_objective.repr_learning_rate
         backtrack_count = 0
         saved_params = _save_parameters(params)
+        # Safety clip projected gradients before stepping
+        projected_gradients = _clip_projected_gradients(projected_gradients, max_norm=float(grad_clip_norm or 1.0))
 
         for _retry in range(stage2_objective.pu_backtrack_max_retries + 1):
             _preconditioned_parameter_step(params, projected_gradients, weights, effective_lr)
+            # Sync Adam running averages to reflect the repr step
+            _sync_adam_state_after_repr_step(optimizer, params, projected_gradients, effective_lr)
 
             if stage2_objective.pu_backtrack_max_retries > 0:
                 # Check FM loss after update (bypass DDP to avoid deadlock)
                 with torch.no_grad():
+                    noise_gen.manual_seed(batch_seed)
                     after_losses = training_state(
                         images,
                         z,
@@ -3068,6 +3123,7 @@ def _run_projected_stage2_batch(
                         False,
                         lambda_cycle,
                         flow_condition=flow_condition,
+                        noise_generator=noise_gen,
                     )
                     after_flow_loss = float(after_losses[3].detach().cpu())
                 actual_fm_delta = after_flow_loss - flow_loss_guard_value
@@ -3124,12 +3180,15 @@ def _run_projected_stage2_batch(
         effective_lr = stage2_objective.repr_learning_rate
         backtrack_count = 0
         saved_params = _save_parameters(params)
+        # Safety clip projected gradients before stepping
+        projected_gradients = _clip_projected_gradients(projected_gradients, max_norm=float(grad_clip_norm or 1.0))
 
         for _retry in range(stage2_objective.pu_backtrack_max_retries + 1):
             _apply_projected_repr_step(params, projected_gradients, repr_learning_rate=effective_lr)
 
             if stage2_objective.pu_backtrack_max_retries > 0:
                 with torch.no_grad():
+                    noise_gen.manual_seed(batch_seed)
                     after_losses = training_state(
                         images,
                         z,
@@ -3137,6 +3196,7 @@ def _run_projected_stage2_batch(
                         False,
                         lambda_cycle,
                         flow_condition=flow_condition,
+                        noise_generator=noise_gen,
                     )
                     after_flow_loss = float(after_losses[3].detach().cpu())
                 actual_fm_delta = after_flow_loss - flow_loss_guard_value
@@ -3159,7 +3219,7 @@ def _run_projected_stage2_batch(
     metrics.update(_projection_result_metrics(projection))
     first_order_fm_increase = max(
         0.0,
-        float((-float(stage2_objective.repr_learning_rate) * projection.dot_before).detach().cpu()),
+        float((-float(stage2_objective.repr_learning_rate) * projection.dot_after).detach().cpu()),
     )
     metrics["fm_descent_credit"] = float(fm_descent_credit)
     metrics["credit_dot_lower_bound"] = float(credit_dot_lower_bound)
@@ -4124,3 +4184,9 @@ def _save_generator(
 def _write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False), encoding="utf-8")
+
+
+def _append_metrics_history(out_dir: Path, metrics: dict) -> None:
+    history_path = out_dir / "metrics_history.jsonl"
+    with open(history_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(metrics, sort_keys=True, allow_nan=False) + "\n")

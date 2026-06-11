@@ -832,7 +832,7 @@ def test_generator_training_step_gram_weighted_sum_outputs_repr_metrics() -> Non
             super().__init__()
             self.offset = nn.Parameter(torch.tensor([0.2, -0.1]))
 
-        def flow_matching_loss(self, images, z):
+        def flow_matching_loss(self, images, z, generator=None):
             loss = self.offset.pow(2).sum() + images.sum() * 0.0 + z.sum() * 0.0
             return loss, {"flow_matching_mse": loss.detach()}
 
@@ -894,7 +894,7 @@ def test_generator_training_step_fm_only_probe_does_not_sample_repr_or_cycle() -
             super().__init__()
             self.weight = nn.Parameter(torch.tensor(2.0))
 
-        def flow_matching_loss(self, images, z):
+        def flow_matching_loss(self, images, z, generator=None):
             loss = self.weight.square() + images.sum() * 0.0 + z.sum() * 0.0
             return loss, {"flow_matching_mse": loss.detach()}
 
@@ -941,7 +941,7 @@ def test_generator_training_step_fm_only_probe_uses_configured_fixed_null_condit
             self.weight = nn.Parameter(torch.tensor(2.0))
             self.flow_condition_z = None
 
-        def flow_matching_loss(self, images, z):
+        def flow_matching_loss(self, images, z, generator=None):
             self.flow_condition_z = z.detach().clone()
             loss = self.weight.square() + images.sum() * 0.0 + z.sum() * 0.0
             return loss, {"flow_matching_mse": loss.detach()}
@@ -1206,7 +1206,7 @@ def test_generator_training_step_gram_repr_only_probe_does_not_compute_flow_loss
     from safa.training import g_loop
 
     class DummyGenerator(nn.Module):
-        def flow_matching_loss(self, images, z):
+        def flow_matching_loss(self, images, z, generator=None):
             raise AssertionError("repr-only probe must not compute FM loss")
 
         def sample(self, z, **kwargs):
@@ -1272,7 +1272,7 @@ def test_generator_training_step_point_projected_uses_point_loss_without_gram(mo
             super().__init__()
             self.weight = nn.Parameter(torch.tensor(0.25))
 
-        def flow_matching_loss(self, images, z):
+        def flow_matching_loss(self, images, z, generator=None):
             loss = self.weight.square() + images.sum() * 0.0 + z.sum() * 0.0
             return loss, {"flow_matching_mse": loss.detach()}
 
@@ -1342,7 +1342,7 @@ def test_descent_credit_projected_batch_records_credit_budget_metrics() -> None:
             self.generator = DummyGenerator()
             self.last_loss_metrics = {}
 
-        def forward(self, images, z, sample_ids, include_repr, lambda_cycle, flow_condition):
+        def forward(self, images, z, sample_ids, include_repr, lambda_cycle, flow_condition, noise_generator=None):
             del images, z, sample_ids, lambda_cycle, flow_condition
             if include_repr:
                 repr_loss = -self.generator.weight
@@ -1423,7 +1423,7 @@ def test_fm_anchored_cagrad_batch_uses_single_optimizer_step_and_logs_metrics() 
             self.generator = DummyGenerator()
             self.last_loss_metrics = {}
 
-        def forward(self, images, z, sample_ids, include_repr, lambda_cycle, flow_condition):
+        def forward(self, images, z, sample_ids, include_repr, lambda_cycle, flow_condition, noise_generator=None):
             del images, z, sample_ids, lambda_cycle, flow_condition
             flow_loss = self.generator.weight.square()
             flow_mse = flow_loss.detach()
@@ -1531,7 +1531,7 @@ def test_fm_primary_constrained_famo_batch_logs_weights_floor_and_gate_metrics()
             self.generator = DummyGenerator()
             self.last_loss_metrics = {}
 
-        def forward(self, images, z, sample_ids, include_repr, lambda_cycle, flow_condition):
+        def forward(self, images, z, sample_ids, include_repr, lambda_cycle, flow_condition, noise_generator=None):
             del images, z, sample_ids, lambda_cycle, flow_condition
             flow_loss = self.generator.weight.square()
             flow_mse = flow_loss.detach()
@@ -1635,7 +1635,7 @@ def test_generator_training_step_prefers_spec_repr_metric_fields(monkeypatch) ->
     from safa.training import g_loop
 
     class DummyGenerator(nn.Module):
-        def flow_matching_loss(self, images, z):
+        def flow_matching_loss(self, images, z, generator=None):
             loss = z.sum() * 0.0 + torch.tensor(0.25, dtype=z.dtype, device=z.device)
             return loss, {"flow_matching_mse": loss.detach()}
 
@@ -1735,7 +1735,7 @@ def test_projected_stage2_rejects_nonfinite_fm_gradients_without_clip_before_opt
             self.generator = DummyGenerator()
             self.last_loss_metrics = {"flow_loss_raw": 1.0}
 
-        def forward(self, images, z, sample_ids, include_repr, lambda_cycle, flow_condition):
+        def forward(self, images, z, sample_ids, include_repr, lambda_cycle, flow_condition, noise_generator=None):
             del images, z, sample_ids, include_repr, lambda_cycle, flow_condition
             loss = FiniteLossWithNonfiniteGrad.apply(self.generator.weight)
             finite = loss.detach()

@@ -584,7 +584,7 @@ class MediumV1GSupportTests(unittest.TestCase):
         from safa.training.g_loop import _GeneratorTrainingStep, _loss_weighting_runtime_from_config
 
         class DummyGenerator(nn.Module):
-            def flow_matching_loss(self, images, z):
+            def flow_matching_loss(self, images, z, generator=None):
                 loss = images.sum() * 0.0 + z.sum() * 0.0 + 2.0
                 return loss, {"flow_matching_mse": loss.detach()}
 
