@@ -4,8 +4,8 @@ sampling_seed: 1337
 device: cuda:0
 num_workers: 8
 # MeanFlow JVP fits 24GB GPU6 with lower batch and AMP.
-global_batch_size: 8
-per_device_batch_size: 8
+global_batch_size: 4
+per_device_batch_size: 4
 amp: true
 learning_rate: 0.0003
 weight_decay: 0.0
@@ -52,7 +52,7 @@ stages:
     gradient_monitor:
       enabled: true
       interval: 20
-      max_samples: 8
+      max_samples: 4
     stage2_objective:
       type: fm_only_probe
       flow_condition: learned_null_condition
