@@ -158,6 +158,47 @@ def test_meanflow_sit_loads_zhuyu_style_checkpoint_keys_and_reports_condition_mi
     )
 
 
+def test_meanflow_sit_loads_raw_ordered_dict_when_state_key_is_empty() -> None:
+    from collections import OrderedDict
+
+    from safa.models.generator import build_generator
+
+    config = _tiny_meanflow_sit_config()
+    config.update({"sit_input_channels": 4, "image_size": 16, "sit_patch_size": 4})
+    generator = build_generator(config)
+    target = generator.vector_field.state_dict()
+    raw_state = OrderedDict(
+        [
+            ("x_embedder.proj.weight", torch.full_like(target["x_embedder.weight"], 0.17)),
+            ("x_embedder.proj.bias", torch.full_like(target["x_embedder.bias"], 0.18)),
+        ]
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "raw_zhuyu.pt"
+        torch.save(raw_state, path)
+        report = generator.load_pretrained(str(path), state_key=None, strict=False)
+
+    assert report["loaded"] is True
+    assert report["source_format"] == "zhuyu_meanflow_sit"
+    assert report["loaded_keys"] == ["x_embedder.bias", "x_embedder.weight"]
+    assert torch.allclose(generator.vector_field.x_embedder.weight, raw_state["x_embedder.proj.weight"])
+
+
+def test_meanflow_sit_raw_ordered_dict_with_nonexistent_state_key_errors_clearly() -> None:
+    from collections import OrderedDict
+
+    from safa.models.generator import build_generator
+
+    generator = build_generator(_tiny_meanflow_sit_config())
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "raw.pt"
+        torch.save(OrderedDict([("x_embedder.proj.weight", torch.zeros(1))]), path)
+        with pytest.raises(KeyError, match="checkpoint missing state_key.*model"):
+            generator.load_pretrained(str(path), state_key="model", strict=False)
+
+
 def test_meanflow_sit_checkpoint_loader_reports_shape_mismatches_without_silent_success() -> None:
     from safa.models.generator import build_generator
 
@@ -214,6 +255,7 @@ def test_e11_meanflow_sit_config_is_k100_stage1_null_conditioned_and_larger_than
     assert config["generator"]["sit_pretrained_path"] == (
         "artifacts/checkpoints/external/meanflow_sit/zhuyu_sit_b_4_imagenet256.pt"
     )
+    assert not config["generator"].get("sit_pretrained_state_key")
     assert config["generator"]["sit_pretrained_source"].startswith("https://drive.google.com/drive/folders/")
     assert config["stages"]["stage2"]["stage2_objective"]["flow_condition"] == "learned_null_condition"
     quality_eval = config["stages"]["stage2"]["quality_eval"]

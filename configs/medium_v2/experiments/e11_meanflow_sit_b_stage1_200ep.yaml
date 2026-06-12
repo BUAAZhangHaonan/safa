@@ -55,7 +55,7 @@ generator:
   sit_mlp_ratio: 4.0
   sit_time_embedding_dim: 256
   sit_pretrained_path: artifacts/checkpoints/external/meanflow_sit/zhuyu_sit_b_4_imagenet256.pt
-  sit_pretrained_state_key: model
+  sit_pretrained_state_key: ""
   sit_pretrained_source: https://drive.google.com/drive/folders/1oWt6tdm5WIeVaZnBuUVheKIG3cNDffl9?usp=drive_link
   sit_pretrained_source_repo: zhuyu-cs/MeanFlow@40a766689c8bccad61f2993ee6905630ac030ff3
 grad_clip_norm: 1.0
