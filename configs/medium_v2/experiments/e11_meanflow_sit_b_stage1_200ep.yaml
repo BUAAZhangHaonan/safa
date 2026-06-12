@@ -11,6 +11,7 @@ weight_decay: 0.0
 latent_training: true
 pixel_image_size: 256
 vae_model: stabilityai/sd-vae-ft-ema
+vae_path: artifacts/checkpoints/external/sd-vae-ft-ema
 vae_scaling_factor: 0.18215
 image_size: 32
 embedding_dim: 512

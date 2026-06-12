@@ -56,6 +56,7 @@ def test_e11_latent_training_declares_vae_and_uses_pixel_image_size_for_transfor
     assert config["pixel_image_size"] == 256
     assert config["image_size"] == 32
     assert config["vae_model"] == "stabilityai/sd-vae-ft-ema"
+    assert config["vae_path"] == "artifacts/checkpoints/external/sd-vae-ft-ema"
     assert config["vae_scaling_factor"] == pytest.approx(0.18215)
     assert g_loop._generator_image_transform_size(config) == 256
 
