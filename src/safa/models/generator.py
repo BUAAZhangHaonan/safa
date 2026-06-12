@@ -522,7 +522,7 @@ class MeanFlowGenerator:
                 t = torch.ones(z.shape[0], device=z.device, dtype=z.dtype)
                 r = torch.zeros(z.shape[0], device=z.device, dtype=z.dtype)
                 velocity = self.vector_field(x, t, r, z)
-                x = x + velocity
+                x = x - velocity
                 if clamp_output:
                     return ((x.clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0)
                 return (x + 1.0) * 0.5
@@ -535,8 +535,8 @@ class MeanFlowGenerator:
                 x_0 = torch.randn(x_1_flow.shape, device=x_1_flow.device, dtype=x_1_flow.dtype, generator=generator)
                 t, r = self._sample_t_r(x_1_flow.shape[0], device=x_1_flow.device, dtype=x_1_flow.dtype, generator=generator)
                 view_t = t.view(-1, 1, 1, 1)
-                x_t = (1.0 - view_t) * x_0 + view_t * x_1_flow
-                target_velocity = x_1_flow - x_0
+                x_t = (1.0 - view_t) * x_1_flow + view_t * x_0
+                target_velocity = x_0 - x_1_flow
                 predicted_velocity = self.vector_field(x_t, t, r, z)
                 meanflow_target = self._meanflow_target(x_t, t, r, z, target_velocity)
                 error = predicted_velocity - meanflow_target.detach()

@@ -309,13 +309,7 @@ class _GeneratorTrainingStep:
 
             def _flow_condition_z(self, z, flow_condition: str):
                 _validate_flow_condition(flow_condition, "training flow_condition")
-                if flow_condition == _FLOW_CONDITION_EMBEDDING:
-                    return z
-                if flow_condition == _FLOW_CONDITION_FIXED_NULL:
-                    return fixed_null_condition_like(z)
-                if flow_condition == _FLOW_CONDITION_LEARNED_NULL:
-                    return learned_null_condition_like(self.generator, z)
-                raise RuntimeError(f"Unsupported flow_condition {flow_condition!r}")
+                return _flow_condition_z_for_generator(self.generator, z, flow_condition)
 
             def _compute_repr_loss(self, z, sample_ids, *, cycle_steps: int):
                 if self.stage2_objective is None:
@@ -728,6 +722,17 @@ def _validate_flow_condition(value, context: str) -> None:
     if value not in _FLOW_CONDITIONS:
         allowed = ", ".join(_FLOW_CONDITIONS)
         raise ValueError(f"{context} must be one of {allowed}, got {value!r}")
+
+
+def _flow_condition_z_for_generator(generator, z, flow_condition: str):
+    _validate_flow_condition(flow_condition, "flow_condition")
+    if flow_condition == _FLOW_CONDITION_EMBEDDING:
+        return z
+    if flow_condition == _FLOW_CONDITION_FIXED_NULL:
+        return fixed_null_condition_like(z)
+    if flow_condition == _FLOW_CONDITION_LEARNED_NULL:
+        return learned_null_condition_like(generator, z)
+    raise RuntimeError(f"Unsupported flow_condition {flow_condition!r}")
 
 
 def _validate_named_repr_weight_mode(objective_type: str, point_weight: float, relation_weight: float, context: str) -> None:
@@ -1507,6 +1512,7 @@ def train_g_from_config(config: dict) -> dict:
                     sampling_seed=sampling_seed,
                     use_amp=use_amp,
                     ema_config=ema_config,
+                    flow_condition=stage_flow_condition,
                 )
                 _attach_validation_metrics(metrics, raw_validation_metrics, ema_validation_metrics)
                 raw_cos = metrics.get("validation_raw_latent_cosine_mean")
@@ -1525,6 +1531,7 @@ def train_g_from_config(config: dict) -> dict:
                         sampling_seed=sampling_seed,
                         use_amp=use_amp,
                         ema_config=ema_config,
+                        flow_condition=stage_flow_condition,
                     )
                 )
                 if stage_name == "stage1" and raw_validation_metrics is not None and raw_validation_metrics.get("face_detect_ge1_rate") is not None:
@@ -3329,6 +3336,7 @@ def _evaluate_validation_variants(
     sampling_seed: int,
     use_amp: bool,
     ema_config: dict,
+    flow_condition: str = _FLOW_CONDITION_EMBEDDING,
 ) -> tuple[dict | None, dict | None]:
     raw_metrics = None
     if ema_config["evaluate_raw"]:
@@ -3341,6 +3349,7 @@ def _evaluate_validation_variants(
             generator_config,
             sampling_seed=sampling_seed,
             use_amp=use_amp,
+            flow_condition=flow_condition,
         )
     ema_metrics = None
     if ema_config["enabled"] and ema_config["evaluate_ema"]:
@@ -3357,6 +3366,7 @@ def _evaluate_validation_variants(
             generator_config,
             sampling_seed=sampling_seed,
             use_amp=use_amp,
+            flow_condition=flow_condition,
         )
     return raw_metrics, ema_metrics
 
@@ -3488,6 +3498,7 @@ def _run_quality_eval_hook(
     sampling_seed: int | None = None,
     use_amp: bool = False,
     ema_config: dict | None = None,
+    flow_condition: str = _FLOW_CONDITION_EMBEDDING,
 ) -> dict[str, float]:
     stages = config.get("stages")
     if not isinstance(stages, dict):
@@ -3556,6 +3567,7 @@ def _run_quality_eval_hook(
             sampling_seed=int(sampling_seed),
             max_samples=generation_max_samples,
             use_amp=use_amp,
+            flow_condition=flow_condition,
         )
         for group in groups:
             real_index = (
@@ -3768,6 +3780,7 @@ def _generate_quality_eval_images(
     sampling_seed: int,
     max_samples: int,
     use_amp: bool,
+    flow_condition: str = _FLOW_CONDITION_EMBEDDING,
 ) -> int:
     import torch
     from safa.evaluation.runner import _save_generated_image_for_eval
@@ -3795,7 +3808,8 @@ def _generate_quality_eval_images(
                     z = z[:remaining]
                     sample_ids = sample_ids[:remaining]
                 x_init = make_x_init_for_sample_ids(sample_ids, sampling_seed, generator_config.image_size, z.device, z.dtype)
-                generated = generator.sample(z, steps=generator_config.sample_steps, x_init=x_init)
+                condition_z = _flow_condition_z_for_generator(generator, z, flow_condition)
+                generated = generator.sample(condition_z, steps=generator_config.sample_steps, x_init=x_init)
                 assert_finite_tensor("quality_eval_generated_image", generated)
                 for index, sample_id in enumerate(sample_ids):
                     _save_generated_image_for_eval(
@@ -3851,7 +3865,18 @@ def _finite_quality_value(payload: dict, field: str) -> float:
     return numeric
 
 
-def _evaluate_validation(generator, e0, loader, detector, device, generator_config: FlowGeneratorConfig, *, sampling_seed: int, use_amp: bool = False) -> dict:
+def _evaluate_validation(
+    generator,
+    e0,
+    loader,
+    detector,
+    device,
+    generator_config: FlowGeneratorConfig,
+    *,
+    sampling_seed: int,
+    use_amp: bool = False,
+    flow_condition: str = _FLOW_CONDITION_EMBEDDING,
+) -> dict:
     if loader is None:
         return {}
     import torch
@@ -3872,7 +3897,8 @@ def _evaluate_validation(generator, e0, loader, detector, device, generator_conf
             z = batch["z"].to(device, non_blocking=True)
             sample_ids = list(batch["sample_id"])
             x_init = make_x_init_for_sample_ids(sample_ids, sampling_seed, generator_config.image_size, z.device, z.dtype)
-            generated = generator.sample(z, steps=generator_config.sample_steps, x_init=x_init)
+            condition_z = _flow_condition_z_for_generator(generator, z, flow_condition)
+            generated = generator.sample(condition_z, steps=generator_config.sample_steps, x_init=x_init)
             assert_finite_tensor("validation_generated_image", generated)
             source_out = e0(normalize_for_e0(source))
             generated_out = e0(normalize_for_e0(generated))

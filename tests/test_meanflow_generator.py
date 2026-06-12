@@ -76,6 +76,74 @@ def test_e9_meanflow_config_is_200_epoch_one_step_gpu6_safe_and_larger_than_5m()
     assert parameter_count > FIVE_M_FM_PARAMETER_COUNT
 
 
+def test_meanflow_loss_uses_official_data_to_noise_path_and_velocity() -> None:
+    from torch import nn
+
+    from safa.models.generator import build_generator
+
+    class RecorderField(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.x_t = None
+            self.t = None
+            self.r = None
+            self.z = None
+
+        def forward(self, x_t, t, r, z):
+            self.x_t = x_t.detach().clone()
+            self.t = t.detach().clone()
+            self.r = r.detach().clone()
+            self.z = z.detach().clone()
+            return torch.zeros_like(x_t)
+
+    config = _small_meanflow_config()
+    config["meanflow_jvp_mode"] = "first_order"
+    config["meanflow_adaptive_weighting"] = False
+    generator = build_generator(config)
+    recorder = RecorderField()
+    generator.vector_field = recorder
+
+    def fixed_sample_t_r(batch_size: int, *, device, dtype, generator=None):
+        del generator
+        assert batch_size == 2
+        return (
+            torch.tensor([0.0, 1.0], device=device, dtype=dtype),
+            torch.tensor([0.0, 0.0], device=device, dtype=dtype),
+        )
+
+    captured = {}
+
+    def capture_weighted_loss(error, meanflow_target):
+        captured["target"] = meanflow_target.detach().clone()
+        return error.square().mean()
+
+    generator._sample_t_r = fixed_sample_t_r
+    generator._weighted_loss = capture_weighted_loss
+    images = torch.stack(
+        (
+            torch.full((3, 16, 16), 0.75),
+            torch.full((3, 16, 16), 0.25),
+        )
+    )
+    z = torch.zeros(2, 16)
+    seed = 17
+    expected_data = images.mul(2.0).sub(1.0)
+    expected_noise = torch.randn(
+        expected_data.shape,
+        generator=torch.Generator().manual_seed(seed),
+        device=expected_data.device,
+        dtype=expected_data.dtype,
+    )
+
+    generator.flow_matching_loss(images, z, generator=torch.Generator().manual_seed(seed))
+
+    assert torch.allclose(recorder.x_t[0], expected_data[0])
+    assert torch.allclose(recorder.x_t[1], expected_noise[1])
+    assert torch.equal(recorder.t, torch.tensor([0.0, 1.0]))
+    assert torch.equal(recorder.r, torch.tensor([0.0, 0.0]))
+    assert torch.allclose(captured["target"], expected_noise - expected_data)
+
+
 def test_meanflow_loss_returns_scalar_metrics_and_backpropagates() -> None:
     from safa.models.generator import build_generator
 
@@ -96,6 +164,39 @@ def test_meanflow_loss_returns_scalar_metrics_and_backpropagates() -> None:
         if parameter.grad is not None and torch.isfinite(parameter.grad).all()
     ]
     assert finite_grads
+
+
+def test_meanflow_sample_subtracts_one_step_mean_velocity_at_noise_endpoint() -> None:
+    from torch import nn
+
+    from safa.models.generator import build_generator
+
+    class ConstantMeanVelocity(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.x_t = None
+            self.t = None
+            self.r = None
+
+        def forward(self, x_t, t, r, z):
+            del z
+            self.x_t = x_t.detach().clone()
+            self.t = t.detach().clone()
+            self.r = r.detach().clone()
+            return torch.full_like(x_t, 0.25)
+
+    generator = build_generator(_small_meanflow_config())
+    field = ConstantMeanVelocity()
+    generator.vector_field = field
+    z = torch.zeros(1, 16)
+    eps = torch.full((1, 3, 16, 16), 0.2)
+
+    output = generator.sample(z, x_init=eps, clamp_output=False)
+
+    assert torch.allclose(field.x_t, eps)
+    assert torch.equal(field.t, torch.ones(1))
+    assert torch.equal(field.r, torch.zeros(1))
+    assert torch.allclose(output, (eps - 0.25 + 1.0) * 0.5)
 
 
 def test_meanflow_sample_is_one_step_and_steps_none_matches_steps_one() -> None:

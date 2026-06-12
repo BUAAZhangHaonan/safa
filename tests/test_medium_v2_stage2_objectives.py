@@ -1040,6 +1040,104 @@ def test_generator_training_step_fm_only_probe_uses_configured_learned_null_cond
     assert module.last_loss_metrics["flow_condition"] == "learned_null_condition"
 
 
+def test_validation_sampling_uses_configured_learned_null_condition() -> None:
+    from torch import nn
+    import torch.nn.functional as F
+
+    from safa.models.generator import FlowGeneratorConfig
+    from safa.training import g_loop
+
+    class DummyGenerator(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.null_condition = nn.Parameter(torch.tensor([7.0, -5.0]))
+            self.sample_condition_z = None
+
+        def make_null_condition(self, *, batch_size: int, device, dtype):
+            return self.null_condition.to(device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1)
+
+        def sample(self, z, **kwargs):
+            del kwargs
+            self.sample_condition_z = z.detach().clone()
+            return torch.zeros(z.shape[0], 3, 4, 4, device=z.device, dtype=z.dtype)
+
+    class DummyE0(nn.Module):
+        def forward(self, images):
+            batch_size = images.shape[0]
+            base = torch.tensor(
+                [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+                device=images.device,
+                dtype=images.dtype,
+            )
+            embedding = F.normalize(base[:batch_size], dim=1)
+            logits = torch.zeros(batch_size, 2, device=images.device, dtype=images.dtype)
+            return {"embedding": embedding, "logits": logits}
+
+    generator = DummyGenerator()
+    loader = [
+        {
+            "image": torch.zeros(3, 3, 4, 4),
+            "z": F.normalize(torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]), dim=1),
+            "sample_id": ["a", "b", "c"],
+        }
+    ]
+
+    metrics = g_loop._evaluate_validation(
+        generator,
+        DummyE0(),
+        loader,
+        None,
+        torch.device("cpu"),
+        FlowGeneratorConfig(embedding_dim=2, image_size=4, sample_steps=1),
+        sampling_seed=1337,
+        flow_condition="learned_null_condition",
+    )
+
+    assert torch.equal(generator.sample_condition_z, torch.tensor([[7.0, -5.0], [7.0, -5.0], [7.0, -5.0]]))
+    assert metrics["latent_cosine_mean"] == pytest.approx(1.0)
+
+
+def test_quality_eval_sampling_uses_configured_learned_null_condition(tmp_path) -> None:
+    from torch import nn
+
+    from safa.models.generator import FlowGeneratorConfig
+    from safa.training import g_loop
+
+    class DummyGenerator(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.null_condition = nn.Parameter(torch.tensor([7.0, -5.0]))
+            self.sample_condition_z = None
+
+        def make_null_condition(self, *, batch_size: int, device, dtype):
+            return self.null_condition.to(device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1)
+
+        def sample(self, z, **kwargs):
+            del kwargs
+            self.sample_condition_z = z.detach().clone()
+            return torch.zeros(z.shape[0], 3, 4, 4, device=z.device, dtype=z.dtype)
+
+    generator = DummyGenerator()
+    loader = [{"z": torch.eye(2), "sample_id": ["a", "b"]}]
+    generated_dir = tmp_path / "generated"
+
+    count = g_loop._generate_quality_eval_images(
+        generator=generator,
+        loader=loader,
+        generated_dir=generated_dir,
+        device=torch.device("cpu"),
+        generator_config=FlowGeneratorConfig(embedding_dim=2, image_size=4, sample_steps=1),
+        sampling_seed=1337,
+        max_samples=2,
+        use_amp=False,
+        flow_condition="learned_null_condition",
+    )
+
+    assert count == 2
+    assert torch.equal(generator.sample_condition_z, torch.tensor([[7.0, -5.0], [7.0, -5.0]]))
+    assert len(list(generated_dir.glob("*.png"))) == 2
+
+
 def test_stage1_flow_condition_config_supports_explicit_fixed_null_and_rejects_unknown() -> None:
     from safa.training import g_loop
 
