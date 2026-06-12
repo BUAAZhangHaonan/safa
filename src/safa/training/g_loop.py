@@ -21,6 +21,11 @@ from safa.models.conditioning import fixed_null_condition_like, learned_null_con
 from safa.models.e0 import assert_e0_frozen, freeze_e0, load_e0_checkpoint
 from safa.models.generator import GENERATOR_MODEL_TYPE_FLOW, FlowGeneratorConfig, build_generator
 from safa.training.audit import audit_no_identity_supervision
+from safa.training.latent_codec import (
+    build_latent_codec_from_train_config,
+    latent_training_enabled,
+    validate_latent_training_config,
+)
 from safa.training.losses import cosine_cycle_loss, normalize_for_e0
 from safa.training.projected_update import (
     aggregate_two_task_fm_anchored_cagrad,
@@ -144,6 +149,7 @@ class _GeneratorTrainingStep:
         sampling_seed: int,
         loss_weighting: _LossWeightingRuntime | None = None,
         stage2_objective: _Stage2ObjectiveRuntime | None = None,
+        latent_codec=None,
     ):
         from torch import nn
         schedule = generator_config.cycle_steps_schedule
@@ -158,6 +164,7 @@ class _GeneratorTrainingStep:
                 self.loss_weighting = loss_weighting if loss_weighting is not None else _LossWeightingRuntime(type="legacy")
                 self.uncertainty_loss = UncertaintyWeightedLoss(["flow", "cycle"]) if self.loss_weighting.type == "uncertainty" else None
                 self.stage2_objective = stage2_objective
+                self.latent_codec = latent_codec
                 self._schedule = schedule
                 self._batch_idx = 0
                 self.last_loss_metrics: dict[str, float | str] = {}
@@ -275,6 +282,7 @@ class _GeneratorTrainingStep:
                         self.generator_config.image_size,
                         z.device,
                         z.dtype,
+                        channels=_generator_sample_channels(self.generator_config),
                     )
                     generated = self.generator.sample(
                         z,
@@ -284,8 +292,9 @@ class _GeneratorTrainingStep:
                         clamp_output=False,
                     )
                     assert_finite_tensor("stage2_generated_image", generated)
+                    generated_for_e0 = _decode_generated_samples(generated, self.latent_codec, context="stage2_generated_image_decoded")
                     self.e0.eval()
-                    e0_out = self.e0(normalize_for_e0(generated))
+                    e0_out = self.e0(normalize_for_e0(generated_for_e0))
                     cycle_loss = cosine_cycle_loss(e0_out["embedding"], z)
                     self._batch_idx += 1
                 flow_loss, flow_metrics = self._compute_flow_loss(images, z, effective_flow_condition, noise_generator=noise_generator)
@@ -305,7 +314,13 @@ class _GeneratorTrainingStep:
 
             def _compute_flow_loss(self, images, z, flow_condition: str, noise_generator=None):
                 condition_z = self._flow_condition_z(z, flow_condition)
-                return self.generator.flow_matching_loss(images, condition_z, generator=noise_generator)
+                flow_images = self._encode_flow_images(images)
+                return self.generator.flow_matching_loss(flow_images, condition_z, generator=noise_generator)
+
+            def _encode_flow_images(self, images):
+                if self.latent_codec is None:
+                    return images
+                return self.latent_codec.encode(images)
 
             def _flow_condition_z(self, z, flow_condition: str):
                 _validate_flow_condition(flow_condition, "training flow_condition")
@@ -320,6 +335,7 @@ class _GeneratorTrainingStep:
                     self.generator_config.image_size,
                     z.device,
                     z.dtype,
+                    channels=_generator_sample_channels(self.generator_config),
                 )
                 generated = self.generator.sample(
                     z,
@@ -329,8 +345,9 @@ class _GeneratorTrainingStep:
                     clamp_output=False,
                 )
                 assert_finite_tensor("stage2_generated_image", generated)
+                generated_for_e0 = _decode_generated_samples(generated, self.latent_codec, context="stage2_generated_image_decoded")
                 self.e0.eval()
-                e0_out = self.e0(normalize_for_e0(generated))
+                e0_out = self.e0(normalize_for_e0(generated_for_e0))
                 if "embedding" not in e0_out:
                     raise RuntimeError("E0 output missing embedding for stage2 representation loss")
                 if (
@@ -733,6 +750,36 @@ def _flow_condition_z_for_generator(generator, z, flow_condition: str):
     if flow_condition == _FLOW_CONDITION_LEARNED_NULL:
         return learned_null_condition_like(generator, z)
     raise RuntimeError(f"Unsupported flow_condition {flow_condition!r}")
+
+
+def _generator_sample_channels(generator_config: FlowGeneratorConfig) -> int:
+    if generator_config.model_type == "meanflow_sit":
+        return int(generator_config.sit_input_channels)
+    return 3
+
+
+def _make_x_init_for_generator_config(sample_ids, sampling_seed: int, generator_config: FlowGeneratorConfig, device, dtype):
+    return make_x_init_for_sample_ids(
+        sample_ids,
+        sampling_seed,
+        generator_config.image_size,
+        device,
+        dtype,
+        channels=_generator_sample_channels(generator_config),
+    )
+
+
+def _decode_generated_samples(generated, latent_codec, *, context: str):
+    if latent_codec is None:
+        return generated
+    assert_finite_tensor(f"{context}_latent", generated)
+    decoded = latent_codec.decode(generated)
+    assert_finite_tensor(context, decoded)
+    return decoded
+
+
+def _generator_image_transform_size(config: dict) -> int:
+    return _require_positive_int(config, "pixel_image_size", "train_g config") if latent_training_enabled(config) else int(config["image_size"])
 
 
 def _validate_named_repr_weight_mode(objective_type: str, point_weight: float, relation_weight: float, context: str) -> None:
@@ -1205,7 +1252,16 @@ def train_g_from_config(config: dict) -> dict:
         ema = ExponentialMovingAverage(generator, decay=float(ema_config["decay"]))
         if resume_ema_state_dict is not None:
             ema.load_state_dict(resume_ema_state_dict)
-    training_module = _GeneratorTrainingStep(generator, e0, generator_config, sampling_seed, loss_weighting_runtime, stage2_objective).to(device)
+    latent_codec = build_latent_codec_from_train_config(config, device)
+    training_module = _GeneratorTrainingStep(
+        generator,
+        e0,
+        generator_config,
+        sampling_seed,
+        loss_weighting_runtime,
+        stage2_objective,
+        latent_codec=latent_codec,
+    ).to(device)
     set_seed(int(config["seed"]) + distributed.rank)
 
     _verify_e0_feature_cache_consistency(config)
@@ -1213,7 +1269,7 @@ def train_g_from_config(config: dict) -> dict:
         config["train_index"],
         config["train_features"],
         config["e0_checkpoint"],
-        transform=generator_image_transform(int(config["image_size"])),
+        transform=generator_image_transform(_generator_image_transform_size(config)),
     )
     train_sampler = (
         DistributedSampler(
@@ -1514,6 +1570,7 @@ def train_g_from_config(config: dict) -> dict:
                     use_amp=use_amp,
                     ema_config=ema_config,
                     flow_condition=stage_flow_condition,
+                    latent_codec=latent_codec,
                 )
                 _attach_validation_metrics(metrics, raw_validation_metrics, ema_validation_metrics)
                 raw_cos = metrics.get("validation_raw_latent_cosine_mean")
@@ -1533,6 +1590,7 @@ def train_g_from_config(config: dict) -> dict:
                         use_amp=use_amp,
                         ema_config=ema_config,
                         flow_condition=stage_flow_condition,
+                        latent_codec=latent_codec,
                     )
                 )
                 if stage_name == "stage1" and raw_validation_metrics is not None and raw_validation_metrics.get("face_detect_ge1_rate") is not None:
@@ -2025,7 +2083,8 @@ def _distributed_manifest(distributed: DistributedContext) -> dict:
 def _validate_train_g_config(config: dict) -> None:
     _generator_trainable_mode(config)
     _resume_mode(config)
-    _generator_config_from_train_config(config)
+    generator_config = _generator_config_from_train_config(config)
+    validate_latent_training_config(config, generator_config)
     _require_bool(config, "allow_stage2_without_stage1_gate", "train_g config")
     stages = _stage_config(config)
     ema_config = _ema_config(config)
@@ -3309,7 +3368,7 @@ def _build_validation_loader(config: dict):
         validation["index"],
         validation["features"],
         config["e0_checkpoint"],
-        transform=generator_image_transform(int(config["image_size"])),
+        transform=generator_image_transform(_generator_image_transform_size(config)),
     )
     max_samples = int(validation["max_samples"])
     if max_samples > 0:
@@ -3346,6 +3405,7 @@ def _evaluate_validation_variants(
     use_amp: bool,
     ema_config: dict,
     flow_condition: str = _FLOW_CONDITION_EMBEDDING,
+    latent_codec=None,
 ) -> tuple[dict | None, dict | None]:
     raw_metrics = None
     if ema_config["evaluate_raw"]:
@@ -3359,6 +3419,7 @@ def _evaluate_validation_variants(
             sampling_seed=sampling_seed,
             use_amp=use_amp,
             flow_condition=flow_condition,
+            latent_codec=latent_codec,
         )
     ema_metrics = None
     if ema_config["enabled"] and ema_config["evaluate_ema"]:
@@ -3376,6 +3437,7 @@ def _evaluate_validation_variants(
             sampling_seed=sampling_seed,
             use_amp=use_amp,
             flow_condition=flow_condition,
+            latent_codec=latent_codec,
         )
     return raw_metrics, ema_metrics
 
@@ -3508,6 +3570,7 @@ def _run_quality_eval_hook(
     use_amp: bool = False,
     ema_config: dict | None = None,
     flow_condition: str = _FLOW_CONDITION_EMBEDDING,
+    latent_codec=None,
 ) -> dict[str, float]:
     stages = config.get("stages")
     if not isinstance(stages, dict):
@@ -3577,6 +3640,7 @@ def _run_quality_eval_hook(
             max_samples=generation_max_samples,
             use_amp=use_amp,
             flow_condition=flow_condition,
+            latent_codec=latent_codec,
         )
         for group in groups:
             real_index = (
@@ -3762,7 +3826,7 @@ def _build_quality_eval_loader(config: dict, max_samples: int, *, quality_eval_c
         validation["index"],
         validation["features"],
         config["e0_checkpoint"],
-        transform=generator_image_transform(int(config["image_size"])),
+        transform=generator_image_transform(_generator_image_transform_size(config)),
     )
     val_set = Subset(val_set, list(range(min(max_samples, len(val_set)))))
     if len(val_set) == 0:
@@ -3790,6 +3854,7 @@ def _generate_quality_eval_images(
     max_samples: int,
     use_amp: bool,
     flow_condition: str = _FLOW_CONDITION_EMBEDDING,
+    latent_codec=None,
 ) -> int:
     import torch
     from safa.evaluation.runner import _save_generated_image_for_eval
@@ -3816,13 +3881,14 @@ def _generate_quality_eval_images(
                 if int(z.shape[0]) > remaining:
                     z = z[:remaining]
                     sample_ids = sample_ids[:remaining]
-                x_init = make_x_init_for_sample_ids(sample_ids, sampling_seed, generator_config.image_size, z.device, z.dtype)
+                x_init = _make_x_init_for_generator_config(sample_ids, sampling_seed, generator_config, z.device, z.dtype)
                 condition_z = _flow_condition_z_for_generator(generator, z, flow_condition)
                 generated = generator.sample(condition_z, steps=generator_config.sample_steps, x_init=x_init)
                 assert_finite_tensor("quality_eval_generated_image", generated)
+                generated_for_eval = _decode_generated_samples(generated, latent_codec, context="quality_eval_generated_image_decoded")
                 for index, sample_id in enumerate(sample_ids):
                     _save_generated_image_for_eval(
-                        generated[index],
+                        generated_for_eval[index],
                         generated_dir,
                         global_index=count + index,
                         sample_id=sample_id,
@@ -3885,6 +3951,7 @@ def _evaluate_validation(
     sampling_seed: int,
     use_amp: bool = False,
     flow_condition: str = _FLOW_CONDITION_EMBEDDING,
+    latent_codec=None,
 ) -> dict:
     if loader is None:
         return {}
@@ -3905,12 +3972,13 @@ def _evaluate_validation(
             source = batch["image"].to(device, non_blocking=True)
             z = batch["z"].to(device, non_blocking=True)
             sample_ids = list(batch["sample_id"])
-            x_init = make_x_init_for_sample_ids(sample_ids, sampling_seed, generator_config.image_size, z.device, z.dtype)
+            x_init = _make_x_init_for_generator_config(sample_ids, sampling_seed, generator_config, z.device, z.dtype)
             condition_z = _flow_condition_z_for_generator(generator, z, flow_condition)
             generated = generator.sample(condition_z, steps=generator_config.sample_steps, x_init=x_init)
             assert_finite_tensor("validation_generated_image", generated)
+            generated_for_eval = _decode_generated_samples(generated, latent_codec, context="validation_generated_image_decoded")
             source_out = e0(normalize_for_e0(source))
-            generated_out = e0(normalize_for_e0(generated))
+            generated_out = e0(normalize_for_e0(generated_for_eval))
             generated_embedding = generated_out["embedding"]
             cosine = F.cosine_similarity(generated_embedding, z, dim=1)
             latent_cosine_sum += float(cosine.detach().sum().cpu())
@@ -3918,7 +3986,7 @@ def _evaluate_validation(
             target_embedding_chunks.append(z.detach().to(dtype=torch.float32).cpu())
             generated_embedding_chunks.append(generated_embedding.detach().to(dtype=torch.float32).cpu())
             if detector is not None:
-                counts = detector.detect_counts(generated)
+                counts = detector.detect_counts(generated_for_eval)
                 if len(counts) != int(z.shape[0]):
                     raise RuntimeError(f"Validation face detection count mismatch: batch={int(z.shape[0])} counts={len(counts)}")
                 detected_counts.extend(counts)

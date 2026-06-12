@@ -195,9 +195,7 @@ def build_meanflow_sit_generator(config):
             t = torch.ones(z.shape[0], device=z.device, dtype=z.dtype)
             mean_velocity = self.vector_field(x, r, t, z)
             x = x - mean_velocity
-            if clamp_output:
-                return ((x.clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0)
-            return (x + 1.0) * 0.5
+            return self._model_to_data_space(x, clamp_output=clamp_output)
 
         def flow_matching_loss(self, x_1, z, generator=None):
             self._validate_z(z)
@@ -205,7 +203,7 @@ def build_meanflow_sit_generator(config):
                 raise ValueError(
                     f"x_1 must have shape [B,{config.sit_input_channels},{self.image_size},{self.image_size}], got {tuple(x_1.shape)}"
                 )
-            x_data = x_1.mul(2.0).sub(1.0)
+            x_data = self._data_to_model_space(x_1)
             eps = torch.randn(x_data.shape, device=x_data.device, dtype=x_data.dtype, generator=generator)
             r, t = self._sample_t_r(x_data.shape[0], device=x_data.device, dtype=x_data.dtype, generator=generator)
             view_t = t.view(-1, 1, 1, 1)
@@ -310,6 +308,20 @@ def build_meanflow_sit_generator(config):
             weights = (per_sample.detach() + config.meanflow_norm_eps).pow(-config.meanflow_norm_p)
             weights = weights / weights.mean().clamp_min(config.meanflow_norm_eps)
             return (per_sample * weights).mean()
+
+        def _data_to_model_space(self, x):
+            if config.sit_data_space == "pixel":
+                return x.mul(2.0).sub(1.0)
+            if config.sit_data_space == "latent":
+                return x
+            raise RuntimeError(f"Unsupported sit_data_space {config.sit_data_space!r}")
+
+        def _model_to_data_space(self, x, *, clamp_output: bool):
+            if config.sit_data_space == "pixel":
+                return ((x.clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0) if clamp_output else (x + 1.0) * 0.5
+            if config.sit_data_space == "latent":
+                return x
+            raise RuntimeError(f"Unsupported sit_data_space {config.sit_data_space!r}")
 
         def _validate_z(self, z):
             if z.ndim != 2 or z.shape[1] != self.embedding_dim:

@@ -21,21 +21,24 @@ def normalize_sample_id(sample_id: str | int) -> str:
     raise TypeError(f"sample_id must be str or int, got {type(sample_id).__name__}")
 
 
-def make_x_init_for_sample_ids(sample_ids: Iterable[str | int], base_seed: int, image_size: int, device, dtype) -> torch.Tensor:
+def make_x_init_for_sample_ids(sample_ids: Iterable[str | int], base_seed: int, image_size: int, device, dtype, *, channels: int = 3) -> torch.Tensor:
     import torch
 
     ids = [normalize_sample_id(sample_id) for sample_id in sample_ids]
     size = int(image_size)
     if size <= 0:
         raise ValueError(f"image_size must be positive, got {image_size}")
+    channel_count = int(channels)
+    if channel_count <= 0:
+        raise ValueError(f"channels must be positive, got {channels}")
     if not ids:
-        return torch.empty((0, 3, size, size), device="cpu", dtype=torch.float32).to(device=device, dtype=dtype)
+        return torch.empty((0, channel_count, size, size), device="cpu", dtype=torch.float32).to(device=device, dtype=dtype)
 
     samples = []
     for sample_id in ids:
         generator = torch.Generator(device="cpu")
         generator.manual_seed(stable_sample_seed(int(base_seed), sample_id))
-        samples.append(torch.randn((3, size, size), generator=generator, device="cpu", dtype=torch.float32))
+        samples.append(torch.randn((channel_count, size, size), generator=generator, device="cpu", dtype=torch.float32))
     return torch.stack(samples, dim=0).to(device=device, dtype=dtype)
 
 

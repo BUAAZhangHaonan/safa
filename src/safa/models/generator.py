@@ -12,6 +12,9 @@ GENERATOR_MODEL_TYPES = (GENERATOR_MODEL_TYPE_FLOW, GENERATOR_MODEL_TYPE_MEANFLO
 MEANFLOW_JVP_MODE_TORCH_FUNC = "torch_func"
 MEANFLOW_JVP_MODE_FIRST_ORDER = "first_order"
 MEANFLOW_JVP_MODES = (MEANFLOW_JVP_MODE_TORCH_FUNC, MEANFLOW_JVP_MODE_FIRST_ORDER)
+SIT_DATA_SPACE_PIXEL = "pixel"
+SIT_DATA_SPACE_LATENT = "latent"
+SIT_DATA_SPACES = (SIT_DATA_SPACE_PIXEL, SIT_DATA_SPACE_LATENT)
 DDIM_BETA_SCHEDULE_LINEAR = "linear"
 DDIM_BETA_SCHEDULE_COSINE = "cosine"
 DDIM_BETA_SCHEDULES = (DDIM_BETA_SCHEDULE_LINEAR, DDIM_BETA_SCHEDULE_COSINE)
@@ -75,6 +78,7 @@ class FlowGeneratorConfig:
     sit_time_embedding_dim: int = 256
     sit_pretrained_path: str = ""
     sit_pretrained_state_key: str = ""
+    sit_data_space: str = SIT_DATA_SPACE_PIXEL
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "FlowGeneratorConfig":
@@ -114,6 +118,7 @@ class FlowGeneratorConfig:
             sit_time_embedding_dim=int(payload.get("sit_time_embedding_dim", 256)),
             sit_pretrained_path=str(payload.get("sit_pretrained_path", "")),
             sit_pretrained_state_key=str(payload.get("sit_pretrained_state_key", "")),
+            sit_data_space=str(payload.get("sit_data_space", SIT_DATA_SPACE_PIXEL)),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -157,6 +162,7 @@ class FlowGeneratorConfig:
                     "sit_time_embedding_dim": self.sit_time_embedding_dim,
                 }
             )
+            payload["sit_data_space"] = self.sit_data_space
             if self.sit_pretrained_path:
                 payload["sit_pretrained_path"] = self.sit_pretrained_path
             if self.sit_pretrained_state_key:
@@ -1050,6 +1056,8 @@ def _validate_config(config: FlowGeneratorConfig) -> None:
             raise ValueError(f"sit_mlp_ratio must be positive, got {config.sit_mlp_ratio}")
         if config.sit_time_embedding_dim <= 0:
             raise ValueError(f"sit_time_embedding_dim must be positive, got {config.sit_time_embedding_dim}")
+        if config.sit_data_space not in SIT_DATA_SPACES:
+            raise ValueError(f"sit_data_space must be one of {SIT_DATA_SPACES}, got {config.sit_data_space!r}")
     if config.model_type == GENERATOR_MODEL_TYPE_DDIM:
         if config.sampler != "ddim":
             raise ValueError(f"ddim sampler must be 'ddim', got {config.sampler!r}")
