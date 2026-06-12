@@ -47,6 +47,17 @@ class FakeLatentCodec:
         return torch.full((batch_size, 3, 256, 256), 0.75, device=latents.device, dtype=latents.dtype)
 
 
+class BFloat16OutOfRangeLatentCodec:
+    def __init__(self) -> None:
+        self.decoded_latents_shape = None
+
+    def decode(self, latents):
+        self.decoded_latents_shape = tuple(latents.shape)
+        decoded = torch.full((latents.shape[0], 3, 256, 256), 1.5, device=latents.device, dtype=torch.bfloat16)
+        decoded[:, :, 0, 0] = -0.5
+        return decoded
+
+
 def test_e11_latent_training_declares_vae_and_uses_pixel_image_size_for_transforms() -> None:
     from safa.training import g_loop
 
@@ -151,6 +162,57 @@ def test_generator_training_step_keeps_non_latent_flow_loss_on_pixels() -> None:
     module(pixel_images, torch.eye(2), ["a", "b"], False, 0.0, flow_condition="embedding")
 
     assert generator.seen_image_shape == (2, 3, 64, 64)
+
+
+def test_latent_decoded_eval_samples_are_float32_clamped_before_validation_detector() -> None:
+    from torch import nn
+    import torch.nn.functional as F
+
+    from safa.training import g_loop
+
+    class DummyGenerator(nn.Module):
+        def sample(self, z, **kwargs):
+            del kwargs
+            return torch.zeros(z.shape[0], 4, 32, 32, device=z.device, dtype=torch.bfloat16)
+
+    class StrictE0(nn.Module):
+        def forward(self, images):
+            assert images.dtype == torch.float32
+            batch_size = int(images.shape[0])
+            base = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], device=images.device, dtype=images.dtype)
+            embedding = F.normalize(base[:batch_size], dim=1)
+            logits = torch.zeros(batch_size, 2, device=images.device, dtype=images.dtype)
+            return {"embedding": embedding, "logits": logits}
+
+    class StrictDetector:
+        def detect_counts(self, images):
+            assert images.dtype == torch.float32
+            assert float(images.min()) >= 0.0
+            assert float(images.max()) <= 1.0
+            return [1 for _ in range(int(images.shape[0]))]
+
+    codec = BFloat16OutOfRangeLatentCodec()
+    loader = [
+        {
+            "image": torch.zeros(3, 3, 256, 256),
+            "z": F.normalize(torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]), dim=1),
+            "sample_id": ["a", "b", "c"],
+        }
+    ]
+
+    metrics = g_loop._evaluate_validation(
+        DummyGenerator(),
+        StrictE0(),
+        loader,
+        StrictDetector(),
+        torch.device("cpu"),
+        _latent_generator_config(),
+        sampling_seed=1337,
+        latent_codec=codec,
+    )
+
+    assert codec.decoded_latents_shape == (3, 4, 32, 32)
+    assert metrics["face_detect_ge1_rate"] == pytest.approx(1.0)
 
 
 def test_validation_decodes_latent_samples_before_e0_and_face_detector() -> None:
@@ -261,6 +323,45 @@ def test_quality_eval_decodes_latent_samples_before_saving(tmp_path, monkeypatch
     assert generator.seen_x_init_shape == (2, 4, 32, 32)
     assert codec.decoded_latents_shape == (2, 4, 32, 32)
     assert saved_shapes == [(3, 256, 256), (3, 256, 256)]
+
+
+def test_latent_decoded_quality_samples_are_float32_clamped_before_saving(tmp_path, monkeypatch) -> None:
+    from torch import nn
+
+    from safa.evaluation import runner
+    from safa.training import g_loop
+
+    class DummyGenerator(nn.Module):
+        def sample(self, z, **kwargs):
+            del kwargs
+            return torch.zeros(z.shape[0], 4, 32, 32, device=z.device, dtype=torch.bfloat16)
+
+    saved = []
+
+    def fake_save(image, generated_dir, *, global_index, sample_id, row):
+        del generated_dir, global_index, sample_id, row
+        assert image.dtype == torch.float32
+        assert float(image.min()) >= 0.0
+        assert float(image.max()) <= 1.0
+        saved.append(tuple(image.shape))
+
+    monkeypatch.setattr(runner, "_save_generated_image_for_eval", fake_save)
+
+    count = g_loop._generate_quality_eval_images(
+        generator=DummyGenerator(),
+        loader=[{"z": torch.eye(2), "sample_id": ["a", "b"]}],
+        generated_dir=tmp_path / "generated",
+        device=torch.device("cpu"),
+        generator_config=_latent_generator_config(),
+        sampling_seed=1337,
+        max_samples=2,
+        use_amp=False,
+        flow_condition="embedding",
+        latent_codec=BFloat16OutOfRangeLatentCodec(),
+    )
+
+    assert count == 2
+    assert saved == [(3, 256, 256), (3, 256, 256)]
 
 
 def test_meanflow_sit_latent_data_space_samples_raw_latents_without_pixel_clamp() -> None:

@@ -778,6 +778,13 @@ def _decode_generated_samples(generated, latent_codec, *, context: str):
     return decoded
 
 
+def _prepare_generated_samples_for_pixel_eval(generated, latent_codec, *, context: str):
+    decoded = _decode_generated_samples(generated, latent_codec, context=context)
+    prepared = decoded.float().clamp(0.0, 1.0)
+    assert_finite_tensor(context, prepared)
+    return prepared
+
+
 def _generator_image_transform_size(config: dict) -> int:
     return _require_positive_int(config, "pixel_image_size", "train_g config") if latent_training_enabled(config) else int(config["image_size"])
 
@@ -3885,7 +3892,11 @@ def _generate_quality_eval_images(
                 condition_z = _flow_condition_z_for_generator(generator, z, flow_condition)
                 generated = generator.sample(condition_z, steps=generator_config.sample_steps, x_init=x_init)
                 assert_finite_tensor("quality_eval_generated_image", generated)
-                generated_for_eval = _decode_generated_samples(generated, latent_codec, context="quality_eval_generated_image_decoded")
+                generated_for_eval = _prepare_generated_samples_for_pixel_eval(
+                    generated,
+                    latent_codec,
+                    context="quality_eval_generated_image_decoded",
+                )
                 for index, sample_id in enumerate(sample_ids):
                     _save_generated_image_for_eval(
                         generated_for_eval[index],
@@ -3976,7 +3987,11 @@ def _evaluate_validation(
             condition_z = _flow_condition_z_for_generator(generator, z, flow_condition)
             generated = generator.sample(condition_z, steps=generator_config.sample_steps, x_init=x_init)
             assert_finite_tensor("validation_generated_image", generated)
-            generated_for_eval = _decode_generated_samples(generated, latent_codec, context="validation_generated_image_decoded")
+            generated_for_eval = _prepare_generated_samples_for_pixel_eval(
+                generated,
+                latent_codec,
+                context="validation_generated_image_decoded",
+            )
             source_out = e0(normalize_for_e0(source))
             generated_out = e0(normalize_for_e0(generated_for_eval))
             generated_embedding = generated_out["embedding"]

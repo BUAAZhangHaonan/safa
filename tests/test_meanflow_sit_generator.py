@@ -234,6 +234,7 @@ def test_e11_meanflow_sit_config_is_k100_stage1_null_conditioned_and_larger_than
 
     assert config["experiment_name"] == "e11_meanflow_sit_b_stage1_200ep"
     assert config["device"] == "cuda:0"
+    assert config["amp"] is False
     assert config["pixel_image_size"] == 256
     assert config["image_size"] == config["pixel_image_size"] // 8
     assert config["out_dir"] == "artifacts/checkpoints/e11_meanflow_sit_b_stage1_200ep"

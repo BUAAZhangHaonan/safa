@@ -5,7 +5,7 @@ device: cuda:0
 num_workers: 8
 global_batch_size: 16
 per_device_batch_size: 16
-amp: true
+amp: false
 learning_rate: 0.0001
 weight_decay: 0.0
 latent_training: true
