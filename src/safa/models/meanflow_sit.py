@@ -244,21 +244,30 @@ def build_meanflow_sit_generator(config):
                         "loaded": False,
                         "missing_file": True,
                         "path": "" if path is None else str(path),
+                        "source_format": "missing_file",
+                        "loaded_keys": [],
                         "missing_keys": [],
                         "unexpected_keys": [],
+                        "mismatched_keys": [],
+                        "skipped_keys": [],
                     }
                 raise FileNotFoundError("" if path is None else str(path))
             payload = torch.load(path, map_location="cpu")
-            state_dict = _extract_state_dict(payload, state_key)
-            state_dict = _strip_module_prefix(state_dict)
+            state_dict = _strip_module_prefix(_extract_state_dict(payload, state_key))
             target = self if _looks_like_full_generator_state(state_dict) else self.vector_field
-            incompatible = target.load_state_dict(state_dict, strict=strict)
+            prepared_state, prepare_report = _prepare_pretrained_state_dict(state_dict, target.state_dict())
+            incompatible = target.load_state_dict(prepared_state, strict=strict)
+            unexpected_keys = list(prepare_report["unexpected_keys"]) + list(incompatible.unexpected_keys)
             return {
-                "loaded": True,
+                "loaded": bool(prepared_state),
                 "missing_file": False,
                 "path": str(path),
+                "source_format": prepare_report["source_format"],
+                "loaded_keys": sorted(prepared_state),
                 "missing_keys": list(incompatible.missing_keys),
-                "unexpected_keys": list(incompatible.unexpected_keys),
+                "unexpected_keys": unexpected_keys,
+                "mismatched_keys": prepare_report["mismatched_keys"],
+                "skipped_keys": prepare_report["skipped_keys"],
             }
 
         def _sample_t_r(self, batch_size: int, *, device, dtype, generator=None):
@@ -385,3 +394,66 @@ def _strip_module_prefix(state_dict: dict[str, Any]):
 
 def _looks_like_full_generator_state(state_dict: dict[str, Any]):
     return any(isinstance(key, str) and (key.startswith("vector_field.") or key.startswith("null_condition.")) for key in state_dict)
+
+
+def _prepare_pretrained_state_dict(state_dict: dict[str, Any], target_state: dict[str, Any]):
+    source_format = "zhuyu_meanflow_sit" if _looks_like_zhuyu_state_dict(state_dict) else "safa"
+    prepared: dict[str, Any] = {}
+    unexpected_keys: list[str] = []
+    mismatched_keys: list[dict[str, Any]] = []
+    skipped_keys: list[dict[str, Any]] = []
+    for source_key, value in state_dict.items():
+        if not isinstance(source_key, str):
+            skipped_keys.append({"source_key": repr(source_key), "target_key": "", "reason": "non_string_key"})
+            continue
+        target_key = _map_pretrained_key(source_key, source_format)
+        if target_key not in target_state:
+            unexpected_keys.append(source_key)
+            continue
+        target_value = target_state[target_key]
+        if not isinstance(value, torch.Tensor) or not isinstance(target_value, torch.Tensor):
+            skipped_keys.append({"source_key": source_key, "target_key": target_key, "reason": "non_tensor_value"})
+            continue
+        if tuple(value.shape) != tuple(target_value.shape):
+            mismatched_keys.append(
+                {
+                    "source_key": source_key,
+                    "target_key": target_key,
+                    "source_shape": list(value.shape),
+                    "target_shape": list(target_value.shape),
+                    "reason": "shape_mismatch",
+                }
+            )
+            continue
+        prepared[target_key] = value
+    return prepared, {
+        "source_format": source_format,
+        "unexpected_keys": unexpected_keys,
+        "mismatched_keys": mismatched_keys,
+        "skipped_keys": skipped_keys,
+    }
+
+
+def _looks_like_zhuyu_state_dict(state_dict: dict[str, Any]) -> bool:
+    return any(
+        isinstance(key, str)
+        and (
+            key.startswith("x_embedder.proj.")
+            or key.startswith("y_embedder.embedding_table.")
+            or ".mlp.fc1." in key
+            or ".mlp.fc2." in key
+        )
+        for key in state_dict
+    )
+
+
+def _map_pretrained_key(key: str, source_format: str) -> str:
+    if source_format != "zhuyu_meanflow_sit":
+        return key
+    if key.startswith("x_embedder.proj."):
+        return "x_embedder." + key.removeprefix("x_embedder.proj.")
+    if key == "y_embedder.embedding_table.weight":
+        return "z_embedder.0.weight"
+    key = key.replace(".mlp.fc1.", ".mlp.0.")
+    key = key.replace(".mlp.fc2.", ".mlp.2.")
+    return key

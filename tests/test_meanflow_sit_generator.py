@@ -109,10 +109,78 @@ def test_meanflow_sit_checkpoint_loader_reports_missing_and_unexpected_keys() ->
         torch.save({"model": {"unexpected.weight": torch.zeros(1)}}, path)
         report = generator.load_pretrained(str(path), strict=False)
 
-    assert report["loaded"] is True
+    assert report["loaded"] is False
     assert report["missing_file"] is False
+    assert report["loaded_keys"] == []
     assert report["missing_keys"]
     assert report["unexpected_keys"] == ["unexpected.weight"]
+
+
+def test_meanflow_sit_loads_zhuyu_style_checkpoint_keys_and_reports_condition_mismatch() -> None:
+    from safa.models.generator import build_generator
+
+    config = _tiny_meanflow_sit_config()
+    config.update({"sit_input_channels": 4, "image_size": 16, "sit_patch_size": 4})
+    generator = build_generator(config)
+    target = generator.vector_field.state_dict()
+
+    def like_target(key: str, value: float) -> torch.Tensor:
+        return torch.full_like(target[key], value)
+
+    zhuyu_state = {
+        "x_embedder.proj.weight": like_target("x_embedder.weight", 0.11),
+        "x_embedder.proj.bias": like_target("x_embedder.bias", 0.12),
+        "t_embedder.mlp.0.weight": like_target("t_embedder.mlp.0.weight", 0.21),
+        "r_embedder.mlp.2.bias": like_target("r_embedder.mlp.2.bias", 0.31),
+        "blocks.0.attn.qkv.weight": like_target("blocks.0.attn.qkv.weight", 0.41),
+        "blocks.0.mlp.fc1.weight": like_target("blocks.0.mlp.0.weight", 0.51),
+        "blocks.0.mlp.fc2.bias": like_target("blocks.0.mlp.2.bias", 0.52),
+        "final_layer.linear.weight": like_target("final_layer.linear.weight", 0.61),
+        "y_embedder.embedding_table.weight": torch.zeros(1001, config["sit_hidden_size"]),
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "zhuyu.pt"
+        torch.save({"model": zhuyu_state}, path)
+        report = generator.load_pretrained(str(path), strict=False)
+
+    assert report["loaded"] is True
+    assert report["source_format"] == "zhuyu_meanflow_sit"
+    assert "x_embedder.weight" in report["loaded_keys"]
+    assert "blocks.0.mlp.0.weight" in report["loaded_keys"]
+    assert "final_layer.linear.weight" in report["loaded_keys"]
+    assert torch.allclose(generator.vector_field.x_embedder.weight, like_target("x_embedder.weight", 0.11))
+    assert any(
+        item["source_key"] == "y_embedder.embedding_table.weight"
+        and item["target_key"] == "z_embedder.0.weight"
+        and item["reason"] == "shape_mismatch"
+        for item in report["mismatched_keys"]
+    )
+
+
+def test_meanflow_sit_checkpoint_loader_reports_shape_mismatches_without_silent_success() -> None:
+    from safa.models.generator import build_generator
+
+    config = _tiny_meanflow_sit_config()
+    config.update({"sit_input_channels": 4, "image_size": 16, "sit_patch_size": 4})
+    generator = build_generator(config)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "bad_shape.pt"
+        torch.save({"model": {"x_embedder.proj.weight": torch.zeros(1)}}, path)
+        report = generator.load_pretrained(str(path), strict=False)
+
+    assert report["loaded"] is False
+    assert report["loaded_keys"] == []
+    assert report["mismatched_keys"] == [
+        {
+            "source_key": "x_embedder.proj.weight",
+            "target_key": "x_embedder.weight",
+            "source_shape": [1],
+            "target_shape": [32, 4, 4, 4],
+            "reason": "shape_mismatch",
+        }
+    ]
 
 
 def test_e11_meanflow_sit_config_is_k100_stage1_null_conditioned_and_larger_than_5m() -> None:
@@ -125,6 +193,8 @@ def test_e11_meanflow_sit_config_is_k100_stage1_null_conditioned_and_larger_than
 
     assert config["experiment_name"] == "e11_meanflow_sit_b_stage1_200ep"
     assert config["device"] == "cuda:0"
+    assert config["pixel_image_size"] == 256
+    assert config["image_size"] == config["pixel_image_size"] // 8
     assert config["out_dir"] == "artifacts/checkpoints/e11_meanflow_sit_b_stage1_200ep"
     assert config["out_dir"] != "artifacts/checkpoints/g_medium_v2_meanflow_200ep"
     assert config["out_dir"] != "artifacts/checkpoints/g_medium_v2_ddim_200ep"
@@ -136,9 +206,15 @@ def test_e11_meanflow_sit_config_is_k100_stage1_null_conditioned_and_larger_than
     assert config["generator"]["learned_null_condition"] is True
     assert config["generator"]["meanflow_ratio"] == 0.25
     assert config["generator"]["meanflow_ratio_r_not_equal_t"] == 0.75
+    assert config["generator"]["sit_input_channels"] == 4
+    assert config["generator"]["sit_patch_size"] == 4
     assert config["generator"]["sit_depth"] == 12
     assert config["generator"]["sit_hidden_size"] == 768
     assert config["generator"]["sit_num_heads"] == 12
+    assert config["generator"]["sit_pretrained_path"] == (
+        "artifacts/checkpoints/external/meanflow_sit/zhuyu_sit_b_4_imagenet256.pt"
+    )
+    assert config["generator"]["sit_pretrained_source"].startswith("https://drive.google.com/drive/folders/")
     assert config["stages"]["stage2"]["stage2_objective"]["flow_condition"] == "learned_null_condition"
     quality_eval = config["stages"]["stage2"]["quality_eval"]
     assert quality_eval["distribution_cuda_visible_devices"] == "0"
@@ -147,6 +223,7 @@ def test_e11_meanflow_sit_config_is_k100_stage1_null_conditioned_and_larger_than
 
     g_loop._validate_train_g_config(config)
     generator_config = dict(config["generator"])
+    generator_config["sit_pretrained_path"] = ""
     generator_config["embedding_dim"] = config["embedding_dim"]
     generator_config["image_size"] = config["image_size"]
     generator = build_generator(generator_config)

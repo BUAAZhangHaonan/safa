@@ -19,7 +19,7 @@ from safa.evaluation.metrics import (
 from safa.evaluation.recognizers import InsightFaceDetector
 from safa.models.conditioning import fixed_null_condition_like, learned_null_condition_like
 from safa.models.e0 import assert_e0_frozen, freeze_e0, load_e0_checkpoint
-from safa.models.generator import FlowGeneratorConfig, build_generator
+from safa.models.generator import GENERATOR_MODEL_TYPE_FLOW, FlowGeneratorConfig, build_generator
 from safa.training.audit import audit_no_identity_supervision
 from safa.training.losses import cosine_cycle_loss, normalize_for_e0
 from safa.training.projected_update import (
@@ -1288,6 +1288,7 @@ def train_g_from_config(config: dict) -> dict:
             blocked = _stage2_blocked(
                 distributed,
                 device,
+                generator_config,
                 stages,
                 stage1_stable_hits,
                 baseline_detection_rate,
@@ -1597,7 +1598,7 @@ def train_g_from_config(config: dict) -> dict:
             "metrics": final_metrics,
             "history": history,
             "generator_input": "z_only",
-            "model_type": "conditional_flow_matching",
+            "model_type": _manifest_model_type(generator_config),
             "identity_supervision": False,
             "distributed": _distributed_manifest(distributed),
             **batch_metadata,
@@ -1958,6 +1959,7 @@ def _sync_epoch_control(
 def _stage2_blocked(
     distributed: DistributedContext,
     device,
+    generator_config: FlowGeneratorConfig,
     stages: dict,
     stage1_stable_hits: int,
     baseline_detection_rate: float | None,
@@ -1987,7 +1989,7 @@ def _stage2_blocked(
                     "metrics": history[-1] if history else {},
                     "history": history,
                     "generator_input": "z_only",
-                    "model_type": "conditional_flow_matching",
+                    "model_type": _manifest_model_type(generator_config),
                     "identity_supervision": False,
                     "blocked": True,
                     "block_reason": str(exc),
@@ -2004,6 +2006,13 @@ def _stage2_blocked(
         return bool(flag.item())
     return blocked
 
+
+def _manifest_model_type(generator_config: FlowGeneratorConfig | dict) -> str:
+    if isinstance(generator_config, FlowGeneratorConfig):
+        return generator_config.model_type
+    if isinstance(generator_config, dict):
+        return str(generator_config.get("model_type", GENERATOR_MODEL_TYPE_FLOW))
+    return str(getattr(generator_config, "model_type", GENERATOR_MODEL_TYPE_FLOW))
 
 def _distributed_manifest(distributed: DistributedContext) -> dict:
     return {

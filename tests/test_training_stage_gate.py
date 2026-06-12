@@ -111,6 +111,31 @@ class StageGateTests(unittest.TestCase):
             allow_bypass=False,
         )
 
+
+    def test_manifest_model_type_uses_actual_generator_config(self) -> None:
+        from safa.models.generator import FlowGeneratorConfig
+        from safa.training import g_loop
+
+        generator_config = FlowGeneratorConfig(
+            model_type="meanflow_sit",
+            embedding_dim=2,
+            image_size=4,
+            base_channels=1,
+            channel_multipliers=(1,),
+            time_embedding_dim=4,
+            condition_dim=4,
+            sample_steps=1,
+            train_cycle_steps=1,
+            sampler="meanflow",
+            sit_input_channels=4,
+            sit_patch_size=2,
+            sit_hidden_size=8,
+            sit_depth=1,
+            sit_num_heads=2,
+        )
+
+        self.assertEqual(g_loop._manifest_model_type(generator_config), "meanflow_sit")
+
     def test_generator_config_requires_explicit_generator_block(self) -> None:
         from safa.training.g_loop import _generator_config_from_train_config
 
