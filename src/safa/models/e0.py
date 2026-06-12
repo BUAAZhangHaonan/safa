@@ -13,7 +13,6 @@ class E0Config:
 
 
 def build_e0(config: E0Config, allow_random_init: bool = False):
-    import torch
     from torch import nn
     from torchvision.models import ResNet50_Weights, resnet50
 
@@ -35,7 +34,6 @@ def build_e0(config: E0Config, allow_random_init: bool = False):
 
 class EmotionEncoder:
     def __new__(cls, backbone, in_features: int, embedding_dim: int, num_classes: int):
-        import torch
         from torch import nn
         import torch.nn.functional as F
 

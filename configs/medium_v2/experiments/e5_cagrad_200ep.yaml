@@ -31,7 +31,11 @@ distributed:
 generator:
   model_type: conditional_flow_matching
   base_channels: 32
-  channel_multipliers: [1, 2, 4, 4]
+  channel_multipliers:
+  - 1
+  - 2
+  - 4
+  - 4
   time_embedding_dim: 128
   condition_dim: 512
   sample_steps: 32
@@ -55,10 +59,13 @@ stages:
       point_weight: 1.0
       cagrad_c: 0.5
       fm_descent_floor_fraction: 0.1
-      projection_eps: 0.000000000001
+      projection_eps: 1.0e-12
     quality_eval:
       enabled: true
-      metrics: [niqe, fid, kid]
+      metrics:
+      - niqe
+      - fid
+      - kid
       niqe_interval_epochs: 1
       niqe_max_samples: 512
       distribution_interval_epochs: 20
@@ -66,7 +73,7 @@ stages:
       distribution_timeout_seconds: 3600
       quality_num_workers: 2
       real_index: data/index/val_single_face.jsonl
-      distribution_cuda_visible_devices: "4"
+      distribution_cuda_visible_devices: '6'
       distribution_device: cuda:0
       output_dir: artifacts/eval/e5_cagrad_200ep/quality
       model: raw

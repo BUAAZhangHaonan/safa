@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import torch
 
 _UNIT_NORM_ATOL = 1e-4
 _UNIT_NORM_RTOL = 1e-4
@@ -11,7 +11,7 @@ def hyperspherical_gram_loss(
     point_weight,
     relation_weight,
     offdiag_only: bool = True,
-) -> dict[str, "torch.Tensor"]:
+) -> dict[str, torch.Tensor]:
     import torch
 
     _validate_embedding_pair(pred_embedding, target_embedding)
@@ -42,7 +42,7 @@ def hyperspherical_gram_loss(
     }
 
 
-def hyperspherical_point_cosine_loss(pred_embedding, target_embedding, point_weight) -> dict[str, "torch.Tensor"]:
+def hyperspherical_point_cosine_loss(pred_embedding, target_embedding, point_weight) -> dict[str, torch.Tensor]:
     import torch
 
     _validate_point_embedding_pair(pred_embedding, target_embedding)

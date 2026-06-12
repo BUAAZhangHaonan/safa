@@ -70,7 +70,7 @@ stages:
       distribution_timeout_seconds: 3600
       quality_num_workers: 2
       real_index: data/index/val_single_face.jsonl
-      distribution_cuda_visible_devices: "3"
+      distribution_cuda_visible_devices: "6"
       distribution_device: cuda:0
       output_dir: artifacts/eval/e4_dc_adamw_200ep/quality
       model: raw

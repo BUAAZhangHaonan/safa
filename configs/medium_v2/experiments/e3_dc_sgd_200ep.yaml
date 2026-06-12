@@ -31,7 +31,11 @@ distributed:
 generator:
   model_type: conditional_flow_matching
   base_channels: 32
-  channel_multipliers: [1, 2, 4, 4]
+  channel_multipliers:
+  - 1
+  - 2
+  - 4
+  - 4
   time_embedding_dim: 128
   condition_dim: 512
   sample_steps: 32
@@ -53,12 +57,15 @@ stages:
       flow_condition: embedding
       lambda_repr: 1.0
       point_weight: 1.0
-      repr_learning_rate: 0.00003
-      projection_eps: 0.000000000001
+      repr_learning_rate: 3.0e-05
+      projection_eps: 1.0e-12
       pu_gradient_normalization: true
     quality_eval:
       enabled: true
-      metrics: [niqe, fid, kid]
+      metrics:
+      - niqe
+      - fid
+      - kid
       niqe_interval_epochs: 1
       niqe_max_samples: 512
       distribution_interval_epochs: 20
@@ -66,7 +73,7 @@ stages:
       distribution_timeout_seconds: 3600
       quality_num_workers: 2
       real_index: data/index/val_single_face.jsonl
-      distribution_cuda_visible_devices: "2"
+      distribution_cuda_visible_devices: '6'
       distribution_device: cuda:0
       output_dir: artifacts/eval/e3_dc_sgd_200ep/quality
       model: raw
@@ -79,3 +86,4 @@ validation:
   face_detection:
     enabled: true
     model_name: buffalo_l
+optimizer_type: sgd
