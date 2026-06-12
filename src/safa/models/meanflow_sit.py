@@ -1,0 +1,387 @@
+from __future__ import annotations
+
+import math
+import warnings
+from pathlib import Path
+from typing import Any
+
+import torch
+from torch import nn
+import torch.nn.functional as F
+
+from safa.models.conditioning import LearnedNullCondition
+
+
+def build_meanflow_sit_generator(config):
+    class TimestepEmbedder(nn.Module):
+        def __init__(self, hidden_size: int, frequency_embedding_size: int):
+            super().__init__()
+            self.frequency_embedding_size = frequency_embedding_size
+            self.mlp = nn.Sequential(
+                nn.Linear(frequency_embedding_size, hidden_size),
+                nn.SiLU(),
+                nn.Linear(hidden_size, hidden_size),
+            )
+
+        def forward(self, t):
+            if t.ndim != 1:
+                raise ValueError(f"t must have shape [B], got {tuple(t.shape)}")
+            embedding = _sinusoidal_embedding(t, self.frequency_embedding_size)
+            return self.mlp(embedding.to(dtype=t.dtype))
+
+    class SelfAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            hidden_size = config.sit_hidden_size
+            self.num_heads = config.sit_num_heads
+            self.head_dim = hidden_size // self.num_heads
+            self.scale = self.head_dim**-0.5
+            self.qkv = nn.Linear(hidden_size, hidden_size * 3)
+            self.proj = nn.Linear(hidden_size, hidden_size)
+
+        def forward(self, x):
+            batch_size, num_tokens, hidden_size = x.shape
+            qkv = self.qkv(x).reshape(batch_size, num_tokens, 3, self.num_heads, self.head_dim)
+            qkv = qkv.permute(2, 0, 3, 1, 4)
+            q, k, v = qkv.unbind(0)
+            attention = (q @ k.transpose(-2, -1)) * self.scale
+            attention = attention.softmax(dim=-1)
+            x = attention @ v
+            x = x.transpose(1, 2).reshape(batch_size, num_tokens, hidden_size)
+            return self.proj(x)
+
+    class SiTBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            hidden_size = config.sit_hidden_size
+            self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1.0e-6)
+            self.attn = SelfAttention()
+            self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1.0e-6)
+            mlp_hidden = int(hidden_size * config.sit_mlp_ratio)
+            self.mlp = nn.Sequential(
+                nn.Linear(hidden_size, mlp_hidden),
+                nn.GELU(approximate="tanh"),
+                nn.Linear(mlp_hidden, hidden_size),
+            )
+            self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size))
+
+        def forward(self, x, condition):
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(condition).chunk(6, dim=-1)
+            attn_input = _modulate(self.norm1(x), shift_msa, scale_msa)
+            attn_output = self.attn(attn_input)
+            x = x + gate_msa.unsqueeze(1) * attn_output
+            mlp_input = _modulate(self.norm2(x), shift_mlp, scale_mlp)
+            x = x + gate_mlp.unsqueeze(1) * self.mlp(mlp_input)
+            return x
+
+    class FinalLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            hidden_size = config.sit_hidden_size
+            patch_dim = config.sit_patch_size * config.sit_patch_size * config.sit_input_channels
+            self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1.0e-6)
+            self.linear = nn.Linear(hidden_size, patch_dim)
+            self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size))
+
+        def forward(self, x, condition):
+            shift, scale = self.adaLN_modulation(condition).chunk(2, dim=-1)
+            return self.linear(_modulate(self.norm_final(x), shift, scale))
+
+    class MeanFlowSiTBackbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            hidden_size = config.sit_hidden_size
+            self.x_embedder = nn.Conv2d(
+                config.sit_input_channels,
+                hidden_size,
+                kernel_size=config.sit_patch_size,
+                stride=config.sit_patch_size,
+            )
+            grid_size = config.image_size // config.sit_patch_size
+            pos_embed = _build_2d_sincos_pos_embed(hidden_size, grid_size)
+            self.register_buffer("pos_embed", pos_embed.unsqueeze(0), persistent=False)
+            self.t_embedder = TimestepEmbedder(hidden_size, config.sit_time_embedding_dim)
+            self.r_embedder = TimestepEmbedder(hidden_size, config.sit_time_embedding_dim)
+            self.z_embedder = nn.Sequential(
+                nn.Linear(config.embedding_dim, hidden_size),
+                nn.SiLU(),
+                nn.Linear(hidden_size, hidden_size),
+            )
+            self.blocks = nn.ModuleList([SiTBlock() for _ in range(config.sit_depth)])
+            self.final_layer = FinalLayer()
+            self._initialize_weights()
+
+        def forward(self, x, r, t, z):
+            self._validate_inputs(x, r, t, z)
+            hidden = self.x_embedder(x).flatten(2).transpose(1, 2)
+            hidden = hidden + self.pos_embed.to(device=hidden.device, dtype=hidden.dtype)
+            horizon = (t - r).clamp_min(0.0)
+            condition = self.t_embedder(t) + self.r_embedder(horizon) + self.z_embedder(z)
+            for block in self.blocks:
+                hidden = block(hidden, condition)
+            patches = self.final_layer(hidden, condition)
+            return self._unpatchify(patches)
+
+        def _unpatchify(self, patches):
+            batch_size = patches.shape[0]
+            patch_size = config.sit_patch_size
+            channels = config.sit_input_channels
+            grid_size = config.image_size // patch_size
+            patches = patches.reshape(batch_size, grid_size, grid_size, patch_size, patch_size, channels)
+            patches = torch.einsum("nhwpqc->nchpwq", patches)
+            return patches.reshape(batch_size, channels, config.image_size, config.image_size)
+
+        def _validate_inputs(self, x, r, t, z):
+            expected_x = (config.sit_input_channels, config.image_size, config.image_size)
+            if x.ndim != 4 or tuple(x.shape[1:]) != expected_x:
+                raise ValueError(f"x_t must have shape [B,{expected_x[0]},{expected_x[1]},{expected_x[2]}], got {tuple(x.shape)}")
+            if z.ndim != 2 or z.shape[1] != config.embedding_dim:
+                raise ValueError(f"z must have shape [B,{config.embedding_dim}], got {tuple(z.shape)}")
+            if t.ndim != 1 or t.shape[0] != z.shape[0]:
+                raise ValueError(f"t must have shape [B], got {tuple(t.shape)} for batch {z.shape[0]}")
+            if r.ndim != 1 or r.shape[0] != z.shape[0]:
+                raise ValueError(f"r must have shape [B], got {tuple(r.shape)} for batch {z.shape[0]}")
+
+        def _initialize_weights(self):
+            for module in self.modules():
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight)
+                    if module.bias is not None:
+                        nn.init.constant_(module.bias, 0)
+            nn.init.xavier_uniform_(self.x_embedder.weight.view(self.x_embedder.weight.shape[0], -1))
+            nn.init.constant_(self.x_embedder.bias, 0)
+            for block in self.blocks:
+                nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+            nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+            nn.init.constant_(self.final_layer.linear.weight, 0)
+            nn.init.constant_(self.final_layer.linear.bias, 0)
+
+    class _MeanFlowSiTGenerator(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = config
+            self.embedding_dim = config.embedding_dim
+            self.image_size = config.image_size
+            self.vector_field = MeanFlowSiTBackbone()
+            self.null_condition = LearnedNullCondition(config.embedding_dim) if config.learned_null_condition else None
+            self.pretrained_load_report: dict[str, Any] | None = None
+
+        def forward(self, z):
+            return self.sample(z, steps=1)
+
+        def sample(self, z, steps: int | None = None, checkpoint_steps: bool = False, *, x_init=None, clamp_output: bool = True):
+            del checkpoint_steps
+            self._validate_z(z)
+            requested_steps = 1 if steps is None else int(steps)
+            if requested_steps <= 0:
+                raise ValueError(f"sample steps must be positive, got {requested_steps}")
+            if requested_steps != 1:
+                warnings.warn("MeanFlowSiTGenerator is 1-NFE; ignoring requested sample steps != 1", RuntimeWarning, stacklevel=2)
+            if x_init is None:
+                x = torch.randn(
+                    z.shape[0],
+                    config.sit_input_channels,
+                    self.image_size,
+                    self.image_size,
+                    device=z.device,
+                    dtype=z.dtype,
+                )
+            else:
+                self._validate_x_init(x_init, z)
+                x = x_init
+            r = torch.zeros(z.shape[0], device=z.device, dtype=z.dtype)
+            t = torch.ones(z.shape[0], device=z.device, dtype=z.dtype)
+            mean_velocity = self.vector_field(x, r, t, z)
+            x = x - mean_velocity
+            if clamp_output:
+                return ((x.clamp(-1.0, 1.0) + 1.0) * 0.5).clamp(0.0, 1.0)
+            return (x + 1.0) * 0.5
+
+        def flow_matching_loss(self, x_1, z, generator=None):
+            self._validate_z(z)
+            if x_1.ndim != 4 or tuple(x_1.shape[1:]) != (config.sit_input_channels, self.image_size, self.image_size):
+                raise ValueError(
+                    f"x_1 must have shape [B,{config.sit_input_channels},{self.image_size},{self.image_size}], got {tuple(x_1.shape)}"
+                )
+            x_data = x_1.mul(2.0).sub(1.0)
+            eps = torch.randn(x_data.shape, device=x_data.device, dtype=x_data.dtype, generator=generator)
+            r, t = self._sample_t_r(x_data.shape[0], device=x_data.device, dtype=x_data.dtype, generator=generator)
+            view_t = t.view(-1, 1, 1, 1)
+            z_t = (1.0 - view_t) * x_data + view_t * eps
+            target_velocity = eps - x_data
+            predicted_velocity = self.vector_field(z_t, r, t, z)
+            meanflow_target = self._meanflow_target(z_t, r, t, z, target_velocity)
+            error = predicted_velocity - meanflow_target.detach()
+            raw_mse = error.square().mean()
+            loss = self._weighted_loss(error)
+            return loss, {
+                "flow_matching_mse": raw_mse.detach(),
+                "meanflow_raw_mse": raw_mse.detach(),
+                "meanflow_backbone": "sit",
+                "meanflow_ratio": x_data.new_tensor(config.meanflow_ratio),
+                "meanflow_ratio_r_not_equal_t": x_data.new_tensor(self._ratio_r_not_equal_t()),
+                "meanflow_t_mean": t.detach().mean(),
+                "meanflow_r_mean": r.detach().mean(),
+                "meanflow_h_mean": (t - r).detach().mean(),
+                "meanflow_jvp_mode": config.meanflow_jvp_mode,
+                "meanflow_adaptive_weighting": x_data.new_tensor(float(config.meanflow_adaptive_weighting)),
+                "target_velocity_abs_mean": target_velocity.detach().abs().mean(),
+                "predicted_velocity_abs_mean": predicted_velocity.detach().abs().mean(),
+            }
+
+        def make_null_condition(self, *, batch_size: int, device, dtype):
+            if self.null_condition is None:
+                raise RuntimeError("learned_null_condition is disabled for this generator")
+            return self.null_condition(batch_size=batch_size, device=device, dtype=dtype)
+
+        def load_pretrained(self, checkpoint_path: str | Path | None, *, state_key: str | None = None, strict: bool = False, allow_missing: bool = False):
+            path = Path(checkpoint_path) if checkpoint_path else None
+            if path is None or not path.is_file():
+                if allow_missing:
+                    return {
+                        "loaded": False,
+                        "missing_file": True,
+                        "path": "" if path is None else str(path),
+                        "missing_keys": [],
+                        "unexpected_keys": [],
+                    }
+                raise FileNotFoundError("" if path is None else str(path))
+            payload = torch.load(path, map_location="cpu")
+            state_dict = _extract_state_dict(payload, state_key)
+            state_dict = _strip_module_prefix(state_dict)
+            target = self if _looks_like_full_generator_state(state_dict) else self.vector_field
+            incompatible = target.load_state_dict(state_dict, strict=strict)
+            return {
+                "loaded": True,
+                "missing_file": False,
+                "path": str(path),
+                "missing_keys": list(incompatible.missing_keys),
+                "unexpected_keys": list(incompatible.unexpected_keys),
+            }
+
+        def _sample_t_r(self, batch_size: int, *, device, dtype, generator=None):
+            samples = torch.rand(batch_size, 2, device=device, dtype=dtype, generator=generator)
+            sorted_samples, _ = torch.sort(samples, dim=1)
+            r = sorted_samples[:, 0]
+            t = sorted_samples[:, 1]
+            ratio_not_equal = self._ratio_r_not_equal_t()
+            if ratio_not_equal < 1.0:
+                equal_fraction = 1.0 - ratio_not_equal
+                equal_mask = torch.rand(batch_size, device=device, generator=generator) < equal_fraction
+                r = torch.where(equal_mask, t, r)
+            return r, t
+
+        def _ratio_r_not_equal_t(self):
+            if config.meanflow_ratio_r_not_equal_t >= 0.0:
+                return config.meanflow_ratio_r_not_equal_t
+            return 1.0 - config.meanflow_ratio
+
+        def _meanflow_target(self, z_t, r, t, z, target_velocity):
+            horizon = (t - r).view(-1, 1, 1, 1)
+            if config.meanflow_jvp_mode == "first_order":
+                return target_velocity
+            from torch.func import jvp
+
+            def field_fn(x_arg, r_arg, t_arg, z_arg):
+                return self.vector_field(x_arg, r_arg, t_arg, z_arg)
+
+            _, dudt = jvp(
+                field_fn,
+                (z_t, r, t, z),
+                (target_velocity, torch.zeros_like(r), torch.ones_like(t), torch.zeros_like(z)),
+            )
+            return target_velocity - horizon * dudt
+
+        def _weighted_loss(self, error):
+            per_sample = error.flatten(1).square().mean(dim=1)
+            if not config.meanflow_adaptive_weighting:
+                return per_sample.mean()
+            weights = (per_sample.detach() + config.meanflow_norm_eps).pow(-config.meanflow_norm_p)
+            weights = weights / weights.mean().clamp_min(config.meanflow_norm_eps)
+            return (per_sample * weights).mean()
+
+        def _validate_z(self, z):
+            if z.ndim != 2 or z.shape[1] != self.embedding_dim:
+                raise ValueError(f"G expects z with shape [B,{self.embedding_dim}], got {tuple(z.shape)}")
+
+        def _validate_x_init(self, x_init, z):
+            if not isinstance(x_init, torch.Tensor):
+                raise TypeError(f"x_init must be a torch.Tensor, got {type(x_init).__name__}")
+            expected_shape = (z.shape[0], config.sit_input_channels, self.image_size, self.image_size)
+            if tuple(x_init.shape) != expected_shape:
+                raise ValueError(f"x_init must have shape {expected_shape}, got {tuple(x_init.shape)}")
+            if x_init.device != z.device:
+                raise ValueError(f"x_init device must match z device {z.device}, got {x_init.device}")
+            if x_init.dtype != z.dtype:
+                raise TypeError(f"x_init dtype must match z dtype {z.dtype}, got {x_init.dtype}")
+
+    return _MeanFlowSiTGenerator()
+
+
+def _modulate(x, shift, scale):
+    return x * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+def _sinusoidal_embedding(t, dim: int):
+    half = dim // 2
+    frequencies = torch.exp(
+        -math.log(10000.0) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / max(half, 1)
+    )
+    args = t[:, None].float() * frequencies[None]
+    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if dim % 2 == 1:
+        embedding = F.pad(embedding, (0, 1))
+    return embedding
+
+
+def _build_2d_sincos_pos_embed(embed_dim: int, grid_size: int):
+    if embed_dim % 4 != 0:
+        raise ValueError(f"sit_hidden_size must be divisible by 4 for sin-cos position embedding, got {embed_dim}")
+    grid_h = torch.arange(grid_size, dtype=torch.float32)
+    grid_w = torch.arange(grid_size, dtype=torch.float32)
+    grid = torch.meshgrid(grid_w, grid_h, indexing="xy")
+    emb_h = _sincos_from_grid(embed_dim // 2, grid[1].reshape(-1))
+    emb_w = _sincos_from_grid(embed_dim // 2, grid[0].reshape(-1))
+    return torch.cat([emb_h, emb_w], dim=1)
+
+
+def _sincos_from_grid(embed_dim: int, positions):
+    half = embed_dim // 2
+    omega = torch.arange(half, dtype=torch.float32)
+    omega = 1.0 / (10000 ** (omega / max(half, 1)))
+    out = positions[:, None] * omega[None]
+    return torch.cat([torch.sin(out), torch.cos(out)], dim=1)
+
+
+def _extract_state_dict(payload, state_key: str | None):
+    if state_key:
+        if not isinstance(payload, dict) or state_key not in payload:
+            raise KeyError(f"checkpoint missing state_key {state_key!r}")
+        state_dict = payload[state_key]
+    elif isinstance(payload, dict):
+        for key in ("ema", "model", "model_state_dict", "state_dict"):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                state_dict = value
+                break
+        else:
+            state_dict = payload
+    else:
+        state_dict = payload
+    if not isinstance(state_dict, dict):
+        raise TypeError(f"checkpoint state_dict must be a dict, got {type(state_dict).__name__}")
+    return state_dict
+
+
+def _strip_module_prefix(state_dict: dict[str, Any]):
+    if not all(isinstance(key, str) for key in state_dict):
+        return state_dict
+    if not any(key.startswith("module.") for key in state_dict):
+        return state_dict
+    return {key.removeprefix("module."): value for key, value in state_dict.items()}
+
+
+def _looks_like_full_generator_state(state_dict: dict[str, Any]):
+    return any(isinstance(key, str) and (key.startswith("vector_field.") or key.startswith("null_condition.")) for key in state_dict)

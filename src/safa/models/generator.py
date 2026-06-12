@@ -6,8 +6,9 @@ from typing import Any
 
 GENERATOR_MODEL_TYPE_FLOW = "conditional_flow_matching"
 GENERATOR_MODEL_TYPE_MEANFLOW = "meanflow"
+GENERATOR_MODEL_TYPE_MEANFLOW_SIT = "meanflow_sit"
 GENERATOR_MODEL_TYPE_DDIM = "ddim"
-GENERATOR_MODEL_TYPES = (GENERATOR_MODEL_TYPE_FLOW, GENERATOR_MODEL_TYPE_MEANFLOW, GENERATOR_MODEL_TYPE_DDIM)
+GENERATOR_MODEL_TYPES = (GENERATOR_MODEL_TYPE_FLOW, GENERATOR_MODEL_TYPE_MEANFLOW, GENERATOR_MODEL_TYPE_MEANFLOW_SIT, GENERATOR_MODEL_TYPE_DDIM)
 MEANFLOW_JVP_MODE_TORCH_FUNC = "torch_func"
 MEANFLOW_JVP_MODE_FIRST_ORDER = "first_order"
 MEANFLOW_JVP_MODES = (MEANFLOW_JVP_MODE_TORCH_FUNC, MEANFLOW_JVP_MODE_FIRST_ORDER)
@@ -55,6 +56,7 @@ class FlowGeneratorConfig:
     sampler: str = "heun"
     learned_null_condition: bool = False
     meanflow_ratio: float = 0.75
+    meanflow_ratio_r_not_equal_t: float = -1.0
     meanflow_adaptive_weighting: bool = True
     meanflow_norm_p: float = 0.75
     meanflow_norm_eps: float = 1.0e-3
@@ -64,6 +66,15 @@ class FlowGeneratorConfig:
     ddim_beta_start: float = 1.0e-4
     ddim_beta_end: float = 2.0e-2
     ddim_eta: float = 0.0
+    sit_input_channels: int = 3
+    sit_patch_size: int = 16
+    sit_hidden_size: int = 768
+    sit_depth: int = 12
+    sit_num_heads: int = 12
+    sit_mlp_ratio: float = 4.0
+    sit_time_embedding_dim: int = 256
+    sit_pretrained_path: str = ""
+    sit_pretrained_state_key: str = ""
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "FlowGeneratorConfig":
@@ -84,6 +95,7 @@ class FlowGeneratorConfig:
             sampler=str(payload["sampler"]),
             learned_null_condition=bool(payload.get("learned_null_condition", False)),
             meanflow_ratio=float(payload.get("meanflow_ratio", 0.75)),
+            meanflow_ratio_r_not_equal_t=float(payload.get("meanflow_ratio_r_not_equal_t", -1.0)),
             meanflow_adaptive_weighting=bool(payload.get("meanflow_adaptive_weighting", True)),
             meanflow_norm_p=float(payload.get("meanflow_norm_p", 0.75)),
             meanflow_norm_eps=float(payload.get("meanflow_norm_eps", 1.0e-3)),
@@ -93,6 +105,15 @@ class FlowGeneratorConfig:
             ddim_beta_start=float(payload.get("ddim_beta_start", 1.0e-4)),
             ddim_beta_end=float(payload.get("ddim_beta_end", 2.0e-2)),
             ddim_eta=float(payload.get("ddim_eta", 0.0)),
+            sit_input_channels=int(payload.get("sit_input_channels", 3)),
+            sit_patch_size=int(payload.get("sit_patch_size", 16)),
+            sit_hidden_size=int(payload.get("sit_hidden_size", 768)),
+            sit_depth=int(payload.get("sit_depth", 12)),
+            sit_num_heads=int(payload.get("sit_num_heads", 12)),
+            sit_mlp_ratio=float(payload.get("sit_mlp_ratio", 4.0)),
+            sit_time_embedding_dim=int(payload.get("sit_time_embedding_dim", 256)),
+            sit_pretrained_path=str(payload.get("sit_pretrained_path", "")),
+            sit_pretrained_state_key=str(payload.get("sit_pretrained_state_key", "")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -111,7 +132,7 @@ class FlowGeneratorConfig:
         }
         if self.learned_null_condition:
             payload["learned_null_condition"] = True
-        if self.model_type == GENERATOR_MODEL_TYPE_MEANFLOW:
+        if self.model_type in {GENERATOR_MODEL_TYPE_MEANFLOW, GENERATOR_MODEL_TYPE_MEANFLOW_SIT}:
             payload.update(
                 {
                     "meanflow_ratio": self.meanflow_ratio,
@@ -121,6 +142,25 @@ class FlowGeneratorConfig:
                     "meanflow_jvp_mode": self.meanflow_jvp_mode,
                 }
             )
+        if self.model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT:
+            payload["meanflow_ratio_r_not_equal_t"] = (
+                self.meanflow_ratio_r_not_equal_t if self.meanflow_ratio_r_not_equal_t >= 0.0 else 1.0 - self.meanflow_ratio
+            )
+            payload.update(
+                {
+                    "sit_input_channels": self.sit_input_channels,
+                    "sit_patch_size": self.sit_patch_size,
+                    "sit_hidden_size": self.sit_hidden_size,
+                    "sit_depth": self.sit_depth,
+                    "sit_num_heads": self.sit_num_heads,
+                    "sit_mlp_ratio": self.sit_mlp_ratio,
+                    "sit_time_embedding_dim": self.sit_time_embedding_dim,
+                }
+            )
+            if self.sit_pretrained_path:
+                payload["sit_pretrained_path"] = self.sit_pretrained_path
+            if self.sit_pretrained_state_key:
+                payload["sit_pretrained_state_key"] = self.sit_pretrained_state_key
         if self.model_type == GENERATOR_MODEL_TYPE_DDIM:
             payload.update(
                 {
@@ -618,6 +658,36 @@ class MeanFlowGenerator:
         return _MeanFlowGenerator()
 
 
+class MeanFlowSiTGenerator:
+    def __new__(cls, config: FlowGeneratorConfig | dict[str, Any] | None = None, **kwargs):
+        from safa.models.meanflow_sit import build_meanflow_sit_generator
+
+        cfg_payload = {}
+        if isinstance(config, FlowGeneratorConfig):
+            cfg = config
+        elif config is None and not kwargs:
+            cfg = FlowGeneratorConfig(model_type=GENERATOR_MODEL_TYPE_MEANFLOW_SIT, sampler="meanflow", sample_steps=1, train_cycle_steps=1)
+        else:
+            if config is not None:
+                cfg_payload.update(config)
+            cfg_payload.update(kwargs)
+            cfg_payload.setdefault("model_type", GENERATOR_MODEL_TYPE_MEANFLOW_SIT)
+            cfg_payload.setdefault("sampler", "meanflow")
+            cfg = FlowGeneratorConfig.from_dict(cfg_payload)
+        _validate_config(cfg)
+        if cfg.model_type != GENERATOR_MODEL_TYPE_MEANFLOW_SIT:
+            raise ValueError(f"MeanFlowSiTGenerator requires model_type={GENERATOR_MODEL_TYPE_MEANFLOW_SIT!r}, got {cfg.model_type!r}")
+        generator = build_meanflow_sit_generator(cfg)
+        if cfg.sit_pretrained_path:
+            generator.pretrained_load_report = generator.load_pretrained(
+                cfg.sit_pretrained_path,
+                state_key=cfg.sit_pretrained_state_key or None,
+                strict=False,
+                allow_missing=False,
+            )
+        return generator
+
+
 class DDIMGenerator:
     def __new__(cls, config: FlowGeneratorConfig | dict[str, Any] | None = None, **kwargs):
         import math
@@ -877,6 +947,8 @@ def build_generator(config: dict[str, Any] | FlowGeneratorConfig | None = None, 
             return ConditionalFlowGenerator(config)
         if config.model_type == GENERATOR_MODEL_TYPE_MEANFLOW:
             return MeanFlowGenerator(config)
+        if config.model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT:
+            return MeanFlowSiTGenerator(config)
         if config.model_type == GENERATOR_MODEL_TYPE_DDIM:
             return DDIMGenerator(config)
         raise ValueError(f"Unsupported generator model_type: {config.model_type}")
@@ -890,6 +962,8 @@ def build_generator(config: dict[str, Any] | FlowGeneratorConfig | None = None, 
         return ConditionalFlowGenerator(payload)
     if model_type == GENERATOR_MODEL_TYPE_MEANFLOW:
         return MeanFlowGenerator(payload)
+    if model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT:
+        return MeanFlowSiTGenerator(payload)
     if model_type == GENERATOR_MODEL_TYPE_DDIM:
         return DDIMGenerator(payload)
     raise ValueError(f"Unsupported generator model_type: {model_type}")
@@ -932,7 +1006,7 @@ def _validate_config(config: FlowGeneratorConfig) -> None:
         raise ValueError(f"train_cycle_steps must be positive, got {config.train_cycle_steps}")
     if config.model_type == GENERATOR_MODEL_TYPE_FLOW and config.sampler not in {"euler", "heun"}:
         raise ValueError(f"sampler must be euler or heun, got {config.sampler}")
-    if config.model_type == GENERATOR_MODEL_TYPE_MEANFLOW:
+    if config.model_type in {GENERATOR_MODEL_TYPE_MEANFLOW, GENERATOR_MODEL_TYPE_MEANFLOW_SIT}:
         if config.sampler != "meanflow":
             raise ValueError(f"meanflow sampler must be 'meanflow', got {config.sampler!r}")
         if config.sample_steps != 1:
@@ -941,6 +1015,9 @@ def _validate_config(config: FlowGeneratorConfig) -> None:
             raise ValueError(f"meanflow train_cycle_steps must be 1, got {config.train_cycle_steps}")
         if config.meanflow_ratio < 0.0 or config.meanflow_ratio > 1.0:
             raise ValueError(f"meanflow_ratio must be in [0, 1], got {config.meanflow_ratio}")
+        if config.model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT and config.meanflow_ratio_r_not_equal_t != -1.0:
+            if config.meanflow_ratio_r_not_equal_t < 0.0 or config.meanflow_ratio_r_not_equal_t > 1.0:
+                raise ValueError(f"meanflow_ratio_r_not_equal_t must be in [0, 1], got {config.meanflow_ratio_r_not_equal_t}")
         if config.meanflow_norm_p < 0.0:
             raise ValueError(f"meanflow_norm_p must be non-negative, got {config.meanflow_norm_p}")
         if config.meanflow_norm_eps <= 0.0:
@@ -948,6 +1025,31 @@ def _validate_config(config: FlowGeneratorConfig) -> None:
         if config.meanflow_jvp_mode not in MEANFLOW_JVP_MODES:
             allowed = ", ".join(MEANFLOW_JVP_MODES)
             raise ValueError(f"meanflow_jvp_mode must be one of {allowed}, got {config.meanflow_jvp_mode!r}")
+    if config.model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT:
+        if config.sit_input_channels <= 0:
+            raise ValueError(f"sit_input_channels must be positive, got {config.sit_input_channels}")
+        if config.sit_patch_size <= 0:
+            raise ValueError(f"sit_patch_size must be positive, got {config.sit_patch_size}")
+        if config.image_size % config.sit_patch_size != 0:
+            raise ValueError(
+                f"image_size must be divisible by sit_patch_size={config.sit_patch_size}, got {config.image_size}"
+            )
+        if config.sit_hidden_size <= 0:
+            raise ValueError(f"sit_hidden_size must be positive, got {config.sit_hidden_size}")
+        if config.sit_hidden_size % 4 != 0:
+            raise ValueError(f"sit_hidden_size must be divisible by 4, got {config.sit_hidden_size}")
+        if config.sit_depth <= 0:
+            raise ValueError(f"sit_depth must be positive, got {config.sit_depth}")
+        if config.sit_num_heads <= 0:
+            raise ValueError(f"sit_num_heads must be positive, got {config.sit_num_heads}")
+        if config.sit_hidden_size % config.sit_num_heads != 0:
+            raise ValueError(
+                f"sit_hidden_size must be divisible by sit_num_heads, got {config.sit_hidden_size} and {config.sit_num_heads}"
+            )
+        if config.sit_mlp_ratio <= 0.0:
+            raise ValueError(f"sit_mlp_ratio must be positive, got {config.sit_mlp_ratio}")
+        if config.sit_time_embedding_dim <= 0:
+            raise ValueError(f"sit_time_embedding_dim must be positive, got {config.sit_time_embedding_dim}")
     if config.model_type == GENERATOR_MODEL_TYPE_DDIM:
         if config.sampler != "ddim":
             raise ValueError(f"ddim sampler must be 'ddim', got {config.sampler!r}")

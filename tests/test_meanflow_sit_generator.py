@@ -1,0 +1,154 @@
+from __future__ import annotations
+
+import tempfile
+from pathlib import Path
+
+import pytest
+import yaml
+
+torch = pytest.importorskip("torch")
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+FIVE_M_FM_PARAMETER_COUNT = 5_004_291
+
+
+def _tiny_meanflow_sit_config() -> dict:
+    return {
+        "model_type": "meanflow_sit",
+        "embedding_dim": 16,
+        "image_size": 16,
+        "base_channels": 4,
+        "channel_multipliers": [1],
+        "time_embedding_dim": 8,
+        "condition_dim": 16,
+        "sample_steps": 1,
+        "train_cycle_steps": 1,
+        "sampler": "meanflow",
+        "learned_null_condition": True,
+        "meanflow_ratio": 0.25,
+        "meanflow_ratio_r_not_equal_t": 0.75,
+        "meanflow_adaptive_weighting": True,
+        "meanflow_norm_p": 1.0,
+        "meanflow_norm_eps": 0.001,
+        "meanflow_jvp_mode": "torch_func",
+        "sit_input_channels": 3,
+        "sit_patch_size": 4,
+        "sit_hidden_size": 32,
+        "sit_depth": 2,
+        "sit_num_heads": 4,
+        "sit_mlp_ratio": 2.0,
+        "sit_time_embedding_dim": 32,
+    }
+
+
+def test_build_generator_supports_meanflow_sit_and_preserves_model_type_roundtrip() -> None:
+    from safa.models.generator import FlowGeneratorConfig, build_generator
+
+    config = FlowGeneratorConfig.from_dict(_tiny_meanflow_sit_config())
+
+    assert config.model_type == "meanflow_sit"
+    assert config.to_dict()["model_type"] == "meanflow_sit"
+    assert config.to_dict()["meanflow_ratio"] == 0.25
+    assert config.to_dict()["meanflow_ratio_r_not_equal_t"] == 0.75
+    generator = build_generator(config.to_dict())
+    assert generator.config.model_type == "meanflow_sit"
+    assert generator.config.sample_steps == 1
+    assert generator.config.train_cycle_steps == 1
+
+
+def test_meanflow_sit_forward_loss_and_one_step_sample_shapes() -> None:
+    from safa.models.generator import build_generator
+
+    generator = build_generator(_tiny_meanflow_sit_config())
+    z = torch.zeros(2, 16)
+    x_init = torch.randn(2, 3, 16, 16)
+
+    output = generator(z)
+    one_step = generator.sample(z, steps=1, x_init=x_init, clamp_output=False)
+    ignored_multi_step = generator.sample(z, steps=8, x_init=x_init, clamp_output=False)
+    loss, metrics = generator.flow_matching_loss(torch.rand(2, 3, 16, 16), z)
+    loss.backward()
+
+    assert tuple(output.shape) == (2, 3, 16, 16)
+    assert tuple(one_step.shape) == (2, 3, 16, 16)
+    assert torch.allclose(one_step, ignored_multi_step)
+    assert tuple(loss.shape) == ()
+    assert torch.isfinite(loss)
+    assert metrics["meanflow_backbone"] == "sit"
+    assert metrics["meanflow_jvp_mode"] == "torch_func"
+    assert torch.isfinite(metrics["meanflow_raw_mse"])
+    assert any(parameter.grad is not None for parameter in generator.parameters())
+
+
+def test_meanflow_sit_null_condition_and_embedding_shape_errors_are_clear() -> None:
+    from safa.models.generator import build_generator
+
+    generator = build_generator(_tiny_meanflow_sit_config())
+    null_z = generator.make_null_condition(batch_size=2, device=torch.device("cpu"), dtype=torch.float32)
+
+    assert tuple(null_z.shape) == (2, 16)
+    assert tuple(generator.sample(null_z, steps=1).shape) == (2, 3, 16, 16)
+    with pytest.raises(ValueError, match=r"G expects z with shape \[B,16\]"):
+        generator.sample(torch.zeros(2, 15))
+    with pytest.raises(ValueError, match=r"G expects z with shape \[B,16\]"):
+        generator.flow_matching_loss(torch.rand(2, 3, 16, 16), torch.zeros(2, 17))
+
+
+def test_meanflow_sit_checkpoint_loader_reports_missing_and_unexpected_keys() -> None:
+    from safa.models.generator import build_generator
+
+    generator = build_generator(_tiny_meanflow_sit_config())
+    missing = generator.load_pretrained("/no/such/meanflow_sit.pt", allow_missing=True)
+    assert missing["loaded"] is False
+    assert missing["missing_file"] is True
+    assert missing["missing_keys"] == []
+    assert missing["unexpected_keys"] == []
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "bad.pt"
+        torch.save({"model": {"unexpected.weight": torch.zeros(1)}}, path)
+        report = generator.load_pretrained(str(path), strict=False)
+
+    assert report["loaded"] is True
+    assert report["missing_file"] is False
+    assert report["missing_keys"]
+    assert report["unexpected_keys"] == ["unexpected.weight"]
+
+
+def test_e11_meanflow_sit_config_is_k100_stage1_null_conditioned_and_larger_than_5m() -> None:
+    from safa.models.generator import build_generator
+    from safa.training import g_loop
+
+    path = REPO_ROOT / "configs" / "medium_v2" / "experiments" / "e11_meanflow_sit_b_stage1_200ep.yaml"
+    assert path.is_file()
+    config = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+    assert config["experiment_name"] == "e11_meanflow_sit_b_stage1_200ep"
+    assert config["device"] == "cuda:0"
+    assert config["out_dir"] == "artifacts/checkpoints/e11_meanflow_sit_b_stage1_200ep"
+    assert config["out_dir"] != "artifacts/checkpoints/g_medium_v2_meanflow_200ep"
+    assert config["out_dir"] != "artifacts/checkpoints/g_medium_v2_ddim_200ep"
+    assert config["stages"]["stage2"]["epochs"] == 200
+    assert config["generator"]["model_type"] == "meanflow_sit"
+    assert config["generator"]["sample_steps"] == 1
+    assert config["generator"]["train_cycle_steps"] == 1
+    assert config["generator"]["sampler"] == "meanflow"
+    assert config["generator"]["learned_null_condition"] is True
+    assert config["generator"]["meanflow_ratio"] == 0.25
+    assert config["generator"]["meanflow_ratio_r_not_equal_t"] == 0.75
+    assert config["generator"]["sit_depth"] == 12
+    assert config["generator"]["sit_hidden_size"] == 768
+    assert config["generator"]["sit_num_heads"] == 12
+    assert config["stages"]["stage2"]["stage2_objective"]["flow_condition"] == "learned_null_condition"
+    quality_eval = config["stages"]["stage2"]["quality_eval"]
+    assert quality_eval["distribution_cuda_visible_devices"] == "0"
+    assert quality_eval["distribution_device"] == "cuda:0"
+    assert quality_eval["output_dir"] == "artifacts/eval/e11_meanflow_sit_b_stage1_200ep/quality"
+
+    g_loop._validate_train_g_config(config)
+    generator_config = dict(config["generator"])
+    generator_config["embedding_dim"] = config["embedding_dim"]
+    generator_config["image_size"] = config["image_size"]
+    generator = build_generator(generator_config)
+    parameter_count = sum(parameter.numel() for parameter in generator.parameters())
+    assert parameter_count > FIVE_M_FM_PARAMETER_COUNT
