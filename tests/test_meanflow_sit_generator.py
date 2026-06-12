@@ -94,6 +94,20 @@ def test_meanflow_sit_null_condition_and_embedding_shape_errors_are_clear() -> N
         generator.flow_matching_loss(torch.rand(2, 3, 16, 16), torch.zeros(2, 17))
 
 
+def test_meanflow_sit_flow_loss_accepts_expanded_null_condition_for_jvp() -> None:
+    from safa.models.generator import build_generator
+
+    generator = build_generator(_tiny_meanflow_sit_config())
+    z = generator.make_null_condition(batch_size=2, device=torch.device("cpu"), dtype=torch.float32)
+    x = torch.rand(2, 3, 16, 16)
+
+    assert z.stride(0) == 0
+    loss, metrics = generator.flow_matching_loss(x, z)
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(metrics["meanflow_raw_mse"])
+
+
 def test_meanflow_sit_checkpoint_loader_reports_missing_and_unexpected_keys() -> None:
     from safa.models.generator import build_generator
 

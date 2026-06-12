@@ -294,10 +294,20 @@ def build_meanflow_sit_generator(config):
             def field_fn(x_arg, r_arg, t_arg, z_arg):
                 return self.vector_field(x_arg, r_arg, t_arg, z_arg)
 
+            z_t_jvp = _jvp_safe_tensor(z_t)
+            r_jvp = _jvp_safe_tensor(r)
+            t_jvp = _jvp_safe_tensor(t)
+            z_jvp = _jvp_safe_tensor(z)
+            velocity_jvp = _jvp_safe_tensor(target_velocity)
             _, dudt = jvp(
                 field_fn,
-                (z_t, r, t, z),
-                (target_velocity, torch.zeros_like(r), torch.ones_like(t), torch.zeros_like(z)),
+                (z_t_jvp, r_jvp, t_jvp, z_jvp),
+                (
+                    velocity_jvp,
+                    torch.zeros_like(r_jvp),
+                    torch.ones_like(t_jvp),
+                    torch.zeros_like(z_jvp),
+                ),
             )
             return target_velocity - horizon * dudt
 
@@ -339,6 +349,10 @@ def build_meanflow_sit_generator(config):
                 raise TypeError(f"x_init dtype must match z dtype {z.dtype}, got {x_init.dtype}")
 
     return _MeanFlowSiTGenerator()
+
+
+def _jvp_safe_tensor(tensor):
+    return tensor if tensor.is_contiguous() else tensor.contiguous()
 
 
 def _modulate(x, shift, scale):
