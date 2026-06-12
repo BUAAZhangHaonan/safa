@@ -1509,6 +1509,10 @@ def train_g_from_config(config: dict) -> dict:
                     ema_config=ema_config,
                 )
                 _attach_validation_metrics(metrics, raw_validation_metrics, ema_validation_metrics)
+                raw_cos = metrics.get("validation_raw_latent_cosine_mean")
+                ema_cos = metrics.get("validation_ema_latent_cosine_mean")
+                if raw_cos is not None and ema_cos is not None:
+                    metrics["raw_ema_cosine_gap"] = float(raw_cos - ema_cos)
                 metrics.update(
                     _run_quality_eval_hook(
                         config,
@@ -3228,7 +3232,6 @@ def _run_projected_stage2_batch(
         metrics["repr_param_step_norm_before_clip"] = float(repr_step_norm_before_clip)
         metrics["repr_param_step_norm_after_clip"] = float(repr_step_norm_after_clip)
         metrics["repr_to_fm_param_step_ratio"] = float(repr_step_norm_after_clip / fm_param_step_norm) if fm_param_step_norm > 1e-15 else 0.0
-        metrics["raw_ema_cosine_gap"] = float(metrics.get("cosine_raw", 0.0) - metrics.get("cosine_ema", 0.0))
     training_state.last_loss_metrics = metrics
     logged_loss = flow_loss_guard.detach() + stage2_objective.lambda_repr * repr_loss_raw.detach()
     return logged_loss, flow_mse_guard.detach(), repr_detached.detach(), flow_loss_guard.detach(), repr_loss_raw.detach(), batch_grad_norm, metrics
