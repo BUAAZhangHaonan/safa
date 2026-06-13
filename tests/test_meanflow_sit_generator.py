@@ -249,12 +249,17 @@ def test_e11_meanflow_sit_config_is_k100_stage1_null_conditioned_and_larger_than
     assert config["experiment_name"] == "e11_meanflow_sit_b_stage1_200ep"
     assert config["device"] == "cuda:0"
     assert config["amp"] is False
+    assert config["global_batch_size"] == 64
+    assert config["per_device_batch_size"] == 64
+    assert config["num_workers"] == 16
     assert config["pixel_image_size"] == 256
     assert config["image_size"] == config["pixel_image_size"] // 8
     assert config["out_dir"] == "artifacts/checkpoints/e11_meanflow_sit_b_stage1_200ep"
     assert config["out_dir"] != "artifacts/checkpoints/g_medium_v2_meanflow_200ep"
     assert config["out_dir"] != "artifacts/checkpoints/g_medium_v2_ddim_200ep"
     assert config["stages"]["stage2"]["epochs"] == 200
+    gradient_monitor = config["stages"]["stage2"]["gradient_monitor"]
+    assert gradient_monitor["enabled"] is False
     assert config["generator"]["model_type"] == "meanflow_sit"
     assert config["generator"]["sample_steps"] == 1
     assert config["generator"]["train_cycle_steps"] == 1
@@ -273,7 +278,15 @@ def test_e11_meanflow_sit_config_is_k100_stage1_null_conditioned_and_larger_than
     assert not config["generator"].get("sit_pretrained_state_key")
     assert config["generator"]["sit_pretrained_source"].startswith("https://drive.google.com/drive/folders/")
     assert config["stages"]["stage2"]["stage2_objective"]["flow_condition"] == "learned_null_condition"
+    validation = config["validation"]
+    assert validation["max_samples"] == 128
+    assert validation["batch_size"] == 64
     quality_eval = config["stages"]["stage2"]["quality_eval"]
+    assert quality_eval["niqe_interval_epochs"] == 5
+    assert quality_eval["niqe_max_samples"] == 256
+    assert quality_eval["distribution_interval_epochs"] == 50
+    assert quality_eval["distribution_max_samples"] == 2048
+    assert quality_eval["quality_num_workers"] == 4
     assert quality_eval["distribution_cuda_visible_devices"] == "0"
     assert quality_eval["distribution_device"] == "cuda:0"
     assert quality_eval["output_dir"] == "artifacts/eval/e11_meanflow_sit_b_stage1_200ep/quality"

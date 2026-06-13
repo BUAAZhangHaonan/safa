@@ -2,9 +2,9 @@ experiment_name: e11_meanflow_sit_b_stage1_200ep
 seed: 1337
 sampling_seed: 1337
 device: cuda:0
-num_workers: 8
-global_batch_size: 16
-per_device_batch_size: 16
+num_workers: 16
+global_batch_size: 64
+per_device_batch_size: 64
 amp: false
 learning_rate: 0.0001
 weight_decay: 0.0
@@ -67,7 +67,7 @@ stages:
   stage2:
     epochs: 200
     gradient_monitor:
-      enabled: true
+      enabled: false
       interval: 20
       max_samples: 8
     stage2_objective:
@@ -76,12 +76,12 @@ stages:
     quality_eval:
       enabled: true
       metrics: [niqe, fid, kid]
-      niqe_interval_epochs: 1
-      niqe_max_samples: 512
-      distribution_interval_epochs: 20
-      distribution_max_samples: 3969
+      niqe_interval_epochs: 5
+      niqe_max_samples: 256
+      distribution_interval_epochs: 50
+      distribution_max_samples: 2048
       distribution_timeout_seconds: 3600
-      quality_num_workers: 2
+      quality_num_workers: 4
       real_index: data/index/val_single_face.jsonl
       distribution_cuda_visible_devices: "0"
       distribution_device: cuda:0
@@ -91,8 +91,8 @@ validation:
   enabled: true
   index: data/index/val_single_face.jsonl
   features: artifacts/e0_features/val_single_face_e0_medium_v1
-  max_samples: 512
-  batch_size: 16
+  max_samples: 128
+  batch_size: 64
   face_detection:
     enabled: true
     model_name: buffalo_l
