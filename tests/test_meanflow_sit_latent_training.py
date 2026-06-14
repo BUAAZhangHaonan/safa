@@ -451,3 +451,35 @@ def test_latent_codec_encode_decode_with_cpu_fake_vae() -> None:
     assert torch.equal(vae.decode_input, torch.full((2, 4, 2, 2), 2.0))
     assert torch.equal(decoded, torch.full((2, 3, 16, 16), 0.5))
     assert all(parameter.requires_grad is False for parameter in vae.parameters())
+
+
+def test_latent_codec_decode_preserves_latent_gradients_for_stage2_repr() -> None:
+    from torch import nn
+
+    from safa.training.latent_codec import LatentCodec, LatentCodecConfig
+
+    class FakeDecodeOutput:
+        def __init__(self, sample) -> None:
+            self.sample = sample
+
+    class FakeVAE(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(()))
+
+        def decode(self, latents):
+            sample = latents[:, :3].repeat_interleave(8, dim=2).repeat_interleave(8, dim=3)
+            return FakeDecodeOutput(sample * self.weight)
+
+    vae = FakeVAE()
+    codec = LatentCodec(vae, LatentCodecConfig(source="fake", scaling_factor=1.0))
+    latents = torch.zeros(1, 4, 2, 2, requires_grad=True)
+
+    decoded = codec.decode(latents)
+    loss = decoded.mean()
+    loss.backward()
+
+    assert latents.grad is not None
+    assert torch.isfinite(latents.grad).all()
+    assert float(latents.grad.abs().sum()) > 0.0
+    assert all(parameter.requires_grad is False for parameter in vae.parameters())

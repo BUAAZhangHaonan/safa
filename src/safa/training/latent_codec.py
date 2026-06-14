@@ -36,7 +36,6 @@ class LatentCodec:
         latents = latent_dist.sample()
         return latents * self.scaling_factor
 
-    @torch.no_grad()
     def decode(self, latents: torch.Tensor) -> torch.Tensor:
         self._validate_latents(latents)
         decoded = self.vae.decode(latents / self.scaling_factor)
