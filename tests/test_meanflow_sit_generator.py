@@ -299,3 +299,82 @@ def test_e11_meanflow_sit_config_is_k100_stage1_null_conditioned_and_larger_than
     generator = build_generator(generator_config)
     parameter_count = sum(parameter.numel() for parameter in generator.parameters())
     assert parameter_count > FIVE_M_FM_PARAMETER_COUNT
+
+
+def test_e12_e13_meanflow_sit_stage2_configs_target_gpu4_gpu5() -> None:
+    from safa.training import g_loop
+
+    expected = {
+        "e12_pu_sgd_meanflow_sit_stage2_gpu4_200ep.yaml": {
+            "experiment_name": "e12_pu_sgd_meanflow_sit_stage2_gpu4_200ep",
+            "device": "cuda:0",
+            "optimizer_type": "sgd",
+            "pu_optimizer_type": "sgd",
+            "out_dir": "artifacts/checkpoints/e12_pu_sgd_meanflow_sit_stage2_gpu4_200ep",
+            "quality_dir": "artifacts/eval/e12_pu_sgd_meanflow_sit_stage2_gpu4_200ep/quality",
+        },
+        "e13_pu_adamw_meanflow_sit_stage2_gpu5_200ep.yaml": {
+            "experiment_name": "e13_pu_adamw_meanflow_sit_stage2_gpu5_200ep",
+            "device": "cuda:0",
+            "optimizer_type": "adamw",
+            "pu_optimizer_type": "adamw",
+            "out_dir": "artifacts/checkpoints/e13_pu_adamw_meanflow_sit_stage2_gpu5_200ep",
+            "quality_dir": "artifacts/eval/e13_pu_adamw_meanflow_sit_stage2_gpu5_200ep/quality",
+        },
+    }
+
+    seen_out_dirs = set()
+    for filename, values in expected.items():
+        path = REPO_ROOT / "configs" / "medium_v2" / "experiments" / filename
+        assert path.is_file()
+        config = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+        assert config["experiment_name"] == values["experiment_name"]
+        assert config["device"] == values["device"]
+        assert config["optimizer_type"] == values["optimizer_type"]
+        assert config["global_batch_size"] == 8
+        assert config["per_device_batch_size"] == 8
+        assert config["num_workers"] == 8
+        assert config["latent_training"] is True
+        assert config["pixel_image_size"] == 256
+        assert config["image_size"] == 32
+        assert config["vae_path"] == "artifacts/checkpoints/external/sd-vae-ft-ema"
+        assert config["resume_from"] == "artifacts/checkpoints/e11_meanflow_sit_b_stage1_200ep/best.pt"
+        assert config["resume_mode"] == "model_weights_only"
+        assert config["resume_optimizer_state"] is False
+        assert config["out_dir"] == values["out_dir"]
+        assert config["out_dir"] not in seen_out_dirs
+        seen_out_dirs.add(config["out_dir"])
+
+        generator = config["generator"]
+        assert generator["model_type"] == "meanflow_sit"
+        assert generator["sample_steps"] == 1
+        assert generator["train_cycle_steps"] == 1
+        assert generator["sampler"] == "meanflow"
+        assert generator["sit_input_channels"] == 4
+        assert generator["sit_data_space"] == "latent"
+        assert generator["sit_patch_size"] == 4
+        assert generator["sit_hidden_size"] == 768
+        assert generator["sit_depth"] == 12
+        assert generator["sit_num_heads"] == 12
+        assert generator["sit_pretrained_path"] == (
+            "artifacts/checkpoints/external/meanflow_sit/zhuyu_sit_b_4_imagenet256.pt"
+        )
+
+        objective = config["stages"]["stage2"]["stage2_objective"]
+        assert objective["type"] == "point_projected_two_step"
+        assert objective["flow_condition"] == "embedding"
+        assert objective["optimizer_type"] == values["pu_optimizer_type"]
+        assert objective["repr_step_ratio_cap"] == 0.25
+
+        quality_eval = config["stages"]["stage2"]["quality_eval"]
+        assert quality_eval["distribution_cuda_visible_devices"] == "6"
+        assert quality_eval["distribution_device"] == "cuda:0"
+        assert quality_eval["output_dir"] == values["quality_dir"]
+        assert quality_eval["model"] == "ema"
+
+        validation = config["validation"]
+        assert validation["max_samples"] == 256
+        assert validation["batch_size"] == 8
+
+        g_loop._validate_train_g_config(config)
