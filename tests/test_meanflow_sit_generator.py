@@ -363,6 +363,7 @@ def test_e12_e13_meanflow_sit_stage2_configs_target_gpu4_gpu5() -> None:
         )
 
         objective = config["stages"]["stage2"]["stage2_objective"]
+        assert config["stages"]["stage2"]["gradient_monitor"]["enabled"] is False
         assert objective["type"] == "point_projected_two_step"
         assert objective["flow_condition"] == "embedding"
         assert objective["optimizer_type"] == values["pu_optimizer_type"]

@@ -71,7 +71,7 @@ stages:
   stage2:
     epochs: 200
     gradient_monitor:
-      enabled: true
+      enabled: false
       interval: 20
       max_samples: 4
     stage2_objective:
