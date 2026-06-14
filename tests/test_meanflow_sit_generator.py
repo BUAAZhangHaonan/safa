@@ -332,6 +332,7 @@ def test_e12_e13_meanflow_sit_stage2_configs_target_gpu4_gpu5() -> None:
         assert config["experiment_name"] == values["experiment_name"]
         assert config["device"] == values["device"]
         assert config["optimizer_type"] == values["optimizer_type"]
+        assert config["amp"] is True
         assert config["global_batch_size"] == 8
         assert config["per_device_batch_size"] == 8
         assert config["num_workers"] == 8
