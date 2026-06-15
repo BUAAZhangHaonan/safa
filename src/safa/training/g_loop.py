@@ -666,7 +666,9 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
         pu_gradient_normalization = _optional_bool(payload, "pu_gradient_normalization", context, default=False)
         pu_backtrack_max_retries = int(payload.get("pu_backtrack_max_retries", 0))
         pu_fm_increase_budget = float(payload.get("pu_fm_increase_budget", 0.0))
-        repr_step_ratio_cap = float(payload.get("repr_step_ratio_cap", 0.25))
+        repr_step_ratio_cap = _optional_numeric(payload, "repr_step_ratio_cap", context, default=0.25)
+        if repr_step_ratio_cap < 0.0:
+            raise ValueError(f"{context}.repr_step_ratio_cap must be non-negative, got {repr_step_ratio_cap!r}")
 
         return _Stage2ObjectiveRuntime(
             type=str(objective_type),
@@ -709,7 +711,9 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
     pu_gradient_normalization = _optional_bool(payload, "pu_gradient_normalization", context, default=False)
     pu_backtrack_max_retries = int(payload.get("pu_backtrack_max_retries", 0))
     pu_fm_increase_budget = float(payload.get("pu_fm_increase_budget", 0.0))
-    repr_step_ratio_cap = float(payload.get("repr_step_ratio_cap", 0.25))
+    repr_step_ratio_cap = _optional_numeric(payload, "repr_step_ratio_cap", context, default=0.25)
+    if repr_step_ratio_cap < 0.0:
+        raise ValueError(f"{context}.repr_step_ratio_cap must be non-negative, got {repr_step_ratio_cap!r}")
 
     return _Stage2ObjectiveRuntime(
         type=str(objective_type),
@@ -3132,6 +3136,7 @@ def _run_projected_stage2_batch(
     repr_loss.backward()
     repr_gradients = _synced_gradients_from_parameters("M3 representation", params)
     optimizer.zero_grad(set_to_none=True)
+    repr_step_metrics = dict(training_state.last_loss_metrics)
 
     weighted_repr_gradients = [stage2_objective.lambda_repr * grad for grad in repr_gradients]
 
@@ -3181,7 +3186,7 @@ def _run_projected_stage2_batch(
                 (w * g * lr).double().square().sum() for w, g in zip(weights, projected_gradients)
             )))
 
-        # Trust ratio clip: |repr_step| <= cap * |fm_step|
+        # Historical metric name: before_clip means before trust-ratio cap.
         repr_step_norm_before_clip = _compute_repr_step_norm(effective_lr)
         step_cap = stage2_objective.repr_step_ratio_cap * fm_param_step_norm
         if repr_step_norm_before_clip > step_cap:
@@ -3265,6 +3270,8 @@ def _run_projected_stage2_batch(
         def _compute_repr_step_norm(lr):
             return float(torch.sqrt(sum((g * lr).double().square().sum() for g in projected_gradients)))
 
+        # Historical metric name: before_clip means after optional explicit grad clip,
+        # but before the parameter-step trust-ratio cap.
         repr_step_norm_before_clip = _compute_repr_step_norm(effective_lr)
         step_cap = stage2_objective.repr_step_ratio_cap * fm_param_step_norm
         if repr_step_norm_before_clip > step_cap:
@@ -3305,7 +3312,7 @@ def _run_projected_stage2_batch(
     if ema is not None:
         ema.update(training_state.generator)
 
-    metrics = dict(training_state.last_loss_metrics)
+    metrics = dict(repr_step_metrics)
     metrics.update(_projection_result_metrics(projection))
     first_order_fm_increase = max(
         0.0,

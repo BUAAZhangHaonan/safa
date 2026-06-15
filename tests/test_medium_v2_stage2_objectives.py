@@ -1229,6 +1229,29 @@ def test_e1_pu_sgd_config_declares_repr_step_ratio_cap() -> None:
     assert objective["repr_step_ratio_cap"] == pytest.approx(0.25)
 
 
+@pytest.mark.parametrize("objective_type", ["point_projected_two_step", "gram_projected_two_step"])
+@pytest.mark.parametrize("bad_cap", [-0.1, float("nan")])
+def test_projected_objective_rejects_invalid_repr_step_ratio_cap(objective_type: str, bad_cap: float) -> None:
+    from safa.training import g_loop
+
+    payload = {
+        "type": objective_type,
+        "flow_condition": "embedding",
+        "lambda_repr": 1.0,
+        "point_weight": 1.0,
+        "repr_learning_rate": 0.00003,
+        "projection_eps": 1e-12,
+        "repr_step_ratio_cap": bad_cap,
+    }
+    if objective_type == "gram_projected_two_step":
+        payload.update({"relation_weight": 1.0, "offdiag_only": True})
+
+    with pytest.raises(ValueError, match="repr_step_ratio_cap"):
+        g_loop._stage2_objective_from_config(
+            {"stage1": {"epochs": 0}, "stage2": {"epochs": 1, "stage2_objective": payload}}
+        )
+
+
 @pytest.mark.parametrize("objective_type", ["point_projected_two_step", "point_descent_credit_projected"])
 def test_point_projected_objective_requires_point_only_contract(objective_type: str) -> None:
     from safa.training import g_loop
@@ -1605,6 +1628,160 @@ def test_sgd_projected_batch_caps_repr_parameter_step_and_logs_euclidean_metrics
     source = inspect.getsource(g_loop._run_projected_stage2_batch)
     assert "un_scale" not in source
     assert "grad_clip_norm or 1.0" not in source
+
+
+def test_sgd_projected_batch_does_not_apply_default_unit_gradient_clip() -> None:
+    from contextlib import nullcontext
+    from torch import nn
+
+    from safa.training import g_loop
+
+    class DummyGenerator(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(1.0))
+
+    class DummyTrainingModule(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.generator = DummyGenerator()
+            self.last_loss_metrics = {}
+
+        def forward(self, images, z, sample_ids, include_repr, lambda_cycle, flow_condition, noise_generator=None):
+            del images, z, sample_ids, lambda_cycle, flow_condition, noise_generator
+            if include_repr:
+                repr_loss = 5.0 * self.generator.weight
+                zero = repr_loss.new_tensor(0.0)
+                self.last_loss_metrics = {
+                    "repr_loss": float(repr_loss.detach().cpu()),
+                    "repr_point_loss": float(repr_loss.detach().cpu()),
+                    "repr_relation_loss": 0.0,
+                    "stage2_objective_type": "point_projected_two_step",
+                }
+                return repr_loss, zero, repr_loss.detach(), zero, repr_loss
+            flow_loss = 0.1 * self.generator.weight
+            return flow_loss, flow_loss.detach(), flow_loss.detach(), flow_loss, flow_loss.detach()
+
+    objective = g_loop._stage2_objective_from_config(
+        {
+            "stage1": {"epochs": 0},
+            "stage2": {
+                "epochs": 1,
+                "stage2_objective": {
+                    "type": "point_projected_two_step",
+                    "flow_condition": "embedding",
+                    "lambda_repr": 1.0,
+                    "point_weight": 1.0,
+                    "repr_learning_rate": 1.0,
+                    "projection_eps": 1e-12,
+                    "optimizer_type": "sgd",
+                    "repr_step_ratio_cap": 1000.0,
+                },
+            },
+        }
+    )
+    module = DummyTrainingModule()
+    optimizer = torch.optim.SGD(module.generator.parameters(), lr=0.1)
+
+    g_loop._run_projected_stage2_batch(
+        training_module=module,
+        optimizer=optimizer,
+        images=torch.zeros(1, 3, 4, 4),
+        z=torch.zeros(1, 2),
+        sample_ids=["sample"],
+        lambda_cycle=0.0,
+        amp_ctx=nullcontext(),
+        grad_clip_norm=None,
+        ema=None,
+        stage2_objective=objective,
+        flow_condition="embedding",
+    )
+
+    assert module.generator.weight.detach().item() == pytest.approx(-4.01, abs=1e-6)
+    assert module.last_loss_metrics["repr_param_step_norm_before_clip"] == pytest.approx(5.0, abs=1e-6)
+
+
+def test_projected_batch_backtracking_preserves_repr_metrics_snapshot() -> None:
+    from contextlib import nullcontext
+    from torch import nn
+
+    from safa.training import g_loop
+
+    class DummyGenerator(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(1.0))
+
+    class DummyTrainingModule(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.generator = DummyGenerator()
+            self.last_loss_metrics = {}
+
+        def forward(self, images, z, sample_ids, include_repr, lambda_cycle, flow_condition, noise_generator=None):
+            del images, z, sample_ids, lambda_cycle, flow_condition, noise_generator
+            if include_repr:
+                repr_loss = 2.0 * self.generator.weight
+                zero = repr_loss.new_tensor(0.0)
+                self.last_loss_metrics = {
+                    "repr_loss": float(repr_loss.detach().cpu()),
+                    "repr_point_loss": float(repr_loss.detach().cpu()),
+                    "repr_relation_loss": 0.0,
+                    "stage2_objective_type": "point_projected_two_step",
+                    "flow_condition": "embedding",
+                }
+                return repr_loss, zero, repr_loss.detach(), zero, repr_loss
+            flow_loss = 0.5 * self.generator.weight.square()
+            zero = flow_loss.new_tensor(0.0)
+            self.last_loss_metrics = {
+                "guard_metric": 1.0,
+                "repr_loss": -999.0,
+                "stage2_objective_type": "flow_guard",
+            }
+            return flow_loss, flow_loss.detach(), zero, flow_loss, zero
+
+    objective = g_loop._stage2_objective_from_config(
+        {
+            "stage1": {"epochs": 0},
+            "stage2": {
+                "epochs": 1,
+                "stage2_objective": {
+                    "type": "point_projected_two_step",
+                    "flow_condition": "embedding",
+                    "lambda_repr": 1.0,
+                    "point_weight": 1.0,
+                    "repr_learning_rate": 0.1,
+                    "projection_eps": 1e-12,
+                    "optimizer_type": "sgd",
+                    "pu_backtrack_max_retries": 1,
+                    "pu_fm_increase_budget": 999.0,
+                    "repr_step_ratio_cap": 100.0,
+                },
+            },
+        }
+    )
+    module = DummyTrainingModule()
+    optimizer = torch.optim.SGD(module.generator.parameters(), lr=0.1)
+
+    _, _, _, _, _, _, metrics = g_loop._run_projected_stage2_batch(
+        training_module=module,
+        optimizer=optimizer,
+        images=torch.zeros(1, 3, 4, 4),
+        z=torch.zeros(1, 2),
+        sample_ids=["sample"],
+        lambda_cycle=0.0,
+        amp_ctx=nullcontext(),
+        grad_clip_norm=None,
+        ema=None,
+        stage2_objective=objective,
+        flow_condition="embedding",
+    )
+
+    assert metrics["repr_loss"] == pytest.approx(1.8, abs=1e-6)
+    assert metrics["repr_point_loss"] == pytest.approx(1.8, abs=1e-6)
+    assert "guard_metric" not in metrics
+    assert metrics["stage2_objective_type"] == "point_projected_two_step"
+    assert metrics["pu_backtrack_count"] == 0.0
 
 
 def test_descent_credit_projected_batch_records_credit_budget_metrics() -> None:
