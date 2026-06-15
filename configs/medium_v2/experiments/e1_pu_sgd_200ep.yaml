@@ -58,6 +58,7 @@ stages:
       projection_eps: 0.000000000001
       optimizer_type: sgd
       pu_gradient_normalization: true
+      repr_step_ratio_cap: 0.25
       pu_backtrack_max_retries: 3
       pu_fm_increase_budget: 0.01
     quality_eval:

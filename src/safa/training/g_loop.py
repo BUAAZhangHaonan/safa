@@ -34,6 +34,7 @@ from safa.training.projected_update import (
     project_gradient_onto_fm_feasible_cone,
     project_gradient_onto_fm_feasible_cone_adam,
     project_gradient_to_dot_lower_bound,
+    project_gradient_to_dot_lower_bound_adam,
     update_two_task_famo_logits,
 )
 from safa.training.representation_losses import hyperspherical_gram_loss, hyperspherical_point_cosine_loss
@@ -708,6 +709,7 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
     pu_gradient_normalization = _optional_bool(payload, "pu_gradient_normalization", context, default=False)
     pu_backtrack_max_retries = int(payload.get("pu_backtrack_max_retries", 0))
     pu_fm_increase_budget = float(payload.get("pu_fm_increase_budget", 0.0))
+    repr_step_ratio_cap = float(payload.get("repr_step_ratio_cap", 0.25))
 
     return _Stage2ObjectiveRuntime(
         type=str(objective_type),
@@ -722,6 +724,7 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
         pu_gradient_normalization=pu_gradient_normalization,
         pu_backtrack_max_retries=pu_backtrack_max_retries,
         pu_fm_increase_budget=pu_fm_increase_budget,
+        repr_step_ratio_cap=repr_step_ratio_cap,
     )
 
 
@@ -3135,15 +3138,12 @@ def _run_projected_stage2_batch(
     # --- Step 4: Projection and parameter update ---
     fm_descent_credit = 0.0
     credit_dot_lower_bound = 0.0
-    if stage2_objective.optimizer_type == "adamw" and stage2_objective.type != _POINT_DESCENT_CREDIT_PROJECTED:
+    if stage2_objective.optimizer_type == "adamw":
         # === AdamW path: Q-weighted projection + trust ratio control ===
         weights = _extract_adam_preconditioner_weights(optimizer, params)
 
-        # Q-weighted norms for diagnostics
         repr_norm_q_before = torch.sqrt(sum((w * g * g).sum() for w, g in zip(weights, weighted_repr_gradients)))
         repr_grad_qnorm_before_proj = float(repr_norm_q_before)
-
-        # Normalize repr grad to FM scale before projection
         fm_norm_q = torch.sqrt(sum((w * g * g).sum() for w, g in zip(weights, fm_gradients)))
         norm_ratio = float(repr_norm_q_before / fm_norm_q) if float(fm_norm_q) > 1e-12 else 1.0
 
@@ -3153,10 +3153,20 @@ def _run_projected_stage2_batch(
         else:
             g_repr_for_proj = weighted_repr_gradients
 
-        # Q-weighted projection — projected gradients stay in normalized (FM-scale) space
-        projection = project_gradient_onto_fm_feasible_cone_adam(
-            g_repr_for_proj, fm_gradients, weights, eps=stage2_objective.projection_eps,
-        )
+        if stage2_objective.type == _POINT_DESCENT_CREDIT_PROJECTED:
+            fm_descent_credit = max(0.0, pre_flow_loss_value - flow_loss_guard_value)
+            credit_dot_lower_bound = -fm_descent_credit / float(stage2_objective.repr_learning_rate)
+            projection = project_gradient_to_dot_lower_bound_adam(
+                g_repr_for_proj,
+                fm_gradients,
+                weights,
+                lower_bound=credit_dot_lower_bound,
+                eps=stage2_objective.projection_eps,
+            )
+        else:
+            projection = project_gradient_onto_fm_feasible_cone_adam(
+                g_repr_for_proj, fm_gradients, weights, eps=stage2_objective.projection_eps,
+            )
         projected_gradients = projection.projected_gradients
 
         repr_grad_qnorm_after_proj = float(torch.sqrt(sum((w * g * g).sum() for w, g in zip(weights, projected_gradients))))
@@ -3174,10 +3184,8 @@ def _run_projected_stage2_batch(
         # Trust ratio clip: |repr_step| <= cap * |fm_step|
         repr_step_norm_before_clip = _compute_repr_step_norm(effective_lr)
         step_cap = stage2_objective.repr_step_ratio_cap * fm_param_step_norm
-        if step_cap > 1e-15 and repr_step_norm_before_clip > step_cap:
-            trust_scale = step_cap / repr_step_norm_before_clip
-            effective_lr *= trust_scale
-        repr_step_norm_after_clip = _compute_repr_step_norm(effective_lr)
+        if repr_step_norm_before_clip > step_cap:
+            effective_lr = 0.0 if step_cap <= 1e-15 else effective_lr * (step_cap / repr_step_norm_before_clip)
 
         for _retry in range(stage2_objective.pu_backtrack_max_retries + 1):
             # Apply preconditioned repr step directly — never touch Adam state
@@ -3210,6 +3218,8 @@ def _run_projected_stage2_batch(
                 break
         else:
             _restore_parameters(params, saved_params)
+            effective_lr = 0.0
+        repr_step_norm_after_clip = _compute_repr_step_norm(effective_lr)
 
     else:
         # === SGD Euclidean path ===
@@ -3218,6 +3228,7 @@ def _run_projected_stage2_batch(
         fm_norm = math.sqrt(fm_norm_sq)
         repr_norm = math.sqrt(repr_norm_sq)
         norm_ratio = repr_norm / fm_norm if fm_norm > 1e-12 else 1.0
+        repr_grad_euclidean_norm_before_proj = float(repr_norm)
 
         if stage2_objective.pu_gradient_normalization and fm_norm > 1e-12 and repr_norm > 1e-12:
             scale = fm_norm / repr_norm
@@ -3241,22 +3252,27 @@ def _run_projected_stage2_batch(
                 eps=stage2_objective.projection_eps,
             )
 
-        # Un-normalize projected gradients
-        if stage2_objective.pu_gradient_normalization and fm_norm > 1e-12 and repr_norm > 1e-12:
-            un_scale = repr_norm / fm_norm
-            projected_gradients = [g * un_scale for g in projection.projected_gradients]
-        else:
-            projected_gradients = projection.projected_gradients
+        projected_gradients = projection.projected_gradients
+        repr_grad_euclidean_norm_after_proj = float(torch.sqrt(sum(g.double().square().sum() for g in projected_gradients)))
 
         # Backtracking line search with vanilla SGD step
         effective_lr = stage2_objective.repr_learning_rate
         backtrack_count = 0
         saved_params = _save_parameters(params)
-        # Safety clip projected gradients before stepping
-        projected_gradients = _clip_projected_gradients(projected_gradients, max_norm=float(grad_clip_norm or 1.0))
+        if grad_clip_norm is not None:
+            projected_gradients = _clip_projected_gradients(projected_gradients, max_norm=float(grad_clip_norm))
+
+        def _compute_repr_step_norm(lr):
+            return float(torch.sqrt(sum((g * lr).double().square().sum() for g in projected_gradients)))
+
+        repr_step_norm_before_clip = _compute_repr_step_norm(effective_lr)
+        step_cap = stage2_objective.repr_step_ratio_cap * fm_param_step_norm
+        if repr_step_norm_before_clip > step_cap:
+            effective_lr = 0.0 if step_cap <= 1e-15 else effective_lr * (step_cap / repr_step_norm_before_clip)
 
         for _retry in range(stage2_objective.pu_backtrack_max_retries + 1):
-            _apply_projected_repr_step(params, projected_gradients, repr_learning_rate=effective_lr)
+            if effective_lr > 0.0:
+                _apply_projected_repr_step(params, projected_gradients, repr_learning_rate=effective_lr)
 
             if stage2_objective.pu_backtrack_max_retries > 0:
                 with torch.no_grad():
@@ -3283,6 +3299,8 @@ def _run_projected_stage2_batch(
                 break
         else:
             _restore_parameters(params, saved_params)
+            effective_lr = 0.0
+        repr_step_norm_after_clip = _compute_repr_step_norm(effective_lr)
 
     if ema is not None:
         ema.update(training_state.generator)
@@ -3307,13 +3325,17 @@ def _run_projected_stage2_batch(
     metrics["pu_backtrack_count"] = float(backtrack_count)
     metrics["pu_effective_repr_lr"] = float(effective_lr)
     metrics["fm_param_step_norm"] = float(fm_param_step_norm)
-    # AdamW-specific diagnostics
-    if stage2_objective.optimizer_type == "adamw" and stage2_objective.type != _POINT_DESCENT_CREDIT_PROJECTED:
+    metrics["repr_param_step_norm_before_clip"] = float(repr_step_norm_before_clip)
+    metrics["repr_param_step_norm_after_clip"] = float(repr_step_norm_after_clip)
+    metrics["repr_to_fm_param_step_ratio"] = float(repr_step_norm_after_clip / fm_param_step_norm) if fm_param_step_norm > 1e-15 else 0.0
+    if stage2_objective.optimizer_type == "adamw":
+        metrics["pu_norm_ratio_qweighted"] = float(norm_ratio)
         metrics["repr_grad_qnorm_before_proj"] = float(repr_grad_qnorm_before_proj)
         metrics["repr_grad_qnorm_after_proj"] = float(repr_grad_qnorm_after_proj)
-        metrics["repr_param_step_norm_before_clip"] = float(repr_step_norm_before_clip)
-        metrics["repr_param_step_norm_after_clip"] = float(repr_step_norm_after_clip)
-        metrics["repr_to_fm_param_step_ratio"] = float(repr_step_norm_after_clip / fm_param_step_norm) if fm_param_step_norm > 1e-15 else 0.0
+    else:
+        metrics["pu_norm_ratio_euclidean"] = float(norm_ratio)
+        metrics["repr_grad_euclidean_norm_before_proj"] = float(repr_grad_euclidean_norm_before_proj)
+        metrics["repr_grad_euclidean_norm_after_proj"] = float(repr_grad_euclidean_norm_after_proj)
     training_state.last_loss_metrics = metrics
     logged_loss = flow_loss_guard.detach() + stage2_objective.lambda_repr * repr_loss_raw.detach()
     return logged_loss, flow_mse_guard.detach(), repr_detached.detach(), flow_loss_guard.detach(), repr_loss_raw.detach(), batch_grad_norm, metrics

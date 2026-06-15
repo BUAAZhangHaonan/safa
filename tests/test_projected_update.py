@@ -26,6 +26,7 @@ from safa.training.projected_update import (
     project_gradient_onto_fm_feasible_cone,
     project_gradient_onto_fm_feasible_cone_adam,
     project_gradient_to_dot_lower_bound,
+    project_gradient_to_dot_lower_bound_adam,
     update_dual_budget_controller,
     update_two_task_famo_logits,
 )
@@ -462,6 +463,31 @@ def test_adam_q_weighted_projection_skips_tiny_fm_gradient() -> None:
 
     assert result.projection_applied is False
     assert torch.allclose(result.projected_gradients[0], g_repr[0])
+
+
+def test_adam_q_weighted_lower_bound_projection_enforces_credit_floor() -> None:
+    g_repr = [torch.tensor([1.0, 0.0], dtype=torch.float64)]
+    g_fm = [torch.tensor([-1.0, 1.0], dtype=torch.float64)]
+    weights = [torch.tensor([4.0, 1.0], dtype=torch.float64)]
+
+    result = project_gradient_to_dot_lower_bound_adam(g_repr, g_fm, weights, lower_bound=-0.25, eps=1e-12)
+
+    assert isinstance(result, ProjectionResult)
+    assert result.projection_applied is True
+    assert result.dot_before.item() == pytest.approx(-4.0)
+    assert result.dot_after.item() == pytest.approx(-0.25)
+    assert result.fm_first_order_effect.item() == pytest.approx(0.25)
+
+
+def test_adam_q_weighted_lower_bound_projection_differs_from_euclidean() -> None:
+    g_repr = [torch.tensor([1.0, 0.0], dtype=torch.float64)]
+    g_fm = [torch.tensor([-1.0, 1.0], dtype=torch.float64)]
+    weights = [torch.tensor([4.0, 1.0], dtype=torch.float64)]
+
+    adam_result = project_gradient_to_dot_lower_bound_adam(g_repr, g_fm, weights, lower_bound=-0.25, eps=1e-12)
+    eucl_result = project_gradient_to_dot_lower_bound(g_repr, g_fm, lower_bound=-0.25, eps=1e-12)
+
+    assert not torch.allclose(adam_result.projected_gradients[0], eucl_result.projected_gradients[0], atol=1e-8)
 
 
 # --- FM-primary constrained FAMO tests ---
