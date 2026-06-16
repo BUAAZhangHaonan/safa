@@ -18,6 +18,18 @@ SIT_DATA_SPACES = (SIT_DATA_SPACE_PIXEL, SIT_DATA_SPACE_LATENT)
 DDIM_BETA_SCHEDULE_LINEAR = "linear"
 DDIM_BETA_SCHEDULE_COSINE = "cosine"
 DDIM_BETA_SCHEDULES = (DDIM_BETA_SCHEDULE_LINEAR, DDIM_BETA_SCHEDULE_COSINE)
+SIT_ATTENTION_BACKEND_AUTO = "auto"
+SIT_ATTENTION_BACKEND_NATIVE = "native"
+SIT_ATTENTION_BACKEND_SDPA = "sdpa"
+SIT_ATTENTION_BACKEND_FA2 = "fa2"
+SIT_ATTENTION_BACKEND_FA4 = "fa4"
+SIT_ATTENTION_BACKENDS = (
+    SIT_ATTENTION_BACKEND_AUTO,
+    SIT_ATTENTION_BACKEND_NATIVE,
+    SIT_ATTENTION_BACKEND_SDPA,
+    SIT_ATTENTION_BACKEND_FA2,
+    SIT_ATTENTION_BACKEND_FA4,
+)
 
 GENERATOR_CHECKPOINT_MODEL_CONFIG_FIELDS = (
     "model_type",
@@ -79,6 +91,7 @@ class FlowGeneratorConfig:
     sit_pretrained_path: str = ""
     sit_pretrained_state_key: str = ""
     sit_data_space: str = SIT_DATA_SPACE_PIXEL
+    attention_backend: str = SIT_ATTENTION_BACKEND_AUTO
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "FlowGeneratorConfig":
@@ -119,6 +132,7 @@ class FlowGeneratorConfig:
             sit_pretrained_path=str(payload.get("sit_pretrained_path", "")),
             sit_pretrained_state_key=str(payload.get("sit_pretrained_state_key", "")),
             sit_data_space=str(payload.get("sit_data_space", SIT_DATA_SPACE_PIXEL)),
+            attention_backend=str(payload.get("attention_backend", SIT_ATTENTION_BACKEND_AUTO)),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -163,6 +177,7 @@ class FlowGeneratorConfig:
                 }
             )
             payload["sit_data_space"] = self.sit_data_space
+            payload["attention_backend"] = self.attention_backend
             if self.sit_pretrained_path:
                 payload["sit_pretrained_path"] = self.sit_pretrained_path
             if self.sit_pretrained_state_key:
@@ -1058,6 +1073,8 @@ def _validate_config(config: FlowGeneratorConfig) -> None:
             raise ValueError(f"sit_time_embedding_dim must be positive, got {config.sit_time_embedding_dim}")
         if config.sit_data_space not in SIT_DATA_SPACES:
             raise ValueError(f"sit_data_space must be one of {SIT_DATA_SPACES}, got {config.sit_data_space!r}")
+        if config.attention_backend not in SIT_ATTENTION_BACKENDS:
+            raise ValueError(f"attention_backend must be one of {SIT_ATTENTION_BACKENDS}, got {config.attention_backend!r}")
     if config.model_type == GENERATOR_MODEL_TYPE_DDIM:
         if config.sampler != "ddim":
             raise ValueError(f"ddim sampler must be 'ddim', got {config.sampler!r}")

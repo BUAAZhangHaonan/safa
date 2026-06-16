@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from functools import lru_cache
+import importlib
 import math
 import warnings
 from pathlib import Path
@@ -10,6 +12,130 @@ from torch import nn
 import torch.nn.functional as F
 
 from safa.models.conditioning import LearnedNullCondition
+
+
+ATTENTION_BACKEND_AUTO = "auto"
+ATTENTION_BACKEND_NATIVE = "native"
+ATTENTION_BACKEND_SDPA = "sdpa"
+ATTENTION_BACKEND_FA2 = "fa2"
+ATTENTION_BACKEND_FA4 = "fa4"
+ATTENTION_BACKENDS = (
+    ATTENTION_BACKEND_AUTO,
+    ATTENTION_BACKEND_NATIVE,
+    ATTENTION_BACKEND_SDPA,
+    ATTENTION_BACKEND_FA2,
+    ATTENTION_BACKEND_FA4,
+)
+ATTENTION_BACKEND_PRIORITY = (ATTENTION_BACKEND_FA4, ATTENTION_BACKEND_FA2, ATTENTION_BACKEND_SDPA, ATTENTION_BACKEND_NATIVE)
+
+
+def resolve_meanflow_sit_attention_backend(requested_backend: str = ATTENTION_BACKEND_AUTO) -> str:
+    requested = _normalize_attention_backend(requested_backend)
+    if requested == ATTENTION_BACKEND_AUTO:
+        for backend in ATTENTION_BACKEND_PRIORITY:
+            if _is_attention_backend_available(backend):
+                return backend
+        return ATTENTION_BACKEND_NATIVE
+    if not _is_attention_backend_available(requested):
+        raise RuntimeError(f"MeanFlow-SiT attention backend {requested!r} is not available: {_attention_backend_unavailable_reason(requested)}")
+    return requested
+
+
+def describe_meanflow_sit_attention_backends() -> dict[str, dict[str, str | bool]]:
+    return {
+        backend: {
+            "available": _is_attention_backend_available(backend),
+            "reason": _attention_backend_unavailable_reason(backend),
+        }
+        for backend in ATTENTION_BACKEND_PRIORITY
+    }
+
+
+def clear_meanflow_sit_attention_backend_cache() -> None:
+    _attention_backend_probe.cache_clear()
+
+
+def _normalize_attention_backend(value: str) -> str:
+    backend = str(value).lower()
+    if backend not in ATTENTION_BACKENDS:
+        raise ValueError(f"attention_backend must be one of {ATTENTION_BACKENDS}, got {value!r}")
+    return backend
+
+
+def _is_attention_backend_available(backend: str) -> bool:
+    return _attention_backend_probe(_normalize_attention_backend(backend))[0]
+
+
+def _attention_backend_unavailable_reason(backend: str) -> str:
+    return _attention_backend_probe(_normalize_attention_backend(backend))[1]
+
+
+@lru_cache(maxsize=None)
+def _attention_backend_probe(backend: str) -> tuple[bool, str]:
+    if backend == ATTENTION_BACKEND_NATIVE:
+        return True, "available"
+    if backend == ATTENTION_BACKEND_SDPA:
+        if hasattr(F, "scaled_dot_product_attention"):
+            return True, "available"
+        return False, "torch.nn.functional.scaled_dot_product_attention is missing"
+    if backend == ATTENTION_BACKEND_FA2:
+        fn, reason = _load_fa2_attention_func()
+        if fn is None:
+            return False, reason
+        return _probe_flash_attention_func(fn, backend)
+    if backend == ATTENTION_BACKEND_FA4:
+        fn, reason = _load_fa4_attention_func()
+        if fn is None:
+            return False, reason
+        return _probe_flash_attention_func(fn, backend)
+    return False, f"unsupported backend {backend!r}"
+
+
+def _load_fa2_attention_func():
+    candidates = (
+        ("flash_attn", "flash_attn_func"),
+        ("flash_attn.flash_attn_interface", "flash_attn_func"),
+    )
+    errors: list[str] = []
+    for module_name, attr_name in candidates:
+        try:
+            module = importlib.import_module(module_name)
+            func = getattr(module, attr_name)
+        except Exception as exc:
+            errors.append(f"{module_name}.{attr_name}: {type(exc).__name__}: {exc}")
+            continue
+        return func, "available"
+    return None, "; ".join(errors) if errors else "standard flash_attn API is missing"
+
+
+def _load_fa4_attention_func():
+    try:
+        module = importlib.import_module("flash_attn.cute")
+        return getattr(module, "flash_attn_func"), "available"
+    except Exception as exc:
+        return None, f"flash_attn.cute.flash_attn_func: {type(exc).__name__}: {exc}"
+
+
+def _probe_flash_attention_func(func, backend: str) -> tuple[bool, str]:
+    if not torch.cuda.is_available():
+        return False, "CUDA is not available"
+    try:
+        device = torch.device("cuda")
+        q = torch.randn(1, 16, 2, 32, device=device, dtype=torch.float16, requires_grad=True)
+        k = torch.randn(1, 16, 2, 32, device=device, dtype=torch.float16, requires_grad=True)
+        v = torch.randn(1, 16, 2, 32, device=device, dtype=torch.float16, requires_grad=True)
+        result = func(q, k, v, softmax_scale=32**-0.5, causal=False)
+        out = _first_tensor(result)
+        if not isinstance(out, torch.Tensor):
+            return False, f"{backend} returned {type(out).__name__}, expected Tensor"
+        out.float().sum().backward()
+    except Exception as exc:
+        return False, f"{backend} forward/backward probe failed: {type(exc).__name__}: {exc}"
+    return True, "available"
+
+
+def _first_tensor(result):
+    return result[0] if isinstance(result, tuple) else result
 
 
 def build_meanflow_sit_generator(config):
@@ -36,6 +162,8 @@ def build_meanflow_sit_generator(config):
             self.num_heads = config.sit_num_heads
             self.head_dim = hidden_size // self.num_heads
             self.scale = self.head_dim**-0.5
+            self.requested_attention_backend = _normalize_attention_backend(config.attention_backend)
+            self.resolved_attention_backend = resolve_meanflow_sit_attention_backend(self.requested_attention_backend)
             self.qkv = nn.Linear(hidden_size, hidden_size * 3)
             self.proj = nn.Linear(hidden_size, hidden_size)
 
@@ -44,11 +172,44 @@ def build_meanflow_sit_generator(config):
             qkv = self.qkv(x).reshape(batch_size, num_tokens, 3, self.num_heads, self.head_dim)
             qkv = qkv.permute(2, 0, 3, 1, 4)
             q, k, v = qkv.unbind(0)
-            attention = (q @ k.transpose(-2, -1)) * self.scale
-            attention = attention.softmax(dim=-1)
-            x = attention @ v
+            x = self._attention(q, k, v)
             x = x.transpose(1, 2).reshape(batch_size, num_tokens, hidden_size)
             return self.proj(x)
+
+        def _attention(self, q, k, v):
+            backend = self.resolved_attention_backend
+            if backend != ATTENTION_BACKEND_NATIVE and _is_forward_ad_enabled():
+                return self._native_attention(q, k, v)
+            if backend == ATTENTION_BACKEND_NATIVE:
+                return self._native_attention(q, k, v)
+            if backend == ATTENTION_BACKEND_SDPA:
+                return F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False, scale=self.scale)
+            if backend == ATTENTION_BACKEND_FA2:
+                func, _ = _load_fa2_attention_func()
+                if func is None:
+                    raise RuntimeError("FA2 attention backend was resolved but the standard flash_attn API is missing")
+                return self._flash_attention(func, q, k, v)
+            if backend == ATTENTION_BACKEND_FA4:
+                func, _ = _load_fa4_attention_func()
+                if func is None:
+                    raise RuntimeError("FA4 attention backend was resolved but flash_attn.cute.flash_attn_func is missing")
+                return self._flash_attention(func, q, k, v)
+            raise RuntimeError(f"Unsupported MeanFlow-SiT attention backend {backend!r}")
+
+        def _native_attention(self, q, k, v):
+            attention = (q @ k.transpose(-2, -1)) * self.scale
+            attention = attention.softmax(dim=-1)
+            return attention @ v
+
+        def _flash_attention(self, func, q, k, v):
+            q = q.transpose(1, 2).contiguous()
+            k = k.transpose(1, 2).contiguous()
+            v = v.transpose(1, 2).contiguous()
+            result = func(q, k, v, softmax_scale=self.scale, causal=False)
+            out = _first_tensor(result)
+            if not isinstance(out, torch.Tensor):
+                raise RuntimeError(f"Flash attention backend returned {type(out).__name__}, expected Tensor")
+            return out.transpose(1, 2)
 
     class SiTBlock(nn.Module):
         def __init__(self):
@@ -108,6 +269,8 @@ def build_meanflow_sit_generator(config):
                 nn.Linear(hidden_size, hidden_size),
             )
             self.blocks = nn.ModuleList([SiTBlock() for _ in range(config.sit_depth)])
+            self.requested_attention_backend = config.attention_backend
+            self.resolved_attention_backend = self.blocks[0].attn.resolved_attention_backend
             self.final_layer = FinalLayer()
             self._initialize_weights()
 
@@ -166,7 +329,12 @@ def build_meanflow_sit_generator(config):
             self.image_size = config.image_size
             self.vector_field = MeanFlowSiTBackbone()
             self.null_condition = LearnedNullCondition(config.embedding_dim) if config.learned_null_condition else None
+            self.requested_attention_backend = self.vector_field.requested_attention_backend
             self.pretrained_load_report: dict[str, Any] | None = None
+
+        @property
+        def attention_backend(self) -> str:
+            return self.vector_field.resolved_attention_backend
 
         def forward(self, z):
             return self.sample(z, steps=1)
@@ -224,6 +392,8 @@ def build_meanflow_sit_generator(config):
                 "meanflow_r_mean": r.detach().mean(),
                 "meanflow_h_mean": (t - r).detach().mean(),
                 "meanflow_jvp_mode": config.meanflow_jvp_mode,
+                "meanflow_attention_backend": self.attention_backend,
+                "meanflow_attention_backend_requested": self.requested_attention_backend,
                 "meanflow_adaptive_weighting": x_data.new_tensor(float(config.meanflow_adaptive_weighting)),
                 "target_velocity_abs_mean": target_velocity.detach().abs().mean(),
                 "predicted_velocity_abs_mean": predicted_velocity.detach().abs().mean(),
@@ -353,6 +523,10 @@ def build_meanflow_sit_generator(config):
 
 def _jvp_safe_tensor(tensor):
     return tensor if tensor.is_contiguous() else tensor.contiguous()
+
+
+def _is_forward_ad_enabled() -> bool:
+    return int(torch.autograd.forward_ad._current_level) >= 0
 
 
 def _modulate(x, shift, scale):

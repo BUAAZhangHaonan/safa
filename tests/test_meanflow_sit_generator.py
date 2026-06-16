@@ -412,6 +412,7 @@ def test_e14_meanflow_sit_mixed_face_continuation_config() -> None:
     assert generator["sit_hidden_size"] == 768
     assert generator["sit_depth"] == 12
     assert generator["sit_num_heads"] == 12
+    assert generator["attention_backend"] == "auto"
 
     stage2 = config["stages"]["stage2"]
     assert stage2["epochs"] == 200
