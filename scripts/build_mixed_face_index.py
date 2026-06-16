@@ -22,8 +22,8 @@ DEFAULT_CELEBAHQ_ROOT = Path("/home/k100/Datasets/Face/CelebAMask-HQ/CelebAMask-
 DEFAULT_FFHQ_ROOT = Path("/home/k100/Datasets/Face/FFHQ-1024")
 DEFAULT_AFFECTNET_TRAIN_INDEX = Path("data/index/train_balanced_medium.jsonl")
 DEFAULT_AFFECTNET_VAL_INDEX = Path("data/index/val_single_face.jsonl")
-DEFAULT_TRAIN_OUT = Path("data/index/e14_face_mixed_train.jsonl")
-DEFAULT_VAL_OUT = Path("data/index/e14_face_mixed_val.jsonl")
+DEFAULT_TRAIN_OUT = Path("data/index/train_face_mixed_e14.jsonl")
+DEFAULT_VAL_OUT = Path("data/index/val_face_mixed_e14.jsonl")
 DEFAULT_EXPECTED_CELEBAHQ_COUNT = 30000
 DEFAULT_EXPECTED_FFHQ_COUNT = 70000
 

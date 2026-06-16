@@ -380,3 +380,53 @@ def test_e12_e13_meanflow_sit_stage2_configs_target_gpu4_gpu5() -> None:
         assert validation["batch_size"] == 8
 
         g_loop._validate_train_g_config(config)
+
+
+def test_e14_meanflow_sit_mixed_face_continuation_config() -> None:
+    from safa.training import g_loop
+
+    path = REPO_ROOT / "configs" / "medium_v2" / "experiments" / "e14_meanflow_sit_b_face_mixed_continue_200ep.yaml"
+    assert path.is_file()
+    config = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+    assert config["experiment_name"] == "e14_meanflow_sit_b_face_mixed_continue_200ep"
+    assert config["device"] == "cuda:0"
+    assert config["global_batch_size"] == 128
+    assert config["per_device_batch_size"] == 128
+    assert config["train_index"] == "data/index/train_face_mixed_e14.jsonl"
+    assert config["train_features"] == "artifacts/e0_features/train_face_mixed_e14_e0_medium_v1"
+    assert config["resume_from"] == "artifacts/checkpoints/e11_meanflow_sit_b_stage1_200ep/best_stage2.pt"
+    assert config["resume_mode"] == "model_weights_only"
+    assert config["resume_optimizer_state"] is False
+    assert config["out_dir"] == "artifacts/checkpoints/e14_meanflow_sit_b_face_mixed_continue_200ep"
+
+    generator = config["generator"]
+    assert generator["model_type"] == "meanflow_sit"
+    assert generator["sample_steps"] == 1
+    assert generator["train_cycle_steps"] == 1
+    assert generator["sampler"] == "meanflow"
+    assert generator["learned_null_condition"] is True
+    assert generator["sit_input_channels"] == 4
+    assert generator["sit_data_space"] == "latent"
+    assert generator["sit_patch_size"] == 4
+    assert generator["sit_hidden_size"] == 768
+    assert generator["sit_depth"] == 12
+    assert generator["sit_num_heads"] == 12
+
+    stage2 = config["stages"]["stage2"]
+    assert stage2["epochs"] == 200
+    assert stage2["gradient_monitor"]["enabled"] is False
+    objective = stage2["stage2_objective"]
+    assert objective["type"] == "fm_only_probe"
+    assert objective["flow_condition"] == "learned_null_condition"
+
+    quality_eval = stage2["quality_eval"]
+    assert quality_eval["real_index"] == "data/index/val_face_mixed_e14.jsonl"
+    assert quality_eval["output_dir"] == "artifacts/eval/e14_meanflow_sit_b_face_mixed_continue_200ep/quality"
+    assert quality_eval["model"] == "ema"
+
+    validation = config["validation"]
+    assert validation["index"] == "data/index/val_face_mixed_e14.jsonl"
+    assert validation["features"] == "artifacts/e0_features/val_face_mixed_e14_e0_medium_v1"
+
+    g_loop._validate_train_g_config(config)

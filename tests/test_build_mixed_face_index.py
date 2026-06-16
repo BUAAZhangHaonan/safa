@@ -28,6 +28,19 @@ def _read_jsonl(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
 
 
+def test_default_output_paths_match_e14_mixed_face_names() -> None:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("build_mixed_face_index", SCRIPT)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    assert module.DEFAULT_TRAIN_OUT == Path("data/index/train_face_mixed_e14.jsonl")
+    assert module.DEFAULT_VAL_OUT == Path("data/index/val_face_mixed_e14.jsonl")
+
+
 def _record(root: Path, rel_path: str, *, sample_id: str, label: int, split: str) -> dict:
     image_path = root / rel_path
     _make_image(image_path)
