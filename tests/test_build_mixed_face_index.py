@@ -49,24 +49,31 @@ def _run_builder(
     ffhq_root: Path,
     train_out: Path,
     val_out: Path,
+    expected_celebahq_count: int | None = None,
+    expected_ffhq_count: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    command = [
+        sys.executable,
+        str(SCRIPT),
+        "--affectnet-train-index",
+        str(affectnet_train),
+        "--affectnet-val-index",
+        str(affectnet_val),
+        "--celebahq-root",
+        str(celebahq_root),
+        "--ffhq-root",
+        str(ffhq_root),
+        "--train-out",
+        str(train_out),
+        "--val-out",
+        str(val_out),
+    ]
+    if expected_celebahq_count is not None:
+        command.extend(["--expected-celebahq-count", str(expected_celebahq_count)])
+    if expected_ffhq_count is not None:
+        command.extend(["--expected-ffhq-count", str(expected_ffhq_count)])
     return subprocess.run(
-        [
-            sys.executable,
-            str(SCRIPT),
-            "--affectnet-train-index",
-            str(affectnet_train),
-            "--affectnet-val-index",
-            str(affectnet_val),
-            "--celebahq-root",
-            str(celebahq_root),
-            "--ffhq-root",
-            str(ffhq_root),
-            "--train-out",
-            str(train_out),
-            "--val-out",
-            str(val_out),
-        ],
+        command,
         cwd=REPO_ROOT,
         text=True,
         capture_output=True,
@@ -104,6 +111,8 @@ def test_cli_builds_mixed_train_val_indexes_and_manifest(tmp_path: Path) -> None
         ffhq_root=ffhq_root,
         train_out=train_out,
         val_out=val_out,
+        expected_celebahq_count=2,
+        expected_ffhq_count=3,
     )
 
     assert result.returncode == 0, result.stderr
@@ -181,7 +190,125 @@ def test_cli_fails_on_duplicate_sample_id_across_sources(tmp_path: Path) -> None
         ffhq_root=ffhq_root,
         train_out=tmp_path / "mixed_train.jsonl",
         val_out=tmp_path / "mixed_val.jsonl",
+        expected_celebahq_count=1,
+        expected_ffhq_count=1,
     )
 
     assert result.returncode != 0
     assert "duplicate sample_id" in result.stderr
+
+
+def test_cli_fails_when_celebahq_count_does_not_match_expected(tmp_path: Path) -> None:
+    affectnet_root = tmp_path / "affectnet"
+    affectnet_train = tmp_path / "train.jsonl"
+    affectnet_val = tmp_path / "val.jsonl"
+    _write_jsonl(
+        affectnet_train,
+        [_record(affectnet_root, "train/a.jpg", sample_id="train:a.jpg", label=0, split="train")],
+    )
+    _write_jsonl(
+        affectnet_val,
+        [_record(affectnet_root, "val/b.jpg", sample_id="val:b.jpg", label=0, split="val")],
+    )
+    celebahq_root = tmp_path / "celebahq"
+    ffhq_root = tmp_path / "ffhq"
+    _make_image(celebahq_root / "00000.jpg")
+    _make_image(ffhq_root / "FFHQ-1024-1" / "00000.png")
+
+    result = _run_builder(
+        affectnet_train=affectnet_train,
+        affectnet_val=affectnet_val,
+        celebahq_root=celebahq_root,
+        ffhq_root=ffhq_root,
+        train_out=tmp_path / "mixed_train.jsonl",
+        val_out=tmp_path / "mixed_val.jsonl",
+        expected_celebahq_count=2,
+        expected_ffhq_count=1,
+    )
+
+    assert result.returncode != 0
+    assert "CelebA-HQ expected 2 images but found 1" in result.stderr
+
+
+def test_cli_fails_when_ffhq_count_does_not_match_expected(tmp_path: Path) -> None:
+    affectnet_root = tmp_path / "affectnet"
+    affectnet_train = tmp_path / "train.jsonl"
+    affectnet_val = tmp_path / "val.jsonl"
+    _write_jsonl(
+        affectnet_train,
+        [_record(affectnet_root, "train/a.jpg", sample_id="train:a.jpg", label=0, split="train")],
+    )
+    _write_jsonl(
+        affectnet_val,
+        [_record(affectnet_root, "val/b.jpg", sample_id="val:b.jpg", label=0, split="val")],
+    )
+    celebahq_root = tmp_path / "celebahq"
+    ffhq_root = tmp_path / "ffhq"
+    _make_image(celebahq_root / "00000.jpg")
+    _make_image(ffhq_root / "FFHQ-1024-1" / "00000.png")
+
+    result = _run_builder(
+        affectnet_train=affectnet_train,
+        affectnet_val=affectnet_val,
+        celebahq_root=celebahq_root,
+        ffhq_root=ffhq_root,
+        train_out=tmp_path / "mixed_train.jsonl",
+        val_out=tmp_path / "mixed_val.jsonl",
+        expected_celebahq_count=1,
+        expected_ffhq_count=2,
+    )
+
+    assert result.returncode != 0
+    assert "FFHQ expected 2 images but found 1" in result.stderr
+
+
+def test_cli_fails_on_duplicate_image_path_across_train_and_val(tmp_path: Path) -> None:
+    affectnet_root = tmp_path / "affectnet"
+    duplicate_image = affectnet_root / "shared.jpg"
+    _make_image(duplicate_image)
+    affectnet_train = tmp_path / "train.jsonl"
+    affectnet_val = tmp_path / "val.jsonl"
+    _write_jsonl(
+        affectnet_train,
+        [
+            {
+                "sample_id": "train:shared.jpg",
+                "image_path": str(duplicate_image),
+                "label": 0,
+                "split": "train",
+                "dataset_root": str(affectnet_root),
+                "dataset_version": "affectnet-unit",
+            }
+        ],
+    )
+    _write_jsonl(
+        affectnet_val,
+        [
+            {
+                "sample_id": "val:shared.jpg",
+                "image_path": str(duplicate_image),
+                "label": 0,
+                "split": "val",
+                "dataset_root": str(affectnet_root),
+                "dataset_version": "affectnet-unit",
+            }
+        ],
+    )
+    celebahq_root = tmp_path / "celebahq"
+    ffhq_root = tmp_path / "ffhq"
+    _make_image(celebahq_root / "00000.jpg")
+    _make_image(ffhq_root / "FFHQ-1024-1" / "00000.png")
+
+    result = _run_builder(
+        affectnet_train=affectnet_train,
+        affectnet_val=affectnet_val,
+        celebahq_root=celebahq_root,
+        ffhq_root=ffhq_root,
+        train_out=tmp_path / "mixed_train.jsonl",
+        val_out=tmp_path / "mixed_val.jsonl",
+        expected_celebahq_count=1,
+        expected_ffhq_count=1,
+    )
+
+    assert result.returncode != 0
+    assert "duplicate image_path" in result.stderr
