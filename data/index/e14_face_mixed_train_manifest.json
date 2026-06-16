@@ -1,0 +1,28 @@
+{
+  "affectnet_train_index": "data/index/train_balanced_medium.jsonl",
+  "affectnet_train_index_sha256": "bcdab61f555ffae532646e0f0402537070149fb0e775ef30d7ceccdd53924544",
+  "affectnet_val_index": "data/index/val_single_face.jsonl",
+  "affectnet_val_index_sha256": "da14e23eacefecbc2948d1374fb93961a13d017a9183aa1fe2a2f62b33a4b4ea",
+  "celebahq_root": "/home/k100/Datasets/Face/CelebAMask-HQ/CelebAMask-HQ/CelebA-HQ-img",
+  "ffhq_root": "/home/k100/Datasets/Face/FFHQ-1024",
+  "generic_face_label": 0,
+  "generic_face_split": "train",
+  "num_train": 130000,
+  "num_val": 3969,
+  "output_order_rule": "AffectNet train rows first, then sorted CelebA-HQ images, then sorted FFHQ images; val rows are AffectNet val rows.",
+  "schema_version": 1,
+  "train_dataset_counts": {
+    "affectnet": 30000,
+    "celebahq": 30000,
+    "ffhq": 70000
+  },
+  "train_index": "data/index/e14_face_mixed_train.jsonl",
+  "train_index_sha256": "1d0859c57a048756545f383db139362fc4e7752d85adcf5ac92ce73f890a0f67",
+  "train_ordered_sample_id_sha256": "49abea38970ac72030854bf84637451a2886a49ce6736ab740df91ecbe415ec5",
+  "val_dataset_counts": {
+    "affectnet": 3969
+  },
+  "val_index": "data/index/e14_face_mixed_val.jsonl",
+  "val_index_sha256": "da14e23eacefecbc2948d1374fb93961a13d017a9183aa1fe2a2f62b33a4b4ea",
+  "val_ordered_sample_id_sha256": "000eee4cf38b4c80d6e2850bbe9df7ca656d6be4b7826607852e35844a72dca6"
+}
