@@ -363,6 +363,9 @@ def build_meanflow_sit_generator(config):
             t = torch.ones(z.shape[0], device=z.device, dtype=z.dtype)
             mean_velocity = self.vector_field(x, r, t, z)
             x = x - mean_velocity
+            # DDP: keep null_condition.embedding in autograd graph even when unused
+            if self.null_condition is not None:
+                x = x + 0.0 * self.null_condition.embedding.sum()
             return self._model_to_data_space(x, clamp_output=clamp_output)
 
         def flow_matching_loss(self, x_1, z, generator=None):
@@ -382,6 +385,9 @@ def build_meanflow_sit_generator(config):
             error = predicted_velocity - meanflow_target.detach()
             raw_mse = error.square().mean()
             loss = self._weighted_loss(error)
+            # DDP: keep null_condition.embedding in autograd graph even when unused
+            if self.null_condition is not None:
+                loss = loss + 0.0 * self.null_condition.embedding.sum()
             return loss, {
                 "flow_matching_mse": raw_mse.detach(),
                 "meanflow_raw_mse": raw_mse.detach(),

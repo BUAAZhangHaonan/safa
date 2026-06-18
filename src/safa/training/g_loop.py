@@ -1316,7 +1316,7 @@ def train_g_from_config(config: dict) -> dict:
         if distributed.is_main:
             print(f"Uncertainty loss state: {uw_state_action}")
     if distributed.enabled:
-        training_module = DistributedDataParallel(training_module, device_ids=[distributed.local_rank], output_device=distributed.local_rank)
+        training_module = DistributedDataParallel(training_module, device_ids=[distributed.local_rank], output_device=distributed.local_rank, find_unused_parameters=bool(config.get("ddp_find_unused_parameters", False)))
     _optimizer_type = str(config.get("optimizer_type", "adamw"))
     if _optimizer_type not in ("adamw", "sgd"):
         raise ValueError(f"config.optimizer_type must be 'adamw' or 'sgd', got {_optimizer_type!r}")
