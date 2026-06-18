@@ -34,6 +34,8 @@ REQUIRED_E0_TRAIN_KEYS = (
     "embedding_dim",
     "image_size",
     "imagenet_weights",
+    "backbone",
+    "backbone_path",
     "train_index",
     "val_index",
     "out_dir",
@@ -139,8 +141,22 @@ def train_e0_from_config(config: dict) -> dict:
         num_classes=int(config["num_classes"]),
         embedding_dim=int(config["embedding_dim"]),
         imagenet_weights=str(config["imagenet_weights"]),
+        backbone=str(config["backbone"]),
+        backbone_path=str(config["backbone_path"]),
     )
-    model = build_e0(model_config).to(device)
+    model = build_e0(model_config, allow_random_init=bool(config.get("init_from_checkpoint", ""))).to(device)
+    init_from_checkpoint = str(config.get("init_from_checkpoint", "") or "")
+    if init_from_checkpoint:
+        import torch as _torch
+        from pathlib import Path as _Path
+        ckpt_path = _Path(init_from_checkpoint)
+        if not ckpt_path.is_file():
+            raise FileNotFoundError(f"init_from_checkpoint not found: {ckpt_path}")
+        ckpt = _torch.load(ckpt_path, map_location=device, weights_only=True)
+        missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        if missing or unexpected:
+            print(f"[warm-start] missing={list(missing)[:5]} unexpected={list(unexpected)[:5]}")
+        print(f"[warm-start] loaded {ckpt_path} (epoch={ckpt.get('metrics', {}).get('epoch', '?')}, acc={ckpt.get('metrics', {}).get('accuracy', '?')})")
     if distributed.enabled:
         model = DistributedDataParallel(model, device_ids=[distributed.local_rank], output_device=distributed.local_rank)
     optimizer = torch.optim.AdamW(unwrap_model(model).parameters(), lr=float(config["learning_rate"]), weight_decay=float(config["weight_decay"]))
@@ -254,6 +270,7 @@ def train_e0_from_config(config: dict) -> dict:
             "checkpoint": str(out_dir / "best.pt"),
             "embedding_dim": model_config.embedding_dim,
             "num_classes": model_config.num_classes,
+            "backbone": model_config.backbone,
             "l2_normalized": True,
             "best_metrics": best_metrics,
             "majority_val_accuracy": majority,

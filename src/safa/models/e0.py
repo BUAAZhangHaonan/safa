@@ -10,25 +10,130 @@ class E0Config:
     num_classes: int = 8
     embedding_dim: int = 512
     imagenet_weights: str = "IMAGENET1K_V2"
+    backbone: str = "resnet50"
+    backbone_path: str = ""
+
+
+_SUPPORTED_BACKBONES = ("resnet18", "resnet50", "vgg16", "dinov2_large", "dinov3_vitl16")
+
+
+def _build_resnet(name: str, imagenet_weights: str):
+    from torch import nn
+    from torchvision.models import ResNet50_Weights, ResNet18_Weights, resnet18, resnet50
+
+    if name == "resnet50":
+        weights_enum = ResNet50_Weights
+        ctor = resnet50
+    elif name == "resnet18":
+        weights_enum = ResNet18_Weights
+        ctor = resnet18
+    else:
+        raise ValueError(f"Unsupported resnet variant: {name}")
+
+    weights = None
+    if imagenet_weights:
+        try:
+            weights = getattr(weights_enum, imagenet_weights)
+        except AttributeError as exc:
+            raise ValueError(f"Unknown torchvision {name} weights: {imagenet_weights}") from exc
+    model = ctor(weights=weights)
+    in_features = model.fc.in_features
+    model.fc = nn.Identity()
+    return model, in_features
+
+
+def _build_vgg16(imagenet_weights: str):
+    from torch import nn
+    from torchvision.models import VGG16_Weights, vgg16
+
+    weights = None
+    if imagenet_weights:
+        try:
+            weights = getattr(VGG16_Weights, imagenet_weights)
+        except AttributeError as exc:
+            raise ValueError(f"Unknown torchvision VGG16 weights: {imagenet_weights}") from exc
+    model = vgg16(weights=weights)
+    in_features = model.classifier[-1].in_features
+    model.classifier = nn.Sequential(*list(model.classifier.children())[:-1])
+    return model, in_features
+
+
+def _build_dinov2_large(backbone_path: str):
+    from torch import nn
+
+    if not backbone_path:
+        raise ValueError("dinov2_large backbone requires backbone_path pointing to the local model dir")
+    try:
+        from transformers import AutoModel
+    except ImportError as exc:
+        raise RuntimeError("transformers is required for dinov2_large backbone") from exc
+
+    class _DINOv2Wrapper(nn.Module):
+        def __init__(self, path: str):
+            super().__init__()
+            self.encoder = AutoModel.from_pretrained(path)
+            self.hidden_size = int(self.encoder.config.hidden_size)
+
+        def forward(self, images):
+            outputs = self.encoder(pixel_values=images)
+            cls_token = outputs.last_hidden_state[:, 0, :]
+            return cls_token
+
+    wrapper = _DINOv2Wrapper(backbone_path)
+    return wrapper, wrapper.hidden_size
+
+
+def _build_dinov3_vitl16(backbone_path: str):
+    from torch import nn
+
+    if not backbone_path:
+        raise ValueError("dinov3_vitl16 backbone requires backbone_path pointing to the local model dir")
+    try:
+        from transformers import AutoModel
+    except ImportError as exc:
+        raise RuntimeError("transformers is required for dinov3_vitl16 backbone") from exc
+
+    class _DINOv3Wrapper(nn.Module):
+        def __init__(self, path: str):
+            super().__init__()
+            self.encoder = AutoModel.from_pretrained(path)
+            self.hidden_size = int(self.encoder.config.hidden_size)
+
+        def forward(self, images):
+            outputs = self.encoder(pixel_values=images)
+            cls_token = outputs.last_hidden_state[:, 0, :]
+            return cls_token
+
+    wrapper = _DINOv3Wrapper(backbone_path)
+    return wrapper, wrapper.hidden_size
 
 
 def build_e0(config: E0Config, allow_random_init: bool = False):
     from torch import nn
-    from torchvision.models import ResNet50_Weights, resnet50
 
     if config.embedding_dim <= 0:
         raise ValueError(f"E0 embedding_dim must be positive, got {config.embedding_dim}")
-    weights = None
-    if config.imagenet_weights:
-        try:
-            weights = getattr(ResNet50_Weights, config.imagenet_weights)
-        except AttributeError as exc:
-            raise ValueError(f"Unknown torchvision ResNet-50 weights: {config.imagenet_weights}") from exc
-    elif not allow_random_init:
-        raise RuntimeError("Random E0 initialization is not allowed for experiment runs")
-    backbone = resnet50(weights=weights)
-    in_features = backbone.fc.in_features
-    backbone.fc = nn.Identity()
+    if config.backbone not in _SUPPORTED_BACKBONES:
+        raise ValueError(f"Unknown backbone {config.backbone!r}, supported: {_SUPPORTED_BACKBONES}")
+
+    needs_imagenet = config.backbone in {"resnet18", "resnet50", "vgg16"}
+    if needs_imagenet:
+        if not config.imagenet_weights and not allow_random_init:
+            raise RuntimeError("Random E0 initialization is not allowed for experiment runs")
+
+    if config.backbone == "resnet50":
+        backbone, in_features = _build_resnet("resnet50", config.imagenet_weights)
+    elif config.backbone == "resnet18":
+        backbone, in_features = _build_resnet("resnet18", config.imagenet_weights)
+    elif config.backbone == "vgg16":
+        backbone, in_features = _build_vgg16(config.imagenet_weights)
+    elif config.backbone == "dinov2_large":
+        backbone, in_features = _build_dinov2_large(config.backbone_path)
+    elif config.backbone == "dinov3_vitl16":
+        backbone, in_features = _build_dinov3_vitl16(config.backbone_path)
+    else:
+        raise ValueError(f"Unsupported backbone: {config.backbone}")
+
     return EmotionEncoder(backbone=backbone, in_features=in_features, embedding_dim=config.embedding_dim, num_classes=config.num_classes)
 
 
@@ -87,6 +192,8 @@ def load_e0_checkpoint(path: str | Path, device: str | None = None):
         num_classes=int(cfg["num_classes"]),
         embedding_dim=int(cfg["embedding_dim"]),
         imagenet_weights="",
+        backbone=str(cfg.get("backbone", "resnet50")),
+        backbone_path=str(cfg.get("backbone_path", "")),
     )
     model = build_e0(load_config, allow_random_init=True)
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -100,6 +207,8 @@ def checkpoint_payload(model, config: E0Config, metrics: dict[str, Any]) -> dict
             "num_classes": config.num_classes,
             "embedding_dim": config.embedding_dim,
             "imagenet_weights": config.imagenet_weights,
+            "backbone": config.backbone,
+            "backbone_path": config.backbone_path,
         },
         "metrics": metrics,
     }
