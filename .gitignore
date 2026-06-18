@@ -14,3 +14,10 @@ artifacts/
 *.pth
 *.ckpt
 *.onnx
+
+# Pretrained model weights (large, downloaded separately)
+pretrained/
+
+# Local backup files
+*.bak
+*.orig
