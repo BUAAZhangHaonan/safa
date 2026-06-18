@@ -13,6 +13,7 @@ from safa.evaluation.perturbations import perturbation_map
 from safa.evaluation.recognizers import InsightFaceDetector, build_recognizers, describe_recognizer_assets, validate_recognizer_configs
 from safa.models.e0 import freeze_e0, load_e0_checkpoint
 from safa.models.generator import build_generator, require_generator_model_config
+from safa.training.latent_codec import build_latent_codec_from_train_config
 from safa.training.losses import normalize_for_e0
 from safa.training.transforms import generator_image_transform
 from safa.utils.device import assert_finite_tensor, require_cuda_device
@@ -38,6 +39,11 @@ def run_eval_from_config(config: dict) -> dict:
     e0.to(device)
     freeze_e0(e0)
     generator = _load_generator(config["g_checkpoint"], config, str(device))
+    latent_codec = None
+    if config.get("latent_training", False) or config.get("vae_model") or config.get("vae_path"):
+        latent_codec = build_latent_codec_from_train_config(config, device)
+        if latent_codec is not None:
+            latent_codec.vae.eval()
     sampling_seed = sampling_base_seed_from_config(config)
     dataset = FeatureAlignedAffectNet(
         config["index"],
@@ -81,7 +87,7 @@ def run_eval_from_config(config: dict) -> dict:
                     detector,
                 )
             else:
-                generated = _sample_generated_for_eval(generator, z, sample_ids, sampling_seed, int(config["image_size"]))
+                generated = _sample_generated_for_eval(generator, z, sample_ids, sampling_seed, int(config["image_size"]), latent_codec=latent_codec)
                 assert_finite_tensor("eval_generated", generated)
                 generated_out = e0(normalize_for_e0(generated))
             if generated_chunks is not None:
@@ -322,9 +328,22 @@ def _finite_float_metadata(value, field: str) -> float:
     return parsed
 
 
-def _sample_generated_for_eval(generator, z, sample_ids, sampling_seed: int, image_size: int):
-    x_init = make_x_init_for_sample_ids(sample_ids, sampling_seed, image_size, z.device, z.dtype)
-    return generator.sample(z, x_init=x_init)
+def _sample_generated_for_eval(generator, z, sample_ids, sampling_seed: int, image_size: int, latent_codec=None):
+    # MeanFlow SIT works in latent space; use generator's own channels and image_size.
+    gen_cfg = getattr(generator, "config", None)
+    if gen_cfg is not None and getattr(gen_cfg, "model_type", None) == "meanflow_sit":
+        channels = int(gen_cfg.sit_input_channels)
+        gen_image_size = int(gen_cfg.image_size)
+    else:
+        channels = 3
+        gen_image_size = image_size
+    x_init = make_x_init_for_sample_ids(sample_ids, sampling_seed, gen_image_size, z.device, z.dtype, channels=channels)
+    generated = generator.sample(z, x_init=x_init)
+    if latent_codec is not None:
+        import torch
+        with torch.no_grad():
+            generated = latent_codec.decode(generated)
+    return generated
 
 
 def _candidate_rerank_config(config: dict) -> dict:

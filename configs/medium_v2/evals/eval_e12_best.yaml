@@ -1,0 +1,49 @@
+seed: 1337
+sampling_seed: 1337
+device: cuda:0
+num_workers: 4
+batch_size: 16
+image_size: 224
+index: data/index/val_single_face.jsonl
+features: artifacts/e0_features/val_single_face_e0_medium_v1
+e0_checkpoint: artifacts/checkpoints/e0_medium_v1/best.pt
+g_checkpoint: artifacts/checkpoints/e12_pu_sgd_meanflow_sit_stage2_gpu4_200ep_rerun1/best.pt
+checkpoint_model: raw
+latent_training: true
+pixel_image_size: 256
+vae_model: stabilityai/sd-vae-ft-ema
+vae_path: artifacts/checkpoints/external/sd-vae-ft-ema
+vae_scaling_factor: 0.18215
+out_json: artifacts/eval/e12_pu_sgd_meanflow_sit_gpu01_20260618/best/result.json
+per_sample_jsonl: artifacts/eval/e12_pu_sgd_meanflow_sit_gpu01_20260618/best/per_sample.jsonl
+sample_dir: artifacts/eval/e12_pu_sgd_meanflow_sit_gpu01_20260618/best/samples
+generated_image_dir: artifacts/eval/e12_pu_sgd_meanflow_sit_gpu01_20260618/best/generated_images
+face_detection:
+  enabled: true
+  model_name: buffalo_l
+  threshold: 0.95
+  single_face_eq1_threshold: 0.98
+  latent_cosine_threshold: -1.0
+privacy:
+  enabled: true
+  recognizers:
+  - name: arcface
+    type: insightface
+    model_name: buffalo_l
+  - name: facenet
+    type: torchscript
+    checkpoint: artifacts/privacy/facenet.pt
+    embedding_dim: 512
+    input_size: 160
+  - name: adaface
+    type: torchscript
+    checkpoint: artifacts/privacy/adaface.pt
+    embedding_dim: 512
+    input_size: 112
+anti_steg:
+  enabled: false
+candidate_rerank:
+  enabled: false
+  num_candidates: 4
+  single_face_priority: true
+  selection_metric: latent_cosine
