@@ -395,7 +395,7 @@ def test_e15_meanflow_sit_mixed_face_full_resume_config() -> None:
     assert config["per_device_batch_size"] == 512
     assert config["train_index"] == "data/index/train_face_mixed_e14.jsonl"
     assert config["train_features"] == "artifacts/e0_features/train_face_mixed_e14_e0_medium_v1"
-    assert config["resume_from"] == "artifacts/checkpoints/e14_meanflow_sit_b_face_mixed_continue_200ep/last.pt"
+    assert config["resume_from"] == "artifacts/checkpoints/e15_meanflow_sit_b_face_mixed_resume_e14_2400ep/last.pt"
     assert config["resume_mode"] == "training_state"
     assert config["resume_optimizer_state"] is True
     assert config["out_dir"] == "artifacts/checkpoints/e15_meanflow_sit_b_face_mixed_resume_e14_2400ep"

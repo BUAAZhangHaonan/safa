@@ -20,7 +20,7 @@ train_features: artifacts/e0_features/train_face_mixed_e14_e0_medium_v1
 e0_checkpoint: artifacts/checkpoints/e0_medium_v1/best.pt
 out_dir: artifacts/checkpoints/e15_meanflow_sit_b_face_mixed_resume_e14_2400ep
 allow_stage2_without_stage1_gate: true
-resume_from: artifacts/checkpoints/e14_meanflow_sit_b_face_mixed_continue_200ep/last.pt
+resume_from: artifacts/checkpoints/e15_meanflow_sit_b_face_mixed_resume_e14_2400ep/last.pt
 resume_mode: training_state
 resume_optimizer_state: true
 resume_from_legacy_stage1_metrics: false
