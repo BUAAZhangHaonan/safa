@@ -1,0 +1,24 @@
+seed: 1337
+device: cuda:0
+num_workers: 8
+batch_size: 128
+epochs: 10
+learning_rate: 0.0003
+weight_decay: 0.0001
+label_smoothing: 0.1
+class_weight: true
+scheduler: cosine
+warmup_epochs: 2
+early_stopping_patience: 5
+augmentation: strong
+num_classes: 8
+embedding_dim: 512
+image_size: 112
+imagenet_weights: ""
+backbone: iresnet100
+backbone_path: pretrained/iresnet100-glint360k/backbone.pth
+train_index: data/index/train.jsonl
+val_index: data/index/val.jsonl
+out_dir: artifacts/checkpoints/e0_iresnet100
+distributed:
+  backend: gloo
