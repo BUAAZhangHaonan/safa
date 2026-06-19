@@ -1138,6 +1138,59 @@ def test_quality_eval_sampling_uses_configured_learned_null_condition(tmp_path) 
     assert len(list(generated_dir.glob("*.png"))) == 2
 
 
+def test_quality_eval_releases_cuda_cache_before_distribution_subprocess(tmp_path, monkeypatch) -> None:
+    from safa.models.generator import FlowGeneratorConfig
+    from safa.training import g_loop
+
+    real_index = tmp_path / "real.jsonl"
+    config = {
+        "validation": {"enabled": True},
+        "stages": {
+            "stage2": {
+                "quality_eval": {
+                    "enabled": True,
+                    "metrics": ["fid"],
+                    "distribution_interval_epochs": 1,
+                    "distribution_max_samples": 1,
+                    "distribution_timeout_seconds": 30,
+                    "real_index": str(real_index),
+                    "distribution_device": "cuda:0",
+                    "output_dir": str(tmp_path / "quality"),
+                    "model": "ema",
+                }
+            }
+        },
+    }
+    calls: list[str] = []
+
+    monkeypatch.setattr(g_loop, "_build_quality_eval_loader", lambda *args, **kwargs: [{"z": torch.zeros(1, 2), "sample_id": ["a"]}])
+    monkeypatch.setattr(g_loop, "_quality_eval_current_generator", lambda *args, **kwargs: object())
+    monkeypatch.setattr(g_loop, "_generate_quality_eval_images", lambda **kwargs: 1)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty_cache"))
+
+    def fake_distribution_eval(**kwargs):
+        calls.append("subprocess")
+        assert "empty_cache" in calls
+        return {"metrics": ["fid"], "num_generated": 1, "num_real": 1, "fid": 1.0}
+
+    monkeypatch.setattr(g_loop, "_evaluate_generation_quality_subprocess", fake_distribution_eval)
+
+    metrics = g_loop._run_quality_eval_hook(
+        config,
+        "stage2",
+        0,
+        generator=object(),
+        ema=object(),
+        device=torch.device("cuda:0"),
+        generator_config=FlowGeneratorConfig(embedding_dim=2, image_size=4, sample_steps=1),
+        sampling_seed=1337,
+    )
+
+    assert calls == ["empty_cache", "subprocess"]
+    assert metrics["quality_ema_fid"] == pytest.approx(1.0)
+
+
 def test_stage1_flow_condition_config_supports_explicit_fixed_null_and_rejects_unknown() -> None:
     from safa.training import g_loop
 

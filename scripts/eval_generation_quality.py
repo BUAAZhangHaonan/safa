@@ -104,7 +104,10 @@ def prepare_metric_for_device(metric, device):
         try:
             return metric.to(device), device
         except Exception as exc:
-            raise RuntimeError(f"failed to move quality metric to device {device}") from exc
+            metric_name = type(metric).__name__
+            raise RuntimeError(
+                f"failed to move quality metric {metric_name} to device {device}: {exc}"
+            ) from exc
     try:
         import torch
     except ImportError as exc:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from dataclasses import dataclass
+import gc
 import math
 import json
 import hashlib
@@ -3578,6 +3579,26 @@ def _evaluate_generation_quality_subprocess(
     return payload
 
 
+def _release_cuda_cache_before_quality_subprocess(device: str) -> None:
+    try:
+        import torch
+    except ImportError:
+        return
+
+    requested = str(device)
+    if requested == "auto":
+        if not torch.cuda.is_available():
+            return
+    else:
+        selected = torch.device(requested)
+        if selected.type != "cuda":
+            return
+        if not torch.cuda.is_available():
+            return
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 def _subprocess_output_details(stderr, stdout) -> str:
     parts = []
     for value in (stderr, stdout):
@@ -3695,6 +3716,7 @@ def _run_quality_eval_hook(
                 "subset_seed": subset_seed,
             }
             if _quality_eval_needs_real_index(group.metrics):
+                _release_cuda_cache_before_quality_subprocess(distribution_device)
                 result = _evaluate_generation_quality_subprocess(
                     **eval_kwargs,
                     device=distribution_device,

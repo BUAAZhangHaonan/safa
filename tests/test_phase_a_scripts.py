@@ -371,6 +371,17 @@ def test_quality_eval_auto_device_moves_torchmetrics_to_cuda_when_available(
     assert fake_fid.update_devices == ["cuda", "cuda"]
 
 
+def test_quality_eval_metric_device_error_includes_metric_type_and_cause() -> None:
+    module = _load_script("eval_generation_quality")
+
+    class BrokenMetric:
+        def to(self, device):
+            raise RuntimeError("cuda oom marker")
+
+    with pytest.raises(RuntimeError, match="BrokenMetric.*cuda:0.*cuda oom marker"):
+        module.prepare_metric_for_device(BrokenMetric(), "cuda:0")
+
+
 def test_quality_eval_seed_alias_makes_kid_compute_deterministic_and_honors_limits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
