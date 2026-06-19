@@ -21,3 +21,4 @@ pretrained/
 # Local backup files
 *.bak
 *.orig
+logs/
