@@ -14,7 +14,17 @@ class E0Config:
     backbone_path: str = ""
 
 
-_SUPPORTED_BACKBONES = ("resnet18", "resnet50", "vgg16", "dinov2_large", "dinov3_vitl16")
+_SUPPORTED_BACKBONES = (
+    "resnet18",
+    "resnet50",
+    "vgg16",
+    "dinov2_large",
+    "dinov3_vitl16",
+    "convnext_tiny",
+    "swin_tiny",
+    "iresnet100",
+    "mobilenetv3_large",
+)
 
 
 def _build_resnet(name: str, imagenet_weights: str):
@@ -108,6 +118,75 @@ def _build_dinov3_vitl16(backbone_path: str):
     return wrapper, wrapper.hidden_size
 
 
+def _build_convnext_tiny(imagenet_weights: str):
+    from torch import nn
+    from torchvision.models import convnext_tiny, ConvNeXt_Tiny_Weights
+
+    weights = None
+    if imagenet_weights:
+        try:
+            weights = getattr(ConvNeXt_Tiny_Weights, imagenet_weights)
+        except AttributeError as exc:
+            raise ValueError(f"Unknown torchvision ConvNeXt-Tiny weights: {imagenet_weights}") from exc
+    model = convnext_tiny(weights=weights)
+    # m.features -> (B,768,7,7); m.avgpool -> (B,768,1,1); m.classifier[0] is LayerNorm2d(768) — must apply on 4D
+    features = nn.Sequential(model.features, model.avgpool, model.classifier[0], nn.Flatten(1))
+    return features, 768
+
+
+def _build_swin_tiny(imagenet_weights: str):
+    from torch import nn
+    from torchvision.models import swin_t, Swin_T_Weights
+
+    weights = None
+    if imagenet_weights:
+        try:
+            weights = getattr(Swin_T_Weights, imagenet_weights)
+        except AttributeError as exc:
+            raise ValueError(f"Unknown torchvision Swin-Tiny weights: {imagenet_weights}") from exc
+    model = swin_t(weights=weights)
+    # m.features outputs (B,H,W,768) channels-last; m.norm final LN over last dim; m.permute -> (B,768,H,W); m.avgpool -> (B,768,1,1)
+    features = nn.Sequential(model.features, model.norm, model.permute, model.avgpool, nn.Flatten(1))
+    return features, 768
+
+
+def _build_mobilenetv3_large(imagenet_weights: str):
+    from torch import nn
+    from torchvision.models import mobilenet_v3_large, MobileNet_V3_Large_Weights
+
+    weights = None
+    if imagenet_weights:
+        try:
+            weights = getattr(MobileNet_V3_Large_Weights, imagenet_weights)
+        except AttributeError as exc:
+            raise ValueError(f"Unknown torchvision MobileNetV3-Large weights: {imagenet_weights}") from exc
+    model = mobilenet_v3_large(weights=weights)
+    # m.features -> (B,960,7,7); m.avgpool -> (B,960,1,1)
+    features = nn.Sequential(model.features, model.avgpool, nn.Flatten(1))
+    return features, 960
+
+
+def _build_iresnet100(backbone_path: str):
+    import torch
+
+    if not backbone_path:
+        raise ValueError("iresnet100 backbone requires backbone_path pointing to a local ArcFace checkpoint")
+    from safa.models.backbones.iresnet import iresnet100
+
+    model = iresnet100()
+    state = torch.load(backbone_path, map_location="cpu")
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    # drop ArcFace classification head weight (key "weight" — the final 512x512 FC after the IResNet features)
+    state = {k: v for k, v in state.items() if k != "weight"}
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        raise RuntimeError(f"iresnet100 load_state_dict missing keys: {missing[:10]}")
+    if unexpected:
+        raise RuntimeError(f"iresnet100 load_state_dict unexpected keys: {unexpected[:10]}")
+    return model, 512
+
+
 def build_e0(config: E0Config, allow_random_init: bool = False):
     from torch import nn
 
@@ -116,7 +195,14 @@ def build_e0(config: E0Config, allow_random_init: bool = False):
     if config.backbone not in _SUPPORTED_BACKBONES:
         raise ValueError(f"Unknown backbone {config.backbone!r}, supported: {_SUPPORTED_BACKBONES}")
 
-    needs_imagenet = config.backbone in {"resnet18", "resnet50", "vgg16"}
+    needs_imagenet = config.backbone in {
+        "resnet18",
+        "resnet50",
+        "vgg16",
+        "convnext_tiny",
+        "swin_tiny",
+        "mobilenetv3_large",
+    }
     if needs_imagenet:
         if not config.imagenet_weights and not allow_random_init:
             raise RuntimeError("Random E0 initialization is not allowed for experiment runs")
@@ -131,6 +217,14 @@ def build_e0(config: E0Config, allow_random_init: bool = False):
         backbone, in_features = _build_dinov2_large(config.backbone_path)
     elif config.backbone == "dinov3_vitl16":
         backbone, in_features = _build_dinov3_vitl16(config.backbone_path)
+    elif config.backbone == "convnext_tiny":
+        backbone, in_features = _build_convnext_tiny(config.imagenet_weights)
+    elif config.backbone == "swin_tiny":
+        backbone, in_features = _build_swin_tiny(config.imagenet_weights)
+    elif config.backbone == "mobilenetv3_large":
+        backbone, in_features = _build_mobilenetv3_large(config.imagenet_weights)
+    elif config.backbone == "iresnet100":
+        backbone, in_features = _build_iresnet100(config.backbone_path)
     else:
         raise ValueError(f"Unsupported backbone: {config.backbone}")
 
