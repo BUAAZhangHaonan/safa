@@ -1,0 +1,25 @@
+seed: 1337
+device: cuda:0
+num_workers: 8
+batch_size: 32
+epochs: 10
+learning_rate: 0.00005
+weight_decay: 0.0001
+label_smoothing: 0.1
+class_weight: true
+scheduler: cosine
+warmup_epochs: 3
+early_stopping_patience: 5
+augmentation: strong
+num_classes: 8
+embedding_dim: 512
+image_size: 224
+imagenet_weights: ''
+backbone: dinov2_large
+backbone_path: pretrained/dinov2-large
+init_from_checkpoint: ''
+train_index: data/index/train.jsonl
+val_index: data/index/val.jsonl
+out_dir: artifacts/checkpoints/e0_dinov2_large_v2
+distributed:
+  backend: gloo
