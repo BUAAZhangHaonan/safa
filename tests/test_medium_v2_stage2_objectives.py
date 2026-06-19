@@ -496,8 +496,8 @@ def test_train_g_applies_generator_trainable_after_resume_before_ddp_and_optimiz
     monkeypatch.setattr(g_loop, "_stage2_gradient_conflict_config", lambda stages: g_loop._GradientConflictConfig(enabled=False))
 
     class FakeDDP:
-        def __init__(self, module, *, device_ids, output_device) -> None:
-            del device_ids, output_device
+        def __init__(self, module, *, device_ids=None, output_device=None, **kwargs) -> None:
+            del device_ids, output_device, kwargs
             events.append("ddp_wrap")
             self.module = module
 
