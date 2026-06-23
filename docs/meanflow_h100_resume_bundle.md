@@ -35,7 +35,7 @@ bash scripts/h100/setup_meanflow_env.sh
 conda activate meanflow
 ```
 
-脚本会先尝试安装 `cu130` PyTorch wheel。若安装失败，会自动回退到官方 `cu128` wheel。驱动 `585` 可以运行 CUDA 12.8 wheel。
+服务器驱动版本按 `585` 设计，驱动 `585` 最高支持 CUDA 13.0；环境脚本会优先尝试安装 `cu130` PyTorch wheel。若该 wheel 不可用，会自动回退到官方 `cu128` wheel。驱动 `585` 也可以运行 CUDA 12.8 wheel。
 
 如果 `conda` 命令不存在，先安装 Miniconda 或 Mambaforge，然后重新运行脚本。
 
@@ -182,7 +182,7 @@ CUDA_VISIBLE_DEVICES=0,1 bash scripts/h100/train_meanflow_h100.sh
 
 ### cu130 wheel 不存在
 
-这是正常情况。安装脚本会自动回退到 cu128。驱动 585 可以运行 cu128 wheel。
+这是正常情况。服务器驱动 585 最高支持 CUDA 13.0；安装脚本会优先尝试 cu130 wheel，不可用时自动回退 cu128。驱动 585 可以运行 cu128 wheel。
 
 ## 7. 关键路径
 
