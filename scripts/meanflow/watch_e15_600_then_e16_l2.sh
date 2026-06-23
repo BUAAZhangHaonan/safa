@@ -21,6 +21,8 @@ E16_EXP="e16_meanflow_sit_l2_face_mixed_2400ep"
 E16_TEMPLATE_CONFIG="configs/medium_v2/experiments/${E16_EXP}.yaml"
 E16_RUNTIME_CONFIG="configs/medium_v2/experiments/${E16_EXP}_runtime.yaml"
 E16_CKPT_DIR="artifacts/checkpoints/${E16_EXP}"
+E16_PRETRAIN="artifacts/checkpoints/external/meanflow_sit/zhuyu_sit_l_2_imagenet256.pt"
+E16_PRETRAIN_SOURCE="zhuyu-cs/MeanFlow ImageNet256 sit_l_2_meanflow_ema.pt"
 E16_LOG_DIR="artifacts/logs"
 E16_LOG="${E16_LOG_DIR}/${E16_EXP}_$(date +%Y%m%d_%H%M%S).log"
 
@@ -138,8 +140,10 @@ config["per_device_batch_size"] = batch
 config["global_batch_size"] = batch
 config["resume_from"] = ""
 config["resume_optimizer_state"] = False
-config.setdefault("generator", {})["sit_pretrained_path"] = ""
-config["generator"]["sit_pretrained_source"] = "no local L/2 pretrained found, training from scratch"
+config.setdefault("generator", {})["sit_pretrained_path"] = "artifacts/checkpoints/external/meanflow_sit/zhuyu_sit_l_2_imagenet256.pt"
+config["generator"]["sit_pretrained_state_key"] = ""
+config["generator"]["sit_pretrained_source"] = "zhuyu-cs/MeanFlow ImageNet256 sit_l_2_meanflow_ema.pt"
+config["generator"]["sit_pretrained_source_repo"] = "https://github.com/zhuyu-cs/MeanFlow; https://drive.google.com/drive/folders/1oWt6tdm5WIeVaZnBuUVheKIG3cNDffl9?usp=drive_link"
 config.setdefault("stages", {}).setdefault("stage2", {}).setdefault("quality_eval", {})["output_dir"] = "artifacts/eval/e16_meanflow_sit_l2_face_mixed_2400ep/quality"
 yaml.safe_dump(config, dst.open("w"), sort_keys=False, allow_unicode=True)
 PY
@@ -156,6 +160,13 @@ launch_e16() {
     log "E16 checkpoint already exists at ${E16_CKPT_DIR}/last.pt; refusing to start duplicate training"
     exit 0
   fi
+  if [[ ! -f "$E16_PRETRAIN" ]]; then
+    log "missing E16 L/2 pretrained weight: ${E16_PRETRAIN}"
+    exit 2
+  fi
+  local pretrain_size
+  pretrain_size="$(stat -c "%s" "$E16_PRETRAIN")"
+  log "using E16 L/2 pretrained weight: ${E16_PRETRAIN} size=${pretrain_size} source=${E16_PRETRAIN_SOURCE}"
   local existing
   existing="$(find_e16_pid | head -n 1 || true)"
   if [[ -n "$existing" ]] && process_is_alive "$existing"; then
@@ -164,7 +175,7 @@ launch_e16() {
     exit 0
   fi
   write_e16_runtime_config "$batch"
-  log "starting E16 ${E16_EXP} with batch=${batch}; no local L/2 pretrained found, training from scratch"
+  log "starting E16 ${E16_EXP} with batch=${batch}; warm-starting from L/2 ImageNet256 pretrained weight"
   log "runtime_config=${E16_RUNTIME_CONFIG} log=${E16_LOG}"
   nohup env CUDA_VISIBLE_DEVICES="$CUDA_DEVICE" PYTHONPATH=src PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True PYTORCH_ALLOC_CONF=expandable_segments:True LD_LIBRARY_PATH="/home/k100/miniconda3/envs/pt210_cu130_fa4/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}" "$PYTHON_BIN" -m safa.cli.train_g --config "$E16_RUNTIME_CONFIG" > "$E16_LOG" 2>&1 &
   local pid="$!"
@@ -175,6 +186,10 @@ launch_e16() {
 log "watcher started target_epoch=${TARGET_EPOCH} poll_seconds=${POLL_SECONDS}"
 if [[ ! -f "$E16_TEMPLATE_CONFIG" ]]; then
   log "missing E16 template config: ${E16_TEMPLATE_CONFIG}"
+  exit 2
+fi
+if [[ ! -f "$E16_PRETRAIN" ]]; then
+  log "missing E16 L/2 pretrained weight while waiting: ${E16_PRETRAIN}"
   exit 2
 fi
 
