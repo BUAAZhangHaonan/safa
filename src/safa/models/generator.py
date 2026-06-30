@@ -8,17 +8,20 @@ GENERATOR_MODEL_TYPE_FLOW = "conditional_flow_matching"
 GENERATOR_MODEL_TYPE_MEANFLOW = "meanflow"
 GENERATOR_MODEL_TYPE_MEANFLOW_SIT = "meanflow_sit"
 GENERATOR_MODEL_TYPE_SIT_DIFFUSION = "sit_diffusion"
+GENERATOR_MODEL_TYPE_LATENT_CONSISTENCY = "latent_consistency"
 GENERATOR_MODEL_TYPE_DDIM = "ddim"
 GENERATOR_MODEL_TYPES = (
     GENERATOR_MODEL_TYPE_FLOW,
     GENERATOR_MODEL_TYPE_MEANFLOW,
     GENERATOR_MODEL_TYPE_MEANFLOW_SIT,
     GENERATOR_MODEL_TYPE_SIT_DIFFUSION,
+    GENERATOR_MODEL_TYPE_LATENT_CONSISTENCY,
     GENERATOR_MODEL_TYPE_DDIM,
 )
 SIT_GENERATOR_MODEL_TYPES = (
     GENERATOR_MODEL_TYPE_MEANFLOW_SIT,
     GENERATOR_MODEL_TYPE_SIT_DIFFUSION,
+    GENERATOR_MODEL_TYPE_LATENT_CONSISTENCY,
 )
 LATENT_CAPABLE_GENERATOR_MODEL_TYPES = SIT_GENERATOR_MODEL_TYPES
 MEANFLOW_JVP_MODE_TORCH_FUNC = "torch_func"
@@ -32,6 +35,10 @@ DDIM_BETA_SCHEDULE_COSINE = "cosine"
 DDIM_BETA_SCHEDULES = (DDIM_BETA_SCHEDULE_LINEAR, DDIM_BETA_SCHEDULE_COSINE)
 DIFFUSION_PREDICTION_TYPE_EPSILON = "epsilon"
 DIFFUSION_PREDICTION_TYPES = (DIFFUSION_PREDICTION_TYPE_EPSILON,)
+CONSISTENCY_PREDICTION_TYPE_X0 = "x0"
+CONSISTENCY_PREDICTION_TYPES = (CONSISTENCY_PREDICTION_TYPE_X0,)
+CONSISTENCY_TARGET_ANALYTIC_X0 = "analytic_x0"
+CONSISTENCY_TARGETS = (CONSISTENCY_TARGET_ANALYTIC_X0,)
 SIT_ATTENTION_BACKEND_AUTO = "auto"
 SIT_ATTENTION_BACKEND_NATIVE = "native"
 SIT_ATTENTION_BACKEND_SDPA = "sdpa"
@@ -98,6 +105,10 @@ class FlowGeneratorConfig:
     diffusion_train_timesteps: int = 1000
     diffusion_beta_schedule: str = DDIM_BETA_SCHEDULE_LINEAR
     diffusion_prediction_type: str = DIFFUSION_PREDICTION_TYPE_EPSILON
+    consistency_train_timesteps: int = 1000
+    consistency_prediction_type: str = CONSISTENCY_PREDICTION_TYPE_X0
+    consistency_target: str = CONSISTENCY_TARGET_ANALYTIC_X0
+    consistency_min_step_gap: int = 1
     sit_input_channels: int = 3
     sit_patch_size: int = 16
     sit_hidden_size: int = 768
@@ -142,6 +153,10 @@ class FlowGeneratorConfig:
             diffusion_train_timesteps=int(payload.get("diffusion_train_timesteps", 1000)),
             diffusion_beta_schedule=str(payload.get("diffusion_beta_schedule", DDIM_BETA_SCHEDULE_LINEAR)),
             diffusion_prediction_type=str(payload.get("diffusion_prediction_type", DIFFUSION_PREDICTION_TYPE_EPSILON)),
+            consistency_train_timesteps=int(payload.get("consistency_train_timesteps", 1000)),
+            consistency_prediction_type=str(payload.get("consistency_prediction_type", CONSISTENCY_PREDICTION_TYPE_X0)),
+            consistency_target=str(payload.get("consistency_target", CONSISTENCY_TARGET_ANALYTIC_X0)),
+            consistency_min_step_gap=int(payload.get("consistency_min_step_gap", 1)),
             sit_input_channels=int(payload.get("sit_input_channels", 3)),
             sit_patch_size=int(payload.get("sit_patch_size", 16)),
             sit_hidden_size=int(payload.get("sit_hidden_size", 768)),
@@ -202,7 +217,7 @@ class FlowGeneratorConfig:
                 payload["sit_pretrained_path"] = self.sit_pretrained_path
             if self.sit_pretrained_state_key:
                 payload["sit_pretrained_state_key"] = self.sit_pretrained_state_key
-        if self.model_type == GENERATOR_MODEL_TYPE_SIT_DIFFUSION:
+        if self.model_type in {GENERATOR_MODEL_TYPE_SIT_DIFFUSION, GENERATOR_MODEL_TYPE_LATENT_CONSISTENCY}:
             payload.update(
                 {
                     "sit_input_channels": self.sit_input_channels,
@@ -214,9 +229,21 @@ class FlowGeneratorConfig:
                     "sit_time_embedding_dim": self.sit_time_embedding_dim,
                     "sit_data_space": self.sit_data_space,
                     "attention_backend": self.attention_backend,
-                    "diffusion_train_timesteps": self.diffusion_train_timesteps,
-                    "diffusion_beta_schedule": self.diffusion_beta_schedule,
-                    "diffusion_prediction_type": self.diffusion_prediction_type,
+                    **(
+                        {
+                            "diffusion_train_timesteps": self.diffusion_train_timesteps,
+                            "diffusion_beta_schedule": self.diffusion_beta_schedule,
+                            "diffusion_prediction_type": self.diffusion_prediction_type,
+                        }
+                        if self.model_type == GENERATOR_MODEL_TYPE_SIT_DIFFUSION
+                        else {
+                            "diffusion_beta_schedule": self.diffusion_beta_schedule,
+                            "consistency_train_timesteps": self.consistency_train_timesteps,
+                            "consistency_prediction_type": self.consistency_prediction_type,
+                            "consistency_target": self.consistency_target,
+                            "consistency_min_step_gap": self.consistency_min_step_gap,
+                        }
+                    ),
                     "ddim_beta_start": self.ddim_beta_start,
                     "ddim_beta_end": self.ddim_beta_end,
                     "ddim_eta": self.ddim_eta,
@@ -789,6 +816,44 @@ class SiTDiffusionGenerator:
         return generator
 
 
+class LatentConsistencyGenerator:
+    def __new__(cls, config: FlowGeneratorConfig | dict[str, Any] | None = None, **kwargs):
+        from safa.models.latent_consistency import build_latent_consistency_generator
+
+        cfg_payload = {}
+        if isinstance(config, FlowGeneratorConfig):
+            cfg = config
+        elif config is None and not kwargs:
+            cfg = FlowGeneratorConfig(
+                model_type=GENERATOR_MODEL_TYPE_LATENT_CONSISTENCY,
+                sampler="consistency",
+                sample_steps=4,
+                train_cycle_steps=4,
+            )
+        else:
+            if config is not None:
+                cfg_payload.update(config)
+            cfg_payload.update(kwargs)
+            cfg_payload.setdefault("model_type", GENERATOR_MODEL_TYPE_LATENT_CONSISTENCY)
+            cfg_payload.setdefault("sampler", "consistency")
+            cfg = FlowGeneratorConfig.from_dict(cfg_payload)
+        _validate_config(cfg)
+        if cfg.model_type != GENERATOR_MODEL_TYPE_LATENT_CONSISTENCY:
+            raise ValueError(
+                f"LatentConsistencyGenerator requires model_type={GENERATOR_MODEL_TYPE_LATENT_CONSISTENCY!r}, "
+                f"got {cfg.model_type!r}"
+            )
+        generator = build_latent_consistency_generator(cfg)
+        if cfg.sit_pretrained_path:
+            generator.pretrained_load_report = generator.load_pretrained(
+                cfg.sit_pretrained_path,
+                state_key=cfg.sit_pretrained_state_key or None,
+                strict=False,
+                allow_missing=False,
+            )
+        return generator
+
+
 class DDIMGenerator:
     def __new__(cls, config: FlowGeneratorConfig | dict[str, Any] | None = None, **kwargs):
         import math
@@ -1052,6 +1117,8 @@ def build_generator(config: dict[str, Any] | FlowGeneratorConfig | None = None, 
             return MeanFlowSiTGenerator(config)
         if config.model_type == GENERATOR_MODEL_TYPE_SIT_DIFFUSION:
             return SiTDiffusionGenerator(config)
+        if config.model_type == GENERATOR_MODEL_TYPE_LATENT_CONSISTENCY:
+            return LatentConsistencyGenerator(config)
         if config.model_type == GENERATOR_MODEL_TYPE_DDIM:
             return DDIMGenerator(config)
         raise ValueError(f"Unsupported generator model_type: {config.model_type}")
@@ -1069,6 +1136,8 @@ def build_generator(config: dict[str, Any] | FlowGeneratorConfig | None = None, 
         return MeanFlowSiTGenerator(payload)
     if model_type == GENERATOR_MODEL_TYPE_SIT_DIFFUSION:
         return SiTDiffusionGenerator(payload)
+    if model_type == GENERATOR_MODEL_TYPE_LATENT_CONSISTENCY:
+        return LatentConsistencyGenerator(payload)
     if model_type == GENERATOR_MODEL_TYPE_DDIM:
         return DDIMGenerator(payload)
     raise ValueError(f"Unsupported generator model_type: {model_type}")
@@ -1152,7 +1221,45 @@ def _validate_config(config: FlowGeneratorConfig) -> None:
             )
         if config.ddim_eta != 0.0:
             raise ValueError(f"sit_diffusion currently supports deterministic DDIM only, got ddim_eta={config.ddim_eta}")
-    if config.model_type in {GENERATOR_MODEL_TYPE_MEANFLOW_SIT, GENERATOR_MODEL_TYPE_SIT_DIFFUSION}:
+    if config.model_type == GENERATOR_MODEL_TYPE_LATENT_CONSISTENCY:
+        if config.sampler != "consistency":
+            raise ValueError(f"latent_consistency sampler must be 'consistency', got {config.sampler!r}")
+        if config.consistency_train_timesteps <= 1:
+            raise ValueError(
+                f"consistency_train_timesteps must be greater than 1, got {config.consistency_train_timesteps}"
+            )
+        if config.diffusion_beta_schedule not in DDIM_BETA_SCHEDULES:
+            allowed = ", ".join(DDIM_BETA_SCHEDULES)
+            raise ValueError(f"diffusion_beta_schedule must be one of {allowed}, got {config.diffusion_beta_schedule!r}")
+        if config.consistency_prediction_type not in CONSISTENCY_PREDICTION_TYPES:
+            allowed = ", ".join(CONSISTENCY_PREDICTION_TYPES)
+            raise ValueError(
+                f"consistency_prediction_type must be one of {allowed}, got {config.consistency_prediction_type!r}"
+            )
+        if config.consistency_target not in CONSISTENCY_TARGETS:
+            allowed = ", ".join(CONSISTENCY_TARGETS)
+            raise ValueError(f"consistency_target must be one of {allowed}, got {config.consistency_target!r}")
+        if config.consistency_min_step_gap <= 0:
+            raise ValueError(f"consistency_min_step_gap must be positive, got {config.consistency_min_step_gap}")
+        if config.consistency_min_step_gap >= config.consistency_train_timesteps:
+            raise ValueError(
+                "consistency_min_step_gap must be less than consistency_train_timesteps, "
+                f"got {config.consistency_min_step_gap} >= {config.consistency_train_timesteps}"
+            )
+        if config.ddim_beta_start <= 0.0 or config.ddim_beta_start >= 1.0:
+            raise ValueError(f"ddim_beta_start must be in (0, 1), got {config.ddim_beta_start}")
+        if config.ddim_beta_end <= 0.0 or config.ddim_beta_end >= 1.0:
+            raise ValueError(f"ddim_beta_end must be in (0, 1), got {config.ddim_beta_end}")
+        if config.ddim_beta_start >= config.ddim_beta_end:
+            raise ValueError(
+                "latent_consistency beta schedule requires ddim_beta_start < ddim_beta_end, "
+                f"got {config.ddim_beta_start} >= {config.ddim_beta_end}"
+            )
+        if config.ddim_eta != 0.0:
+            raise ValueError(
+                f"latent_consistency currently supports deterministic consistency sampling only, got ddim_eta={config.ddim_eta}"
+            )
+    if config.model_type in SIT_GENERATOR_MODEL_TYPES:
         if config.sit_input_channels <= 0:
             raise ValueError(f"sit_input_channels must be positive, got {config.sit_input_channels}")
         if config.sit_patch_size <= 0:

@@ -53,6 +53,28 @@ def _latent_sit_diffusion_generator_config():
     )
 
 
+def _latent_consistency_generator_config():
+    from safa.models.generator import FlowGeneratorConfig
+
+    return FlowGeneratorConfig(
+        model_type="latent_consistency",
+        embedding_dim=2,
+        image_size=32,
+        sample_steps=4,
+        train_cycle_steps=4,
+        sampler="consistency",
+        sit_input_channels=4,
+        sit_patch_size=4,
+        sit_hidden_size=32,
+        sit_depth=2,
+        sit_num_heads=4,
+        sit_mlp_ratio=2.0,
+        sit_time_embedding_dim=32,
+        sit_data_space="latent",
+        consistency_train_timesteps=32,
+    )
+
+
 class FakeLatentCodec:
     def __init__(self) -> None:
         self.encoded_images_shape = None
@@ -118,6 +140,12 @@ def test_latent_training_config_accepts_sit_diffusion_latent_generator() -> None
     validate_latent_training_config(_load_e11_config(), _latent_sit_diffusion_generator_config())
 
 
+def test_latent_training_config_accepts_latent_consistency_latent_generator() -> None:
+    from safa.training.latent_codec import validate_latent_training_config
+
+    validate_latent_training_config(_load_e11_config(), _latent_consistency_generator_config())
+
+
 def test_latent_training_config_rejects_non_latent_capable_generator() -> None:
     from safa.models.generator import FlowGeneratorConfig
     from safa.training.latent_codec import validate_latent_training_config
@@ -140,6 +168,20 @@ def test_sit_diffusion_latent_training_x_init_uses_four_channels() -> None:
     assert tuple(x_init.shape) == (2, 4, 32, 32)
 
 
+def test_latent_consistency_latent_training_x_init_uses_four_channels() -> None:
+    from safa.training import g_loop
+
+    x_init = g_loop._make_x_init_for_generator_config(
+        ["a", "b"],
+        1337,
+        _latent_consistency_generator_config(),
+        torch.device("cpu"),
+        torch.float32,
+    )
+
+    assert tuple(x_init.shape) == (2, 4, 32, 32)
+
+
 def test_eval_runner_sit_diffusion_latent_x_init_uses_four_channels() -> None:
     from torch import nn
 
@@ -149,6 +191,34 @@ def test_eval_runner_sit_diffusion_latent_x_init_uses_four_channels() -> None:
         def __init__(self) -> None:
             super().__init__()
             self.config = _latent_sit_diffusion_generator_config()
+            self.seen_x_init_shape = None
+
+        def sample(self, z, **kwargs):
+            self.seen_x_init_shape = tuple(kwargs["x_init"].shape)
+            return torch.zeros(z.shape[0], 4, 32, 32, device=z.device, dtype=z.dtype)
+
+    generator = DummyGenerator()
+    generated = runner._sample_generated_for_eval(
+        generator,
+        torch.eye(2),
+        ["a", "b"],
+        1337,
+        256,
+    )
+
+    assert generator.seen_x_init_shape == (2, 4, 32, 32)
+    assert tuple(generated.shape) == (2, 4, 32, 32)
+
+
+def test_eval_runner_latent_consistency_latent_x_init_uses_four_channels() -> None:
+    from torch import nn
+
+    from safa.evaluation import runner
+
+    class DummyGenerator(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = _latent_consistency_generator_config()
             self.seen_x_init_shape = None
 
         def sample(self, z, **kwargs):
