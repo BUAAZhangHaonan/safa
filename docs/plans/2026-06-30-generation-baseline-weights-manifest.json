@@ -1,0 +1,30 @@
+{
+  "meanflow_sit_weights": {
+    "meanflow_sit_b2": {
+      "path": "artifacts/checkpoints/external/meanflow_sit/zhuyu_sit_b_2_imagenet256.pt",
+      "required_shapes": {
+        "blocks.11.attn.qkv.weight": [2304, 768],
+        "final_layer.linear.weight": [16, 768],
+        "pos_embed": [1, 256, 768],
+        "x_embedder.proj.weight": [768, 4, 2, 2]
+      },
+      "source": "zhuyu-cs/MeanFlow ImageNet256 SiT-B/2 MeanFlow EMA"
+    },
+    "meanflow_sit_l2": {
+      "path": "artifacts/checkpoints/external/meanflow_sit/zhuyu_sit_l_2_imagenet256.pt",
+      "required_shapes": {
+        "blocks.23.attn.qkv.weight": [3072, 1024],
+        "final_layer.linear.weight": [16, 1024],
+        "pos_embed": [1, 256, 1024],
+        "x_embedder.proj.weight": [1024, 4, 2, 2]
+      },
+      "source": "zhuyu-cs/MeanFlow ImageNet256 SiT-L/2 MeanFlow EMA"
+    }
+  },
+  "unavailable_public_pretrained": {
+    "latent_consistency_b2": "No reliable public SAFA-compatible Latent-Consistency-B/2 pretrained checkpoint is known for this matrix.",
+    "latent_consistency_l2": "No reliable public SAFA-compatible Latent-Consistency-L/2 pretrained checkpoint is known for this matrix.",
+    "sit_diffusion_b2": "No reliable public SAFA-compatible SiT-Diffusion-B/2 pretrained checkpoint is known for this matrix.",
+    "sit_diffusion_l2": "No reliable public SAFA-compatible SiT-Diffusion-L/2 pretrained checkpoint is known for this matrix."
+  }
+}
