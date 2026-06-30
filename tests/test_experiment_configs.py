@@ -20,6 +20,38 @@ def _load_experiment_config(filename: str) -> dict:
     ("filename", "expected"),
     [
         (
+            "e19_meanflow_sit_b2_face_mixed_2400ep.yaml",
+            {
+                "experiment_name": "e19_meanflow_sit_b2_face_mixed_2400ep",
+                "model_type": "meanflow_sit",
+                "sampler": "meanflow",
+                "sample_steps": 1,
+                "train_cycle_steps": 1,
+                "quality_dir": "artifacts/eval/e19_meanflow_sit_b2_face_mixed_2400ep/quality",
+                "sit_hidden_size": 768,
+                "sit_depth": 12,
+                "sit_num_heads": 12,
+                "sit_pretrained_path": "artifacts/checkpoints/external/meanflow_sit/zhuyu_sit_b_2_imagenet256.pt",
+                "eval_cells": [{"name": "meanflow_b2_1step", "sampler": "meanflow", "sample_steps": 1}],
+            },
+        ),
+        (
+            "e20_rectified_flow_sit_b2_face_mixed_2400ep.yaml",
+            {
+                "experiment_name": "e20_rectified_flow_sit_b2_face_mixed_2400ep",
+                "model_type": "rectified_flow_sit",
+                "sampler": "euler",
+                "sample_steps": 16,
+                "train_cycle_steps": 16,
+                "quality_dir": "artifacts/eval/e20_rectified_flow_sit_b2_face_mixed_2400ep/quality",
+                "sit_hidden_size": 768,
+                "sit_depth": 12,
+                "sit_num_heads": 12,
+                "sit_pretrained_path": "artifacts/checkpoints/external/meanflow_sit/zhuyu_sit_b_2_imagenet256.pt",
+                "eval_cells": [{"name": "rectified_flow_sit_b2_euler16", "sampler": "euler", "sample_steps": 16}],
+            },
+        ),
+        (
             "e17_sit_diffusion_l2_face_mixed_2400ep.yaml",
             {
                 "experiment_name": "e17_sit_diffusion_l2_face_mixed_2400ep",
@@ -28,6 +60,11 @@ def _load_experiment_config(filename: str) -> dict:
                 "sample_steps": 16,
                 "train_cycle_steps": 16,
                 "quality_dir": "artifacts/eval/e17_sit_diffusion_l2_face_mixed_2400ep/quality",
+                "sit_hidden_size": 1024,
+                "sit_depth": 24,
+                "sit_num_heads": 16,
+                "sit_pretrained_path": "artifacts/checkpoints/external/meanflow_sit/zhuyu_sit_l_2_imagenet256.pt",
+                "eval_cells": [{"name": "sit_diffusion_l2_ddim16", "sampler": "ddim", "sample_steps": 16}],
             },
         ),
         (
@@ -39,6 +76,65 @@ def _load_experiment_config(filename: str) -> dict:
                 "sample_steps": 4,
                 "train_cycle_steps": 4,
                 "quality_dir": "artifacts/eval/e18_latent_consistency_l2_face_mixed_2400ep/quality",
+                "sit_hidden_size": 1024,
+                "sit_depth": 24,
+                "sit_num_heads": 16,
+                "sit_pretrained_path": "artifacts/checkpoints/external/meanflow_sit/zhuyu_sit_l_2_imagenet256.pt",
+                "eval_cells": [{"name": "latent_consistency_l2_4step", "sampler": "consistency", "sample_steps": 4}],
+            },
+        ),
+        (
+            "e21_rectified_flow_sit_l2_face_mixed_2400ep.yaml",
+            {
+                "experiment_name": "e21_rectified_flow_sit_l2_face_mixed_2400ep",
+                "model_type": "rectified_flow_sit",
+                "sampler": "euler",
+                "sample_steps": 16,
+                "train_cycle_steps": 16,
+                "quality_dir": "artifacts/eval/e21_rectified_flow_sit_l2_face_mixed_2400ep/quality",
+                "sit_hidden_size": 1024,
+                "sit_depth": 24,
+                "sit_num_heads": 16,
+                "sit_pretrained_path": "artifacts/checkpoints/external/meanflow_sit/zhuyu_sit_l_2_imagenet256.pt",
+                "eval_cells": [{"name": "rectified_flow_sit_l2_euler16", "sampler": "euler", "sample_steps": 16}],
+            },
+        ),
+        (
+            "e22_sit_diffusion_b2_face_mixed_2400ep.yaml",
+            {
+                "experiment_name": "e22_sit_diffusion_b2_face_mixed_2400ep",
+                "model_type": "sit_diffusion",
+                "sampler": "ddim",
+                "sample_steps": 16,
+                "train_cycle_steps": 16,
+                "quality_dir": "artifacts/eval/e22_sit_diffusion_b2_face_mixed_2400ep/quality",
+                "sit_hidden_size": 768,
+                "sit_depth": 12,
+                "sit_num_heads": 12,
+                "sit_pretrained_path": "artifacts/checkpoints/external/meanflow_sit/zhuyu_sit_b_2_imagenet256.pt",
+                "eval_cells": [
+                    {"name": "sit_diffusion_b2_ddim1", "sampler": "ddim", "sample_steps": 1},
+                    {"name": "sit_diffusion_b2_ddim16", "sampler": "ddim", "sample_steps": 16},
+                ],
+            },
+        ),
+        (
+            "e23_latent_consistency_b2_face_mixed_2400ep.yaml",
+            {
+                "experiment_name": "e23_latent_consistency_b2_face_mixed_2400ep",
+                "model_type": "latent_consistency",
+                "sampler": "consistency",
+                "sample_steps": 4,
+                "train_cycle_steps": 4,
+                "quality_dir": "artifacts/eval/e23_latent_consistency_b2_face_mixed_2400ep/quality",
+                "sit_hidden_size": 768,
+                "sit_depth": 12,
+                "sit_num_heads": 12,
+                "sit_pretrained_path": "artifacts/checkpoints/external/meanflow_sit/zhuyu_sit_b_2_imagenet256.pt",
+                "eval_cells": [
+                    {"name": "latent_consistency_b2_1step", "sampler": "consistency", "sample_steps": 1},
+                    {"name": "latent_consistency_b2_4step", "sampler": "consistency", "sample_steps": 4},
+                ],
             },
         ),
     ],
@@ -70,10 +166,16 @@ def test_e17_e18_baseline_configs_validate_and_keep_stage1_null_prior(filename: 
     assert generator["sit_input_channels"] == 4
     assert generator["sit_data_space"] == "latent"
     assert generator["sit_patch_size"] == 2
-    assert generator["sit_hidden_size"] == 1024
-    assert generator["sit_depth"] == 24
-    assert generator["sit_num_heads"] == 16
-    assert generator["sit_pretrained_path"] == "artifacts/checkpoints/external/meanflow_sit/zhuyu_sit_l_2_imagenet256.pt"
+    assert generator["sit_hidden_size"] == expected["sit_hidden_size"]
+    assert generator["sit_depth"] == expected["sit_depth"]
+    assert generator["sit_num_heads"] == expected["sit_num_heads"]
+    assert generator["sit_pretrained_path"] == expected["sit_pretrained_path"]
+    eval_cells = generator["eval_cells"]
+    assert len(eval_cells) == len(expected["eval_cells"])
+    for actual, expected_cell in zip(eval_cells, expected["eval_cells"]):
+        for key, value in expected_cell.items():
+            assert actual[key] == value
+        assert actual["note"]
 
     objective = config["stages"]["stage2"]["stage2_objective"]
     assert objective["type"] == "fm_only_probe"
@@ -93,6 +195,47 @@ def test_e17_e18_baseline_configs_validate_and_keep_stage1_null_prior(filename: 
     generator_payload["image_size"] = config["image_size"]
     FlowGeneratorConfig.from_dict(generator_payload)
     g_loop._validate_train_g_config(config)
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "e19_meanflow_sit_b2_face_mixed_2400ep.yaml",
+        "e20_rectified_flow_sit_b2_face_mixed_2400ep.yaml",
+        "e21_rectified_flow_sit_l2_face_mixed_2400ep.yaml",
+        "e22_sit_diffusion_b2_face_mixed_2400ep.yaml",
+        "e23_latent_consistency_b2_face_mixed_2400ep.yaml",
+    ],
+)
+def test_new_generation_baseline_configs_have_buildable_model_types(filename: str) -> None:
+    from safa.models.generator import build_generator
+
+    config = _load_experiment_config(filename)
+    generator = dict(config["generator"])
+    generator.update(
+        {
+            "embedding_dim": 16,
+            "image_size": 16,
+            "base_channels": 4,
+            "channel_multipliers": [1],
+            "time_embedding_dim": 8,
+            "condition_dim": 16,
+            "learned_null_condition": True,
+            "sit_input_channels": 3,
+            "sit_data_space": "pixel",
+            "sit_patch_size": 4,
+            "sit_hidden_size": 32,
+            "sit_depth": 2,
+            "sit_num_heads": 4,
+            "sit_mlp_ratio": 2.0,
+            "sit_time_embedding_dim": 32,
+            "sit_pretrained_path": "",
+            "attention_backend": "native",
+        }
+    )
+    built = build_generator(generator)
+
+    assert built.config.model_type == config["generator"]["model_type"]
 
 
 def test_e18_declares_analytic_x0_consistency_surrogate() -> None:

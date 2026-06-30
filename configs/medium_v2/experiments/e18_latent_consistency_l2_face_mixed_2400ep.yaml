@@ -66,6 +66,11 @@ generator:
   consistency_prediction_type: x0
   consistency_target: analytic_x0
   consistency_min_step_gap: 1
+  eval_cells:
+  - name: latent_consistency_l2_4step
+    sampler: consistency
+    sample_steps: 4
+    note: primary 4-step consistency report cell for the L/2 consistency checkpoint
 grad_clip_norm: 1.0
 stages:
   stage1:

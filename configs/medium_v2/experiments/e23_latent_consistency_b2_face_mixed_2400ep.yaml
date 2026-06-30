@@ -1,4 +1,4 @@
-experiment_name: e17_sit_diffusion_l2_face_mixed_2400ep
+experiment_name: e23_latent_consistency_b2_face_mixed_2400ep
 seed: 1337
 sampling_seed: 1337
 device: cuda:0
@@ -18,7 +18,7 @@ embedding_dim: 512
 train_index: data/index/train_face_mixed_e14.jsonl
 train_features: artifacts/e0_features/train_face_mixed_e14_e0_medium_v1
 e0_checkpoint: artifacts/checkpoints/e0_medium_v1/best.pt
-out_dir: artifacts/checkpoints/e17_sit_diffusion_l2_face_mixed_2400ep
+out_dir: artifacts/checkpoints/e23_latent_consistency_b2_face_mixed_2400ep
 allow_stage2_without_stage1_gate: true
 resume_from: ''
 resume_mode: model_weights_only
@@ -34,41 +34,47 @@ best_model: ema
 distributed:
   backend: gloo
 generator:
-  model_type: sit_diffusion
+  model_type: latent_consistency
   base_channels: 1
   channel_multipliers:
   - 1
   time_embedding_dim: 128
   condition_dim: 512
-  sample_steps: 16
-  train_cycle_steps: 16
+  sample_steps: 4
+  train_cycle_steps: 4
   cycle_steps_schedule: []
-  sampler: ddim
+  sampler: consistency
   learned_null_condition: true
   sit_input_channels: 4
   sit_data_space: latent
   sit_patch_size: 2
-  sit_hidden_size: 1024
-  sit_depth: 24
-  sit_num_heads: 16
+  sit_hidden_size: 768
+  sit_depth: 12
+  sit_num_heads: 12
   sit_mlp_ratio: 4.0
   sit_time_embedding_dim: 256
   attention_backend: auto
-  sit_pretrained_path: artifacts/checkpoints/external/meanflow_sit/zhuyu_sit_l_2_imagenet256.pt
+  sit_pretrained_path: artifacts/checkpoints/external/meanflow_sit/zhuyu_sit_b_2_imagenet256.pt
   sit_pretrained_state_key: ''
-  sit_pretrained_source: zhuyu-cs/MeanFlow ImageNet256 sit_l_2_meanflow_ema.pt; partial warm start only
-  sit_pretrained_source_repo: https://github.com/zhuyu-cs/MeanFlow; https://drive.google.com/drive/folders/1oWt6tdm5WIeVaZnBuUVheKIG3cNDffl9?usp=drive_link
-  diffusion_train_timesteps: 1000
+  sit_pretrained_source: no reliable public latent-consistency SiT-B/2 SAFA-aligned pretrained weight; optional partial warm start only
+  sit_pretrained_source_repo: https://github.com/openai/consistency_models
   diffusion_beta_schedule: linear
-  diffusion_prediction_type: epsilon
   ddim_beta_start: 0.0001
   ddim_beta_end: 0.02
   ddim_eta: 0.0
+  consistency_train_timesteps: 1000
+  consistency_prediction_type: x0
+  consistency_target: analytic_x0
+  consistency_min_step_gap: 1
   eval_cells:
-  - name: sit_diffusion_l2_ddim16
-    sampler: ddim
-    sample_steps: 16
-    note: primary 16-step DDIM report cell for the L/2 diffusion checkpoint
+  - name: latent_consistency_b2_1step
+    sampler: consistency
+    sample_steps: 1
+    note: one-step consistency sampler report cell for the same B/2 checkpoint
+  - name: latent_consistency_b2_4step
+    sampler: consistency
+    sample_steps: 4
+    note: primary 4-step consistency report cell for the B/2 checkpoint
 grad_clip_norm: 1.0
 stages:
   stage1:
@@ -98,7 +104,7 @@ stages:
       real_index: data/index/val_face_mixed_e14.jsonl
       distribution_cuda_visible_devices: '0'
       distribution_device: cuda:0
-      output_dir: artifacts/eval/e17_sit_diffusion_l2_face_mixed_2400ep/quality
+      output_dir: artifacts/eval/e23_latent_consistency_b2_face_mixed_2400ep/quality
       model: ema
 validation:
   enabled: true

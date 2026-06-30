@@ -7,6 +7,7 @@ from typing import Any
 GENERATOR_MODEL_TYPE_FLOW = "conditional_flow_matching"
 GENERATOR_MODEL_TYPE_MEANFLOW = "meanflow"
 GENERATOR_MODEL_TYPE_MEANFLOW_SIT = "meanflow_sit"
+GENERATOR_MODEL_TYPE_RECTIFIED_FLOW_SIT = "rectified_flow_sit"
 GENERATOR_MODEL_TYPE_SIT_DIFFUSION = "sit_diffusion"
 GENERATOR_MODEL_TYPE_LATENT_CONSISTENCY = "latent_consistency"
 GENERATOR_MODEL_TYPE_DDIM = "ddim"
@@ -14,12 +15,14 @@ GENERATOR_MODEL_TYPES = (
     GENERATOR_MODEL_TYPE_FLOW,
     GENERATOR_MODEL_TYPE_MEANFLOW,
     GENERATOR_MODEL_TYPE_MEANFLOW_SIT,
+    GENERATOR_MODEL_TYPE_RECTIFIED_FLOW_SIT,
     GENERATOR_MODEL_TYPE_SIT_DIFFUSION,
     GENERATOR_MODEL_TYPE_LATENT_CONSISTENCY,
     GENERATOR_MODEL_TYPE_DDIM,
 )
 SIT_GENERATOR_MODEL_TYPES = (
     GENERATOR_MODEL_TYPE_MEANFLOW_SIT,
+    GENERATOR_MODEL_TYPE_RECTIFIED_FLOW_SIT,
     GENERATOR_MODEL_TYPE_SIT_DIFFUSION,
     GENERATOR_MODEL_TYPE_LATENT_CONSISTENCY,
 )
@@ -213,6 +216,24 @@ class FlowGeneratorConfig:
             )
             payload["sit_data_space"] = self.sit_data_space
             payload["attention_backend"] = self.attention_backend
+            if self.sit_pretrained_path:
+                payload["sit_pretrained_path"] = self.sit_pretrained_path
+            if self.sit_pretrained_state_key:
+                payload["sit_pretrained_state_key"] = self.sit_pretrained_state_key
+        if self.model_type == GENERATOR_MODEL_TYPE_RECTIFIED_FLOW_SIT:
+            payload.update(
+                {
+                    "sit_input_channels": self.sit_input_channels,
+                    "sit_patch_size": self.sit_patch_size,
+                    "sit_hidden_size": self.sit_hidden_size,
+                    "sit_depth": self.sit_depth,
+                    "sit_num_heads": self.sit_num_heads,
+                    "sit_mlp_ratio": self.sit_mlp_ratio,
+                    "sit_time_embedding_dim": self.sit_time_embedding_dim,
+                    "sit_data_space": self.sit_data_space,
+                    "attention_backend": self.attention_backend,
+                }
+            )
             if self.sit_pretrained_path:
                 payload["sit_pretrained_path"] = self.sit_pretrained_path
             if self.sit_pretrained_state_key:
@@ -786,6 +807,44 @@ class MeanFlowSiTGenerator:
         return generator
 
 
+class RectifiedFlowSiTGenerator:
+    def __new__(cls, config: FlowGeneratorConfig | dict[str, Any] | None = None, **kwargs):
+        from safa.models.rectified_flow_sit import build_rectified_flow_sit_generator
+
+        cfg_payload = {}
+        if isinstance(config, FlowGeneratorConfig):
+            cfg = config
+        elif config is None and not kwargs:
+            cfg = FlowGeneratorConfig(
+                model_type=GENERATOR_MODEL_TYPE_RECTIFIED_FLOW_SIT,
+                sampler="euler",
+                sample_steps=16,
+                train_cycle_steps=16,
+            )
+        else:
+            if config is not None:
+                cfg_payload.update(config)
+            cfg_payload.update(kwargs)
+            cfg_payload.setdefault("model_type", GENERATOR_MODEL_TYPE_RECTIFIED_FLOW_SIT)
+            cfg_payload.setdefault("sampler", "euler")
+            cfg = FlowGeneratorConfig.from_dict(cfg_payload)
+        _validate_config(cfg)
+        if cfg.model_type != GENERATOR_MODEL_TYPE_RECTIFIED_FLOW_SIT:
+            raise ValueError(
+                f"RectifiedFlowSiTGenerator requires model_type={GENERATOR_MODEL_TYPE_RECTIFIED_FLOW_SIT!r}, "
+                f"got {cfg.model_type!r}"
+            )
+        generator = build_rectified_flow_sit_generator(cfg)
+        if cfg.sit_pretrained_path:
+            generator.pretrained_load_report = generator.load_pretrained(
+                cfg.sit_pretrained_path,
+                state_key=cfg.sit_pretrained_state_key or None,
+                strict=False,
+                allow_missing=False,
+            )
+        return generator
+
+
 class SiTDiffusionGenerator:
     def __new__(cls, config: FlowGeneratorConfig | dict[str, Any] | None = None, **kwargs):
         from safa.models.sit_diffusion import build_sit_diffusion_generator
@@ -1115,6 +1174,8 @@ def build_generator(config: dict[str, Any] | FlowGeneratorConfig | None = None, 
             return MeanFlowGenerator(config)
         if config.model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT:
             return MeanFlowSiTGenerator(config)
+        if config.model_type == GENERATOR_MODEL_TYPE_RECTIFIED_FLOW_SIT:
+            return RectifiedFlowSiTGenerator(config)
         if config.model_type == GENERATOR_MODEL_TYPE_SIT_DIFFUSION:
             return SiTDiffusionGenerator(config)
         if config.model_type == GENERATOR_MODEL_TYPE_LATENT_CONSISTENCY:
@@ -1134,6 +1195,8 @@ def build_generator(config: dict[str, Any] | FlowGeneratorConfig | None = None, 
         return MeanFlowGenerator(payload)
     if model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT:
         return MeanFlowSiTGenerator(payload)
+    if model_type == GENERATOR_MODEL_TYPE_RECTIFIED_FLOW_SIT:
+        return RectifiedFlowSiTGenerator(payload)
     if model_type == GENERATOR_MODEL_TYPE_SIT_DIFFUSION:
         return SiTDiffusionGenerator(payload)
     if model_type == GENERATOR_MODEL_TYPE_LATENT_CONSISTENCY:
@@ -1199,6 +1262,9 @@ def _validate_config(config: FlowGeneratorConfig) -> None:
         if config.meanflow_jvp_mode not in MEANFLOW_JVP_MODES:
             allowed = ", ".join(MEANFLOW_JVP_MODES)
             raise ValueError(f"meanflow_jvp_mode must be one of {allowed}, got {config.meanflow_jvp_mode!r}")
+    if config.model_type == GENERATOR_MODEL_TYPE_RECTIFIED_FLOW_SIT:
+        if config.sampler not in {"euler", "heun"}:
+            raise ValueError(f"rectified_flow_sit sampler must be euler or heun, got {config.sampler!r}")
     if config.model_type == GENERATOR_MODEL_TYPE_SIT_DIFFUSION:
         if config.sampler != "ddim":
             raise ValueError(f"sit_diffusion sampler must be 'ddim', got {config.sampler!r}")
