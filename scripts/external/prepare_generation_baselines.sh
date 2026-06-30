@@ -69,7 +69,7 @@ main() {
 
   try_download_meanflow_b2
 
-  "${PYTHON_BIN}" "${VERIFY_SCRIPT}" --root "${ROOT_DIR}" --manifest "${MANIFEST_PATH}"
+  "${PYTHON_BIN}" "${VERIFY_SCRIPT}" --root "${ROOT_DIR}" --manifest "${MANIFEST_PATH}" --require-existing all
   echo "wrote manifest: ${MANIFEST_PATH}"
 }
 

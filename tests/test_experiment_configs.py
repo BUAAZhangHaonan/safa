@@ -20,6 +20,24 @@ def _load_experiment_config(filename: str) -> dict:
     ("filename", "expected"),
     [
         (
+            "e16_meanflow_sit_l2_face_mixed_2400ep.yaml",
+            {
+                "experiment_name": "e16_meanflow_sit_l2_face_mixed_2400ep",
+                "model_type": "meanflow_sit",
+                "sampler": "meanflow",
+                "sample_steps": 1,
+                "train_cycle_steps": 1,
+                "quality_dir": "artifacts/eval/e16_meanflow_sit_l2_face_mixed_2400ep/quality",
+                "global_batch_size": 64,
+                "per_device_batch_size": 64,
+                "sit_hidden_size": 1024,
+                "sit_depth": 24,
+                "sit_num_heads": 16,
+                "sit_pretrained_path": "artifacts/checkpoints/external/meanflow_sit/zhuyu_sit_l_2_imagenet256.pt",
+                "eval_cells": [{"name": "meanflow_l2_1step", "sampler": "meanflow", "sample_steps": 1}],
+            },
+        ),
+        (
             "e19_meanflow_sit_b2_face_mixed_2400ep.yaml",
             {
                 "experiment_name": "e19_meanflow_sit_b2_face_mixed_2400ep",
@@ -64,7 +82,10 @@ def _load_experiment_config(filename: str) -> dict:
                 "sit_depth": 24,
                 "sit_num_heads": 16,
                 "sit_pretrained_path": "artifacts/checkpoints/external/meanflow_sit/zhuyu_sit_l_2_imagenet256.pt",
-                "eval_cells": [{"name": "sit_diffusion_l2_ddim16", "sampler": "ddim", "sample_steps": 16}],
+                "eval_cells": [
+                    {"name": "sit_diffusion_l2_ddim1", "sampler": "ddim", "sample_steps": 1},
+                    {"name": "sit_diffusion_l2_ddim16", "sampler": "ddim", "sample_steps": 16},
+                ],
             },
         ),
         (
@@ -80,7 +101,10 @@ def _load_experiment_config(filename: str) -> dict:
                 "sit_depth": 24,
                 "sit_num_heads": 16,
                 "sit_pretrained_path": "artifacts/checkpoints/external/meanflow_sit/zhuyu_sit_l_2_imagenet256.pt",
-                "eval_cells": [{"name": "latent_consistency_l2_4step", "sampler": "consistency", "sample_steps": 4}],
+                "eval_cells": [
+                    {"name": "latent_consistency_l2_1step", "sampler": "consistency", "sample_steps": 1},
+                    {"name": "latent_consistency_l2_4step", "sampler": "consistency", "sample_steps": 4},
+                ],
             },
         ),
         (
@@ -154,8 +178,8 @@ def test_e17_e18_baseline_configs_validate_and_keep_stage1_null_prior(filename: 
     assert config["out_dir"] == f"artifacts/checkpoints/{expected['experiment_name']}"
     assert config["resume_from"] == ""
     assert config["resume_optimizer_state"] is False
-    assert config["global_batch_size"] == 16
-    assert config["per_device_batch_size"] == 16
+    assert config["global_batch_size"] == expected.get("global_batch_size", 16)
+    assert config["per_device_batch_size"] == expected.get("per_device_batch_size", 16)
 
     generator = config["generator"]
     assert generator["model_type"] == expected["model_type"]
@@ -246,3 +270,38 @@ def test_e18_declares_analytic_x0_consistency_surrogate() -> None:
     assert generator["consistency_prediction_type"] == "x0"
     assert generator["consistency_target"] == "analytic_x0"
     assert generator["consistency_min_step_gap"] == 1
+
+
+def test_generation_baseline_matrix_declares_all_12_report_cells() -> None:
+    configs = [
+        "e16_meanflow_sit_l2_face_mixed_2400ep.yaml",
+        "e17_sit_diffusion_l2_face_mixed_2400ep.yaml",
+        "e18_latent_consistency_l2_face_mixed_2400ep.yaml",
+        "e19_meanflow_sit_b2_face_mixed_2400ep.yaml",
+        "e20_rectified_flow_sit_b2_face_mixed_2400ep.yaml",
+        "e21_rectified_flow_sit_l2_face_mixed_2400ep.yaml",
+        "e22_sit_diffusion_b2_face_mixed_2400ep.yaml",
+        "e23_latent_consistency_b2_face_mixed_2400ep.yaml",
+    ]
+    expected_cells = {
+        "meanflow_l2_1step",
+        "sit_diffusion_l2_ddim1",
+        "sit_diffusion_l2_ddim16",
+        "latent_consistency_l2_1step",
+        "latent_consistency_l2_4step",
+        "meanflow_b2_1step",
+        "rectified_flow_sit_b2_euler16",
+        "rectified_flow_sit_l2_euler16",
+        "sit_diffusion_b2_ddim1",
+        "sit_diffusion_b2_ddim16",
+        "latent_consistency_b2_1step",
+        "latent_consistency_b2_4step",
+    }
+
+    cells = []
+    for filename in configs:
+        generator = _load_experiment_config(filename)["generator"]
+        cells.extend(generator["eval_cells"])
+
+    assert len(cells) == 12
+    assert {cell["name"] for cell in cells} == expected_cells

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -85,6 +86,42 @@ def _shape_of(value: Any) -> list[int] | None:
     return [int(item) for item in shape]
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_torch_checkpoint(path: Path) -> tuple[Any, dict[str, Any]]:
+    import torch
+
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        return payload, {
+            "weights_only_supported": True,
+            "weights_only_used": True,
+            "weights_only_fallback_reason": "",
+        }
+    except TypeError as exc:
+        if "weights_only" not in str(exc):
+            raise
+        payload = torch.load(path, map_location="cpu")
+        return payload, {
+            "weights_only_supported": False,
+            "weights_only_used": False,
+            "weights_only_fallback_reason": f"unsupported_argument: {exc}",
+        }
+    except Exception as exc:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        return payload, {
+            "weights_only_supported": True,
+            "weights_only_used": False,
+            "weights_only_fallback_reason": f"{type(exc).__name__}: {exc}",
+        }
+
+
 def verify_weight(root: Path, name: str, spec: dict[str, Any], state_key: str | None) -> tuple[dict[str, Any], bool]:
     path = root / spec["path"]
     result: dict[str, Any] = {
@@ -94,10 +131,18 @@ def verify_weight(root: Path, name: str, spec: dict[str, Any], state_key: str | 
         "exists": path.is_file(),
         "ok": False,
         "shape_checks": [],
+        "sha256": "",
+        "size_bytes": 0,
+        "weights_only_supported": None,
+        "weights_only_used": False,
+        "weights_only_fallback_reason": "",
     }
     if not path.is_file():
         result["status"] = "missing"
         return result, True
+
+    result["sha256"] = _sha256_file(path)
+    result["size_bytes"] = path.stat().st_size
 
     try:
         import torch
@@ -107,7 +152,8 @@ def verify_weight(root: Path, name: str, spec: dict[str, Any], state_key: str | 
         return result, False
 
     try:
-        payload = torch.load(path, map_location="cpu")
+        payload, load_report = _load_torch_checkpoint(path)
+        result.update(load_report)
         state = _strip_module_prefix(_extract_state_dict(payload, state_key))
     except Exception as exc:
         result["status"] = "error"
@@ -139,9 +185,13 @@ def build_manifest(root: Path, state_key: str | None) -> tuple[dict[str, Any], b
         result, ok = verify_weight(root, name, spec, state_key)
         weights.append(result)
         all_ok = all_ok and ok
+    weights_only_supported_values = [
+        item["weights_only_supported"] for item in weights if item.get("weights_only_supported") is not None
+    ]
     manifest = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "root": str(root),
+        "weights_only_supported": all(weights_only_supported_values) if weights_only_supported_values else None,
         "meanflow_sit_weights": weights,
         "unavailable_public_pretrained": NO_RELIABLE_PUBLIC_PRETRAINED,
         "policy": {
@@ -155,12 +205,22 @@ def build_manifest(root: Path, state_key: str | None) -> tuple[dict[str, Any], b
     return manifest, all_ok
 
 
+def _expand_required_existing(values: list[str]) -> list[str]:
+    required: list[str] = []
+    for value in values:
+        names = sorted(MEANFLOW_WEIGHTS) if value == "all" else [value]
+        for name in names:
+            if name not in required:
+                required.append(name)
+    return required
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Verify generation baseline external checkpoint shapes.")
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--manifest", type=Path, default=Path("artifacts/manifests/generation_baseline_weights_manifest.json"))
     parser.add_argument("--state-key", default=None)
-    parser.add_argument("--require-existing", action="append", choices=sorted(MEANFLOW_WEIGHTS), default=[])
+    parser.add_argument("--require-existing", action="append", choices=["all", *sorted(MEANFLOW_WEIGHTS)], default=[])
     return parser.parse_args()
 
 
@@ -169,10 +229,15 @@ def main() -> int:
     root = args.root.resolve()
     manifest, ok = build_manifest(root, args.state_key)
     by_name = {item["name"]: item for item in manifest["meanflow_sit_weights"]}
-    missing_required = [name for name in args.require_existing if not by_name[name]["exists"]]
+    required_existing = _expand_required_existing(args.require_existing)
+    missing_required = [name for name in required_existing if not by_name[name]["exists"]]
+    failed_required = [name for name in required_existing if by_name[name]["exists"] and not by_name[name]["ok"]]
     if missing_required:
         ok = False
         manifest["missing_required"] = missing_required
+    if failed_required:
+        ok = False
+        manifest["failed_required"] = failed_required
     manifest_path = args.manifest
     if not manifest_path.is_absolute():
         manifest_path = root / manifest_path

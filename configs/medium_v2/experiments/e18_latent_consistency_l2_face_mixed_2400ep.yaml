@@ -67,6 +67,10 @@ generator:
   consistency_target: analytic_x0
   consistency_min_step_gap: 1
   eval_cells:
+  - name: latent_consistency_l2_1step
+    sampler: consistency
+    sample_steps: 1
+    note: one-step consistency sampler report cell for the same L/2 checkpoint; this does not change training sampler or steps
   - name: latent_consistency_l2_4step
     sampler: consistency
     sample_steps: 4

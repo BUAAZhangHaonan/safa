@@ -64,6 +64,11 @@ generator:
   sit_pretrained_state_key: ''
   sit_pretrained_source: zhuyu-cs/MeanFlow ImageNet256 sit_l_2_meanflow_ema.pt
   sit_pretrained_source_repo: https://github.com/zhuyu-cs/MeanFlow; https://drive.google.com/drive/folders/1oWt6tdm5WIeVaZnBuUVheKIG3cNDffl9?usp=drive_link
+  eval_cells:
+  - name: meanflow_l2_1step
+    sampler: meanflow
+    sample_steps: 1
+    note: native one-step MeanFlow report cell for the L/2 checkpoint
 grad_clip_norm: 1.0
 stages:
   stage1:

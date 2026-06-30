@@ -65,6 +65,10 @@ generator:
   ddim_beta_end: 0.02
   ddim_eta: 0.0
   eval_cells:
+  - name: sit_diffusion_l2_ddim1
+    sampler: ddim
+    sample_steps: 1
+    note: DDIM-1 report cell for the same L/2 diffusion checkpoint; this does not change training sampler or steps
   - name: sit_diffusion_l2_ddim16
     sampler: ddim
     sample_steps: 16
