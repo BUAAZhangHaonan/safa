@@ -98,12 +98,17 @@ def build_latent_consistency_generator(config):
     def load_pretrained(checkpoint_path: str | Path | None, *, state_key: str | None = None, strict: bool = False, allow_missing: bool = False):
         return base._sit_diffusion_load_pretrained(checkpoint_path, state_key=state_key, strict=strict, allow_missing=allow_missing)
 
+    def normalize_timesteps(timesteps, *, dtype):
+        max_timestep = max(int(config.consistency_train_timesteps) - 1, 1)
+        return timesteps.to(dtype=dtype) / float(max_timestep)
+
     base.forward = forward
     base.flow_matching_loss = flow_matching_loss
     base.sample = sample
     base.consistency_timesteps = consistency_timesteps
     base._sit_diffusion_load_pretrained = base.load_pretrained
     base.load_pretrained = load_pretrained
+    base._normalize_timesteps = normalize_timesteps
     return base
 
 

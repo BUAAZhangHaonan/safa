@@ -65,6 +65,18 @@ def test_build_generator_supports_tiny_latent_consistency() -> None:
     assert generator.config.sampler == "consistency"
 
 
+def test_latent_consistency_normalizes_analytic_x0_timesteps_to_unit_interval() -> None:
+    from safa.models.generator import build_generator
+
+    generator = build_generator(_tiny_latent_consistency_config())
+    timesteps = torch.tensor([0, 31], dtype=torch.long)
+
+    normalized = generator._normalize_timesteps(timesteps, dtype=torch.float32)
+
+    assert torch.allclose(normalized, torch.tensor([0.0, 1.0]), atol=1.0e-6)
+    assert normalized[-1].item() > 0.99
+
+
 def test_latent_consistency_loss_reports_flow_compatible_metrics() -> None:
     from safa.models.generator import build_generator
 
