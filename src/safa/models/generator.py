@@ -16,6 +16,11 @@ GENERATOR_MODEL_TYPES = (
     GENERATOR_MODEL_TYPE_SIT_DIFFUSION,
     GENERATOR_MODEL_TYPE_DDIM,
 )
+SIT_GENERATOR_MODEL_TYPES = (
+    GENERATOR_MODEL_TYPE_MEANFLOW_SIT,
+    GENERATOR_MODEL_TYPE_SIT_DIFFUSION,
+)
+LATENT_CAPABLE_GENERATOR_MODEL_TYPES = SIT_GENERATOR_MODEL_TYPES
 MEANFLOW_JVP_MODE_TORCH_FUNC = "torch_func"
 MEANFLOW_JVP_MODE_FIRST_ORDER = "first_order"
 MEANFLOW_JVP_MODES = (MEANFLOW_JVP_MODE_TORCH_FUNC, MEANFLOW_JVP_MODE_FIRST_ORDER)
@@ -232,6 +237,12 @@ class FlowGeneratorConfig:
                 }
             )
         return payload
+
+
+def generator_sample_channels(config: FlowGeneratorConfig) -> int:
+    if config.model_type in SIT_GENERATOR_MODEL_TYPES:
+        return int(config.sit_input_channels)
+    return 3
 
 
 def require_generator_model_config(payload: dict[str, Any], checkpoint_path: str) -> dict[str, Any]:
@@ -1130,6 +1141,15 @@ def _validate_config(config: FlowGeneratorConfig) -> None:
         if config.diffusion_prediction_type not in DIFFUSION_PREDICTION_TYPES:
             allowed = ", ".join(DIFFUSION_PREDICTION_TYPES)
             raise ValueError(f"diffusion_prediction_type must be one of {allowed}, got {config.diffusion_prediction_type!r}")
+        if config.ddim_beta_start <= 0.0 or config.ddim_beta_start >= 1.0:
+            raise ValueError(f"ddim_beta_start must be in (0, 1), got {config.ddim_beta_start}")
+        if config.ddim_beta_end <= 0.0 or config.ddim_beta_end >= 1.0:
+            raise ValueError(f"ddim_beta_end must be in (0, 1), got {config.ddim_beta_end}")
+        if config.ddim_beta_start >= config.ddim_beta_end:
+            raise ValueError(
+                "sit_diffusion beta schedule requires ddim_beta_start < ddim_beta_end, "
+                f"got {config.ddim_beta_start} >= {config.ddim_beta_end}"
+            )
         if config.ddim_eta != 0.0:
             raise ValueError(f"sit_diffusion currently supports deterministic DDIM only, got ddim_eta={config.ddim_eta}")
     if config.model_type in {GENERATOR_MODEL_TYPE_MEANFLOW_SIT, GENERATOR_MODEL_TYPE_SIT_DIFFUSION}:

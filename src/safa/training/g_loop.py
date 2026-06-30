@@ -20,7 +20,7 @@ from safa.evaluation.metrics import (
 from safa.evaluation.recognizers import InsightFaceDetector
 from safa.models.conditioning import fixed_null_condition_like, learned_null_condition_like
 from safa.models.e0 import assert_e0_frozen, freeze_e0, load_e0_checkpoint
-from safa.models.generator import GENERATOR_MODEL_TYPE_FLOW, FlowGeneratorConfig, build_generator
+from safa.models.generator import GENERATOR_MODEL_TYPE_FLOW, FlowGeneratorConfig, build_generator, generator_sample_channels
 from safa.training.audit import audit_no_identity_supervision
 from safa.training.latent_codec import (
     build_latent_codec_from_train_config,
@@ -761,9 +761,7 @@ def _flow_condition_z_for_generator(generator, z, flow_condition: str):
 
 
 def _generator_sample_channels(generator_config: FlowGeneratorConfig) -> int:
-    if generator_config.model_type == "meanflow_sit":
-        return int(generator_config.sit_input_channels)
-    return 3
+    return generator_sample_channels(generator_config)
 
 
 def _make_x_init_for_generator_config(sample_ids, sampling_seed: int, generator_config: FlowGeneratorConfig, device, dtype):

@@ -124,3 +124,21 @@ def test_sit_diffusion_requires_ddim_sampler_but_not_one_sample_step() -> None:
     config["sampler"] = "meanflow"
     with pytest.raises(ValueError, match="sit_diffusion sampler must be 'ddim'"):
         build_generator(config)
+
+
+@pytest.mark.parametrize(
+    ("updates", "match"),
+    [
+        ({"ddim_beta_start": 0.0}, "ddim_beta_start must be in \\(0, 1\\)"),
+        ({"ddim_beta_end": 1.0}, "ddim_beta_end must be in \\(0, 1\\)"),
+        ({"ddim_beta_start": 0.02, "ddim_beta_end": 0.01}, "ddim_beta_start < ddim_beta_end"),
+    ],
+)
+def test_sit_diffusion_validates_beta_range_and_order(updates, match) -> None:
+    from safa.models.generator import build_generator
+
+    config = _tiny_sit_diffusion_config()
+    config.update(updates)
+
+    with pytest.raises(ValueError, match=match):
+        build_generator(config)
