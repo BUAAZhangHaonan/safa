@@ -7,8 +7,15 @@ from typing import Any
 GENERATOR_MODEL_TYPE_FLOW = "conditional_flow_matching"
 GENERATOR_MODEL_TYPE_MEANFLOW = "meanflow"
 GENERATOR_MODEL_TYPE_MEANFLOW_SIT = "meanflow_sit"
+GENERATOR_MODEL_TYPE_SIT_DIFFUSION = "sit_diffusion"
 GENERATOR_MODEL_TYPE_DDIM = "ddim"
-GENERATOR_MODEL_TYPES = (GENERATOR_MODEL_TYPE_FLOW, GENERATOR_MODEL_TYPE_MEANFLOW, GENERATOR_MODEL_TYPE_MEANFLOW_SIT, GENERATOR_MODEL_TYPE_DDIM)
+GENERATOR_MODEL_TYPES = (
+    GENERATOR_MODEL_TYPE_FLOW,
+    GENERATOR_MODEL_TYPE_MEANFLOW,
+    GENERATOR_MODEL_TYPE_MEANFLOW_SIT,
+    GENERATOR_MODEL_TYPE_SIT_DIFFUSION,
+    GENERATOR_MODEL_TYPE_DDIM,
+)
 MEANFLOW_JVP_MODE_TORCH_FUNC = "torch_func"
 MEANFLOW_JVP_MODE_FIRST_ORDER = "first_order"
 MEANFLOW_JVP_MODES = (MEANFLOW_JVP_MODE_TORCH_FUNC, MEANFLOW_JVP_MODE_FIRST_ORDER)
@@ -18,6 +25,8 @@ SIT_DATA_SPACES = (SIT_DATA_SPACE_PIXEL, SIT_DATA_SPACE_LATENT)
 DDIM_BETA_SCHEDULE_LINEAR = "linear"
 DDIM_BETA_SCHEDULE_COSINE = "cosine"
 DDIM_BETA_SCHEDULES = (DDIM_BETA_SCHEDULE_LINEAR, DDIM_BETA_SCHEDULE_COSINE)
+DIFFUSION_PREDICTION_TYPE_EPSILON = "epsilon"
+DIFFUSION_PREDICTION_TYPES = (DIFFUSION_PREDICTION_TYPE_EPSILON,)
 SIT_ATTENTION_BACKEND_AUTO = "auto"
 SIT_ATTENTION_BACKEND_NATIVE = "native"
 SIT_ATTENTION_BACKEND_SDPA = "sdpa"
@@ -81,6 +90,9 @@ class FlowGeneratorConfig:
     ddim_beta_start: float = 1.0e-4
     ddim_beta_end: float = 2.0e-2
     ddim_eta: float = 0.0
+    diffusion_train_timesteps: int = 1000
+    diffusion_beta_schedule: str = DDIM_BETA_SCHEDULE_LINEAR
+    diffusion_prediction_type: str = DIFFUSION_PREDICTION_TYPE_EPSILON
     sit_input_channels: int = 3
     sit_patch_size: int = 16
     sit_hidden_size: int = 768
@@ -122,6 +134,9 @@ class FlowGeneratorConfig:
             ddim_beta_start=float(payload.get("ddim_beta_start", 1.0e-4)),
             ddim_beta_end=float(payload.get("ddim_beta_end", 2.0e-2)),
             ddim_eta=float(payload.get("ddim_eta", 0.0)),
+            diffusion_train_timesteps=int(payload.get("diffusion_train_timesteps", 1000)),
+            diffusion_beta_schedule=str(payload.get("diffusion_beta_schedule", DDIM_BETA_SCHEDULE_LINEAR)),
+            diffusion_prediction_type=str(payload.get("diffusion_prediction_type", DIFFUSION_PREDICTION_TYPE_EPSILON)),
             sit_input_channels=int(payload.get("sit_input_channels", 3)),
             sit_patch_size=int(payload.get("sit_patch_size", 16)),
             sit_hidden_size=int(payload.get("sit_hidden_size", 768)),
@@ -178,6 +193,30 @@ class FlowGeneratorConfig:
             )
             payload["sit_data_space"] = self.sit_data_space
             payload["attention_backend"] = self.attention_backend
+            if self.sit_pretrained_path:
+                payload["sit_pretrained_path"] = self.sit_pretrained_path
+            if self.sit_pretrained_state_key:
+                payload["sit_pretrained_state_key"] = self.sit_pretrained_state_key
+        if self.model_type == GENERATOR_MODEL_TYPE_SIT_DIFFUSION:
+            payload.update(
+                {
+                    "sit_input_channels": self.sit_input_channels,
+                    "sit_patch_size": self.sit_patch_size,
+                    "sit_hidden_size": self.sit_hidden_size,
+                    "sit_depth": self.sit_depth,
+                    "sit_num_heads": self.sit_num_heads,
+                    "sit_mlp_ratio": self.sit_mlp_ratio,
+                    "sit_time_embedding_dim": self.sit_time_embedding_dim,
+                    "sit_data_space": self.sit_data_space,
+                    "attention_backend": self.attention_backend,
+                    "diffusion_train_timesteps": self.diffusion_train_timesteps,
+                    "diffusion_beta_schedule": self.diffusion_beta_schedule,
+                    "diffusion_prediction_type": self.diffusion_prediction_type,
+                    "ddim_beta_start": self.ddim_beta_start,
+                    "ddim_beta_end": self.ddim_beta_end,
+                    "ddim_eta": self.ddim_eta,
+                }
+            )
             if self.sit_pretrained_path:
                 payload["sit_pretrained_path"] = self.sit_pretrained_path
             if self.sit_pretrained_state_key:
@@ -709,6 +748,36 @@ class MeanFlowSiTGenerator:
         return generator
 
 
+class SiTDiffusionGenerator:
+    def __new__(cls, config: FlowGeneratorConfig | dict[str, Any] | None = None, **kwargs):
+        from safa.models.sit_diffusion import build_sit_diffusion_generator
+
+        cfg_payload = {}
+        if isinstance(config, FlowGeneratorConfig):
+            cfg = config
+        elif config is None and not kwargs:
+            cfg = FlowGeneratorConfig(model_type=GENERATOR_MODEL_TYPE_SIT_DIFFUSION, sampler="ddim", sample_steps=16, train_cycle_steps=16)
+        else:
+            if config is not None:
+                cfg_payload.update(config)
+            cfg_payload.update(kwargs)
+            cfg_payload.setdefault("model_type", GENERATOR_MODEL_TYPE_SIT_DIFFUSION)
+            cfg_payload.setdefault("sampler", "ddim")
+            cfg = FlowGeneratorConfig.from_dict(cfg_payload)
+        _validate_config(cfg)
+        if cfg.model_type != GENERATOR_MODEL_TYPE_SIT_DIFFUSION:
+            raise ValueError(f"SiTDiffusionGenerator requires model_type={GENERATOR_MODEL_TYPE_SIT_DIFFUSION!r}, got {cfg.model_type!r}")
+        generator = build_sit_diffusion_generator(cfg)
+        if cfg.sit_pretrained_path:
+            generator.pretrained_load_report = generator.load_pretrained(
+                cfg.sit_pretrained_path,
+                state_key=cfg.sit_pretrained_state_key or None,
+                strict=False,
+                allow_missing=False,
+            )
+        return generator
+
+
 class DDIMGenerator:
     def __new__(cls, config: FlowGeneratorConfig | dict[str, Any] | None = None, **kwargs):
         import math
@@ -970,6 +1039,8 @@ def build_generator(config: dict[str, Any] | FlowGeneratorConfig | None = None, 
             return MeanFlowGenerator(config)
         if config.model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT:
             return MeanFlowSiTGenerator(config)
+        if config.model_type == GENERATOR_MODEL_TYPE_SIT_DIFFUSION:
+            return SiTDiffusionGenerator(config)
         if config.model_type == GENERATOR_MODEL_TYPE_DDIM:
             return DDIMGenerator(config)
         raise ValueError(f"Unsupported generator model_type: {config.model_type}")
@@ -985,6 +1056,8 @@ def build_generator(config: dict[str, Any] | FlowGeneratorConfig | None = None, 
         return MeanFlowGenerator(payload)
     if model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT:
         return MeanFlowSiTGenerator(payload)
+    if model_type == GENERATOR_MODEL_TYPE_SIT_DIFFUSION:
+        return SiTDiffusionGenerator(payload)
     if model_type == GENERATOR_MODEL_TYPE_DDIM:
         return DDIMGenerator(payload)
     raise ValueError(f"Unsupported generator model_type: {model_type}")
@@ -1046,7 +1119,20 @@ def _validate_config(config: FlowGeneratorConfig) -> None:
         if config.meanflow_jvp_mode not in MEANFLOW_JVP_MODES:
             allowed = ", ".join(MEANFLOW_JVP_MODES)
             raise ValueError(f"meanflow_jvp_mode must be one of {allowed}, got {config.meanflow_jvp_mode!r}")
-    if config.model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT:
+    if config.model_type == GENERATOR_MODEL_TYPE_SIT_DIFFUSION:
+        if config.sampler != "ddim":
+            raise ValueError(f"sit_diffusion sampler must be 'ddim', got {config.sampler!r}")
+        if config.diffusion_train_timesteps <= 1:
+            raise ValueError(f"diffusion_train_timesteps must be greater than 1, got {config.diffusion_train_timesteps}")
+        if config.diffusion_beta_schedule not in DDIM_BETA_SCHEDULES:
+            allowed = ", ".join(DDIM_BETA_SCHEDULES)
+            raise ValueError(f"diffusion_beta_schedule must be one of {allowed}, got {config.diffusion_beta_schedule!r}")
+        if config.diffusion_prediction_type not in DIFFUSION_PREDICTION_TYPES:
+            allowed = ", ".join(DIFFUSION_PREDICTION_TYPES)
+            raise ValueError(f"diffusion_prediction_type must be one of {allowed}, got {config.diffusion_prediction_type!r}")
+        if config.ddim_eta != 0.0:
+            raise ValueError(f"sit_diffusion currently supports deterministic DDIM only, got ddim_eta={config.ddim_eta}")
+    if config.model_type in {GENERATOR_MODEL_TYPE_MEANFLOW_SIT, GENERATOR_MODEL_TYPE_SIT_DIFFUSION}:
         if config.sit_input_channels <= 0:
             raise ValueError(f"sit_input_channels must be positive, got {config.sit_input_channels}")
         if config.sit_patch_size <= 0:
