@@ -6,10 +6,13 @@ CODE_DIR="${ROOT_DIR}/artifacts/external/generation_baselines"
 WEIGHT_DIR="${ROOT_DIR}/artifacts/checkpoints/external/meanflow_sit"
 MANIFEST_PATH="${ROOT_DIR}/artifacts/manifests/generation_baseline_weights_manifest.json"
 VERIFY_SCRIPT="${ROOT_DIR}/scripts/external/verify_generation_baseline_weights.py"
+PREFERRED_PYTHON="/home/k100/miniconda3/envs/pt210_cu130_fa4/bin/python"
 PYTHON_BIN="${PYTHON:-}"
 
 if [[ -z "${PYTHON_BIN}" ]]; then
-  if command -v python3 >/dev/null 2>&1; then
+  if [[ -x "${PREFERRED_PYTHON}" ]]; then
+    PYTHON_BIN="${PREFERRED_PYTHON}"
+  elif command -v python3 >/dev/null 2>&1; then
     PYTHON_BIN="python3"
   else
     PYTHON_BIN="python"
@@ -30,6 +33,22 @@ clone_if_missing() {
   git clone --depth 1 "${url}" "${dest}"
 }
 
+gdown_is_available() {
+  "${PYTHON_BIN}" -m gdown --help >/dev/null 2>&1 || command -v gdown >/dev/null 2>&1
+}
+
+run_gdown() {
+  if "${PYTHON_BIN}" -m gdown --help >/dev/null 2>&1; then
+    "${PYTHON_BIN}" -m gdown "$@"
+    return $?
+  fi
+  if command -v gdown >/dev/null 2>&1; then
+    gdown "$@"
+    return $?
+  fi
+  return 127
+}
+
 try_download_meanflow_b2() {
   local out_path="${WEIGHT_DIR}/zhuyu_sit_b_2_imagenet256.pt"
   if [[ -f "${out_path}" ]]; then
@@ -39,16 +58,16 @@ try_download_meanflow_b2() {
 
   echo "MeanFlow-SiT B/2 weight is missing: ${out_path}"
   echo "Set MEANFLOW_SIT_B2_GDRIVE_URL or MEANFLOW_SIT_B2_GDRIVE_ID to let this script try gdown."
-  if ! command -v gdown >/dev/null 2>&1; then
-    echo "gdown is not installed; skipping automatic B/2 download."
+  if ! gdown_is_available; then
+    echo "gdown is not available via ${PYTHON_BIN} -m gdown or PATH; skipping automatic B/2 download."
     return 0
   fi
 
   mkdir -p "${WEIGHT_DIR}"
   if [[ -n "${MEANFLOW_SIT_B2_GDRIVE_URL:-}" ]]; then
-    gdown --fuzzy "${MEANFLOW_SIT_B2_GDRIVE_URL}" -O "${out_path}" || rm -f "${out_path}"
+    run_gdown --fuzzy "${MEANFLOW_SIT_B2_GDRIVE_URL}" -O "${out_path}" || rm -f "${out_path}"
   elif [[ -n "${MEANFLOW_SIT_B2_GDRIVE_ID:-}" ]]; then
-    gdown "${MEANFLOW_SIT_B2_GDRIVE_ID}" -O "${out_path}" || rm -f "${out_path}"
+    run_gdown "${MEANFLOW_SIT_B2_GDRIVE_ID}" -O "${out_path}" || rm -f "${out_path}"
   fi
 }
 
