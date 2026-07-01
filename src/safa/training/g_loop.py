@@ -119,6 +119,7 @@ class _Stage2ObjectiveRuntime:
     pu_backtrack_max_retries: int = 0
     pu_fm_increase_budget: float = 0.0
     repr_step_ratio_cap: float = 0.25
+    lambda_lpips: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -181,6 +182,16 @@ class _GeneratorTrainingStep:
                         torch.full((2,), float("nan"), dtype=torch.float64),
                         persistent=True,
                     )
+                self._lpips_cache = None
+                self._lpips_first_logged = False
+
+            @property
+            def _lpips_metric(self):
+                if self._lpips_cache is None:
+                    import pyiqa
+                    device = self.e0.device if hasattr(self.e0, "device") else next(self.parameters()).device
+                    self._lpips_cache = pyiqa.create_metric("lpips", as_loss=True).to(device)
+                return self._lpips_cache
 
             def reset_batch_idx(self):
                 self._batch_idx = 0
@@ -236,7 +247,7 @@ class _GeneratorTrainingStep:
                                 flow_condition=effective_flow_condition,
                             )
                             return flow_loss, flow_metrics["flow_matching_mse"].detach(), secondary_loss.detach(), flow_loss, secondary_loss
-                        repr_loss, repr_metrics = self._compute_repr_loss(z, sample_ids, cycle_steps=cycle_steps)
+                        repr_loss, repr_metrics = self._compute_repr_loss(z, sample_ids, cycle_steps=cycle_steps, images=images)
                         self._batch_idx += 1
                         if self.stage2_objective.type == "gram_weighted_sum":
                             flow_loss, flow_metrics = self._compute_flow_loss(images, z, effective_flow_condition, noise_generator=noise_generator)
@@ -328,7 +339,7 @@ class _GeneratorTrainingStep:
                 _validate_flow_condition(flow_condition, "training flow_condition")
                 return _flow_condition_z_for_generator(self.generator, z, flow_condition)
 
-            def _compute_repr_loss(self, z, sample_ids, *, cycle_steps: int):
+            def _compute_repr_loss(self, z, sample_ids, *, cycle_steps: int, images=None):
                 if self.stage2_objective is None:
                     raise RuntimeError("stage2_objective is required to compute representation loss")
                 x_init = make_x_init_for_sample_ids(
@@ -370,6 +381,27 @@ class _GeneratorTrainingStep:
                         self.stage2_objective.relation_weight,
                         offdiag_only=self.stage2_objective.offdiag_only,
                     )
+                if self.stage2_objective.lambda_lpips > 0.0 and images is not None:
+                    import torch as _torch
+                    # Both generated_for_e0 and images (x0) are in [0,1].
+                    # - generated_for_e0: decoded from latent codec (.add(1).mul(0.5).clamp(0,1))
+                    # - images: generator_image_transform = Resize + ToTensor only (no Normalize)
+                    # pyiqa lpips expects [0,1] inputs and does internal [-1,1] normalization.
+                    # as_loss=True was set at creation time so gradients flow.
+                    lpips_loss = self._lpips_metric(generated_for_e0, images).mean()
+                    if not _torch.isfinite(lpips_loss):
+                        raise RuntimeError(f"LPIPS loss not finite: {lpips_loss.item()}")
+                    losses["repr"] = losses["repr"] + self.stage2_objective.lambda_lpips * lpips_loss
+                    losses["lpips"] = lpips_loss.detach()
+                    if not self._lpips_first_logged:
+                        print(
+                            f"[LPIPS] first batch: lpips_loss={lpips_loss.item():.4f}, "
+                            f"x_hat range=[{generated_for_e0.min().item():.3f}, {generated_for_e0.max().item():.3f}], "
+                            f"x0 range=[{images.min().item():.3f}, {images.max().item():.3f}], "
+                            f"lambda_lpips={self.stage2_objective.lambda_lpips}",
+                            flush=True,
+                        )
+                        self._lpips_first_logged = True
                 return losses["repr"], losses
 
             def _stage2_repr_loss_metrics(
