@@ -598,7 +598,7 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
         required=objective_type in {"gram_weighted_sum", *_PROJECTED_STAGE2_OBJECTIVES, *_CAGRAD_STAGE2_OBJECTIVES, "fm_only_probe"},
     )
     if objective_type == "fm_only_probe":
-        for field in ("lambda_repr", "point_weight", "relation_weight", "offdiag_only", "repr_learning_rate", "projection_eps"):
+        for field in ("lambda_repr", "point_weight", "relation_weight", "offdiag_only", "repr_learning_rate", "projection_eps", "lambda_lpips"):
             if field in payload:
                 raise ValueError(f"{context}.{field} is not valid for fm_only_probe")
         return _Stage2ObjectiveRuntime(
@@ -609,6 +609,9 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
             offdiag_only=True,
             flow_condition=flow_condition,
         )
+    lambda_lpips = _optional_numeric(payload, "lambda_lpips", context, default=0.0)
+    if lambda_lpips < 0.0:
+        raise ValueError(f"{context}.lambda_lpips must be non-negative, got {lambda_lpips!r}")
     lambda_repr = _require_numeric(payload, "lambda_repr", context)
     point_weight = _require_numeric(payload, "point_weight", context)
     if lambda_repr < 0.0:
@@ -665,6 +668,7 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
                 famo_eps=float(famo_eps),
                 famo_min_loss_fm=float(famo_min_loss_fm),
                 famo_min_loss_cl=float(famo_min_loss_cl),
+                lambda_lpips=float(lambda_lpips),
             )
         projection_eps = _require_numeric(payload, "projection_eps", context)
         if projection_eps < 0.0:
@@ -688,6 +692,7 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
                 projection_eps=float(projection_eps),
                 cagrad_c=float(cagrad_c),
                 fm_descent_floor_fraction=float(floor_fraction),
+                lambda_lpips=float(lambda_lpips),
             )
         repr_learning_rate = _require_numeric(payload, "repr_learning_rate", context)
         if repr_learning_rate <= 0.0:
@@ -717,6 +722,7 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
             pu_backtrack_max_retries=pu_backtrack_max_retries,
             pu_fm_increase_budget=pu_fm_increase_budget,
             repr_step_ratio_cap=repr_step_ratio_cap,
+            lambda_lpips=float(lambda_lpips),
         )
 
     relation_weight = _require_numeric(payload, "relation_weight", context)
@@ -762,6 +768,7 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
         pu_backtrack_max_retries=pu_backtrack_max_retries,
         pu_fm_increase_budget=pu_fm_increase_budget,
         repr_step_ratio_cap=repr_step_ratio_cap,
+        lambda_lpips=float(lambda_lpips),
     )
 
 
