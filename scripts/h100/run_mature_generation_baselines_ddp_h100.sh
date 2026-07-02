@@ -6,7 +6,7 @@ PYTHON_BIN="${PYTHON:-/home/k100/miniconda3/envs/pt210_cu130_fa4/bin/python}"
 NPROC_PER_NODE=4
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 DRY_RUN=1
-INCLUDE_E16=0
+INCLUDE_E16=1
 ONE=""
 LOG_DIR="artifacts/logs"
 RUN_DIR="artifacts/run"
@@ -19,7 +19,7 @@ usage() {
 Usage: scripts/h100/run_mature_generation_baselines_ddp_h100.sh [options]
 
 Default mode is dry-run. Pass --run to start sequential 4-GPU torchrun training.
-By default this mature queue runs E19 only and marks E16 as skip-current. Use --include-e16 to opt in.
+This high-throughput queue writes no-eval runtime YAMLs for the current mature MeanFlow-SiT E19/E16 set.
 
 Options:
   --run                  Start training.
@@ -28,7 +28,7 @@ Options:
   --python PATH          Python used for runtime YAML generation.
   --nproc-per-node N     torchrun processes per node. Defaults to 4.
   --timestamp VALUE      Timestamp for log, pid, and status files.
-  --include-e16          Include E16 L/2 after E19.
+  --include-e16          Kept for compatibility; E16 is already included by default.
   --one NAME_OR_CONFIG   Run one experiment by name or config path.
   -h, --help             Show this help.
 EOF
@@ -88,8 +88,8 @@ runtime_config_for_config() {
 batch_for_config() {
   local name="$1"
   case "${name}" in
-    e19_*) printf '32 128\n' ;;
-    e16_*) printf '16 64\n' ;;
+    e19_*) printf '256 1024\n' ;;
+    e16_*) printf '128 512\n' ;;
     *) echo "no H100 mature batch mapping for ${name}" >&2; return 1 ;;
   esac
 }
@@ -148,21 +148,30 @@ config["distributed"] = dict(config.get("distributed") or {})
 config["distributed"]["backend"] = "nccl"
 config["global_batch_size"] = global_batch
 config["per_device_batch_size"] = per_device_batch
-config["num_workers"] = 8
+config["num_workers"] = 16
+config["disable_eval"] = True
+config["eval"] = {"enabled": False}
+config["visualization"] = {"enabled": False}
 config["validation"] = dict(config.get("validation") or {})
-config["validation"]["batch_size"] = 16
+config["validation"]["enabled"] = False
+config["validation"]["max_samples"] = 0
+config["validation"]["batch_size"] = 1
+config["validation"]["face_detection"] = dict(config["validation"].get("face_detection") or {})
+config["validation"]["face_detection"]["enabled"] = False
 
 stages = dict(config.get("stages") or {})
 stage2 = dict(stages.get("stage2") or {})
 quality_eval = dict(stage2.get("quality_eval") or {})
-output_dir = quality_eval.get("output_dir")
-if output_dir:
-    output_dir = str(output_dir)
-    if not output_dir.endswith("_h100_mature_ddp"):
-        output_dir = f"{output_dir}_h100_mature_ddp"
-    quality_eval["output_dir"] = output_dir
-quality_eval["distribution_cuda_visible_devices"] = "0"
-quality_eval["distribution_device"] = "cuda:0"
+quality_eval["enabled"] = False
+quality_eval["metrics"] = []
+quality_eval["niqe_interval_epochs"] = 1_000_000_000
+quality_eval["distribution_interval_epochs"] = 1_000_000_000
+quality_eval["niqe_max_samples"] = 0
+quality_eval["distribution_max_samples"] = 0
+quality_eval["quality_num_workers"] = 0
+quality_eval["distribution_timeout_seconds"] = 1
+quality_eval["distribution_cuda_visible_devices"] = ""
+quality_eval["distribution_device"] = "cpu"
 stage2["quality_eval"] = quality_eval
 stages["stage2"] = stage2
 config["stages"] = stages
@@ -248,9 +257,7 @@ print_plan() {
   echo "torchrun: ${TORCHRUN_BIN}"
   echo "nproc_per_node: ${NPROC_PER_NODE}"
   echo "cuda_visible_devices: ${CUDA_VISIBLE_DEVICES}"
-  if [[ "${INCLUDE_E16}" -eq 0 && -z "${ONE}" ]]; then
-    echo "skip-current: e16_meanflow_sit_l2_face_mixed_2400ep"
-  fi
+  echo "eval: disabled"
   echo "logs: ${LOG_DIR}"
   echo "pids: ${RUN_DIR}"
   echo "order:"

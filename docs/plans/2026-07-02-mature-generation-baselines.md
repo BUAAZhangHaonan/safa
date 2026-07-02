@@ -32,16 +32,19 @@ The first paper-quality table should report two tracks instead of forcing all me
 - **Trainable prior track**: DDPM/DDIM-style latent diffusion, Flow Matching/SiT, MeanFlow-SiT, and optionally standalone Consistency Training. These must use the same face data, resolution, VAE latent space, and Stage 1/Stage 2 budget.
 - **Frozen prior + adapter track**: StyleGAN2/3 FFHQ, SDXL-base, SDXL-Turbo or LCM/Lightning/Hyper-SD/DMD2. These keep the mature generator mostly frozen and train only the adapter or condition path for SAFA Stage 2.
 
-### First-Batch Main Table Recommendation
+### Final Training Matrix
 
-| Track | Paradigm | Representative model | Concrete candidate | Step budget |
-| --- | --- | --- | --- | --- |
-| Frozen + adapter | GAN | StyleGAN2-ADA or StyleGAN3 | FFHQ pretrained `.pkl` | 1 generator forward |
-| Frozen + adapter | Latent diffusion | SDXL-base | `stabilityai/stable-diffusion-xl-base-1.0` | 20/40 steps |
-| Frozen + adapter | Diffusion acceleration | SDXL-Lightning or LCM-SDXL | official 4-step checkpoint or LoRA | 2/4 steps first; 1-step optional |
-| Trainable prior | Diffusion | DDPM/DDIM latent UNet or DiT | same face mixed dataset, same VAE | 16/32 steps and DDIM curve |
-| Trainable prior | Flow matching | Flow Matching / SiT | same face mixed dataset, same VAE | 16/32 ODE steps |
-| Trainable prior | One-step flow | MeanFlow-SiT | E16 L/2 and E19 B/2 | 1-NFE |
+The final matrix uses three layers. Keep all three columns visible in reports and runbooks:
+
+| Layer 1: Paradigm / route | Layer 2: Representative family | Layer 3: Concrete checkpoint / step | Official code | Pretrained status | Training track |
+| --- | --- | --- | --- | --- | --- |
+| GAN prior | StyleGAN2-ADA or StyleGAN3 | FFHQ official `.pkl`, 1 generator forward | Official NVIDIA StyleGAN family code | Not wired in this repo yet | Frozen prior + adapter track |
+| Latent diffusion | SDXL-base | `stabilityai/stable-diffusion-xl-base-1.0`, 20/40 steps | Official diffusers / Stability checkpoint path | Not downloaded into repo artifacts yet | Frozen prior + adapter track |
+| Diffusion acceleration | SDXL-Lightning / LCM-SDXL / Hyper-SD / DMD2 | Official 2/4-step checkpoint or LoRA first; 1-step optional | Official project or diffusers integration per checkpoint | Not downloaded into repo artifacts yet | Frozen prior + adapter track |
+| Trainable diffusion | DDPM/DDIM latent UNet or DiT | Repo trainable checkpoint, 16/32 DDIM steps | Repo implementation once config is promoted | Not current mature default | Trainable prior track |
+| Flow matching / interpolant flow | Flow Matching / SiT | Repo trainable checkpoint, 16/32 ODE steps | Repo implementation once config is promoted | Not current mature default | Trainable prior track |
+| One-step flow | MeanFlow-SiT | E19 SiT-B/2, 1-NFE, `configs/medium_v2/experiments/e19_meanflow_sit_b2_face_mixed_2400ep.yaml` | MeanFlow official code family, adapted in repo | Official pretrained prior path is local: `artifacts/checkpoints/external/meanflow_sit/zhuyu_sit_b_2_imagenet256.pt` | Trainable prior track |
+| One-step flow | MeanFlow-SiT | E16 SiT-L/2, 1-NFE, `configs/medium_v2/experiments/e16_meanflow_sit_l2_face_mixed_2400ep.yaml` | MeanFlow official code family, adapted in repo | Official pretrained prior path is local: `artifacts/checkpoints/external/meanflow_sit/zhuyu_sit_l_2_imagenet256.pt` | Trainable prior track |
 
 This keeps the experiment broad enough for a general vision venue while still making the one-step question testable: the key comparison is not only final FID, but Stage 2 time-to-quality, NFE/latency, stability, face pass rate, and representation preservation under matched quality constraints.
 
@@ -64,8 +67,19 @@ bash scripts/k100/run_mature_generation_baselines_k100.sh --run
 bash scripts/k100/run_mature_generation_baselines_k100.sh --include-e19 --run
 bash scripts/h100/run_mature_generation_baselines_ddp_h100.sh --dry-run
 bash scripts/h100/run_mature_generation_baselines_ddp_h100.sh --run
-bash scripts/h100/run_mature_generation_baselines_ddp_h100.sh --include-e16 --run
 ```
+
+The H100 launcher is the high-throughput upload-side queue. It defaults to E19 B/2 then E16 L/2. It writes runtime YAMLs with training eval disabled:
+
+- `disable_eval: true`
+- `validation.enabled: false`
+- `validation.face_detection.enabled: false`
+- `stages.stage2.quality_eval.enabled: false`
+- `stages.stage2.quality_eval.metrics: []`
+- NIQE/FID/KID intervals set to a very large value and sample counts set to zero
+- `visualization.enabled: false`
+
+The default H100 batch settings are conservative for 4-GPU DDP: B/2 uses `per_device_batch_size=256, global_batch_size=1024`; L/2 uses `per_device_batch_size=128, global_batch_size=512`. Change these in the generated runtime YAML or by editing the script if memory headroom differs. K100 single-card L/2 uses `per_device_batch_size=32, global_batch_size=32`.
 
 Both launchers write runtime YAMLs and auto-resume from `out_dir/last.pt` by setting:
 

@@ -128,12 +128,29 @@ config["distributed"] = dict(config.get("distributed") or {})
 config["distributed"]["backend"] = "gloo"
 config["global_batch_size"] = global_batch
 config["per_device_batch_size"] = per_device_batch
+config["disable_eval"] = True
+config["eval"] = {"enabled": False}
+config["visualization"] = {"enabled": False}
+config["validation"] = dict(config.get("validation") or {})
+config["validation"]["enabled"] = False
+config["validation"]["max_samples"] = 0
+config["validation"]["batch_size"] = 1
+config["validation"]["face_detection"] = dict(config["validation"].get("face_detection") or {})
+config["validation"]["face_detection"]["enabled"] = False
 
 stages = dict(config.get("stages") or {})
 stage2 = dict(stages.get("stage2") or {})
 quality_eval = dict(stage2.get("quality_eval") or {})
-quality_eval["distribution_cuda_visible_devices"] = "0"
-quality_eval["distribution_device"] = "cuda:0"
+quality_eval["enabled"] = False
+quality_eval["metrics"] = []
+quality_eval["niqe_interval_epochs"] = 1_000_000_000
+quality_eval["distribution_interval_epochs"] = 1_000_000_000
+quality_eval["niqe_max_samples"] = 0
+quality_eval["distribution_max_samples"] = 0
+quality_eval["quality_num_workers"] = 0
+quality_eval["distribution_timeout_seconds"] = 1
+quality_eval["distribution_cuda_visible_devices"] = ""
+quality_eval["distribution_device"] = "cpu"
 stage2["quality_eval"] = quality_eval
 stages["stage2"] = stage2
 config["stages"] = stages
@@ -199,6 +216,7 @@ print_plan() {
   echo "timestamp: ${TIMESTAMP}"
   echo "python: ${PYTHON_BIN}"
   echo "cuda_visible_devices: ${CUDA_VISIBLE_DEVICES}"
+  echo "eval: disabled"
   echo "logs: ${LOG_DIR}"
   echo "pids: ${RUN_DIR}"
   echo "order:"

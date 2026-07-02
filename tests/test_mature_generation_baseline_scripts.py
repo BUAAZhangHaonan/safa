@@ -57,6 +57,23 @@ def _load_yaml(path: Path) -> dict:
         return yaml.safe_load(handle)
 
 
+def _assert_no_eval_runtime(config: dict) -> None:
+    assert config["disable_eval"] is True
+    validation = config["validation"]
+    assert validation["enabled"] is False
+    assert validation["max_samples"] == 0
+    assert validation["face_detection"]["enabled"] is False
+
+    quality_eval = config["stages"]["stage2"]["quality_eval"]
+    assert quality_eval["enabled"] is False
+    assert quality_eval["metrics"] == []
+    assert quality_eval["niqe_interval_epochs"] == 1000000000
+    assert quality_eval["distribution_interval_epochs"] == 1000000000
+    assert quality_eval["niqe_max_samples"] == 0
+    assert quality_eval["distribution_max_samples"] == 0
+    assert quality_eval["quality_num_workers"] == 0
+
+
 def _runtime(repo_root: Path, name: str, suffix: str) -> Path:
     return repo_root / "configs" / "medium_v2" / "experiments" / f"{name}{suffix}.yaml"
 
@@ -84,6 +101,7 @@ def test_k100_mature_dry_run_writes_runtime_resume_and_lists_only_mature_family(
     assert e16_runtime["per_device_batch_size"] == 32
     assert e16_runtime["global_batch_size"] == 32
     assert e16_runtime["distributed"]["backend"] == "gloo"
+    _assert_no_eval_runtime(e16_runtime)
 
     assert not _runtime(repo_root, E19, "_k100_runtime").exists()
 
@@ -99,6 +117,9 @@ def test_k100_mature_include_e19_opt_in(tmp_path: Path) -> None:
     assert e19_runtime["resume_from"] == ""
     assert e19_runtime["resume_mode"] == "model_weights_only"
     assert e19_runtime["resume_optimizer_state"] is False
+    assert e19_runtime["per_device_batch_size"] == 32
+    assert e19_runtime["global_batch_size"] == 32
+    _assert_no_eval_runtime(e19_runtime)
 
 def test_k100_mature_one_selects_single_config(tmp_path: Path) -> None:
     repo_root = _copy_mature_config_tree(tmp_path)
@@ -112,7 +133,7 @@ def test_k100_mature_one_selects_single_config(tmp_path: Path) -> None:
     assert not _runtime(repo_root, E16, "_k100_runtime").exists()
 
 
-def test_h100_mature_default_skips_current_e16_and_include_e16_opt_in(tmp_path: Path) -> None:
+def test_h100_mature_default_covers_e19_and_e16_with_no_eval_runtime(tmp_path: Path) -> None:
     repo_root = _copy_mature_config_tree(tmp_path)
     e19_last = repo_root / "artifacts" / "checkpoints" / E19 / "last.pt"
     e19_last.parent.mkdir(parents=True)
@@ -122,24 +143,25 @@ def test_h100_mature_default_skips_current_e16_and_include_e16_opt_in(tmp_path: 
 
     assert default.returncode == 0, default.stderr
     assert "DRY RUN: mature MeanFlow-SiT H100 DDP queue" in default.stdout
-    assert "skip-current: e16_meanflow_sit_l2_face_mixed_2400ep" in default.stdout
     assert f"runtime_config: configs/medium_v2/experiments/{E19}_h100_mature_ddp_runtime.yaml" in default.stdout
-    assert f"{E16}_h100_mature_ddp_runtime.yaml" not in default.stdout
+    assert f"runtime_config: configs/medium_v2/experiments/{E16}_h100_mature_ddp_runtime.yaml" in default.stdout
+    assert default.stdout.index(E19) < default.stdout.index(E16)
     assert "torchrun --standalone --nproc_per_node=4" in default.stdout
+    assert "eval: disabled" in default.stdout
 
     e19_runtime = _load_yaml(_runtime(repo_root, E19, "_h100_mature_ddp_runtime"))
     assert e19_runtime["resume_from"] == f"artifacts/checkpoints/{E19}/last.pt"
     assert e19_runtime["resume_mode"] == "training_state"
     assert e19_runtime["resume_optimizer_state"] is True
     assert e19_runtime["distributed"]["backend"] == "nccl"
-    assert e19_runtime["per_device_batch_size"] == 32
-    assert e19_runtime["global_batch_size"] == 128
+    assert e19_runtime["per_device_batch_size"] == 256
+    assert e19_runtime["global_batch_size"] == 1024
+    _assert_no_eval_runtime(e19_runtime)
 
-    include = _run(H100_SCRIPT, _copy_mature_config_tree(tmp_path / "include"), "--include-e16")
-
-    assert include.returncode == 0, include.stderr
-    assert f"runtime_config: configs/medium_v2/experiments/{E16}_h100_mature_ddp_runtime.yaml" in include.stdout
-    assert include.stdout.index(E19) < include.stdout.index(E16)
+    e16_runtime = _load_yaml(_runtime(repo_root, E16, "_h100_mature_ddp_runtime"))
+    assert e16_runtime["per_device_batch_size"] == 128
+    assert e16_runtime["global_batch_size"] == 512
+    _assert_no_eval_runtime(e16_runtime)
 
 
 def test_h100_mature_one_selects_e16_even_without_include_flag(tmp_path: Path) -> None:
