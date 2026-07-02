@@ -71,7 +71,8 @@ def test_k100_mature_dry_run_writes_runtime_resume_and_lists_only_mature_family(
 
     assert result.returncode == 0, result.stderr
     assert "DRY RUN: mature MeanFlow-SiT K100 queue" in result.stdout
-    assert result.stdout.index(E16) < result.stdout.index(E19)
+    assert E16 in result.stdout
+    assert E19 not in result.stdout
     assert "e17_sit_diffusion" not in result.stdout
     assert "e20_rectified_flow" not in result.stdout
     assert "-m safa.cli.train_g --config configs/medium_v2/experiments/e16_meanflow_sit_l2_face_mixed_2400ep_k100_runtime.yaml" in result.stdout
@@ -84,11 +85,20 @@ def test_k100_mature_dry_run_writes_runtime_resume_and_lists_only_mature_family(
     assert e16_runtime["global_batch_size"] == 32
     assert e16_runtime["distributed"]["backend"] == "gloo"
 
+    assert not _runtime(repo_root, E19, "_k100_runtime").exists()
+
+
+def test_k100_mature_include_e19_opt_in(tmp_path: Path) -> None:
+    repo_root = _copy_mature_config_tree(tmp_path)
+
+    result = _run(K100_SCRIPT, repo_root, "--include-e19")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.index(E16) < result.stdout.index(E19)
     e19_runtime = _load_yaml(_runtime(repo_root, E19, "_k100_runtime"))
     assert e19_runtime["resume_from"] == ""
     assert e19_runtime["resume_mode"] == "model_weights_only"
     assert e19_runtime["resume_optimizer_state"] is False
-
 
 def test_k100_mature_one_selects_single_config(tmp_path: Path) -> None:
     repo_root = _copy_mature_config_tree(tmp_path)

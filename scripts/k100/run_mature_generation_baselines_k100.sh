@@ -5,22 +5,20 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_BIN="${PYTHON:-/home/k100/miniconda3/envs/pt210_cu130_fa4/bin/python}"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 DRY_RUN=1
+INCLUDE_E19=0
 ONE=""
 LOG_DIR="artifacts/logs"
 RUN_DIR="artifacts/run"
 CU13_LIBRARY_PATH="/home/k100/miniconda3/envs/pt210_cu130_fa4/lib/python3.12/site-packages/nvidia/cu13/lib"
 
-CONFIGS=(
-  "configs/medium_v2/experiments/e16_meanflow_sit_l2_face_mixed_2400ep.yaml"
-  "configs/medium_v2/experiments/e19_meanflow_sit_b2_face_mixed_2400ep.yaml"
-)
-
+E16_CONFIG="configs/medium_v2/experiments/e16_meanflow_sit_l2_face_mixed_2400ep.yaml"
+E19_CONFIG="configs/medium_v2/experiments/e19_meanflow_sit_b2_face_mixed_2400ep.yaml"
 usage() {
   cat <<'EOF'
 Usage: scripts/k100/run_mature_generation_baselines_k100.sh [options]
 
 Default mode is dry-run. Pass --run to start sequential single-GPU training.
-This mature queue only includes MeanFlow-SiT main-table baselines: E16 L/2 and E19 B/2.
+This mature queue defaults to E16 L/2. Use --include-e19 or --one for E19 B/2.
 
 Options:
   --run              Start training.
@@ -28,6 +26,7 @@ Options:
   --repo-root PATH   Repository root. Defaults to the script's repo.
   --python PATH      Python used for runtime YAML generation and training.
   --timestamp VALUE  Timestamp for log, pid, and status files.
+  --include-e19      Include E19 B/2 after E16.
   --one NAME_OR_CONFIG
                      Run one experiment by name or config path.
   -h, --help         Show this help.
@@ -41,6 +40,7 @@ while [[ $# -gt 0 ]]; do
     --repo-root) REPO_ROOT="$2"; shift 2 ;;
     --python) PYTHON_BIN="$2"; shift 2 ;;
     --timestamp) TIMESTAMP="$2"; shift 2 ;;
+    --include-e19) INCLUDE_E19=1; shift ;;
     --one) ONE="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 64 ;;
@@ -82,20 +82,27 @@ matches_one() {
   [[ "${wanted}" == "${name}" || "${wanted}" == "${base}" || "${wanted}" == "${config}" || "${wanted}" == "${REPO_ROOT}/${config}" ]]
 }
 
+all_configs() {
+  printf '%s\n' "${E16_CONFIG}"
+  if [[ "${INCLUDE_E19}" -eq 1 || -n "${ONE}" ]]; then
+    printf '%s\n' "${E19_CONFIG}"
+  fi
+}
+
 select_configs() {
   local config matched=0
-  for config in "${CONFIGS[@]}"; do
+  while IFS= read -r config; do
+    [[ -n "${config}" ]] || continue
     if [[ -z "${ONE}" ]] || matches_one "${config}" "${ONE}"; then
       printf '%s\n' "${config}"
       matched=1
     fi
-  done
+  done < <(all_configs)
   if [[ -n "${ONE}" && "${matched}" -eq 0 ]]; then
     echo "no config matched --one ${ONE}" >&2
     return 65
   fi
 }
-
 write_runtime_config() {
   local config="$1" runtime_config="$2" per_device_batch="$3" global_batch="$4"
   mkdir -p "$(dirname "${REPO_ROOT}/${runtime_config}")"
