@@ -23,11 +23,20 @@ def _run_queue(*args: str, marker: str = "safa_no_e16_marker_for_test") -> subpr
     )
 
 
-def test_generation_baseline_queue_defaults_to_dry_run_and_lists_order() -> None:
+def test_generation_baseline_queue_refuses_without_ablation_only() -> None:
     result = _run_queue()
 
+    assert result.returncode == 64
+    assert "internal ablation" in result.stderr
+    assert "--ablation-only" in result.stderr
+    assert "not paper main-table mature baselines" in result.stderr
+
+
+def test_generation_baseline_queue_ablation_only_dry_run_lists_order() -> None:
+    result = _run_queue("--ablation-only")
+
     assert result.returncode == 0
-    assert "DRY RUN: pass --run to start training" in result.stdout
+    assert "DRY RUN: internal ablation queue" in result.stdout
     expected_order = [
         "e22_sit_diffusion_b2_face_mixed_2400ep",
         "e23_latent_consistency_b2_face_mixed_2400ep",
@@ -49,7 +58,7 @@ def test_generation_baseline_queue_exits_when_e16_process_is_running() -> None:
     process = subprocess.Popen(["bash", "-lc", f"exec -a '{marker}' sleep 60"])
     try:
         time.sleep(0.2)
-        result = _run_queue(marker=marker)
+        result = _run_queue("--ablation-only", marker=marker)
     finally:
         process.terminate()
         process.wait(timeout=5)

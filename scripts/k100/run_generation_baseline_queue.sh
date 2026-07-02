@@ -5,6 +5,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_BIN="${PYTHON:-/home/k100/miniconda3/envs/pt210_cu130_fa4/bin/python}"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 DRY_RUN=1
+ABLATION_ONLY=0
 E16_PATTERN="${SAFA_E16_PATTERN:-e16_meanflow_sit_l2_face_mixed_2400ep}"
 
 CONFIGS=(
@@ -19,9 +20,11 @@ CONFIGS=(
 
 usage() {
   cat <<'EOF'
-Usage: scripts/k100/run_generation_baseline_queue.sh [--run] [--repo-root PATH] [--python PATH] [--timestamp VALUE]
+Usage: scripts/k100/run_generation_baseline_queue.sh [--ablation-only] [--run] [--repo-root PATH] [--python PATH] [--timestamp VALUE]
 
-Default mode is dry-run. Pass --run to start training.
+Default mode refuses to run. Pass --ablation-only to acknowledge this is the internal ablation queue.
+With --ablation-only, default mode is dry-run. Add --run to start training.
+E17/E18/E20/E21/E22/E23 are internal ablation experiments, not paper main-table mature baselines.
 The script exits without starting anything while an E16 train_g process is still running.
 EOF
 }
@@ -30,6 +33,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --run)
       DRY_RUN=0
+      shift
+      ;;
+    --ablation-only)
+      ABLATION_ONLY=1
       shift
       ;;
     --repo-root)
@@ -59,6 +66,12 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ "${ABLATION_ONLY}" -ne 1 ]]; then
+  echo "Refusing to run generation baseline queue by default: E17/E18/E20/E21/E22/E23 are internal ablation experiments, not paper main-table mature baselines." >&2
+  echo "Pass --ablation-only to dry-run or run this internal ablation queue." >&2
+  exit 64
+fi
 
 LOG_DIR="artifacts/logs"
 RUN_DIR="artifacts/run"
@@ -135,9 +148,9 @@ if [[ -n "${e16_matches}" ]]; then
 fi
 
 if [[ "${DRY_RUN}" -eq 1 ]]; then
-  print_plan "DRY RUN: pass --run to start training"
+  print_plan "DRY RUN: internal ablation queue; pass --run with --ablation-only to start training"
   exit 0
 fi
 
-print_plan "RUN: starting generation baseline queue"
+print_plan "RUN: starting internal ablation generation baseline queue"
 run_queue

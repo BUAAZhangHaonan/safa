@@ -46,6 +46,7 @@ def _run_queue(repo_root: Path, *args: str, marker: str = "safa_no_h100_ddp_e16_
         [
             "bash",
             str(SCRIPT),
+            "--ablation-only",
             "--repo-root",
             str(repo_root),
             "--timestamp",
@@ -71,13 +72,38 @@ def _load_yaml(path: Path) -> dict:
         return yaml.safe_load(handle)
 
 
+def test_h100_generation_baseline_ddp_queue_refuses_without_ablation_only(tmp_path: Path) -> None:
+    repo_root = _copy_config_tree(tmp_path)
+    result = subprocess.run(
+        [
+            "bash",
+            str(SCRIPT),
+            "--repo-root",
+            str(repo_root),
+            "--timestamp",
+            "20260701_120000",
+            "--python",
+            sys.executable,
+        ],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    assert result.returncode == 64
+    assert "internal ablation" in result.stderr
+    assert "--ablation-only" in result.stderr
+    assert "not paper main-table mature baselines" in result.stderr
+
+
 def test_dry_run_prints_runtime_configs_batches_commands_and_artifacts(tmp_path: Path) -> None:
     repo_root = _copy_config_tree(tmp_path)
 
     result = _run_queue(repo_root)
 
     assert result.returncode == 0, result.stderr
-    assert "DRY RUN: pass --run to start training" in result.stdout
+    assert "DRY RUN: internal ablation H100 DDP queue" in result.stdout
     positions = [result.stdout.index(name) for name in QUEUE_ORDER]
     assert positions == sorted(positions)
 
@@ -143,7 +169,7 @@ def test_e16_guard_exits_2_and_skip_e16_check_bypasses_it(tmp_path: Path) -> Non
     assert "E16 training is still running" in guarded.stdout
     assert marker in guarded.stdout
     assert skipped.returncode == 0, skipped.stderr
-    assert "DRY RUN: pass --run to start training" in skipped.stdout
+    assert "DRY RUN: internal ablation H100 DDP queue" in skipped.stdout
 
 
 def test_one_selects_single_config_by_name_or_config_path(tmp_path: Path) -> None:
