@@ -150,7 +150,6 @@ class StageGateTests(unittest.TestCase):
         cases = [
             ("validation", lambda config: config.pop("validation")),
             ("validation.enabled", lambda config: config["validation"].pop("enabled")),
-            ("validation.enabled", lambda config: config["validation"].update({"enabled": False})),
             ("validation.index", lambda config: config["validation"].pop("index")),
             ("validation.features", lambda config: config["validation"].pop("features")),
             ("validation.max_samples", lambda config: config["validation"].pop("max_samples")),
@@ -167,10 +166,70 @@ class StageGateTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, field):
                     g_loop._validate_train_g_config(config)
 
+    def test_stage2_allows_explicit_no_eval_validation_block(self) -> None:
+        from safa.training import g_loop
+
+        config = self._base_train_config()
+        config["allow_stage2_without_stage1_gate"] = True
+        config["stages"]["stage1"]["epochs"] = 0
+        config["validation"].update({"enabled": False, "max_samples": 0})
+        config["validation"]["face_detection"]["enabled"] = False
+        config["stages"]["stage2"]["quality_eval"] = {
+            "enabled": False,
+            "metrics": [],
+            "quality_num_workers": 0,
+        }
+
+        g_loop._validate_train_g_config(config)
+
+    def test_stage1_face_gate_rejects_no_eval_validation_block(self) -> None:
+        from safa.training import g_loop
+
+        config = self._base_train_config()
+        config["validation"].update({"enabled": False, "max_samples": 0})
+        config["validation"]["face_detection"]["enabled"] = False
+
+        with self.assertRaisesRegex(ValueError, "Stage 1 face detection gate"):
+            g_loop._validate_train_g_config(config)
+
     def test_stage2_accepts_explicit_validation_face_detection_config(self) -> None:
         from safa.training import g_loop
 
         g_loop._validate_train_g_config(self._base_train_config())
+
+    def test_save_generator_allows_last_only_metrics_when_validation_is_disabled(self) -> None:
+        import tempfile
+        import torch
+        from torch import nn
+        from pathlib import Path
+
+        from safa.models.generator import FlowGeneratorConfig
+        from safa.training import g_loop
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            checkpoint_path = Path(tmp_dir) / "last.pt"
+            train_config = {
+                "stages": self._base_train_config()["stages"],
+                "validation": {"enabled": False, "face_detection": {"enabled": False}},
+                "ema": self._base_train_config()["ema"],
+                "best_model": "raw",
+            }
+            metrics = {"stage": "stage2", "loss": 1.0}
+
+            g_loop._save_generator(
+                checkpoint_path,
+                nn.Linear(2, 2),
+                FlowGeneratorConfig(embedding_dim=2, image_size=4, sample_steps=1, train_cycle_steps=1),
+                train_config,
+                metrics,
+                [metrics],
+                ema_config=train_config["ema"],
+                best_model="raw",
+            )
+
+            payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+            self.assertEqual(payload["metrics"], metrics)
+            self.assertFalse(payload["training_config"]["validation"]["enabled"])
 
     def test_explicit_global_and_per_device_batch_semantics_use_per_device_loader_batch(self) -> None:
         import torch

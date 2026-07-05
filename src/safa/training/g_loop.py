@@ -20,7 +20,7 @@ from safa.evaluation.metrics import (
 from safa.evaluation.recognizers import InsightFaceDetector
 from safa.models.conditioning import fixed_null_condition_like, learned_null_condition_like
 from safa.models.e0 import assert_e0_frozen, freeze_e0, load_e0_checkpoint
-from safa.models.generator import GENERATOR_MODEL_TYPE_FLOW, FlowGeneratorConfig, build_generator
+from safa.models.generator import GENERATOR_MODEL_TYPE_FLOW, FlowGeneratorConfig, build_generator, generator_sample_channels
 from safa.training.audit import audit_no_identity_supervision
 from safa.training.latent_codec import (
     build_latent_codec_from_train_config,
@@ -800,9 +800,7 @@ def _flow_condition_z_for_generator(generator, z, flow_condition: str):
 
 
 def _generator_sample_channels(generator_config: FlowGeneratorConfig) -> int:
-    if generator_config.model_type == "meanflow_sit":
-        return int(generator_config.sit_input_channels)
-    return 3
+    return generator_sample_channels(generator_config)
 
 
 def _make_x_init_for_generator_config(sample_ids, sampling_seed: int, generator_config: FlowGeneratorConfig, device, dtype):
@@ -1612,21 +1610,27 @@ def train_g_from_config(config: dict) -> dict:
                     metrics["optimizer_resumed"] = optimizer_resumed
                 if loss_weighting_runtime.type == "uncertainty":
                     metrics["lambda_cycle_legacy_schedule"] = lambda_cycle
-                raw_validation_metrics, ema_validation_metrics = _evaluate_validation_variants(
-                    unwrap_model(training_module).generator,
-                    ema,
-                    e0,
-                    validation_loader,
-                    detector,
-                    device,
-                    generator_config,
-                    sampling_seed=sampling_seed,
-                    use_amp=use_amp,
-                    ema_config=ema_config,
-                    flow_condition=stage_flow_condition,
-                    latent_codec=latent_codec,
-                )
+                raw_validation_metrics = None
+                ema_validation_metrics = None
+                if validation_loader is not None:
+                    raw_validation_metrics, ema_validation_metrics = _evaluate_validation_variants(
+                        unwrap_model(training_module).generator,
+                        ema,
+                        e0,
+                        validation_loader,
+                        detector,
+                        device,
+                        generator_config,
+                        sampling_seed=sampling_seed,
+                        use_amp=use_amp,
+                        ema_config=ema_config,
+                        flow_condition=stage_flow_condition,
+                        latent_codec=latent_codec,
+                    )
                 _attach_validation_metrics(metrics, raw_validation_metrics, ema_validation_metrics)
+                metrics["training_eval_enabled"] = validation_loader is not None
+                if validation_loader is None:
+                    metrics["checkpoint_selection"] = "last_only_no_eval"
                 raw_cos = metrics.get("validation_raw_latent_cosine_mean")
                 ema_cos = metrics.get("validation_ema_latent_cosine_mean")
                 if raw_cos is not None and ema_cos is not None:
@@ -1661,7 +1665,10 @@ def train_g_from_config(config: dict) -> dict:
                     metrics["next_lambda_cycle"] = next_lambda
                     lambda_cycle = next_lambda
 
-                _validate_checkpoint_selection_metrics(metrics, best_model=best_model)
+                if _validation_enabled(config):
+                    _validate_checkpoint_selection_metrics(metrics, best_model=best_model)
+                else:
+                    _validate_last_checkpoint_metrics(metrics)
                 history.append(metrics)
                 # Append per-epoch metrics to JSONL for easy analysis
                 _append_metrics_history(out_dir, metrics)
@@ -1676,17 +1683,18 @@ def train_g_from_config(config: dict) -> dict:
                 }
                 _save_generator(out_dir / "last.pt", unwrap_model(training_module).generator, generator_config, config, metrics, history, **checkpoint_kwargs)
                 _write_json(out_dir / "last_metrics.json", metrics)
-                stage_best_path = out_dir / f"best_{stage_name}.pt"
-                if _is_better(metrics, history[:-1], best_model=best_model):
-                    _save_generator(stage_best_path, unwrap_model(training_module).generator, generator_config, config, metrics, history, **checkpoint_kwargs)
-                if stage_name == "stage1":
-                    for filename in _stage1_single_face_checkpoint_filenames_to_save(metrics, history[:-1]):
-                        _save_generator(out_dir / filename, unwrap_model(training_module).generator, generator_config, config, metrics, history, **checkpoint_kwargs)
-                if _is_better_overall(metrics, history[:-1], best_model=best_model):
-                    _save_generator(best_checkpoint, unwrap_model(training_module).generator, generator_config, config, metrics, history, **checkpoint_kwargs)
-                if stage_name == "stage2":
-                    for filename in _stage2_checkpoint_filenames_to_save(metrics, history[:-1]):
-                        _save_generator(out_dir / filename, unwrap_model(training_module).generator, generator_config, config, metrics, history, **checkpoint_kwargs)
+                if _validation_enabled(config):
+                    stage_best_path = out_dir / f"best_{stage_name}.pt"
+                    if _is_better(metrics, history[:-1], best_model=best_model):
+                        _save_generator(stage_best_path, unwrap_model(training_module).generator, generator_config, config, metrics, history, **checkpoint_kwargs)
+                    if stage_name == "stage1":
+                        for filename in _stage1_single_face_checkpoint_filenames_to_save(metrics, history[:-1]):
+                            _save_generator(out_dir / filename, unwrap_model(training_module).generator, generator_config, config, metrics, history, **checkpoint_kwargs)
+                    if _is_better_overall(metrics, history[:-1], best_model=best_model):
+                        _save_generator(best_checkpoint, unwrap_model(training_module).generator, generator_config, config, metrics, history, **checkpoint_kwargs)
+                    if stage_name == "stage2":
+                        for filename in _stage2_checkpoint_filenames_to_save(metrics, history[:-1]):
+                            _save_generator(out_dir / filename, unwrap_model(training_module).generator, generator_config, config, metrics, history, **checkpoint_kwargs)
                 should_break = stage_name == "stage1" and stage1_stable_hits >= int(stages["stage1"]["stable_epochs"])
             lambda_cycle, baseline_detection_rate, stage1_stable_hits, should_break = _sync_epoch_control(
                 lambda_cycle,
@@ -2168,7 +2176,13 @@ def _validate_train_g_config(config: dict) -> None:
                 "stages.stage2.gradient_conflict.max_samples must be less than or equal to train_g config.per_device_batch_size, "
                 f"got max_samples={gradient_conflict.max_samples} per_device_batch_size={batch_config.per_device_batch_size}"
             )
-    _validate_validation_block(config)
+    validation = _validate_validation_block(config)
+    if (
+        not _require_bool(validation, "enabled", "validation")
+        and int(_require_field(stages["stage1"], "epochs", "stages.stage1")) > 0
+        and _require_bool(stages["stage1"], "require_face_detection_gate", "stages.stage1")
+    ):
+        raise ValueError("validation.enabled must be true when Stage 1 face detection gate is enabled")
     _validate_quality_eval_configs(config, stages)
     if int(_require_field(stages["stage2"], "epochs", "stages.stage2")) > 0:
         _validate_stage2_validation_config(config)
@@ -2285,10 +2299,17 @@ def _validate_validation_block(config: dict) -> dict:
     return validation
 
 
+def _validation_enabled(config: dict) -> bool:
+    validation = _require_mapping(config, "validation", "train_g config")
+    if "enabled" not in validation:
+        return True
+    return _require_bool(validation, "enabled", "validation")
+
+
 def _validate_stage2_validation_config(config: dict) -> None:
     validation = _validate_validation_block(config)
     if not _require_bool(validation, "enabled", "validation"):
-        raise ValueError("validation.enabled must be true when Stage 2 epochs > 0")
+        return
     for field in ("index", "features", "max_samples", "batch_size"):
         _require_field(validation, field, "validation")
     detection = _require_mapping(validation, "face_detection", "validation")
@@ -4279,6 +4300,12 @@ def _validate_checkpoint_selection_metrics(metrics: dict, context: str = "checkp
             raise ValueError(f"{context}.{field} must be finite, got {value!r}")
 
 
+def _validate_last_checkpoint_metrics(metrics: dict, context: str = "checkpoint metrics") -> None:
+    for field in ("loss", "stage"):
+        _require_field(metrics, field, context)
+    _finite_metric_value(metrics, "loss", context)
+
+
 def _is_better(metrics: dict, previous: list[dict], best_model: str = "raw") -> bool:
     _validate_checkpoint_selection_metrics(metrics, best_model=best_model)
     current_score = _composite_score(metrics, best_model)
@@ -4333,7 +4360,10 @@ def _save_generator(
 
     ema_config = dict(ema_config if ema_config is not None else _ema_config(train_config))
     best_model = str(best_model if best_model is not None else _best_model(train_config, ema_config))
-    _validate_checkpoint_selection_metrics(metrics, best_model=best_model)
+    if _validation_enabled(train_config):
+        _validate_checkpoint_selection_metrics(metrics, best_model=best_model)
+    else:
+        _validate_last_checkpoint_metrics(metrics)
     if ema_config["enabled"] and ema_config["save_ema_checkpoint"] and ema_model_state_dict is None:
         raise ValueError("ema_model_state_dict is required when ema.enabled and ema.save_ema_checkpoint are true")
     if not ema_config["enabled"] and ema_model_state_dict is not None:

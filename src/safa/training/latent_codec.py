@@ -6,7 +6,10 @@ from typing import Any
 
 import torch
 
-from safa.models.generator import GENERATOR_MODEL_TYPE_MEANFLOW_SIT, FlowGeneratorConfig
+from safa.models.generator import (
+    LATENT_CAPABLE_GENERATOR_MODEL_TYPES,
+    FlowGeneratorConfig,
+)
 
 
 @dataclass(frozen=True)
@@ -81,8 +84,9 @@ def latent_codec_config_from_train_config(config: dict[str, Any]) -> LatentCodec
 def validate_latent_training_config(config: dict[str, Any], generator_config: FlowGeneratorConfig) -> None:
     if not latent_training_enabled(config):
         return
-    if generator_config.model_type != GENERATOR_MODEL_TYPE_MEANFLOW_SIT:
-        raise ValueError("latent_training requires generator.model_type == 'meanflow_sit'")
+    if generator_config.model_type not in LATENT_CAPABLE_GENERATOR_MODEL_TYPES:
+        allowed = ", ".join(LATENT_CAPABLE_GENERATOR_MODEL_TYPES)
+        raise ValueError(f"latent_training requires generator.model_type in {{{allowed}}}")
     if generator_config.sit_input_channels != 4:
         raise ValueError("latent_training requires generator.sit_input_channels == 4")
     if generator_config.sit_data_space != "latent":

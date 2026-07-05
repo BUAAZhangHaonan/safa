@@ -426,7 +426,7 @@ def build_meanflow_sit_generator(config):
                         "skipped_keys": [],
                     }
                 raise FileNotFoundError("" if path is None else str(path))
-            payload = torch.load(path, map_location="cpu")
+            payload, load_report = _load_torch_checkpoint(path)
             state_dict = _strip_module_prefix(_extract_state_dict(payload, state_key))
             target = self if _looks_like_full_generator_state(state_dict) else self.vector_field
             prepared_state, prepare_report = _prepare_pretrained_state_dict(state_dict, target.state_dict())
@@ -442,6 +442,7 @@ def build_meanflow_sit_generator(config):
                 "unexpected_keys": unexpected_keys,
                 "mismatched_keys": prepare_report["mismatched_keys"],
                 "skipped_keys": prepare_report["skipped_keys"],
+                **load_report,
             }
 
         def _sample_t_r(self, batch_size: int, *, device, dtype, generator=None):
@@ -529,6 +530,32 @@ def build_meanflow_sit_generator(config):
 
 def _jvp_safe_tensor(tensor):
     return tensor if tensor.is_contiguous() else tensor.contiguous()
+
+
+def _load_torch_checkpoint(path: Path) -> tuple[Any, dict[str, Any]]:
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        return payload, {
+            "weights_only_supported": True,
+            "weights_only_used": True,
+            "weights_only_fallback_reason": "",
+        }
+    except TypeError as exc:
+        if "weights_only" not in str(exc):
+            raise
+        payload = torch.load(path, map_location="cpu")
+        return payload, {
+            "weights_only_supported": False,
+            "weights_only_used": False,
+            "weights_only_fallback_reason": f"unsupported_argument: {exc}",
+        }
+    except Exception as exc:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        return payload, {
+            "weights_only_supported": True,
+            "weights_only_used": False,
+            "weights_only_fallback_reason": f"{type(exc).__name__}: {exc}",
+        }
 
 
 def _is_forward_ad_enabled() -> bool:
