@@ -70,11 +70,14 @@ _POINT_PROJECTED_TWO_STEP = "point_projected_two_step"
 _POINT_DESCENT_CREDIT_PROJECTED = "point_descent_credit_projected"
 _FM_ANCHORED_CAGRAD = "fm_anchored_cagrad"
 _FM_PRIMARY_CONSTRAINED_FAMO = "fm_primary_constrained_famo"
+_PEFT_FM = "peft_fm"
+_PEFT_MLP = "peft_mlp"
 _PROJECTED_STAGE2_OBJECTIVES = (_GRAM_PROJECTED_TWO_STEP, _POINT_PROJECTED_TWO_STEP, _POINT_DESCENT_CREDIT_PROJECTED)
 _CAGRAD_STAGE2_OBJECTIVES = (_FM_ANCHORED_CAGRAD, _FM_PRIMARY_CONSTRAINED_FAMO)
 _GENERATOR_TRAINABLE_FULL = "full"
 _GENERATOR_TRAINABLE_CONDITIONING_ONLY = "conditioning_only"
-_GENERATOR_TRAINABLE_MODES = (_GENERATOR_TRAINABLE_FULL, _GENERATOR_TRAINABLE_CONDITIONING_ONLY)
+_GENERATOR_TRAINABLE_IP_ADAPTER = "ip_adapter"
+_GENERATOR_TRAINABLE_MODES = (_GENERATOR_TRAINABLE_FULL, _GENERATOR_TRAINABLE_CONDITIONING_ONLY, _GENERATOR_TRAINABLE_IP_ADAPTER)
 _RESUME_MODE_TRAINING_STATE = "training_state"
 _RESUME_MODE_MODEL_WEIGHTS_ONLY = "model_weights_only"
 _RESUME_MODES = (_RESUME_MODE_TRAINING_STATE, _RESUME_MODE_MODEL_WEIGHTS_ONLY)
@@ -234,6 +237,42 @@ class _GeneratorTrainingStep:
                     else:
                         cycle_steps = self.generator_config.train_cycle_steps
                     if self.stage2_objective is not None:
+                        if self.stage2_objective.type == _PEFT_FM:
+                            from safa.training.peft_runner import init_peft_generator, run_peft_stage2_batch
+                            init_peft_generator(self.generator, self.stage2_objective)
+                            _peft_batch = {"image": images, "z": z, "sample_id": sample_ids}
+                            total_loss_peft, flow_mse_peft, cycle_zero_peft, flow_loss_peft, repr_loss_peft, aux_metrics_peft = run_peft_stage2_batch(self, _peft_batch, self.stage2_objective)
+                        elif self.stage2_objective.type == _PEFT_MLP:
+                            from safa.training.peft_runner import init_peft_mlp_generator, run_peft_mlp_batch
+                            init_peft_mlp_generator(self.generator, self.stage2_objective)
+                            _peft_batch = {"image": images, "z": z, "sample_id": sample_ids}
+                            total_loss_peft, flow_mse_peft, cycle_zero_peft, flow_loss_peft, repr_loss_peft, aux_metrics_peft = run_peft_mlp_batch(self, _peft_batch, self.stage2_objective)
+                            # Build minimal loss metrics dict inline (avoid _stage2_repr_loss_metrics
+                            # which expects repr_metrics with point/relation keys).
+                            self.last_loss_metrics = {
+                                "loss": float(total_loss_peft.detach().cpu()),
+                                "flow_loss_normalized": float(flow_loss_peft.detach().cpu() if hasattr(flow_loss_peft, "detach") else flow_loss_peft),
+                                "flow_loss_raw": float(flow_loss_peft.detach().cpu() if hasattr(flow_loss_peft, "detach") else flow_loss_peft),
+                                "flow_matching_mse": float(flow_mse_peft.detach().cpu() if hasattr(flow_mse_peft, "detach") else flow_mse_peft),
+                                "repr_loss": float(repr_loss_peft.detach().cpu() if hasattr(repr_loss_peft, "detach") else repr_loss_peft),
+                                "repr_loss_normalized": float(repr_loss_peft.detach().cpu() if hasattr(repr_loss_peft, "detach") else repr_loss_peft),
+                                "repr_point_loss": float(repr_loss_peft.detach().cpu() if hasattr(repr_loss_peft, "detach") else repr_loss_peft),
+                                "repr_relation_loss": 0.0,
+                                "cycle_loss": 0.0,
+                                "cycle_loss_normalized": 0.0,
+                                "cycle_loss_raw": 0.0,
+                                "effective_repr_loss_weight": float(self.stage2_objective.lambda_repr),
+                                "effective_flow_loss_weight": 1.0,
+                                "effective_cycle_loss_weight": 0.0,
+                                "lambda_repr": float(self.stage2_objective.lambda_repr),
+                                "lambda_cycle": 0.0,
+                                "flow_condition": str(effective_flow_condition),
+                                "loss_weighting_type": "peft_fm",
+                                "stage": "stage2",
+                            }
+                            for _k, _v in aux_metrics_peft.items():
+                                self.last_loss_metrics[_k] = float(_v.detach().cpu()) if hasattr(_v, "detach") else float(_v)
+                            return total_loss_peft, flow_mse_peft, cycle_zero_peft.detach(), flow_loss_peft, repr_loss_peft
                         if self.stage2_objective.type == "fm_only_probe":
                             flow_loss, flow_metrics = self._compute_flow_loss(images, z, effective_flow_condition, noise_generator=noise_generator)
                             self._batch_idx += 1
@@ -588,6 +627,8 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
         _FM_PRIMARY_CONSTRAINED_FAMO,
         "fm_only_probe",
         "gram_repr_only_probe",
+        _PEFT_FM,
+        _PEFT_MLP,
     )
     if objective_type not in allowed_types:
         allowed = ", ".join(allowed_types)
@@ -597,6 +638,44 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
         context,
         required=objective_type in {"gram_weighted_sum", *_PROJECTED_STAGE2_OBJECTIVES, *_CAGRAD_STAGE2_OBJECTIVES, "fm_only_probe"},
     )
+    if objective_type == _PEFT_FM:
+        # PEFT objective: parse and return _PEFTStage2Objective.
+        beta_preserve = _optional_numeric(payload, "beta_preserve", context, default=0.5)
+        gamma_cond = _optional_numeric(payload, "gamma_cond", context, default=0.05)
+        lambda_repr_peft = _optional_numeric(payload, "lambda_repr", context, default=0.5)
+        repr_interval_peft = int(_optional_numeric(payload, "repr_interval", context, default=8))
+        layers_payload = payload.get("ip_adapter_layers", [6, 7, 8, 9, 10, 11])
+        if not isinstance(layers_payload, (list, tuple)):
+            raise ValueError(f"{context}.ip_adapter_layers must be a list of ints, got {type(layers_payload).__name__}")
+        ip_adapter_layers = tuple(int(x) for x in layers_payload)
+        ip_adapter_num_tokens = int(_optional_numeric(payload, "ip_adapter_num_tokens", context, default=4))
+        flow_condition_peft = _flow_condition_from_config(payload, context, required=False)
+        if flow_condition_peft is None:
+            flow_condition_peft = "embedding"
+        from safa.training.peft_runner import _PEFTStage2Objective
+        return _PEFTStage2Objective(
+            type=str(objective_type),
+            beta_preserve=beta_preserve,
+            gamma_cond=gamma_cond,
+            lambda_repr=lambda_repr_peft,
+            repr_interval=repr_interval_peft,
+            ip_adapter_layers=ip_adapter_layers,
+            ip_adapter_num_tokens=ip_adapter_num_tokens,
+            flow_condition=flow_condition_peft,
+        )
+    if objective_type == _PEFT_MLP:
+        lambda_repr_mlp = _optional_numeric(payload, "lambda_repr", context, default=1.0)
+        repr_interval_mlp = int(_optional_numeric(payload, "repr_interval", context, default=1))
+        flow_condition_mlp = _flow_condition_from_config(payload, context, required=False)
+        if flow_condition_mlp is None:
+            flow_condition_mlp = "embedding"
+        from safa.training.peft_runner import _PEFTMLPObjective
+        return _PEFTMLPObjective(
+            type=str(objective_type),
+            lambda_repr=float(lambda_repr_mlp),
+            repr_interval=int(repr_interval_mlp),
+            flow_condition=flow_condition_mlp,
+        )
     if objective_type == "fm_only_probe":
         for field in ("lambda_repr", "point_weight", "relation_weight", "offdiag_only", "repr_learning_rate", "projection_eps", "lambda_lpips"):
             if field in payload:
@@ -1002,6 +1081,11 @@ def _apply_generator_trainable_mode(generator, mode: str) -> None:
             trainable = name.startswith("vector_field.z_mlp.") or ".condition." in name
             param.requires_grad_(trainable)
         return
+    if mode == _GENERATOR_TRAINABLE_IP_ADAPTER:
+        # No-op at this stage: init_peft_generator (called lazily on the first
+        # PEFT batch) will wrap ip_adapter sub-modules and freeze the base.
+        # Freezing here would leave the optimizer without any trainable params.
+        return
     raise ValueError(
         "generator_trainable mode must be "
         f"{_GENERATOR_TRAINABLE_FULL!r} or {_GENERATOR_TRAINABLE_CONDITIONING_ONLY!r}, got {mode!r}"
@@ -1268,12 +1352,28 @@ def train_g_from_config(config: dict) -> dict:
     resume_optimizer_state_dict = None
     resume_loss_weighting_state = None
     # Optional: absent resume_from starts a fresh generator run.
+    # R6-continue local patch: if the stage2 objective is peft_mlp, eagerly wrap
+    # the ConditionMLPAdapter BEFORE loading the resume checkpoint so adapter
+    # keys (vector_field.cond_mlp_adapter.*) are present in the model.
+    if stage2_objective is not None and stage2_objective.type == _PEFT_MLP:
+        from safa.training.peft_runner import init_peft_mlp_generator
+        init_peft_mlp_generator(generator, stage2_objective)
     if config.get("resume_from"):
         resume_path = Path(config["resume_from"])
         if not resume_path.is_file():
             raise FileNotFoundError(f"resume_from checkpoint not found: {resume_path}")
         ckpt = torch.load(resume_path, map_location=device, weights_only=True)
-        generator.load_state_dict(ckpt["model_state_dict"])
+        # PEFT path: adapter keys (cond_mlp_adapter.*) are NOT in the resume ckpt.
+        # Load backbone strict=False so adapter uses random init (PEFT standard).
+        _is_peft_mlp = (stage2_objective is not None and stage2_objective.type == _PEFT_MLP)
+        missing, unexpected = generator.load_state_dict(ckpt["model_state_dict"], strict=False)
+        if missing:
+            non_adapter_missing = [k for k in missing if 'cond_mlp_adapter' not in k]
+            if non_adapter_missing:
+                raise RuntimeError(f'Missing non-adapter keys: {non_adapter_missing}')
+            print(f'[PEFT] cond_mlp_adapter random-init, missing keys OK: {len(missing)} keys')
+        if unexpected:
+            print(f'[load_state_dict] unexpected keys: {unexpected[:5]}')
         if resume_mode == _RESUME_MODE_TRAINING_STATE:
             if "history" in ckpt:
                 resume_history = _resume_history_for_checkpoint_selection(ckpt["history"], str(resume_path), config, stages)
@@ -1299,6 +1399,15 @@ def train_g_from_config(config: dict) -> dict:
             sep = ", ".join(restored)
             print(f"Resumed generator from {resume_path} (restored: {sep})")
     _apply_generator_trainable_mode(generator, generator_trainable_mode)
+    if stage2_objective is not None and stage2_objective.type == _PEFT_FM:
+        # Eagerly wrap IP-Adapter so optimizer captures adapter params.
+        # init_peft_generator is idempotent (guards on backbone._ip_adapter_wrapped).
+        from safa.training.peft_runner import init_peft_generator
+        init_peft_generator(generator, stage2_objective)
+    elif stage2_objective is not None and stage2_objective.type == _PEFT_MLP:
+        # Eagerly wrap Condition-MLP so optimizer captures adapter params.
+        from safa.training.peft_runner import init_peft_mlp_generator
+        init_peft_mlp_generator(generator, stage2_objective)
     ema = None
     if ema_config["enabled"]:
         ema = ExponentialMovingAverage(generator, decay=float(ema_config["decay"]))
