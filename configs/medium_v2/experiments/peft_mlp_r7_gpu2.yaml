@@ -1,0 +1,92 @@
+allow_stage2_without_stage1_gate: true
+amp: false
+best_model: raw
+device: cuda:0
+distributed:
+  backend: gloo
+e0_checkpoint: artifacts/checkpoints/e0_medium_v1/best.pt
+ema:
+  decay: 0.999
+  enabled: false
+  evaluate_ema: false
+  evaluate_raw: true
+  save_ema_checkpoint: false
+embedding_dim: 512
+experiment_name: peft_mlp_r7_gpu2
+generator:
+  attention_backend: auto
+  base_channels: 1
+  channel_multipliers:
+  - 1
+  condition_dim: 512
+  cycle_steps_schedule: []
+  learned_null_condition: true
+  meanflow_adaptive_weighting: true
+  meanflow_jvp_mode: torch_func
+  meanflow_norm_eps: 0.001
+  meanflow_norm_p: 1.0
+  meanflow_ratio: 0.25
+  meanflow_ratio_r_not_equal_t: 0.75
+  model_type: meanflow_sit
+  sample_steps: 1
+  sampler: meanflow
+  sit_data_space: latent
+  sit_depth: 12
+  sit_hidden_size: 768
+  sit_input_channels: 4
+  sit_mlp_ratio: 4.0
+  sit_num_heads: 12
+  sit_patch_size: 4
+  sit_time_embedding_dim: 256
+  time_embedding_dim: 128
+  train_cycle_steps: 1
+generator_trainable: ip_adapter
+global_batch_size: 8
+grad_clip_norm: 1.0
+image_size: 32
+latent_training: true
+learning_rate: 0.0003
+num_workers: 8
+out_dir: artifacts/checkpoints/peft_mlp_r7_gpu2
+per_device_batch_size: 8
+pixel_image_size: 256
+resume_from: artifacts/checkpoints/e15_meanflow_sit_b_face_mixed_h100_resume_2400ep/last.pt
+resume_mode: model_weights_only
+resume_optimizer_state: false
+sampling_seed: 1337
+seed: 1337
+stages:
+  stage1:
+    epochs: 0
+    require_face_detection_gate: false
+  stage2:
+    epochs: 1
+    eval_interval_iter: 50
+    gradient_monitor:
+      enabled: false
+      interval: 20
+      max_samples: 8
+    max_iter: 800
+    quality_eval:
+      enabled: false
+    save_interval_iter: 200
+    stage2_objective:
+      type: peft_mlp
+      lambda_repr: 0.5
+      repr_interval: 1
+train_features: artifacts/e0_features/train_balanced_medium_e0_medium_v1
+train_index: data/index/train_balanced_medium.jsonl
+vae_model: stabilityai/sd-vae-ft-ema
+vae_path: artifacts/checkpoints/external/sd-vae-ft-ema
+vae_scaling_factor: 0.18215
+validation:
+  batch_size: 32
+  enabled: true
+  face_detection:
+    enabled: true
+    model_name: buffalo_l
+  features: artifacts/e0_features/val_single_face_e0_medium_v1
+  index: data/index/val_single_face.jsonl
+  interval_iter: 50
+  max_samples: 256
+weight_decay: 0.0
