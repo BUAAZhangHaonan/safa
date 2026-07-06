@@ -134,3 +134,63 @@ def test_privacy_guard_pass_requires_explicit_formal_eval_flag() -> None:
     assert module.privacy_guard_pass(metrics) is True
     metrics["privacy_guard_pass"] = False
     assert module.privacy_guard_pass(metrics) is False
+
+
+def test_privacy_skip_is_recorded_when_formal_privacy_result_is_missing(tmp_path: Path) -> None:
+    module = _load_script()
+    now = "2026-07-06T00:00:00Z"
+    m3_status = {"complete": True, "checkpoint_ready": True}
+    cases = {
+        "marked_skipped": {
+            "privacy_guard_pass": True,
+            "privacy_skipped": True,
+            "skip_reason": "privacy_guard_failed",
+            "metrics": {"privacy": {"arcface": {"same_identity_similarity_mean": 0.7}}},
+        },
+        "has_skip_reason": {
+            "privacy_guard_pass": True,
+            "privacy_skipped": False,
+            "skip_reason": "privacy_protocol_blocker",
+            "metrics": {"privacy": {"arcface": {"same_identity_similarity_mean": 0.7}}},
+        },
+        "empty_privacy_metrics": {
+            "privacy_guard_pass": True,
+            "privacy_skipped": False,
+            "skip_reason": None,
+            "metrics": {"privacy": {}},
+        },
+    }
+
+    for name, metrics in cases.items():
+        case_dir = tmp_path / name
+        paths = _paths(module, case_dir)
+        paths.m3_metrics.parent.mkdir(parents=True)
+        paths.m3_metrics.write_text(json.dumps(metrics), encoding="utf-8")
+
+        events = module.write_privacy_skip_if_needed(paths, m3_status, now)
+
+        assert [event["type"] for event in events] == ["privacy_skipped"]
+        payload = json.loads(paths.privacy_skip_json.read_text(encoding="utf-8"))
+        assert payload["privacy_skipped"] is True
+        assert payload["reason"] == "privacy_guard_not_passed_or_missing"
+        assert payload["metrics"] == metrics
+
+
+def test_privacy_skip_is_not_recorded_for_formal_privacy_result(tmp_path: Path) -> None:
+    module = _load_script()
+    now = "2026-07-06T00:00:00Z"
+    m3_status = {"complete": True, "checkpoint_ready": True}
+    paths = _paths(module, tmp_path)
+    metrics = {
+        "privacy_guard_pass": True,
+        "privacy_skipped": False,
+        "skip_reason": None,
+        "metrics": {"privacy": {"arcface": {"same_identity_similarity_mean": 0.2}}},
+    }
+    paths.m3_metrics.parent.mkdir(parents=True)
+    paths.m3_metrics.write_text(json.dumps(metrics), encoding="utf-8")
+
+    events = module.write_privacy_skip_if_needed(paths, m3_status, now)
+
+    assert events == []
+    assert not paths.privacy_skip_json.exists()

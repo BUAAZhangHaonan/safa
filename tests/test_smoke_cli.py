@@ -113,7 +113,7 @@ class SmokeCliTests(unittest.TestCase):
         self.assertIsInstance(config["face_detection_model"], str)
 
     def test_runbook_referenced_smoke_script_exists(self) -> None:
-        runbook = Path("docs/4029_runbook.md").read_text(encoding="utf-8")
+        runbook = Path("docs/experiments/4029_runbook.md").read_text(encoding="utf-8")
         script = Path("scripts/run_smoke_tmux.sh")
 
         self.assertIn(str(script), runbook)

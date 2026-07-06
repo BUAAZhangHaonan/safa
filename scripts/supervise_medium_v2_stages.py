@@ -396,11 +396,25 @@ def privacy_guard_pass(metrics: dict[str, Any]) -> bool:
     return value
 
 
+def formal_privacy_result_available(metrics: dict[str, Any]) -> bool:
+    if not privacy_guard_pass(metrics):
+        return False
+    if metrics.get("privacy_skipped") is not False:
+        return False
+    if "skip_reason" not in metrics or metrics["skip_reason"] is not None:
+        return False
+    eval_metrics = metrics.get("metrics")
+    if not isinstance(eval_metrics, dict):
+        return False
+    privacy_metrics = eval_metrics.get("privacy")
+    return isinstance(privacy_metrics, dict) and bool(privacy_metrics)
+
+
 def write_privacy_skip_if_needed(paths: StageSupervisorPaths, m3_status: dict[str, Any], now: str) -> list[dict[str, Any]]:
     if not m3_status.get("complete") or not m3_status.get("checkpoint_ready"):
         return []
     metrics = read_json(paths.m3_metrics)
-    if isinstance(metrics, dict) and privacy_guard_pass(metrics):
+    if isinstance(metrics, dict) and formal_privacy_result_available(metrics):
         return []
     payload = {
         "time": now,
