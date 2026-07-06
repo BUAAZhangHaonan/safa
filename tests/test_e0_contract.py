@@ -214,6 +214,8 @@ class E0TrainingLoopTests(unittest.TestCase):
             "num_classes": 2,
             "embedding_dim": 2,
             "imagenet_weights": "",
+            "backbone": "resnet50",
+            "backbone_path": "",
             "learning_rate": 0.001,
             "weight_decay": 0.0,
             "epochs": 1,

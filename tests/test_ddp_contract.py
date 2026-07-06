@@ -81,6 +81,7 @@ class DDPContractTests(unittest.TestCase):
                 {
                     "ema": {"enabled": False, "decay": 0.999, "evaluate_raw": True, "evaluate_ema": False, "save_ema_checkpoint": False},
                     "best_model": "raw",
+                    "validation": {"enabled": False, "face_detection": {"enabled": False}},
                 },
                 metrics,
                 [],
