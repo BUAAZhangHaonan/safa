@@ -35,6 +35,7 @@ class EvalContractTests(unittest.TestCase):
         dataset_len: int = 1,
         batch_size: int = 1,
         save_generated_images: bool = False,
+        latent_codec=None,
     ):
         import torch
 
@@ -68,6 +69,8 @@ class EvalContractTests(unittest.TestCase):
 
         class DummyE0(torch.nn.Module):
             def forward(self, images):
+                if latent_codec is not None and images.shape[1] != 3:
+                    raise AssertionError("eval must decode latent candidates before E0")
                 embeddings = []
                 for image in images.detach().cpu():
                     marker = float(image[0, 0, 0])
@@ -87,8 +90,15 @@ class EvalContractTests(unittest.TestCase):
                 logits = torch.tensor([[1.0, 0.0]], device=images.device, dtype=images.dtype).repeat(images.shape[0], 1)
                 return {"embedding": embedding, "logits": logits}
 
+        generator_config = SimpleNamespace(
+            embedding_dim=2,
+            image_size=4,
+            model_type="meanflow_sit" if latent_codec is not None else "conditional_flow_matching",
+            sit_input_channels=4,
+        )
+
         class DummyGenerator(torch.nn.Module):
-            config = SimpleNamespace(embedding_dim=2)
+            config = generator_config
 
             def __init__(self):
                 super().__init__()
@@ -99,7 +109,8 @@ class EvalContractTests(unittest.TestCase):
                 call_index = len(self.x_inits)
                 self.x_inits.append(kwargs["x_init"].detach().clone())
                 candidate_index = call_index % num_candidates
-                generated = torch.zeros((z.shape[0], 3, 4, 4), device=z.device, dtype=z.dtype)
+                channels = int(self.config.sit_input_channels) if latent_codec is not None else 3
+                generated = torch.zeros((z.shape[0], channels, 4, 4), device=z.device, dtype=z.dtype)
                 generated[:, 0, 0, 0] = float(candidate_index)
                 generated[:, 0, 0, 1] = z[:, 1]
                 return generated
@@ -149,6 +160,9 @@ class EvalContractTests(unittest.TestCase):
                 config["candidate_rerank"] = candidate_rerank
             if save_generated_images:
                 config["save_generated_images"] = True
+            if latent_codec is not None:
+                config["latent_training"] = True
+                config["vae_model"] = "dummy-vae"
 
             generator = DummyGenerator()
             detector = DummyDetector() if face_counts is not None else None
@@ -171,6 +185,7 @@ class EvalContractTests(unittest.TestCase):
                 patch.object(runner, "load_e0_checkpoint", return_value=(DummyE0(), {"model_config": {"embedding_dim": 2}})),
                 patch.object(runner, "_load_generator", return_value=generator),
                 patch.object(runner, "_build_face_detector", return_value=detector),
+                patch.object(runner, "build_latent_codec_from_train_config", return_value=latent_codec),
                 patch.object(runner, "normalize_for_e0", side_effect=lambda images: images),
                 patch.object(runner, "_save_generated_image_for_eval", side_effect=fake_save_generated_image_for_eval),
             ):
@@ -747,28 +762,54 @@ class EvalContractTests(unittest.TestCase):
         self.assertAlmostEqual(rows[0]["candidate_rerank"]["selected_latent_cosine"], 0.9)
 
     @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for candidate rerank tests")
-    def test_candidate_rerank_falls_back_to_latent_cosine_without_face_detector(self) -> None:
-        result, rows, generator = self._run_candidate_rerank_eval(
+    def test_candidate_rerank_latent_training_decodes_candidates_before_eval(self) -> None:
+        import torch
+
+        class DummyLatentCodec:
+            def __init__(self):
+                self.vae = SimpleNamespace(eval=lambda: None)
+                self.decoded_latent_shapes = []
+
+            def decode(self, latents):
+                self.decoded_latent_shapes.append(tuple(latents.shape))
+                decoded = torch.zeros((latents.shape[0], 3, 4, 4), device=latents.device, dtype=latents.dtype)
+                decoded[:, 0, 0, 0] = latents[:, 0, 0, 0]
+                decoded[:, 0, 0, 1] = latents[:, 0, 0, 1]
+                return decoded
+
+        codec = DummyLatentCodec()
+
+        _, rows, generator = self._run_candidate_rerank_eval(
             candidate_rerank={
                 "enabled": True,
-                "num_candidates": 3,
-                "single_face_priority": True,
+                "num_candidates": 2,
+                "single_face_priority": False,
                 "selection_metric": "latent_cosine",
             },
-            cosines=[0.55, 0.92, 0.8],
+            cosines=[0.7, 0.9],
             face_counts=None,
             face_detection_enabled=False,
+            latent_codec=codec,
         )
 
-        self.assertEqual(len(generator.x_inits), 3)
-        self.assertEqual(result["sampling"]["candidate_rerank"]["enabled"], True)
-        self.assertEqual(rows[0]["face_detection"], {})
-        metadata = rows[0]["candidate_rerank"]
-        self.assertEqual(metadata["selected_candidate_index"], 1)
-        self.assertAlmostEqual(metadata["selected_latent_cosine"], 0.92)
-        self.assertIsNone(metadata["selected_face_count"])
-        self.assertNotIn("face_count", metadata["candidates"][0])
-        self.assertAlmostEqual(rows[0]["affective"]["latent_cosine"], 0.92)
+        self.assertEqual(codec.decoded_latent_shapes, [(1, 4, 4, 4), (1, 4, 4, 4)])
+        self.assertEqual(len(generator.x_inits), 2)
+        self.assertEqual(rows[0]["candidate_rerank"]["selected_candidate_index"], 1)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for candidate rerank tests")
+    def test_candidate_rerank_rejects_single_face_priority_without_face_detector(self) -> None:
+        with self.assertRaisesRegex(ValueError, "face_detection.enabled"):
+            self._run_candidate_rerank_eval(
+                candidate_rerank={
+                    "enabled": True,
+                    "num_candidates": 3,
+                    "single_face_priority": True,
+                    "selection_metric": "latent_cosine",
+                },
+                cosines=[0.55, 0.92, 0.8],
+                face_counts=None,
+                face_detection_enabled=False,
+            )
 
     @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for candidate rerank tests")
     def test_candidate_rerank_selects_independently_per_sample_in_batch(self) -> None:
@@ -906,7 +947,8 @@ class EvalContractTests(unittest.TestCase):
                         "accept_latent_cosine_threshold": 0.95,
                         "require_single_face": True,
                     },
-                }
+                },
+                "face_detection": {"enabled": True},
             }
         )
 
@@ -941,7 +983,8 @@ class EvalContractTests(unittest.TestCase):
                         "single_face_priority": True,
                         "selection_metric": "latent_cosine",
                         "adaptive_k": adaptive_k,
-                    }
+                    },
+                    "face_detection": {"enabled": True},
                 }
             )
 
@@ -1136,34 +1179,25 @@ class EvalContractTests(unittest.TestCase):
         self.assertEqual(metadata["selected_face_count"], 1)
 
     @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for candidate rerank tests")
-    def test_candidate_rerank_adaptive_missing_detector_runs_to_max_k(self) -> None:
-        _, rows, generator = self._run_candidate_rerank_eval(
-            candidate_rerank={
-                "enabled": True,
-                "num_candidates": 3,
-                "single_face_priority": False,
-                "selection_metric": "latent_cosine",
-                "adaptive_k": {
+    def test_candidate_rerank_rejects_adaptive_require_single_face_without_face_detector(self) -> None:
+        with self.assertRaisesRegex(ValueError, "face_detection.enabled"):
+            self._run_candidate_rerank_eval(
+                candidate_rerank={
                     "enabled": True,
-                    "min_candidates": 1,
-                    "accept_latent_cosine_threshold": 0.9,
-                    "require_single_face": True,
+                    "num_candidates": 3,
+                    "single_face_priority": False,
+                    "selection_metric": "latent_cosine",
+                    "adaptive_k": {
+                        "enabled": True,
+                        "min_candidates": 1,
+                        "accept_latent_cosine_threshold": 0.9,
+                        "require_single_face": True,
+                    },
                 },
-            },
-            cosines=[0.95, 0.2, 0.1],
-            face_counts=None,
-            face_detection_enabled=False,
-        )
-
-        metadata = rows[0]["candidate_rerank"]
-        self.assertEqual(len(generator.x_inits), 3)
-        self.assertEqual(metadata["num_candidates_evaluated"], 3)
-        self.assertEqual(metadata["stop_reason"], "max_k_missing_metric")
-        self.assertEqual(metadata["selected_candidate_index"], 0)
-        self.assertAlmostEqual(metadata["best_score"], 0.95)
-        self.assertFalse(metadata["threshold_passed"])
-        self.assertIsNone(metadata["selected_face_count"])
-        self.assertFalse(any("face_count" in candidate for candidate in metadata["candidates"]))
+                cosines=[0.95, 0.2, 0.1],
+                face_counts=None,
+                face_detection_enabled=False,
+            )
 
     def test_candidate_rerank_rejects_invalid_config(self) -> None:
         from safa.evaluation import runner
@@ -1271,7 +1305,7 @@ class EvalContractTests(unittest.TestCase):
                 }
 
         class DummyGenerator(torch.nn.Module):
-            config = SimpleNamespace(embedding_dim=2)
+            config = SimpleNamespace(embedding_dim=2, image_size=4, model_type="conditional_flow_matching")
 
             def sample(self, z, **kwargs):
                 return torch.zeros(z.shape[0], 3, 4, 4, device=z.device)
@@ -1335,6 +1369,8 @@ class EvalContractTests(unittest.TestCase):
             self.assertTrue(Path(config["out_json"]).is_file())
             self.assertTrue(Path(config["per_sample_jsonl"]).is_file())
             persisted = json.loads(Path(config["out_json"]).read_text(encoding="utf-8"))
+            self.assertEqual(result["out_json"], config["out_json"])
+            self.assertEqual(persisted["out_json"], config["out_json"])
             self.assertTrue(persisted["privacy_skipped"])
             self.assertEqual(persisted["metrics"]["privacy"], {})
             persisted_metrics = json.dumps(persisted["metrics"], sort_keys=True)

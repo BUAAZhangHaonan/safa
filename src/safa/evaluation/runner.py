@@ -85,6 +85,7 @@ def run_eval_from_config(config: dict) -> dict:
                     int(config["image_size"]),
                     candidate_rerank_cfg,
                     detector,
+                    latent_codec=latent_codec,
                 )
             else:
                 generated = _sample_generated_for_eval(generator, z, sample_ids, sampling_seed, int(config["image_size"]), latent_codec=latent_codec)
@@ -235,6 +236,8 @@ def _build_eval_result(
 
 
 def _write_eval_outputs(config: dict, result: dict, rows: list[dict], dataset_len: int) -> None:
+    out_json = Path(config["out_json"])
+    result["out_json"] = str(out_json)
     flatten_finite_numbers(result["metrics"])
     if len(rows) != dataset_len:
         raise RuntimeError(f"Per-sample eval row count mismatch: rows={len(rows)} dataset={dataset_len}")
@@ -243,10 +246,8 @@ def _write_eval_outputs(config: dict, result: dict, rows: list[dict], dataset_le
     with per_sample_jsonl.open("w", encoding="utf-8", newline="\n") as handle:
         for row in rows:
             handle.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
-    out_json = Path(config["out_json"])
     out_json.parent.mkdir(parents=True, exist_ok=True)
     out_json.write_text(json.dumps(result, indent=2, sort_keys=True, allow_nan=False), encoding="utf-8")
-    result["out_json"] = str(out_json)
 
 
 def _load_generator(checkpoint_path: str, config: dict, device: str):
@@ -368,10 +369,12 @@ def _candidate_rerank_config(config: dict) -> dict:
     }
     adaptive_k = block.get("adaptive_k")
     if adaptive_k is None:
+        _validate_candidate_rerank_face_detection_dependency(config, parsed)
         return parsed
     if not isinstance(adaptive_k, dict):
         raise ValueError("candidate_rerank.adaptive_k must be a mapping")
     if not _require_enabled_flag(adaptive_k, "candidate_rerank.adaptive_k"):
+        _validate_candidate_rerank_face_detection_dependency(config, parsed)
         return parsed
     _require_fields(
         adaptive_k,
@@ -393,7 +396,26 @@ def _candidate_rerank_config(config: dict) -> dict:
         ),
         "require_single_face": require_single_face,
     }
+    _validate_candidate_rerank_face_detection_dependency(config, parsed)
     return parsed
+
+
+def _candidate_rerank_requires_face_detection(config: dict) -> bool:
+    if bool(config.get("single_face_priority", False)):
+        return True
+    adaptive_k = config.get("adaptive_k")
+    return isinstance(adaptive_k, dict) and bool(adaptive_k.get("enabled", False)) and bool(adaptive_k.get("require_single_face", False))
+
+
+def _validate_candidate_rerank_face_detection_dependency(eval_config: dict, candidate_rerank_cfg: dict) -> None:
+    if not _candidate_rerank_requires_face_detection(candidate_rerank_cfg):
+        return
+    face_detection_cfg = eval_config.get("face_detection")
+    if not isinstance(face_detection_cfg, dict) or face_detection_cfg.get("enabled") is not True:
+        raise ValueError(
+            "face_detection.enabled must be true when candidate_rerank.single_face_priority "
+            "or candidate_rerank.adaptive_k.require_single_face is true"
+        )
 
 
 def _disabled_candidate_rerank_config() -> dict:
@@ -436,6 +458,7 @@ def _sample_reranked_generated_for_eval(
     image_size: int,
     candidate_rerank_cfg: dict,
     detector,
+    latent_codec=None,
 ):
     import torch
     import torch.nn.functional as F
@@ -450,6 +473,7 @@ def _sample_reranked_generated_for_eval(
             image_size,
             candidate_rerank_cfg,
             detector,
+            latent_codec=latent_codec,
         )
 
     num_candidates = int(candidate_rerank_cfg["num_candidates"])
@@ -459,7 +483,7 @@ def _sample_reranked_generated_for_eval(
     candidate_face_counts = [] if detector is not None and candidate_rerank_cfg["single_face_priority"] else None
     for candidate_index in range(num_candidates):
         candidate_ids = _candidate_sample_ids(sample_ids, candidate_index)
-        generated = _sample_generated_for_eval(generator, z, candidate_ids, sampling_seed, image_size)
+        generated = _sample_generated_for_eval(generator, z, candidate_ids, sampling_seed, image_size, latent_codec=latent_codec)
         assert_finite_tensor(f"eval_generated_candidate_{candidate_index}", generated)
         generated_out = e0(normalize_for_e0(generated))
         cosine = F.cosine_similarity(generated_out["embedding"], z, dim=1).clamp(-1, 1)
@@ -536,6 +560,7 @@ def _sample_adaptive_reranked_generated_for_eval(
     image_size: int,
     candidate_rerank_cfg: dict,
     detector,
+    latent_codec=None,
 ):
     import torch
     import torch.nn.functional as F
@@ -559,7 +584,7 @@ def _sample_adaptive_reranked_generated_for_eval(
         active_sample_ids = [sample_ids[sample_index] for sample_index in active_indices]
         active_z = z[active_indices]
         candidate_ids = _candidate_sample_ids(active_sample_ids, candidate_index)
-        generated = _sample_generated_for_eval(generator, active_z, candidate_ids, sampling_seed, image_size)
+        generated = _sample_generated_for_eval(generator, active_z, candidate_ids, sampling_seed, image_size, latent_codec=latent_codec)
         assert_finite_tensor(f"eval_generated_candidate_{candidate_index}", generated)
         generated_out = e0(normalize_for_e0(generated))
         cosine = F.cosine_similarity(generated_out["embedding"], active_z, dim=1).clamp(-1, 1)
