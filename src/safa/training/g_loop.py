@@ -72,6 +72,7 @@ _FM_ANCHORED_CAGRAD = "fm_anchored_cagrad"
 _FM_PRIMARY_CONSTRAINED_FAMO = "fm_primary_constrained_famo"
 _PEFT_FM = "peft_fm"
 _PEFT_MLP = "peft_mlp"
+_PEFT_LORA = "peft_lora"
 _PROJECTED_STAGE2_OBJECTIVES = (_GRAM_PROJECTED_TWO_STEP, _POINT_PROJECTED_TWO_STEP, _POINT_DESCENT_CREDIT_PROJECTED)
 _CAGRAD_STAGE2_OBJECTIVES = (_FM_ANCHORED_CAGRAD, _FM_PRIMARY_CONSTRAINED_FAMO)
 _GENERATOR_TRAINABLE_FULL = "full"
@@ -268,6 +269,37 @@ class _GeneratorTrainingStep:
                                 "lambda_cycle": 0.0,
                                 "flow_condition": str(effective_flow_condition),
                                 "loss_weighting_type": "peft_fm",
+                                "stage": "stage2",
+                            }
+                            for _k, _v in aux_metrics_peft.items():
+                                self.last_loss_metrics[_k] = float(_v.detach().cpu()) if hasattr(_v, "detach") else float(_v)
+                            return total_loss_peft, flow_mse_peft, cycle_zero_peft.detach(), flow_loss_peft, repr_loss_peft
+                        if self.stage2_objective.type == _PEFT_LORA:
+                            # Phase0 2026-07-07: PEFT-LoRA dispatch (generic main loop on
+                            # FFHQ + sparse SAFA loop). Same 6-tuple shape as peft_mlp.
+                            from safa.training.peft_runner import init_peft_lora_generator, run_peft_lora_batch
+                            init_peft_lora_generator(self.generator, self.stage2_objective)
+                            _peft_batch = {"image": images, "z": z, "sample_id": sample_ids}
+                            total_loss_peft, flow_mse_peft, cycle_zero_peft, flow_loss_peft, repr_loss_peft, aux_metrics_peft = run_peft_lora_batch(self, _peft_batch, self.stage2_objective)
+                            self.last_loss_metrics = {
+                                "loss": float(total_loss_peft.detach().cpu()),
+                                "flow_loss_normalized": float(flow_loss_peft.detach().cpu() if hasattr(flow_loss_peft, "detach") else flow_loss_peft),
+                                "flow_loss_raw": float(flow_loss_peft.detach().cpu() if hasattr(flow_loss_peft, "detach") else flow_loss_peft),
+                                "flow_matching_mse": float(flow_mse_peft.detach().cpu() if hasattr(flow_mse_peft, "detach") else flow_mse_peft),
+                                "repr_loss": float(repr_loss_peft.detach().cpu() if hasattr(repr_loss_peft, "detach") else repr_loss_peft),
+                                "repr_loss_normalized": float(repr_loss_peft.detach().cpu() if hasattr(repr_loss_peft, "detach") else repr_loss_peft),
+                                "repr_point_loss": float(repr_loss_peft.detach().cpu() if hasattr(repr_loss_peft, "detach") else repr_loss_peft),
+                                "repr_relation_loss": 0.0,
+                                "cycle_loss": 0.0,
+                                "cycle_loss_normalized": 0.0,
+                                "cycle_loss_raw": 0.0,
+                                "effective_repr_loss_weight": float(self.stage2_objective.lambda_repr),
+                                "effective_flow_loss_weight": 1.0,
+                                "effective_cycle_loss_weight": 0.0,
+                                "lambda_repr": float(self.stage2_objective.lambda_repr),
+                                "lambda_cycle": 0.0,
+                                "flow_condition": str(effective_flow_condition),
+                                "loss_weighting_type": "peft_lora",
                                 "stage": "stage2",
                             }
                             for _k, _v in aux_metrics_peft.items():
@@ -629,6 +661,7 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
         "gram_repr_only_probe",
         _PEFT_FM,
         _PEFT_MLP,
+        _PEFT_LORA,
     )
     if objective_type not in allowed_types:
         allowed = ", ".join(allowed_types)
@@ -676,6 +709,16 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
             repr_interval=int(repr_interval_mlp),
             flow_condition=flow_condition_mlp,
         )
+    if objective_type == _PEFT_LORA:
+        # PEFT-LoRA objective: parse via peft_lora_objective_from_config.
+        from safa.training.peft_runner import peft_lora_objective_from_config as _parse_peft_lora
+        flow_condition_lora = _flow_condition_from_config(payload, context, required=False)
+        if flow_condition_lora is None:
+            flow_condition_lora = "embedding"
+        obj = _parse_peft_lora(payload, context)
+        # Re-assign flow_condition (the dataclass default is "embedding" but we
+        # honor an explicit override from the config).
+        return obj.__class__(**{**obj.__dict__, "flow_condition": flow_condition_lora})
     if objective_type == "fm_only_probe":
         for field in ("lambda_repr", "point_weight", "relation_weight", "offdiag_only", "repr_learning_rate", "projection_eps", "lambda_lpips"):
             if field in payload:
@@ -1358,20 +1401,37 @@ def train_g_from_config(config: dict) -> dict:
     if stage2_objective is not None and stage2_objective.type == _PEFT_MLP:
         from safa.training.peft_runner import init_peft_mlp_generator
         init_peft_mlp_generator(generator, stage2_objective)
+    # Phase0 2026-07-07 patch: same eager-wrap pattern for peft_lora so the
+    # LoRA / gated-low-rank / generic-bank keys are present before resume load.
+    if stage2_objective is not None and stage2_objective.type == _PEFT_LORA:
+        from safa.training.peft_runner import init_peft_lora_generator
+        init_peft_lora_generator(generator, stage2_objective)
     if config.get("resume_from"):
         resume_path = Path(config["resume_from"])
         if not resume_path.is_file():
             raise FileNotFoundError(f"resume_from checkpoint not found: {resume_path}")
         ckpt = torch.load(resume_path, map_location=device, weights_only=True)
-        # PEFT path: adapter keys (cond_mlp_adapter.*) are NOT in the resume ckpt.
-        # Load backbone strict=False so adapter uses random init (PEFT standard).
+        # PEFT path: adapter keys (cond_mlp_adapter.* / lora_a.* / lora_b.* /
+        # gated_low_rank_z.* / generic_bank.* / _peft_lora_null_embed) are NOT
+        # in the resume ckpt. Load backbone strict=False so adapter uses random
+        # init (PEFT standard).
         _is_peft_mlp = (stage2_objective is not None and stage2_objective.type == _PEFT_MLP)
+        _is_peft_lora = (stage2_objective is not None and stage2_objective.type == _PEFT_LORA)
         missing, unexpected = generator.load_state_dict(ckpt["model_state_dict"], strict=False)
         if missing:
-            non_adapter_missing = [k for k in missing if 'cond_mlp_adapter' not in k]
+            if _is_peft_lora:
+                # Whitelist PEFT-LoRA adapter keys.
+                adapter_tags = (
+                    "lora_a", "lora_b",
+                    "gated_low_rank_z", "generic_bank",
+                    "_peft_lora_null_embed",
+                )
+                non_adapter_missing = [k for k in missing if not any(tag in k for tag in adapter_tags)]
+            else:
+                non_adapter_missing = [k for k in missing if 'cond_mlp_adapter' not in k]
             if non_adapter_missing:
                 raise RuntimeError(f'Missing non-adapter keys: {non_adapter_missing}')
-            print(f'[PEFT] cond_mlp_adapter random-init, missing keys OK: {len(missing)} keys')
+            print(f'[PEFT] adapter random-init, missing keys OK: {len(missing)} keys')
         if unexpected:
             print(f'[load_state_dict] unexpected keys: {unexpected[:5]}')
         if resume_mode == _RESUME_MODE_TRAINING_STATE:
@@ -1408,6 +1468,11 @@ def train_g_from_config(config: dict) -> dict:
         # Eagerly wrap Condition-MLP so optimizer captures adapter params.
         from safa.training.peft_runner import init_peft_mlp_generator
         init_peft_mlp_generator(generator, stage2_objective)
+    elif stage2_objective is not None and stage2_objective.type == _PEFT_LORA:
+        # Phase0 2026-07-07: ensure PEFT-LoRA wrap is in place before optimizer.
+        # Idempotent (guards on backbone._peft_lora_wrapped).
+        from safa.training.peft_runner import init_peft_lora_generator
+        init_peft_lora_generator(generator, stage2_objective)
     ema = None
     if ema_config["enabled"]:
         ema = ExponentialMovingAverage(generator, decay=float(ema_config["decay"]))
