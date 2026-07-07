@@ -49,8 +49,24 @@ def main():
         has_bank = any("generic_bank" in k for k in state_dict.keys())
         has_null = any("_peft_lora_null_embed" in k for k in state_dict.keys())
         has_final_lora = any("final_layer.adaLN_modulation.1.lora" in k for k in state_dict.keys())
+        # If checkpoint only has block-level LoRA (no gated/bank/null/final) -> pure lora_sweep wrap
         is_peft_lora_full = has_gated or has_bank or has_null or has_final_lora
+        # Auto-detect LoRA targets from checkpoint
+        detected_targets = set()
+        for k in state_dict.keys():
+            if "lora_a" in k:
+                parts = k.split(".")
+                # vector_field.blocks.{N}.{path}.lora_a.weight -> parts[3:-2]
+                if len(parts) > 5 and parts[0] == "vector_field" and parts[1] == "blocks":
+                    target_path = ".".join(parts[3:-2])
+                    detected_targets.add(target_path)
         print(f"[r1_eval] gated={has_gated} bank={has_bank} null={has_null} final_lora={has_final_lora} -> is_peft_lora_full={is_peft_lora_full}")
+        print(f"[r1_eval] detected LoRA targets: {sorted(detected_targets)}")
+        # If pure lora_sweep, override LORA_TARGETS with detected
+        if not is_peft_lora_full and detected_targets:
+            LORA_TARGETS_OVERRIDE = sorted(detected_targets)
+        else:
+            LORA_TARGETS_OVERRIDE = LORA_TARGETS
 
         def patched_load(checkpoint_path, cfg, dev):
             pl = torch.load(str(checkpoint_path), map_location=dev, weights_only=False)
@@ -95,7 +111,7 @@ def main():
                 # Pure lora_sweep wrap
                 from safa.models.peft_lora import wrap_backbone_with_lora_target
                 wrap_backbone_with_lora_target(
-                    gen.vector_field, target_modules=LORA_TARGETS,
+                    gen.vector_field, target_modules=LORA_TARGETS_OVERRIDE,
                     rank=LORA_RANK, alpha=LORA_ALPHA,
                 )
             gen.load_state_dict(pl["model_state_dict"])
