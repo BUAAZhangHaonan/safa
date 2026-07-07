@@ -449,6 +449,11 @@ class _PEFTLoRAObjective:
     ffhq_image_size: int = 256
     ffhq_per_device_batch: int = 16
     flow_condition: str = "embedding"
+    # Phase 0.2 ablation knobs (expert 2026-07-07 strict order).
+    enable_lora: bool = True
+    enable_gated_low_rank: bool = True
+    enable_generic_bank: bool = True
+    lora_blocks: str = "all"
     # Compat fields for helpers that read these attrs.
     beta_preserve: float = 0.0
     gamma_cond_compat: float = 0.0
@@ -477,6 +482,12 @@ def peft_lora_objective_from_config(payload: dict[str, Any], context: str) -> _P
         raise ValueError(f"{context}.step_ratio must be >= 0, got {step_ratio}")
     if not ffhq_index:
         raise ValueError(f"{context}.ffhq_index is required for peft_lora objective")
+    enable_lora = bool(payload.get("enable_lora", True))
+    enable_gated = bool(payload.get("enable_gated_low_rank", True))
+    enable_bank = bool(payload.get("enable_generic_bank", True))
+    lora_blocks = str(payload.get("lora_blocks", "all"))
+    if lora_blocks not in ("all", "last_third"):
+        raise ValueError(f"{context}.lora_blocks must be 'all' or 'last_third', got {lora_blocks!r}")
     return _PEFTLoRAObjective(
         type="peft_lora",
         beta_teacher=beta,
@@ -489,6 +500,10 @@ def peft_lora_objective_from_config(payload: dict[str, Any], context: str) -> _P
         ffhq_index=ffhq_index,
         ffhq_image_size=ffhq_image_size,
         ffhq_per_device_batch=ffhq_batch,
+        enable_lora=enable_lora,
+        enable_gated_low_rank=enable_gated,
+        enable_generic_bank=enable_bank,
+        lora_blocks=lora_blocks,
     )
 
 
@@ -509,6 +524,10 @@ def init_peft_lora_generator(generator: torch.nn.Module, objective: _PEFTLoRAObj
         z_dim=z_dim,
         hidden_size=hidden_size,
         num_generic_embeddings=objective.num_generic_embeddings,
+        enable_lora=objective.enable_lora,
+        enable_gated_low_rank=objective.enable_gated_low_rank,
+        enable_generic_bank=objective.enable_generic_bank,
+        lora_blocks=objective.lora_blocks,
     )
 
 

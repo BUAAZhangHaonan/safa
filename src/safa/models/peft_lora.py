@@ -130,27 +130,45 @@ def wrap_backbone_with_peft_lora(
     z_dim: int | None = None,
     hidden_size: int | None = None,
     num_generic_embeddings: int = 16,
+    enable_lora: bool = True,
+    enable_gated_low_rank: bool = True,
+    enable_generic_bank: bool = True,
+    lora_blocks: str = "all",
 ) -> nn.Module:
     """Attach LoRA + gated low-rank residual + generic bank to a MeanFlow-SiT backbone.
 
     Idempotent: detects ``_peft_lora_wrapped`` and returns immediately on re-entry.
 
+    Phase 0.2 ablation knobs (expert 2026-07-07 strict order):
+    - ``enable_lora`` (default True): when False, block adaLN_modulation[-1]
+      and FinalLayer.adaLN_modulation[-1] keep their original nn.Linear; no
+      LoRA params exist. Used for the "bank-only" arm.
+    - ``enable_gated_low_rank`` (default True): when False, the
+      GatedLowRankResidual is still attached (for state-dict shape compat) but
+      A_proj, B_proj and gate are zeroed and frozen, so delta_z == 0. Used for
+      the LoRA-only arms.
+    - ``enable_generic_bank`` (default True): when False, the
+      GenericEmbeddingBank is attached but its embeddings are zeroed and
+      frozen, so generic_emb == 0. Used for the LoRA-only arms.
+    - ``lora_blocks``: "all" wraps every block; "last_third" wraps only the
+      last len(blocks)//3 blocks (still wraps FinalLayer). Used for the
+      LoRA-only part-blocks arm (T-LoRA high-timestep-overfit analogy).
+
     Side effects on the backbone:
-    1. Each ``block.adaLN_modulation[-1]`` (the nn.Linear inside Sequential) is
-       replaced by a LoRALinear wrapping the original Linear. The original
-       weight/bias tensors are preserved inside LoRALinear.base.
-    2. ``backbone.final_layer.adaLN_modulation[-1]`` is also wrapped (FiLM
-       modulation on the final patch projection is condition-driven too).
+    1. Each selected ``block.adaLN_modulation[-1]`` (the nn.Linear inside
+       Sequential) is replaced by a LoRALinear wrapping the original Linear.
+       The original weight/bias tensors are preserved inside LoRALinear.
+    2. ``backbone.final_layer.adaLN_modulation[-1]`` is also wrapped when
+       ``enable_lora`` is True (FiLM modulation on the final patch projection
+       is condition-driven too).
     3. New sub-modules are attached:
        - ``backbone.gated_low_rank_z`` (GatedLowRankResidual)
        - ``backbone.generic_bank`` (GenericEmbeddingBank)
-       - ``backbone._peft_lora_null_proj`` (nn.Linear(hidden_size, hidden_size, bias=False),
-         identity-ish init, used to project the generator-level null_condition
-         embedding into the backbone condition space; we don't rely on the
-         backbone's own z_embedder because the expert plan disables it).
+       - ``backbone._peft_lora_null_embed`` (Parameter, hidden_size)
     4. ``backbone.forward`` is monkey-patched with the PEFT-LoRA forward.
-    5. Base parameters are frozen; only LoRA / gated / generic / null_proj
-       parameters have requires_grad=True.
+    5. Base parameters are frozen; only LoRA / gated / generic / null_embed
+       parameters have requires_grad=True (and only for components whose
+       ``enable_*`` flag is True).
 
     The original ``z_embedder`` is left in place (state-dict compatible) but is
     NOT called by the patched forward.
@@ -159,6 +177,10 @@ def wrap_backbone_with_peft_lora(
         return backbone
 
     from safa.models.meanflow_sit import _modulate  # module-level helper
+
+    # Validate lora_blocks.
+    if lora_blocks not in ("all", "last_third"):
+        raise ValueError(f"lora_blocks must be 'all' or 'last_third', got {lora_blocks!r}")
 
     # Infer dims from backbone sub-modules.
     if hidden_size is None:
@@ -169,27 +191,49 @@ def wrap_backbone_with_peft_lora(
     device = next(backbone.parameters()).device
     dtype = next(backbone.parameters()).dtype
 
-    # 1. Attach gated low-rank + generic bank.
+    # 1. Attach gated low-rank + generic bank (always, for state-dict shape
+    #    compat). Disabled components are zeroed+ frozen below.
     backbone.gated_low_rank_z = GatedLowRankResidual(z_dim, hidden_size, rank=lora_rank).to(device=device, dtype=dtype)
     backbone.generic_bank = GenericEmbeddingBank(num_generic_embeddings, hidden_size).to(device=device, dtype=dtype)
 
-    # 2. Wrap each block's adaLN_modulation[-1] Linear with LoRALinear.
-    for block in backbone.blocks:
-        mod_seq = block.adaLN_modulation
-        if not isinstance(mod_seq, nn.Sequential) or len(mod_seq) == 0:
-            raise RuntimeError(f"SiTBlock.adaLN_modulation is not a non-empty Sequential: {type(mod_seq)}")
-        base_linear = mod_seq[-1]
-        if not isinstance(base_linear, nn.Linear):
-            raise RuntimeError(f"SiTBlock.adaLN_modulation[-1] is not nn.Linear: {type(base_linear)}")
-        lora_wrapped = LoRALinear(base_linear, rank=lora_rank, alpha=lora_alpha).to(device=device, dtype=dtype)
-        mod_seq[-1] = lora_wrapped
+    # 2. Wrap selected blocks' adaLN_modulation[-1] Linear with LoRALinear.
+    if enable_lora:
+        n_blocks = len(backbone.blocks)
+        if lora_blocks == "last_third":
+            # Last third (rounded down). For 12 blocks -> indices 8,9,10,11.
+            start_idx = n_blocks - max(1, n_blocks // 3)
+            wrap_indices = set(range(start_idx, n_blocks))
+        else:
+            wrap_indices = set(range(n_blocks))
 
-    # 2b. Wrap FinalLayer.adaLN_modulation[-1] too.
-    final_seq = backbone.final_layer.adaLN_modulation
-    if isinstance(final_seq, nn.Sequential) and len(final_seq) > 0 and isinstance(final_seq[-1], nn.Linear):
-        final_base = final_seq[-1]
-        final_lora = LoRALinear(final_base, rank=lora_rank, alpha=lora_alpha).to(device=device, dtype=dtype)
-        final_seq[-1] = final_lora
+        for i, block in enumerate(backbone.blocks):
+            if i not in wrap_indices:
+                continue
+            mod_seq = block.adaLN_modulation
+            if not isinstance(mod_seq, nn.Sequential) or len(mod_seq) == 0:
+                raise RuntimeError(f"SiTBlock.adaLN_modulation is not a non-empty Sequential: {type(mod_seq)}")
+            base_linear = mod_seq[-1]
+            if not isinstance(base_linear, nn.Linear):
+                raise RuntimeError(f"SiTBlock.adaLN_modulation[-1] is not nn.Linear: {type(base_linear)}")
+            lora_wrapped = LoRALinear(base_linear, rank=lora_rank, alpha=lora_alpha).to(device=device, dtype=dtype)
+            mod_seq[-1] = lora_wrapped
+
+        # 2b. Wrap FinalLayer.adaLN_modulation[-1] too (when LoRA enabled).
+        final_seq = backbone.final_layer.adaLN_modulation
+        if isinstance(final_seq, nn.Sequential) and len(final_seq) > 0 and isinstance(final_seq[-1], nn.Linear):
+            final_base = final_seq[-1]
+            final_lora = LoRALinear(final_base, rank=lora_rank, alpha=lora_alpha).to(device=device, dtype=dtype)
+            final_seq[-1] = final_lora
+
+    # 2c. Disable gated_low_rank / generic_bank by zeroing+freezing if requested.
+    if not enable_gated_low_rank:
+        with torch.no_grad():
+            backbone.gated_low_rank_z.A_proj.weight.zero_()
+            backbone.gated_low_rank_z.B_proj.weight.zero_()
+            backbone.gated_low_rank_z.gate.zero_()
+    if not enable_generic_bank:
+        with torch.no_grad():
+            backbone.generic_bank.embeddings.weight.zero_()
 
     # 3. Patched forward.
     def peft_lora_forward(self, x, r, t, z):
@@ -258,14 +302,28 @@ def wrap_backbone_with_peft_lora(
     backbone._peft_lora_null_embed = null_embed_param
 
     backbone._peft_lora_wrapped = True
+    # Record ablation flags on the backbone for downstream introspection
+    # (logging / param counting / debugging).
+    backbone._peft_lora_config = {
+        "enable_lora": bool(enable_lora),
+        "enable_gated_low_rank": bool(enable_gated_low_rank),
+        "enable_generic_bank": bool(enable_generic_bank),
+        "lora_blocks": str(lora_blocks),
+        "lora_rank": int(lora_rank),
+        "lora_alpha": float(lora_alpha),
+        "num_generic_embeddings": int(num_generic_embeddings),
+    }
 
-    # 5. Freeze base, unfreeze adapter params.
+    # 5. Freeze base, unfreeze adapter params based on enabled flags.
     for name, param in backbone.named_parameters():
         is_lora = ("lora_a" in name) or ("lora_b" in name)
         is_gated = name.startswith("gated_low_rank_z.")
         is_generic = name.startswith("generic_bank.")
         is_null = name == "_peft_lora_null_embed"
-        param.requires_grad_(is_lora or is_gated or is_generic or is_null)
+        train_lora = is_lora and enable_lora
+        train_gated = is_gated and enable_gated_low_rank
+        train_generic = is_generic and enable_generic_bank
+        param.requires_grad_(train_lora or train_gated or train_generic or is_null)
 
     return backbone
 
