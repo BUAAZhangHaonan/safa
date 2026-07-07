@@ -103,17 +103,44 @@ class GenericEmbeddingBank(nn.Module):
 
     Forward samples one random embedding index per batch element (uniform).
     Returns [B, hidden_size].
+
+    Phase 0.3 (b): when ``num_embeddings == 1`` the bank degenerates to a
+    single *shared* embedding (forward always returns the same vector). The
+    caller may pass ``init_from_null_embed`` (a hidden_size tensor) to copy
+    initial weights from the null embedding instead of random init.
     """
 
-    def __init__(self, num_embeddings: int = 16, hidden_size: int = 768):
+    def __init__(
+        self,
+        num_embeddings: int = 16,
+        hidden_size: int = 768,
+        init_from_null_embed: torch.Tensor | None = None,
+    ):
         super().__init__()
         self.num_embeddings = int(num_embeddings)
         self.hidden_size = int(hidden_size)
         self.embeddings = nn.Embedding(self.num_embeddings, self.hidden_size)
-        nn.init.normal_(self.embeddings.weight, std=0.02)
+        if init_from_null_embed is not None and self.num_embeddings >= 1:
+            with torch.no_grad():
+                init_vec = init_from_null_embed.detach().clone().to(
+                    dtype=self.embeddings.weight.dtype
+                )
+                if init_vec.shape[-1] != self.hidden_size:
+                    raise ValueError(
+                        f"init_from_null_embed last-dim {init_vec.shape[-1]} != hidden_size {self.hidden_size}"
+                    )
+                # Broadcast the source (shape [hidden_size]) across all bank slots
+                # so single_shared and N-bank both init to the null anchor.
+                self.embeddings.weight.copy_(init_vec.unsqueeze(0).expand(self.num_embeddings, -1))
+        else:
+            nn.init.normal_(self.embeddings.weight, std=0.02)
 
     def forward(self, batch_size: int, *, device, dtype) -> torch.Tensor:
-        idx = torch.randint(0, self.num_embeddings, (batch_size,), device=device)
+        if self.num_embeddings <= 1:
+            # single shared: always index 0
+            idx = torch.zeros(batch_size, dtype=torch.long, device=device)
+        else:
+            idx = torch.randint(0, self.num_embeddings, (batch_size,), device=device)
         return self.embeddings(idx).to(dtype=dtype)
 
 
@@ -134,6 +161,8 @@ def wrap_backbone_with_peft_lora(
     enable_gated_low_rank: bool = True,
     enable_generic_bank: bool = True,
     lora_blocks: str = "all",
+    generic_mode: str = "bank",
+    freeze_null_embed: bool = False,
 ) -> nn.Module:
     """Attach LoRA + gated low-rank residual + generic bank to a MeanFlow-SiT backbone.
 
@@ -153,6 +182,27 @@ def wrap_backbone_with_peft_lora(
     - ``lora_blocks``: "all" wraps every block; "last_third" wraps only the
       last len(blocks)//3 blocks (still wraps FinalLayer). Used for the
       LoRA-only part-blocks arm (T-LoRA high-timestep-overfit analogy).
+
+    Phase 0.3 (a)/(b) knobs (expert 2026-07-07 strict (a)+(b) parallel test):
+    - ``generic_mode`` (default "bank"): one of "bank" / "null" / "single_shared".
+      * "bank": original Phase 0 behaviour, ``num_generic_embeddings`` (e.g. 16)
+        learned embeddings, random-sample one per batch element.
+      * "null" (Phase 0.3 a): the generic bank is NOT created
+        (``backbone.generic_bank = None``). The generic step condition is just
+        ``t_emb + r_emb + null_embed (frozen) + delta_z`` — no learnable generic
+        embedding is added. ``_peft_lora_null_embed`` is frozen in this mode so
+        the only generic-step learnable contributions are LoRA + delta_z.
+      * "single_shared" (Phase 0.3 b): the bank degenerates to ONE shared
+        embedding (always index 0), initialized by copying
+        ``_peft_lora_null_embed``. At step 0 the generic contribution is the
+        null anchor itself; if the expert's "gate=0" intuition holds, the
+        embedding should drift very little and behave close to (a).
+    - ``freeze_null_embed`` (default False): when True, the learnable null
+      anchor ``_peft_lora_null_embed`` is frozen (requires_grad=False). The
+      Phase 0.3 (a) arm turns this on so that the ONLY generic-step learnable
+      contributions are LoRA + delta_z. Phase 0.3 (b) leaves it trainable
+      (matching Phase 0 baseline) so the only difference vs Phase 0 is the
+      bank cardinality (1 vs 16) and init (null vs random).
 
     Side effects on the backbone:
     1. Each selected ``block.adaLN_modulation[-1]`` (the nn.Linear inside
@@ -182,6 +232,12 @@ def wrap_backbone_with_peft_lora(
     if lora_blocks not in ("all", "last_third"):
         raise ValueError(f"lora_blocks must be 'all' or 'last_third', got {lora_blocks!r}")
 
+    # Validate generic_mode (Phase 0.3 a/b knob).
+    if generic_mode not in ("bank", "null", "single_shared"):
+        raise ValueError(
+            f"generic_mode must be 'bank' / 'null' / 'single_shared', got {generic_mode!r}"
+        )
+
     # Infer dims from backbone sub-modules.
     if hidden_size is None:
         hidden_size = int(backbone.x_embedder.out_channels)
@@ -191,10 +247,41 @@ def wrap_backbone_with_peft_lora(
     device = next(backbone.parameters()).device
     dtype = next(backbone.parameters()).dtype
 
-    # 1. Attach gated low-rank + generic bank (always, for state-dict shape
-    #    compat). Disabled components are zeroed+ frozen below.
+    # 1. Attach gated low-rank residual (always, for state-dict shape compat).
     backbone.gated_low_rank_z = GatedLowRankResidual(z_dim, hidden_size, rank=lora_rank).to(device=device, dtype=dtype)
-    backbone.generic_bank = GenericEmbeddingBank(num_generic_embeddings, hidden_size).to(device=device, dtype=dtype)
+
+    # 1b. Create the learnable null anchor FIRST so single_shared bank can
+    #     initialize from it. The original code created this at the very end;
+    #     we move it here to support Phase 0.3 (b) single_shared init.
+    with torch.no_grad():
+        null_embed_param = nn.Parameter(torch.zeros(hidden_size, device=device, dtype=dtype))
+        nn.init.normal_(null_embed_param, std=0.02)
+    backbone._peft_lora_null_embed = null_embed_param
+
+    # 1c. Build the generic bank based on generic_mode (Phase 0.3 a/b).
+    if generic_mode == "null":
+        # (a) main arm: NO bank. generic step condition = t_emb + r_emb +
+        #     null_embed (frozen) + delta_z. We still attach a GenericEmbeddingBank
+        #     module with num_embeddings=1 and zeroed/frozen weights so that
+        #     downstream code (state-dict shape, frozen-step counting) is
+        #     uniform, but the patched forward detects generic_mode and skips
+        #     adding its output to the condition.
+        backbone.generic_bank = GenericEmbeddingBank(1, hidden_size).to(device=device, dtype=dtype)
+        with torch.no_grad():
+            backbone.generic_bank.embeddings.weight.zero_()
+        backbone._peft_generic_mode = "null"
+    elif generic_mode == "single_shared":
+        # (b) validation arm: bank of size 1, init = null_embed_param.
+        backbone.generic_bank = GenericEmbeddingBank(
+            1,
+            hidden_size,
+            init_from_null_embed=backbone._peft_lora_null_embed.detach().clone(),
+        ).to(device=device, dtype=dtype)
+        backbone._peft_generic_mode = "single_shared"
+    else:
+        # "bank" (Phase 0/0.1/0.2): N learned embeddings, random init.
+        backbone.generic_bank = GenericEmbeddingBank(num_generic_embeddings, hidden_size).to(device=device, dtype=dtype)
+        backbone._peft_generic_mode = "bank"
 
     # 2. Wrap selected blocks' adaLN_modulation[-1] Linear with LoRALinear.
     if enable_lora:
@@ -259,8 +346,16 @@ def wrap_backbone_with_peft_lora(
         t_emb = self.t_embedder(t)
         r_emb = self.r_embedder(horizon)
 
-        # generic bank: random embedding per sample
-        generic_emb = self.generic_bank(B, device=device, dtype=dtype)
+        # generic bank contribution depends on generic_mode (Phase 0.3 a/b):
+        # - "bank" / "single_shared": sample 1 embedding per batch element
+        #   (single_shared always returns the same index-0 vector).
+        # - "null": skip the bank entirely so generic_emb == 0; the generic
+        #   step condition is t_emb + r_emb + null_embed (frozen) + delta_z.
+        generic_mode_attr = getattr(self, "_peft_generic_mode", "bank")
+        if generic_mode_attr == "null":
+            generic_emb = torch.zeros(B, hidden_size, device=device, dtype=dtype)
+        else:
+            generic_emb = self.generic_bank(B, device=device, dtype=dtype)
 
         # gated low-rank residual from z (z=zeros in generic step -> still a
         # function of A_proj(0) and B_proj, regularized by L_cond).
@@ -293,14 +388,6 @@ def wrap_backbone_with_peft_lora(
 
     backbone.forward = types.MethodType(peft_lora_forward, backbone)
 
-    # 4. Add a learnable null embedding (hidden_size, ) at backbone level. This
-    #    is a fresh parameter, not present in original state-dict (loaded into
-    #    the new key ``_peft_lora_null_embed``).
-    with torch.no_grad():
-        null_embed_param = nn.Parameter(torch.zeros(hidden_size, device=device, dtype=dtype))
-        nn.init.normal_(null_embed_param, std=0.02)
-    backbone._peft_lora_null_embed = null_embed_param
-
     backbone._peft_lora_wrapped = True
     # Record ablation flags on the backbone for downstream introspection
     # (logging / param counting / debugging).
@@ -312,9 +399,16 @@ def wrap_backbone_with_peft_lora(
         "lora_rank": int(lora_rank),
         "lora_alpha": float(lora_alpha),
         "num_generic_embeddings": int(num_generic_embeddings),
+        "generic_mode": str(generic_mode),
+        "freeze_null_embed": bool(freeze_null_embed),
     }
 
     # 5. Freeze base, unfreeze adapter params based on enabled flags.
+    #    Phase 0.3 (a) "null" arm: null_embed is frozen (freeze_null_embed=True
+    #    AND generic_mode=="null"); generic_bank is also frozen (zeroed). So
+    #    the only generic-step learnable contributions are LoRA + delta_z.
+    #    Phase 0.3 (b) "single_shared" arm: null_embed stays trainable (matching
+    #    Phase 0 baseline) and the bank has 1 learnable embedding.
     for name, param in backbone.named_parameters():
         is_lora = ("lora_a" in name) or ("lora_b" in name)
         is_gated = name.startswith("gated_low_rank_z.")
@@ -322,8 +416,9 @@ def wrap_backbone_with_peft_lora(
         is_null = name == "_peft_lora_null_embed"
         train_lora = is_lora and enable_lora
         train_gated = is_gated and enable_gated_low_rank
-        train_generic = is_generic and enable_generic_bank
-        param.requires_grad_(train_lora or train_gated or train_generic or is_null)
+        train_generic = is_generic and enable_generic_bank and (generic_mode != "null")
+        train_null = is_null and not freeze_null_embed
+        param.requires_grad_(train_lora or train_gated or train_generic or train_null)
 
     return backbone
 

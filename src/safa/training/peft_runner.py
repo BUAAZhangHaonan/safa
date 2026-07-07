@@ -454,6 +454,12 @@ class _PEFTLoRAObjective:
     enable_gated_low_rank: bool = True
     enable_generic_bank: bool = True
     lora_blocks: str = "all"
+    # Phase 0.3 (a)/(b) knobs (expert 2026-07-07 strict (a)+(b) parallel test).
+    # generic_mode: "bank" (default, Phase 0/0.1/0.2 behaviour),
+    #               "null" (Phase 0.3 a: no generic bank, frozen null anchor),
+    #               "single_shared" (Phase 0.3 b: 1 shared embedding init=null).
+    generic_mode: str = "bank"
+    freeze_null_embed: bool = False
     # Compat fields for helpers that read these attrs.
     beta_preserve: float = 0.0
     gamma_cond_compat: float = 0.0
@@ -488,6 +494,13 @@ def peft_lora_objective_from_config(payload: dict[str, Any], context: str) -> _P
     lora_blocks = str(payload.get("lora_blocks", "all"))
     if lora_blocks not in ("all", "last_third"):
         raise ValueError(f"{context}.lora_blocks must be 'all' or 'last_third', got {lora_blocks!r}")
+    # Phase 0.3 (a)/(b) knobs.
+    generic_mode = str(payload.get("generic_mode", "bank"))
+    if generic_mode not in ("bank", "null", "single_shared"):
+        raise ValueError(
+            f"{context}.generic_mode must be 'bank' / 'null' / 'single_shared', got {generic_mode!r}"
+        )
+    freeze_null_embed = bool(payload.get("freeze_null_embed", False))
     return _PEFTLoRAObjective(
         type="peft_lora",
         beta_teacher=beta,
@@ -504,6 +517,8 @@ def peft_lora_objective_from_config(payload: dict[str, Any], context: str) -> _P
         enable_gated_low_rank=enable_gated,
         enable_generic_bank=enable_bank,
         lora_blocks=lora_blocks,
+        generic_mode=generic_mode,
+        freeze_null_embed=freeze_null_embed,
     )
 
 
@@ -528,6 +543,8 @@ def init_peft_lora_generator(generator: torch.nn.Module, objective: _PEFTLoRAObj
         enable_gated_low_rank=objective.enable_gated_low_rank,
         enable_generic_bank=objective.enable_generic_bank,
         lora_blocks=objective.lora_blocks,
+        generic_mode=objective.generic_mode,
+        freeze_null_embed=objective.freeze_null_embed,
     )
 
 
