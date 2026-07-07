@@ -1,0 +1,104 @@
+experiment_name: r2_lora_repr_lr0.25_continue_gpu2
+seed: 1337
+sampling_seed: 1337
+device: cuda:2
+num_workers: 8
+global_batch_size: 4
+per_device_batch_size: 4
+amp: false
+learning_rate: 0.0001
+weight_decay: 0.0
+optimizer_type: adamw
+latent_training: true
+pixel_image_size: 256
+vae_model: stabilityai/sd-vae-ft-ema
+vae_path: artifacts/checkpoints/external/sd-vae-ft-ema
+vae_scaling_factor: 0.18215
+image_size: 32
+embedding_dim: 512
+train_index: data/index/train_face_mixed_e14_4029avail.jsonl
+train_features: artifacts/e0_features/train_face_mixed_e14_e0_medium_v1
+e0_checkpoint: artifacts/checkpoints/e0_medium_v1/best.pt
+out_dir: artifacts/checkpoints/r2_lora_repr_lr0.25_continue_gpu2
+allow_stage2_without_stage1_gate: true
+resume_from: artifacts/checkpoints/r2_lora_repr_lr0.25_gpu1/best.pt
+resume_mode: model_weights_only
+resume_optimizer_state: false
+resume_from_legacy_stage1_metrics: false
+generator_trainable: ip_adapter
+ddp_find_unused_parameters: false
+ema:
+  enabled: false
+  decay: 0.9999
+  evaluate_raw: true
+  evaluate_ema: false
+  save_ema_checkpoint: false
+best_model: raw
+distributed:
+  backend: gloo
+generator:
+  model_type: meanflow_sit
+  base_channels: 1
+  channel_multipliers:
+  - 1
+  time_embedding_dim: 128
+  condition_dim: 512
+  sample_steps: 1
+  train_cycle_steps: 1
+  cycle_steps_schedule: []
+  sampler: meanflow
+  learned_null_condition: true
+  meanflow_ratio: 0.25
+  meanflow_ratio_r_not_equal_t: 0.75
+  meanflow_adaptive_weighting: true
+  meanflow_norm_p: 1.0
+  meanflow_norm_eps: 0.001
+  meanflow_jvp_mode: torch_func
+  sit_input_channels: 4
+  sit_data_space: latent
+  sit_patch_size: 4
+  sit_hidden_size: 768
+  sit_depth: 12
+  sit_num_heads: 12
+  sit_mlp_ratio: 4.0
+  sit_time_embedding_dim: 256
+  attention_backend: auto
+grad_clip_norm: 1.0
+stages:
+  stage1:
+    epochs: 0
+    require_face_detection_gate: false
+  stage2:
+    epochs: 1
+    gradient_monitor:
+      enabled: false
+      interval: 20
+      max_samples: 8
+    stage2_objective:
+      type: peft_lora
+      flow_condition: embedding
+      beta_teacher: 0.0
+      gamma_cond: 0.0
+      lambda_g: 0.0
+      lambda_repr: 0.25
+      step_ratio: 0
+      lora_rank: 8
+      num_generic_embeddings: 16
+      enable_lora: true
+      enable_gated_low_rank: false
+      enable_generic_bank: false
+      generic_mode: "null"
+      ffhq_index: data/ffhq/ffhq_5k_subset/index.jsonl
+      ffhq_image_size: 256
+      ffhq_per_device_batch: 4
+    quality_eval:
+      enabled: false
+validation:
+  enabled: true
+  index: data/index/val_face_mixed_e14.jsonl
+  features: artifacts/e0_features/val_face_mixed_e14_e0_medium_v1
+  max_samples: 256
+  batch_size: 32
+  face_detection:
+    enabled: true
+    model_name: buffalo_l
