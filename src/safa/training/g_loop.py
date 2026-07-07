@@ -1466,6 +1466,24 @@ def train_g_from_config(config: dict) -> dict:
             rank=stage2_objective.rank,
             alpha=stage2_objective.alpha,
         )
+    if stage2_objective is not None and stage2_objective.type == _POINT_PROJECTED_TWO_STEP:
+        # Round 3 (2026-07-08) patch: enable LoRA target-module wrap for
+        # point_projected_two_step so PU-Adam only updates LoRA params.
+        # Triggered when config has lora_target_modules; otherwise falls
+        # through to default IP-Adapter full-fine-tune path.
+        _pp_lora_targets = config.get("stages", {}).get("stage2", {}).get("stage2_objective", {}).get("lora_target_modules")
+        if _pp_lora_targets:
+            from safa.models.peft_lora import wrap_backbone_with_lora_target
+            _pp_rank = int(config.get("stages", {}).get("stage2", {}).get("stage2_objective", {}).get("lora_rank", 8))
+            _pp_alpha = float(config.get("stages", {}).get("stage2", {}).get("stage2_objective", {}).get("lora_alpha", 4.0))
+            wrap_backbone_with_lora_target(
+                generator.vector_field,
+                target_modules=list(_pp_lora_targets),
+                rank=_pp_rank,
+                alpha=_pp_alpha,
+            )
+            print(f"[R3-patch] point_projected_two_step + LoRA target_modules={_pp_lora_targets} rank={_pp_rank} alpha={_pp_alpha}", flush=True)
+
     if config.get("resume_from"):
         resume_path = Path(config["resume_from"])
         if not resume_path.is_file():
@@ -1476,7 +1494,7 @@ def train_g_from_config(config: dict) -> dict:
         # in the resume ckpt. Load backbone strict=False so adapter uses random
         # init (PEFT standard).
         _is_peft_mlp = (stage2_objective is not None and stage2_objective.type == _PEFT_MLP)
-        _is_peft_lora = (stage2_objective is not None and stage2_objective.type in {_PEFT_LORA, _LORA_SWEEP})
+        _is_peft_lora = (stage2_objective is not None and stage2_objective.type in {_PEFT_LORA, _LORA_SWEEP}) or (stage2_objective is not None and stage2_objective.type == _POINT_PROJECTED_TWO_STEP and bool(config.get("stages", {}).get("stage2", {}).get("stage2_objective", {}).get("lora_target_modules")))
         missing, unexpected = generator.load_state_dict(ckpt["model_state_dict"], strict=False)
         if missing:
             if _is_peft_lora:
