@@ -73,6 +73,7 @@ _FM_PRIMARY_CONSTRAINED_FAMO = "fm_primary_constrained_famo"
 _PEFT_FM = "peft_fm"
 _PEFT_MLP = "peft_mlp"
 _PEFT_LORA = "peft_lora"
+_LORA_SWEEP = "lora_sweep"
 _PROJECTED_STAGE2_OBJECTIVES = (_GRAM_PROJECTED_TWO_STEP, _POINT_PROJECTED_TWO_STEP, _POINT_DESCENT_CREDIT_PROJECTED)
 _CAGRAD_STAGE2_OBJECTIVES = (_FM_ANCHORED_CAGRAD, _FM_PRIMARY_CONSTRAINED_FAMO)
 _GENERATOR_TRAINABLE_FULL = "full"
@@ -82,6 +83,27 @@ _GENERATOR_TRAINABLE_MODES = (_GENERATOR_TRAINABLE_FULL, _GENERATOR_TRAINABLE_CO
 _RESUME_MODE_TRAINING_STATE = "training_state"
 _RESUME_MODE_MODEL_WEIGHTS_ONLY = "model_weights_only"
 _RESUME_MODES = (_RESUME_MODE_TRAINING_STATE, _RESUME_MODE_MODEL_WEIGHTS_ONLY)
+
+
+@dataclass(frozen=True)
+class _LoraSweepObjective:
+    """Phase 0.4 (2026-07-07) single-variable LoRA target-module sweep.
+
+    Stores target modules + rank + alpha + flow_condition. Dispatch reuses
+    fm_only_probe loss path; only the wrap differs.
+    """
+    type: str = _LORA_SWEEP
+    target_modules: tuple = ("attn.qkv", "attn.proj")
+    rank: int = 8
+    alpha: float = 4.0
+    flow_condition: str = _FLOW_CONDITION_EMBEDDING
+    lambda_repr: float = 0.0
+    point_weight: float = 0.0
+    relation_weight: float = 0.0
+    offdiag_only: bool = True
+    repr_learning_rate: float = 0.0
+    projection_eps: float = 1e-12
+    lambda_lpips: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -305,14 +327,15 @@ class _GeneratorTrainingStep:
                             for _k, _v in aux_metrics_peft.items():
                                 self.last_loss_metrics[_k] = float(_v.detach().cpu()) if hasattr(_v, "detach") else float(_v)
                             return total_loss_peft, flow_mse_peft, cycle_zero_peft.detach(), flow_loss_peft, repr_loss_peft
-                        if self.stage2_objective.type == "fm_only_probe":
+                        if self.stage2_objective.type == "fm_only_probe" or self.stage2_objective.type == _LORA_SWEEP:
                             flow_loss, flow_metrics = self._compute_flow_loss(images, z, effective_flow_condition, noise_generator=noise_generator)
                             self._batch_idx += 1
                             secondary_loss = flow_loss.new_tensor(0.0)
+                            _sweep_obj_type = "lora_sweep" if self.stage2_objective.type == _LORA_SWEEP else "fm_only_probe"
                             self.last_loss_metrics = self._stage2_probe_loss_metrics(
                                 flow_loss,
                                 secondary_loss,
-                                objective_type="fm_only_probe",
+                                objective_type=_sweep_obj_type,
                                 effective_flow_weight=1.0,
                                 effective_repr_weight=0.0,
                                 flow_condition=effective_flow_condition,
@@ -662,6 +685,7 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
         _PEFT_FM,
         _PEFT_MLP,
         _PEFT_LORA,
+        _LORA_SWEEP,
     )
     if objective_type not in allowed_types:
         allowed = ", ".join(allowed_types)
@@ -719,6 +743,30 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
         # Re-assign flow_condition (the dataclass default is "embedding" but we
         # honor an explicit override from the config).
         return obj.__class__(**{**obj.__dict__, "flow_condition": flow_condition_lora})
+    if objective_type == _LORA_SWEEP:
+        # Phase 0.4 (2026-07-07) LoRA target-module sweep.
+        target_modules_payload = payload.get("lora_target_modules", ["attn.qkv", "attn.proj"])
+        if not isinstance(target_modules_payload, (list, tuple)) or not target_modules_payload:
+            raise ValueError(
+                f"{context}.lora_target_modules must be a non-empty list of attribute paths, "
+                f"got {target_modules_payload!r}"
+            )
+        target_modules = tuple(str(p) for p in target_modules_payload)
+        lora_rank = int(_optional_numeric(payload, "lora_rank", context, default=8))
+        lora_alpha = float(_optional_numeric(payload, "lora_alpha", context, default=4.0))
+        if lora_rank <= 0:
+            raise ValueError(f"{context}.lora_rank must be positive, got {lora_rank!r}")
+        # flow_condition defaults to learned_null_condition (e15 same); required=False here.
+        flow_condition_sweep = _flow_condition_from_config(payload, context, required=False)
+        if flow_condition_sweep is None:
+            flow_condition_sweep = _FLOW_CONDITION_LEARNED_NULL
+        return _LoraSweepObjective(
+            type=_LORA_SWEEP,
+            target_modules=target_modules,
+            rank=lora_rank,
+            alpha=lora_alpha,
+            flow_condition=flow_condition_sweep,
+        )
     if objective_type == "fm_only_probe":
         for field in ("lambda_repr", "point_weight", "relation_weight", "offdiag_only", "repr_learning_rate", "projection_eps", "lambda_lpips"):
             if field in payload:
@@ -977,7 +1025,7 @@ def _flow_condition_for_stage(stages: dict, stage_name: str, stage2_objective: _
     if stage_name == "stage2" and stage2_objective is not None:
         if "flow_condition" in stage:
             raise ValueError("stages.stage2.flow_condition is ambiguous when stages.stage2.stage2_objective.flow_condition is available")
-        if stage2_objective.type in {"gram_weighted_sum", *_PROJECTED_STAGE2_OBJECTIVES, *_CAGRAD_STAGE2_OBJECTIVES, "fm_only_probe"}:
+        if stage2_objective.type in {"gram_weighted_sum", *_PROJECTED_STAGE2_OBJECTIVES, *_CAGRAD_STAGE2_OBJECTIVES, "fm_only_probe", _LORA_SWEEP}:
             if "flow_condition" not in stage.get("stage2_objective", {}):
                 raise ValueError("stages.stage2.stage2_objective.flow_condition is required for flow objectives")
             _validate_flow_condition(stage2_objective.flow_condition, "stages.stage2.stage2_objective.flow_condition")
@@ -1406,6 +1454,18 @@ def train_g_from_config(config: dict) -> dict:
     if stage2_objective is not None and stage2_objective.type == _PEFT_LORA:
         from safa.training.peft_runner import init_peft_lora_generator
         init_peft_lora_generator(generator, stage2_objective)
+    if stage2_objective is not None and stage2_objective.type == _LORA_SWEEP:
+        # Phase 0.4 (2026-07-07) eager wrap: LoRA target-module sweep must be
+        # in place BEFORE the resume checkpoint loads so the LoRA adapter
+        # keys (lora_a / lora_b) are random-init and the base Linear weights
+        # are loaded into LoRALinear.weight via strict=False.
+        from safa.models.peft_lora import wrap_backbone_with_lora_target
+        wrap_backbone_with_lora_target(
+            generator.vector_field,
+            target_modules=list(stage2_objective.target_modules),
+            rank=stage2_objective.rank,
+            alpha=stage2_objective.alpha,
+        )
     if config.get("resume_from"):
         resume_path = Path(config["resume_from"])
         if not resume_path.is_file():
@@ -1416,7 +1476,7 @@ def train_g_from_config(config: dict) -> dict:
         # in the resume ckpt. Load backbone strict=False so adapter uses random
         # init (PEFT standard).
         _is_peft_mlp = (stage2_objective is not None and stage2_objective.type == _PEFT_MLP)
-        _is_peft_lora = (stage2_objective is not None and stage2_objective.type == _PEFT_LORA)
+        _is_peft_lora = (stage2_objective is not None and stage2_objective.type in {_PEFT_LORA, _LORA_SWEEP})
         missing, unexpected = generator.load_state_dict(ckpt["model_state_dict"], strict=False)
         if missing:
             if _is_peft_lora:

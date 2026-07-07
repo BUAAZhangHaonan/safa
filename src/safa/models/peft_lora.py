@@ -456,3 +456,95 @@ def compute_l_cond(backbone: nn.Module, z_sample: torch.Tensor) -> torch.Tensor:
     """
     delta = backbone.gated_low_rank_z(z_sample)  # [B, hidden]
     return delta.square().sum(dim=-1).mean()
+
+
+# ---------------------------------------------------------------------------
+# Phase 0.4 (2026-07-07): Pure LoRA target-module sweep wrapper.
+# ---------------------------------------------------------------------------
+
+
+def wrap_backbone_with_lora_target(
+    backbone,
+    *,
+    target_modules: list[str],
+    rank: int = 8,
+    alpha: float = 4.0,
+):
+    """Pure LoRA fine-tune wrap. No gated low-rank, no generic bank, no null_embed.
+
+    Phase 0.4 single-variable sweep (expert plan 2026-07-07): only adds LoRA to
+    user-specified target_modules attribute paths (relative to each SiTBlock).
+    All base params frozen; only lora_a / lora_b unfrozen.
+
+    MeanFlow-SiT SiTBlock attribute paths (verified 2026-07-07):
+      - "adaLN_modulation.1"  -> the nn.Linear inside Sequential([SiLU, Linear])
+      - "attn.qkv"            -> fused Q/K/V projection (nn.Linear)
+      - "attn.proj"           -> attention output projection (nn.Linear)
+      - "mlp.0"               -> first FFN Linear
+      - "mlp.2"               -> second FFN Linear
+
+    Idempotent: skip if backbone._lora_sweep_wrapped.
+    """
+    if getattr(backbone, "_lora_sweep_wrapped", False):
+        return backbone
+
+    device = next(backbone.parameters()).device
+    dtype = next(backbone.parameters()).dtype
+
+    n_wrapped = 0
+    for block in backbone.blocks:
+        for path in target_modules:
+            # navigate path -> obj; raise if not Linear
+            obj = block
+            for seg in path.split("."):
+                if seg.isdigit():
+                    obj = obj[int(seg)]
+                else:
+                    obj = getattr(obj, seg)
+            if not isinstance(obj, nn.Linear):
+                raise ValueError(
+                    f"target_modules path {path!r} is not nn.Linear, got {type(obj).__name__}"
+                )
+
+            # navigate parent path -> parent container, then setattr/replace
+            segs = path.split(".")
+            parent_path = ".".join(segs[:-1])
+            last_seg = segs[-1]
+            parent = block
+            for seg in parent_path.split("."):
+                if seg:
+                    if seg.isdigit():
+                        parent = parent[int(seg)]
+                    else:
+                        parent = getattr(parent, seg)
+            wrapped = LoRALinear(obj, rank=rank, alpha=alpha).to(device=device, dtype=dtype)
+            if last_seg.isdigit():
+                parent[int(last_seg)] = wrapped
+            else:
+                setattr(parent, last_seg, wrapped)
+            n_wrapped += 1
+
+    print(
+        f"[wrap_backbone_with_lora_target] wrapped {n_wrapped} Linear modules "
+        f"with LoRA rank={rank} alpha={alpha}"
+    )
+
+    # Freeze ALL base params, unfreeze only lora_a / lora_b.
+    n_trainable = 0
+    n_frozen = 0
+    for name, param in backbone.named_parameters():
+        if "lora_a" in name or "lora_b" in name:
+            param.requires_grad_(True)
+            n_trainable += int(param.numel())
+        else:
+            param.requires_grad_(False)
+            n_frozen += int(param.numel())
+    print(
+        f"[wrap_backbone_with_lora_target] trainable={n_trainable:,} frozen={n_frozen:,}"
+    )
+
+    backbone._lora_sweep_wrapped = True
+    backbone._lora_sweep_target_modules = tuple(target_modules)
+    backbone._lora_sweep_rank = int(rank)
+    backbone._lora_sweep_alpha = float(alpha)
+    return backbone

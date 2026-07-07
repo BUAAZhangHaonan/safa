@@ -1,0 +1,8 @@
+seed: 1337
+device: cuda:0
+num_workers: 4
+batch_size: 128
+image_size: 224
+index: data/index/val_face_mixed_e14.jsonl
+checkpoint: artifacts/checkpoints/e0_medium_v1/best.pt
+out_dir: artifacts/e0_features/val_face_mixed_e14_e0_medium_v1
