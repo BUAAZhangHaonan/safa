@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Round 3 GPU 2: 2048-sample FID + Sharpness for r3_lora_repr_lr0.25_5ep_continue_gpu2."""
+"""Round 3 eval for peft_lora adaLN checkpoints (GPU 0/1/2). 2048-sample FID."""
 from __future__ import annotations
-import sys, json, os
+import sys, json
 import numpy as np
 import torch, cv2
 from pathlib import Path
@@ -23,7 +23,41 @@ SEED = 1337
 
 def main():
     torch.manual_seed(SEED); np.random.seed(SEED)
-    config = {{
+    with VAL_INDEX.open() as fh:
+        rows = [json.loads(line) for line in fh if line.strip()]
+
+    # Probe checkpoint
+    payload = torch.load(str(CKPT), map_location="cpu", weights_only=False)
+    state_dict = payload["model_state_dict"]
+    has_peft_lora = any("adaLN_modulation" in k and "lora_a" in k for k in state_dict)
+    print(f"[eval] has peft_lora adaLN: {has_peft_lora}")
+
+    # Monkey-patch _load_generator to wrap peft_lora before load
+    from safa.models.generator import build_generator, require_generator_model_config
+    from safa.models.peft_lora import wrap_backbone_with_peft_lora
+    import safa.evaluation.runner as runner
+
+    def patched_load(checkpoint_path, cfg, dev):
+        pl = torch.load(str(checkpoint_path), map_location=dev, weights_only=False)
+        mc = require_generator_model_config(pl, str(checkpoint_path))
+        gen = build_generator(mc)
+        if has_peft_lora:
+            wrap_backbone_with_peft_lora(
+                gen.vector_field,
+                lora_rank=8,
+                lora_alpha=1,
+                enable_lora=True,
+                enable_gated_low_rank=True,
+                enable_generic_bank=True,
+                generic_mode="bank",
+            )
+        sd = pl["model_state_dict"]
+        miss, unexp = gen.load_state_dict(sd, strict=False); print(f"[load] missing={len(miss)} unexpected={len(unexp)}"); print("missing sample:", miss[:3])
+        return gen.to(dev).eval()
+
+    runner._load_generator = patched_load
+
+    config = {
         "seed": SEED, "device": DEVICE, "num_workers": 4, "batch_size": 32,
         "image_size": 256, "index": str(VAL_INDEX), "features": str(VAL_FEATURES),
         "e0_checkpoint": str(E0_CKPT), "g_checkpoint": str(CKPT),
@@ -31,19 +65,17 @@ def main():
         "per_sample_jsonl": str(OUT_DIR / "per_sample.jsonl"),
         "sample_dir": str(OUT_DIR / "samples"),
         "generated_image_dir": str(OUT_DIR / "generated_images"),
-        "face_detection": {{"enabled": True, "model_name": "buffalo_l",
+        "face_detection": {"enabled": True, "model_name": "buffalo_l",
                           "threshold": 0.5, "single_face_eq1_threshold": 0.98,
-                          "latent_cosine_threshold": 0.95}},
-        "privacy": {{"enabled": False}}, "anti_steg": {{"enabled": False}},
+                          "latent_cosine_threshold": 0.95},
+        "privacy": {"enabled": False}, "anti_steg": {"enabled": False},
         "vae_path": str(VAE_PATH), "vae_scaling_factor": 0.18215,
         "pixel_image_size": 256, "latent_training": True,
-    }}
-    print(f"[r3_eval_r3_lora_repr_lr0.25_5ep_continue_gpu2] running full eval (3969 samples)")
+    }
+    print(f"[eval] running full eval (3969 samples) on {CKPT}")
     from safa.evaluation.runner import run_eval_from_config
     run_eval_from_config(config)
-    print(f"[r3_eval_r3_lora_repr_lr0.25_5ep_continue_gpu2] eval done, computing FID")
-    with VAL_INDEX.open() as fh:
-        rows = [json.loads(line) for line in fh if line.strip()]
+
     real_paths = [Path(r["image_path"]) for r in rows[:2048]]
     gen_files = sorted((OUT_DIR / "generated_images").glob("*.png"))[:2048]
     from torchmetrics.image.fid import FrechetInceptionDistance
@@ -61,20 +93,18 @@ def main():
         t = (to_tensor(img).unsqueeze(0).to(DEVICE) * 255).to(torch.uint8)
         fid_metric.update(t, real=False)
     fid_value = fid_metric.compute().item()
-    print(f"[r3_eval_r3_lora_repr_lr0.25_5ep_continue_gpu2] FID(2048) = {{fid_value:.4f}}")
+    print(f"[eval] FID(2048) = {fid_value:.4f}")
     sharp_values = []
     for gf in gen_files[:512]:
         img_np = cv2.imread(str(gf), cv2.IMREAD_GRAYSCALE)
         if img_np is None: continue
         sharp_values.append(cv2.Laplacian(img_np, cv2.CV_64F).var())
     sharp_mean = float(np.mean(sharp_values)) if sharp_values else float("nan")
-    payload = json.loads(OUT_JSON.read_text())
-    payload["fid_2048"] = fid_value
-    payload["sharpness_mean_generated"] = sharp_mean
-    payload["n_real"] = len(real_paths)
-    payload["n_generated"] = len(gen_files)
-    OUT_JSON.write_text(json.dumps(payload, indent=2))
-    print(f"[r3_eval_r3_lora_repr_lr0.25_5ep_continue_gpu2] DONE, FID={{fid_value:.4f}} sharp={{sharp_mean:.2f}}")
+    payload_out = json.loads(OUT_JSON.read_text())
+    payload_out["fid_2048"] = fid_value
+    payload_out["sharpness_mean_generated"] = sharp_mean
+    OUT_JSON.write_text(json.dumps(payload_out, indent=2))
+    print(f"[eval] DONE, FID={fid_value:.4f} sharp={sharp_mean:.2f}")
 
 
 if __name__ == "__main__":
