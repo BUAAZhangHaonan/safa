@@ -22,3 +22,14 @@ pretrained/
 *.bak
 *.orig
 logs/
+
+# Final-shot patch (2026-07-09): broader backup file patterns
+*.bak_*
+*.bak.*
+*.bak*
+
+# FFHQ raw dataset (6.4GB, downloaded separately)
+data/ffhq/
+
+# Temp scripts (one-off / debug)
+/tmp_*.py
