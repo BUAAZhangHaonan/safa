@@ -163,6 +163,7 @@ def wrap_backbone_with_peft_lora(
     lora_blocks: str = "all",
     generic_mode: str = "bank",
     freeze_null_embed: bool = False,
+    lora_target_modules: list[str] | None = None,
 ) -> nn.Module:
     """Attach LoRA + gated low-rank residual + generic bank to a MeanFlow-SiT backbone.
 
@@ -283,34 +284,68 @@ def wrap_backbone_with_peft_lora(
         backbone.generic_bank = GenericEmbeddingBank(num_generic_embeddings, hidden_size).to(device=device, dtype=dtype)
         backbone._peft_generic_mode = "bank"
 
-    # 2. Wrap selected blocks' adaLN_modulation[-1] Linear with LoRALinear.
+    # 2. Wrap selected blocks Linear modules with LoRALinear.
+    # Final-shot patch (2026-07-09): if lora_target_modules is provided, wrap
+    # those paths on each block (e.g. attn.qkv, attn.proj). Otherwise default
+    # to adaLN_modulation[-1] + FinalLayer.adaLN_modulation[-1] (original behavior).
     if enable_lora:
         n_blocks = len(backbone.blocks)
         if lora_blocks == "last_third":
-            # Last third (rounded down). For 12 blocks -> indices 8,9,10,11.
             start_idx = n_blocks - max(1, n_blocks // 3)
             wrap_indices = set(range(start_idx, n_blocks))
         else:
             wrap_indices = set(range(n_blocks))
 
-        for i, block in enumerate(backbone.blocks):
-            if i not in wrap_indices:
-                continue
-            mod_seq = block.adaLN_modulation
-            if not isinstance(mod_seq, nn.Sequential) or len(mod_seq) == 0:
-                raise RuntimeError(f"SiTBlock.adaLN_modulation is not a non-empty Sequential: {type(mod_seq)}")
-            base_linear = mod_seq[-1]
-            if not isinstance(base_linear, nn.Linear):
-                raise RuntimeError(f"SiTBlock.adaLN_modulation[-1] is not nn.Linear: {type(base_linear)}")
-            lora_wrapped = LoRALinear(base_linear, rank=lora_rank, alpha=lora_alpha).to(device=device, dtype=dtype)
-            mod_seq[-1] = lora_wrapped
+        if lora_target_modules is not None:
+            # Custom target modules mode (e.g. QV LoRA + gated low-rank z).
+            for i, block in enumerate(backbone.blocks):
+                if i not in wrap_indices:
+                    continue
+                for path in lora_target_modules:
+                    obj = block
+                    for seg in path.split("."):
+                        if seg.isdigit():
+                            obj = obj[int(seg)]
+                        else:
+                            obj = getattr(obj, seg)
+                    if not isinstance(obj, nn.Linear):
+                        raise RuntimeError(f"lora_target_modules path {path!r} is not nn.Linear: {type(obj)}")
+                    segs = path.split(".")
+                    parent_path = ".".join(segs[:-1])
+                    last_seg = segs[-1]
+                    parent = block
+                    for seg in parent_path.split("."):
+                        if seg:
+                            if seg.isdigit():
+                                parent = parent[int(seg)]
+                            else:
+                                parent = getattr(parent, seg)
+                    wrapped = LoRALinear(obj, rank=lora_rank, alpha=lora_alpha).to(device=device, dtype=dtype)
+                    if last_seg.isdigit():
+                        parent[int(last_seg)] = wrapped
+                    else:
+                        setattr(parent, last_seg, wrapped)
+            print(f"[wrap_backbone_with_peft_lora] lora_target_modules={lora_target_modules} wrapped {sum(len(b.attn.qkv.weight.shape) for b in backbone.blocks)} paths", flush=True)
+        else:
+            # Default adaLN_modulation mode (original behavior).
+            for i, block in enumerate(backbone.blocks):
+                if i not in wrap_indices:
+                    continue
+                mod_seq = block.adaLN_modulation
+                if not isinstance(mod_seq, nn.Sequential) or len(mod_seq) == 0:
+                    raise RuntimeError(f"SiTBlock.adaLN_modulation is not a non-empty Sequential: {type(mod_seq)}")
+                base_linear = mod_seq[-1]
+                if not isinstance(base_linear, nn.Linear):
+                    raise RuntimeError(f"SiTBlock.adaLN_modulation[-1] is not nn.Linear: {type(base_linear)}")
+                lora_wrapped = LoRALinear(base_linear, rank=lora_rank, alpha=lora_alpha).to(device=device, dtype=dtype)
+                mod_seq[-1] = lora_wrapped
 
-        # 2b. Wrap FinalLayer.adaLN_modulation[-1] too (when LoRA enabled).
-        final_seq = backbone.final_layer.adaLN_modulation
-        if isinstance(final_seq, nn.Sequential) and len(final_seq) > 0 and isinstance(final_seq[-1], nn.Linear):
-            final_base = final_seq[-1]
-            final_lora = LoRALinear(final_base, rank=lora_rank, alpha=lora_alpha).to(device=device, dtype=dtype)
-            final_seq[-1] = final_lora
+            # 2b. Wrap FinalLayer.adaLN_modulation[-1] too (when LoRA enabled).
+            final_seq = backbone.final_layer.adaLN_modulation
+            if isinstance(final_seq, nn.Sequential) and len(final_seq) > 0 and isinstance(final_seq[-1], nn.Linear):
+                final_base = final_seq[-1]
+                final_lora = LoRALinear(final_base, rank=lora_rank, alpha=lora_alpha).to(device=device, dtype=dtype)
+                final_seq[-1] = final_lora
 
     # 2c. Disable gated_low_rank / generic_bank by zeroing+freezing if requested.
     if not enable_gated_low_rank:

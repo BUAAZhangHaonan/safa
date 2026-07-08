@@ -460,6 +460,10 @@ class _PEFTLoRAObjective:
     #               "single_shared" (Phase 0.3 b: 1 shared embedding init=null).
     generic_mode: str = "bank"
     freeze_null_embed: bool = False
+    # Final-shot patch (2026-07-09): custom LoRA target modules (e.g. QV).
+    # When provided, wrap those paths instead of adaLN_modulation. When None,
+    # falls back to adaLN_modulation + FinalLayer.adaLN_modulation (default).
+    lora_target_modules: list[str] | None = None
     # Compat fields for helpers that read these attrs.
     beta_preserve: float = 0.0
     gamma_cond_compat: float = 0.0
@@ -501,6 +505,9 @@ def peft_lora_objective_from_config(payload: dict[str, Any], context: str) -> _P
             f"{context}.generic_mode must be 'bank' / 'null' / 'single_shared', got {generic_mode!r}"
         )
     freeze_null_embed = bool(payload.get("freeze_null_embed", False))
+    _lora_target_modules = payload.get("lora_target_modules", None)
+    if _lora_target_modules is not None and not isinstance(_lora_target_modules, list):
+        raise ValueError(f"{context}.lora_target_modules must be a list of strings, got {type(_lora_target_modules)}")
     return _PEFTLoRAObjective(
         type="peft_lora",
         beta_teacher=beta,
@@ -519,6 +526,7 @@ def peft_lora_objective_from_config(payload: dict[str, Any], context: str) -> _P
         lora_blocks=lora_blocks,
         generic_mode=generic_mode,
         freeze_null_embed=freeze_null_embed,
+        lora_target_modules=_lora_target_modules,
     )
 
 
@@ -545,6 +553,7 @@ def init_peft_lora_generator(generator: torch.nn.Module, objective: _PEFTLoRAObj
         lora_blocks=objective.lora_blocks,
         generic_mode=objective.generic_mode,
         freeze_null_embed=objective.freeze_null_embed,
+        lora_target_modules=objective.lora_target_modules,
     )
 
 
