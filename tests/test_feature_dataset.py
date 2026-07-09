@@ -195,6 +195,72 @@ class FeatureDatasetTests(unittest.TestCase):
             self.assertIn(item["source_sample_id"], item["sample_id"])
             self.assertIn(item["target_sample_id"], item["sample_id"])
 
+    def test_many_to_many_dataset_selects_planned_cyclic_targets(self) -> None:
+        import torch
+
+        from safa.data.feature_dataset import ManyToManyFeatureAlignedAffectNet
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_index_path, target_index_path, cache_dir, checkpoint_path, _ = self._write_many_to_many_fixture(
+                root,
+                source_records=[("source-0", 0, (11, 22, 33))],
+                target_records=[
+                    ("source-0", 0, (101, 102, 103)),
+                    ("cyclic-target-a", 0, (111, 112, 113)),
+                    ("cyclic-target-b", 0, (121, 122, 123)),
+                ],
+                features=torch.eye(1, 4, dtype=torch.float32),
+            )
+
+            label_zero_targets = ["source-0", "cyclic-target-a", "cyclic-target-b"]
+
+            def expected_target_id(*, pairing_seed: int, pair_round: int) -> str:
+                target_position = (0 + pairing_seed + pair_round) % len(label_zero_targets)
+                while label_zero_targets[target_position] == "source-0":
+                    target_position = (target_position + 1) % len(label_zero_targets)
+                return label_zero_targets[target_position]
+
+            dataset = ManyToManyFeatureAlignedAffectNet(
+                source_index_path=source_index_path,
+                target_index_path=target_index_path,
+                source_feature_dir=cache_dir,
+                e0_checkpoint=checkpoint_path,
+                pairing_seed=0,
+                pairs_per_source=2,
+                transform=None,
+            )
+
+            first_pair = dataset[0]
+            second_pair = dataset[1]
+
+            self.assertEqual(len(dataset), 2)
+            self.assertEqual(first_pair["source_sample_id"], "source-0")
+            self.assertEqual(second_pair["source_sample_id"], "source-0")
+            self.assertEqual(first_pair["target_sample_id"], expected_target_id(pairing_seed=0, pair_round=0))
+            self.assertEqual(second_pair["target_sample_id"], expected_target_id(pairing_seed=0, pair_round=1))
+            self.assertEqual(first_pair["pair_id"], "source-0__to__cyclic-target-a__round0")
+            self.assertEqual(second_pair["pair_id"], "source-0__to__cyclic-target-a__round1")
+
+            shifted_dataset = ManyToManyFeatureAlignedAffectNet(
+                source_index_path=source_index_path,
+                target_index_path=target_index_path,
+                source_feature_dir=cache_dir,
+                e0_checkpoint=checkpoint_path,
+                pairing_seed=1,
+                pairs_per_source=2,
+                transform=None,
+            )
+
+            self.assertEqual(
+                [shifted_dataset[0]["target_sample_id"], shifted_dataset[1]["target_sample_id"]],
+                [
+                    expected_target_id(pairing_seed=1, pair_round=0),
+                    expected_target_id(pairing_seed=1, pair_round=1),
+                ],
+            )
+            self.assertEqual(shifted_dataset[1]["pair_id"], "source-0__to__cyclic-target-b__round1")
+
     def test_many_to_many_dataset_rejects_label_bucket_with_only_same_sample_id(self) -> None:
         import torch
 
