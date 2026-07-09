@@ -10,7 +10,7 @@ import os
 import subprocess
 import sys
 from contextlib import nullcontext
-from safa.data.feature_dataset import FeatureAlignedAffectNet
+from safa.data.feature_dataset import FeatureAlignedAffectNet, ManyToManyFeatureAlignedAffectNet
 from safa.evaluation.metrics import (
     DEFAULT_DENSE_GRAM_MAX_SAMPLES,
     compute_validation_relation_metrics,
@@ -1392,6 +1392,53 @@ def _build_train_loader(train_set, *, train_sampler, batch_config: _BatchConfig,
     )
 
 
+def _coerce_many_to_many_int(value, field: str) -> int:
+    if type(value) is int:
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if text and (text.isdigit() or (text[0] in "+-" and text[1:].isdigit())):
+            return int(text)
+    raise ValueError(f"many_to_many.{field} must be int, got {type(value).__name__}")
+
+
+def _build_train_feature_dataset(config: dict, transform):
+    many_to_many = config.get("many_to_many", {})
+    if many_to_many is None:
+        many_to_many = {}
+    if not isinstance(many_to_many, dict):
+        raise ValueError(f"many_to_many must be a mapping, got {type(many_to_many).__name__}")
+
+    enabled = many_to_many.get("enabled", False)
+    if type(enabled) is not bool:
+        raise ValueError(f"many_to_many.enabled must be bool, got {type(enabled).__name__}")
+
+    if not enabled:
+        return FeatureAlignedAffectNet(
+            config["train_index"],
+            config["train_features"],
+            config["e0_checkpoint"],
+            transform=transform,
+        )
+
+    if "target_index" not in many_to_many:
+        raise ValueError("many_to_many.target_index is required when many_to_many.enabled is true")
+    pairing_seed = _coerce_many_to_many_int(many_to_many.get("pairing_seed", 1), "pairing_seed")
+    pairs_per_source = _coerce_many_to_many_int(many_to_many.get("pairs_per_source", 1), "pairs_per_source")
+    if pairs_per_source <= 0:
+        raise ValueError(f"many_to_many.pairs_per_source must be positive, got {pairs_per_source}")
+
+    return ManyToManyFeatureAlignedAffectNet(
+        source_index_path=config["train_index"],
+        source_feature_dir=config["train_features"],
+        e0_checkpoint=config["e0_checkpoint"],
+        target_index_path=many_to_many["target_index"],
+        pairing_seed=pairing_seed,
+        pairs_per_source=pairs_per_source,
+        transform=transform,
+    )
+
+
 def train_g_from_config(config: dict) -> dict:
     import torch
     from torch.utils.data import DistributedSampler
@@ -1569,10 +1616,8 @@ def train_g_from_config(config: dict) -> dict:
     set_seed(int(config["seed"]) + distributed.rank)
 
     _verify_e0_feature_cache_consistency(config)
-    train_set = FeatureAlignedAffectNet(
-        config["train_index"],
-        config["train_features"],
-        config["e0_checkpoint"],
+    train_set = _build_train_feature_dataset(
+        config,
         transform=generator_image_transform(_generator_image_transform_size(config)),
     )
     train_sampler = (
