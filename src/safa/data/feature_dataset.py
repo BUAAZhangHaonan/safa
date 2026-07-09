@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 from pathlib import Path
 
 from safa.data.dataset import load_rgb_image_strict
@@ -175,7 +174,22 @@ class ManyToManyFeatureAlignedAffectNet:
         return eligible
 
     def _select_target(self, source_record, source_index: int, pair_round: int):
-        eligible = self._eligible_targets(source_record)
-        key = f"{self.pairing_seed}:{source_index}:{source_record.sample_id}:{source_record.label}".encode("utf-8")
-        start = int.from_bytes(hashlib.sha256(key).digest()[:8], "big")
-        return eligible[(start + pair_round) % len(eligible)]
+        bucket = self.target_buckets.get(source_record.label, [])
+        bucket_size = len(bucket)
+        if bucket_size == 0:
+            raise ValueError(
+                f"No eligible target in target bucket for label {source_record.label} "
+                f"excluding source sample_id {source_record.sample_id}"
+            )
+
+        target_position = (source_index + self.pairing_seed + pair_round) % bucket_size
+        for _ in range(bucket_size):
+            target_record = bucket[target_position]
+            if target_record.sample_id != source_record.sample_id:
+                return target_record
+            target_position = (target_position + 1) % bucket_size
+
+        raise ValueError(
+            f"No eligible target in target bucket for label {source_record.label} "
+            f"excluding source sample_id {source_record.sample_id}"
+        )
