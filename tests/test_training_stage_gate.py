@@ -293,6 +293,74 @@ class StageGateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "validation"):
             g_loop._validate_train_g_config(config)
 
+    def test_build_train_feature_dataset_defaults_to_legacy_feature_dataset(self) -> None:
+        from unittest import mock
+
+        from safa.training import g_loop
+
+        config = self._base_train_config()
+        config.update(
+            {
+                "train_index": "train.jsonl",
+                "train_features": "features",
+                "e0_checkpoint": "e0.pt",
+            }
+        )
+        transform = object()
+        calls = []
+        dataset = object()
+
+        def record_feature_dataset(*args, **kwargs):
+            calls.append((args, kwargs))
+            return dataset
+
+        with mock.patch.object(g_loop, "FeatureAlignedAffectNet", side_effect=record_feature_dataset):
+            result = g_loop._build_train_feature_dataset(config, transform=transform)
+
+        self.assertIs(result, dataset)
+        self.assertEqual(calls, [(("train.jsonl", "features", "e0.pt"), {"transform": transform})])
+
+    def test_build_train_feature_dataset_uses_many_to_many_when_enabled(self) -> None:
+        from unittest import mock
+
+        from safa.training import g_loop
+
+        config = self._base_train_config()
+        config.update(
+            {
+                "train_index": "train.jsonl",
+                "train_features": "features",
+                "e0_checkpoint": "e0.pt",
+                "many_to_many": {
+                    "enabled": True,
+                    "target_index": "target.jsonl",
+                    "pairing_seed": 7,
+                    "pairs_per_source": 2,
+                },
+            }
+        )
+        transform = object()
+        calls = []
+        dataset = object()
+
+        def record_many_to_many_dataset(*args, **kwargs):
+            calls.append((args, kwargs))
+            return dataset
+
+        with mock.patch.object(g_loop, "ManyToManyFeatureAlignedAffectNet", side_effect=record_many_to_many_dataset):
+            result = g_loop._build_train_feature_dataset(config, transform=transform)
+
+        self.assertIs(result, dataset)
+        self.assertEqual(calls, [((), {
+            "source_index_path": "train.jsonl",
+            "source_feature_dir": "features",
+            "e0_checkpoint": "e0.pt",
+            "target_index_path": "target.jsonl",
+            "pairing_seed": 7,
+            "pairs_per_source": 2,
+            "transform": transform,
+        })])
+
 
     def test_quality_eval_loader_uses_explicit_non_persistent_workers(self) -> None:
         import torch
