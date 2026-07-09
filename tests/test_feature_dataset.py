@@ -213,13 +213,14 @@ class FeatureDatasetTests(unittest.TestCase):
                 features=torch.eye(1, 4, dtype=torch.float32),
             )
 
-            label_zero_targets = ["source-0", "cyclic-target-a", "cyclic-target-b"]
+            source_sample_id = "source-0"
+            source_index = 0
+            label_zero_targets = [source_sample_id, "cyclic-target-a", "cyclic-target-b"]
+            eligible_targets = [target for target in label_zero_targets if target != source_sample_id]
 
             def expected_target_id(*, pairing_seed: int, pair_round: int) -> str:
-                target_position = (0 + pairing_seed + pair_round) % len(label_zero_targets)
-                while label_zero_targets[target_position] == "source-0":
-                    target_position = (target_position + 1) % len(label_zero_targets)
-                return label_zero_targets[target_position]
+                target_position = (source_index + pairing_seed + pair_round) % len(eligible_targets)
+                return eligible_targets[target_position]
 
             dataset = ManyToManyFeatureAlignedAffectNet(
                 source_index_path=source_index_path,
@@ -239,8 +240,9 @@ class FeatureDatasetTests(unittest.TestCase):
             self.assertEqual(second_pair["source_sample_id"], "source-0")
             self.assertEqual(first_pair["target_sample_id"], expected_target_id(pairing_seed=0, pair_round=0))
             self.assertEqual(second_pair["target_sample_id"], expected_target_id(pairing_seed=0, pair_round=1))
+            self.assertNotEqual(first_pair["target_sample_id"], second_pair["target_sample_id"])
             self.assertEqual(first_pair["pair_id"], "source-0__to__cyclic-target-a__round0")
-            self.assertEqual(second_pair["pair_id"], "source-0__to__cyclic-target-a__round1")
+            self.assertEqual(second_pair["pair_id"], "source-0__to__cyclic-target-b__round1")
 
             shifted_dataset = ManyToManyFeatureAlignedAffectNet(
                 source_index_path=source_index_path,
@@ -259,7 +261,8 @@ class FeatureDatasetTests(unittest.TestCase):
                     expected_target_id(pairing_seed=1, pair_round=1),
                 ],
             )
-            self.assertEqual(shifted_dataset[1]["pair_id"], "source-0__to__cyclic-target-b__round1")
+            self.assertNotEqual(shifted_dataset[0]["target_sample_id"], shifted_dataset[1]["target_sample_id"])
+            self.assertEqual(shifted_dataset[1]["pair_id"], "source-0__to__cyclic-target-a__round1")
 
     def test_many_to_many_dataset_rejects_label_bucket_with_only_same_sample_id(self) -> None:
         import torch
