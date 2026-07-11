@@ -5,12 +5,27 @@ python scripts/r5_eval.py <ckpt_path> <out_dir_name> <gpu> [--lora-target] [--fu
 Computes: face detection, FID(2048), sharpness, latent cosine, spearman, source_pred_preserved.
 """
 from __future__ import annotations
-import sys, json, os
-import numpy as np
-import torch, cv2
+
+import json
+import os
+import sys
 from pathlib import Path
 
-REPO = Path("/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization")
+import cv2
+import numpy as np
+import torch
+
+
+def resolve_repo_root(env=None, *, script_path=None) -> Path:
+    environment = os.environ if env is None else env
+    override = environment.get("SAFA_REPO_ROOT")
+    if override:
+        return Path(override).expanduser().resolve()
+    source = Path(__file__) if script_path is None else Path(script_path)
+    return source.resolve().parents[1]
+
+
+REPO = resolve_repo_root()
 sys.path.insert(0, str(REPO / "src"))
 
 CKPT = Path(sys.argv[1])
@@ -24,7 +39,6 @@ VAL_FEATURES = REPO / "artifacts/e0_features/val_face_mixed_e14_e0_medium_v1"
 E0_CKPT = REPO / "artifacts/checkpoints/e0_medium_v1/best.pt"
 VAE_PATH = REPO / "artifacts/checkpoints/external/sd-vae-ft-ema"
 OUT_DIR = REPO / f"artifacts/r5_eval_{OUT_NAME}"
-OUT_DIR.mkdir(parents=True, exist_ok=True)
 OUT_JSON = OUT_DIR / "result.json"
 DEVICE = f"cuda:{GPU}"
 SEED = 1337
@@ -36,7 +50,9 @@ print(f"[r5_eval] lora_target={USE_LORA_TARGET} full_ft={USE_FULL_FT}")
 
 
 def main():
-    torch.manual_seed(SEED); np.random.seed(SEED)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
     with VAL_INDEX.open() as fh:
         rows = [json.loads(line) for line in fh if line.strip()]
 
@@ -81,7 +97,7 @@ def main():
         "vae_path": str(VAE_PATH), "vae_scaling_factor": 0.18215,
         "pixel_image_size": 256, "latent_training": True,
     }
-    print(f"[r5_eval] running full eval (3969 samples)")
+    print("[r5_eval] running full eval (3969 samples)")
     from safa.evaluation.runner import run_eval_from_config
     run_eval_from_config(config)
 
@@ -106,7 +122,8 @@ def main():
     sharp_values = []
     for gf in gen_files[:512]:
         img_np = cv2.imread(str(gf), cv2.IMREAD_GRAYSCALE)
-        if img_np is None: continue
+        if img_np is None:
+            continue
         sharp_values.append(cv2.Laplacian(img_np, cv2.CV_64F).var())
     sharp_mean = float(np.mean(sharp_values)) if sharp_values else float("nan")
     payload_out = json.loads(OUT_JSON.read_text())
