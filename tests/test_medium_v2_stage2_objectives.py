@@ -258,6 +258,70 @@ def test_flow_objective_requires_explicit_flow_condition() -> None:
         g_loop._stage2_objective_from_config(config)
 
 
+def test_point_projected_sample_condition_defaults_to_flow_condition_and_accepts_override() -> None:
+    from safa.training import g_loop
+
+    stages = {
+        "stage1": {"epochs": 0},
+        "stage2": {
+            "epochs": 1,
+            "stage2_objective": {
+                "type": "point_projected_two_step",
+                "flow_condition": "fixed_null_condition",
+                "lambda_repr": 0.5,
+                "point_weight": 1.0,
+                "repr_learning_rate": 3.0e-5,
+                "projection_eps": 1.0e-12,
+            },
+        },
+    }
+
+    objective = g_loop._stage2_objective_from_config(stages)
+    assert objective.sample_condition == "fixed_null_condition"
+
+    stages["stage2"]["stage2_objective"]["sample_condition"] = "embedding"
+    objective = g_loop._stage2_objective_from_config(stages)
+    assert objective.sample_condition == "embedding"
+
+    stages["stage2"]["stage2_objective"]["sample_condition"] = "unknown"
+    with pytest.raises(ValueError, match="sample_condition"):
+        g_loop._stage2_objective_from_config(stages)
+
+
+def test_independent_prior_m2m_requires_null_fm_embedding_sampling_and_zero_lpips() -> None:
+    import copy
+
+    from safa.training import g_loop
+
+    path = REPO_ROOT / "configs" / "medium_v2" / "experiments" / "r6_m2m_full_pu_l05_lr5e5_gpu2.yaml"
+    config = yaml.safe_load(path.read_text(encoding="utf-8"))
+    config["many_to_many"]["semantics"] = "independent_prior"
+    objective = config["stages"]["stage2"]["stage2_objective"]
+    objective["flow_condition"] = "learned_null_condition"
+    objective["sample_condition"] = "embedding"
+    objective["lambda_lpips"] = 0.0
+
+    g_loop._validate_train_g_config(config)
+
+    invalid = []
+    bad_flow = copy.deepcopy(config)
+    bad_flow["stages"]["stage2"]["stage2_objective"]["flow_condition"] = "embedding"
+    invalid.append((bad_flow, "flow_condition"))
+    bad_sample = copy.deepcopy(config)
+    bad_sample["stages"]["stage2"]["stage2_objective"]["sample_condition"] = "fixed_null_condition"
+    invalid.append((bad_sample, "sample_condition"))
+    missing_sample = copy.deepcopy(config)
+    del missing_sample["stages"]["stage2"]["stage2_objective"]["sample_condition"]
+    invalid.append((missing_sample, "sample_condition"))
+    bad_lpips = copy.deepcopy(config)
+    bad_lpips["stages"]["stage2"]["stage2_objective"]["lambda_lpips"] = 0.1
+    invalid.append((bad_lpips, "lambda_lpips"))
+
+    for bad_config, field in invalid:
+        with pytest.raises(ValueError, match=field):
+            g_loop._validate_train_g_config(bad_config)
+
+
 def test_generator_trainable_defaults_to_full() -> None:
     from safa.models.generator import ConditionalFlowGenerator
     from safa.training import g_loop
@@ -430,9 +494,11 @@ def test_train_g_applies_generator_trainable_after_resume_before_ddp_and_optimiz
             super().__init__()
             self.weight = nn.Parameter(torch.tensor(1.0))
 
-        def load_state_dict(self, state_dict):
+        def load_state_dict(self, state_dict, strict=True):
+            del strict
             del state_dict
             events.append("load_resume")
+            return [], []
 
     class FakeTrainingModule(nn.Module):
         def __init__(self, generator, *args, **kwargs) -> None:
@@ -553,10 +619,12 @@ def test_train_g_model_weights_only_resume_skips_training_state_and_initializes_
             super().__init__()
             self.weight = nn.Parameter(torch.tensor(1.0))
 
-        def load_state_dict(self, state_dict):
+        def load_state_dict(self, state_dict, strict=True):
+            del strict
             with torch.no_grad():
                 self.weight.copy_(state_dict["weight"])
             events.append(f"load_resume:{float(self.weight.detach())}")
+            return [], []
 
     class FakeEMA:
         def __init__(self, model, decay: float) -> None:
@@ -1040,6 +1108,73 @@ def test_generator_training_step_fm_only_probe_uses_configured_learned_null_cond
     assert module.last_loss_metrics["flow_condition"] == "learned_null_condition"
 
 
+def test_point_projected_repr_sampling_uses_sample_condition_not_flow_condition() -> None:
+    from torch import nn
+    import torch.nn.functional as F
+
+    from safa.models.generator import FlowGeneratorConfig
+    from safa.training import g_loop
+
+    class DummyGenerator(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(1.0))
+            self.flow_condition_z = None
+            self.sample_condition_z = None
+
+        def make_null_condition(self, *, batch_size: int, device, dtype):
+            return torch.tensor([0.0, 1.0], device=device, dtype=dtype).expand(batch_size, -1)
+
+        def flow_matching_loss(self, images, z, generator=None):
+            del generator
+            self.flow_condition_z = z.detach().clone()
+            loss = self.weight.square() + images.sum() * 0.0 + z.sum() * 0.0
+            return loss, {"flow_matching_mse": loss.detach()}
+
+        def sample(self, z, **kwargs):
+            del kwargs
+            self.sample_condition_z = z.detach().clone()
+            pad = torch.zeros(z.shape[0], 1, device=z.device, dtype=z.dtype)
+            image = torch.cat([z, pad], dim=1).reshape(z.shape[0], 3, 1, 1)
+            return image.expand(z.shape[0], 3, 4, 4)
+
+    class DummyE0(nn.Module):
+        def forward(self, images):
+            return {"embedding": F.normalize(images[:, :2, 0, 0], dim=1)}
+
+    objective = g_loop._stage2_objective_from_config(
+        {
+            "stage1": {"epochs": 0},
+            "stage2": {
+                "epochs": 1,
+                "stage2_objective": {
+                    "type": "point_projected_two_step",
+                    "flow_condition": "embedding",
+                    "sample_condition": "learned_null_condition",
+                    "lambda_repr": 0.5,
+                    "point_weight": 1.0,
+                    "repr_learning_rate": 3.0e-5,
+                    "projection_eps": 1.0e-12,
+                },
+            },
+        }
+    )
+    generator = DummyGenerator()
+    module = g_loop._GeneratorTrainingStep(
+        generator,
+        DummyE0(),
+        FlowGeneratorConfig(embedding_dim=2, image_size=4, train_cycle_steps=1),
+        1337,
+        stage2_objective=objective,
+    )
+    z = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
+
+    module(torch.zeros(2, 3, 4, 4), z, ["a", "b"], True, 0.0)
+
+    assert torch.equal(generator.flow_condition_z, z)
+    assert torch.equal(generator.sample_condition_z, torch.tensor([[0.0, 1.0], [0.0, 1.0]]))
+
+
 def test_validation_sampling_uses_configured_learned_null_condition() -> None:
     from torch import nn
     import torch.nn.functional as F
@@ -1204,6 +1339,30 @@ def test_stage1_flow_condition_config_supports_explicit_fixed_null_and_rejects_u
     stages["stage1"]["flow_condition"] = "zero"
     with pytest.raises(ValueError, match="stages.stage1.flow_condition"):
         g_loop._flow_condition_for_stage(stages, "stage1", None)
+
+
+def test_stage2_sample_condition_is_separate_from_fm_condition() -> None:
+    from safa.training import g_loop
+
+    stages = {
+        "stage1": {"epochs": 0},
+        "stage2": {
+            "epochs": 1,
+            "stage2_objective": {
+                "type": "point_projected_two_step",
+                "flow_condition": "learned_null_condition",
+                "sample_condition": "embedding",
+                "lambda_repr": 0.5,
+                "point_weight": 1.0,
+                "repr_learning_rate": 3.0e-5,
+                "projection_eps": 1.0e-12,
+            },
+        },
+    }
+    objective = g_loop._stage2_objective_from_config(stages)
+
+    assert g_loop._flow_condition_for_stage(stages, "stage2", objective) == "learned_null_condition"
+    assert g_loop._sample_condition_for_stage(stages, "stage2", objective) == "embedding"
 
 
 def test_stage2_objective_accepts_only_named_repr_weight_modes() -> None:

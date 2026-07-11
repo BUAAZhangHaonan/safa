@@ -312,6 +312,104 @@ def test_generator_training_step_keeps_non_latent_flow_loss_on_pixels() -> None:
     assert generator.seen_image_shape == (2, 3, 64, 64)
 
 
+def test_projected_latent_batch_encodes_prior_once_and_reuses_sampled_latents() -> None:
+    from contextlib import nullcontext
+    from torch import nn
+
+    from safa.training import g_loop
+
+    class DummyGenerator(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(1.0))
+
+    class DummyTrainingModule(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.generator = DummyGenerator()
+            self.latent_codec = object()
+            self.encode_calls = 0
+            self.encoded_values = []
+            self.last_loss_metrics = {}
+
+        def _encode_flow_images(self, images):
+            self.encode_calls += 1
+            return torch.full(
+                (images.shape[0], 4, 2, 2),
+                float(self.encode_calls),
+                device=images.device,
+                dtype=images.dtype,
+            )
+
+        def forward(
+            self,
+            images,
+            z,
+            sample_ids,
+            include_repr,
+            lambda_cycle,
+            flow_condition,
+            noise_generator=None,
+            encoded_flow_images=None,
+        ):
+            del images, z, sample_ids, lambda_cycle, flow_condition, noise_generator
+            assert encoded_flow_images is not None
+            self.encoded_values.append(encoded_flow_images.detach().clone())
+            if include_repr:
+                repr_loss = self.generator.weight
+                zero = repr_loss.new_tensor(0.0)
+                self.last_loss_metrics = {
+                    "repr_loss": float(repr_loss.detach()),
+                    "repr_point_loss": float(repr_loss.detach()),
+                    "repr_relation_loss": 0.0,
+                    "stage2_objective_type": "point_projected_two_step",
+                }
+                return repr_loss, zero, repr_loss.detach(), zero, repr_loss
+            flow_loss = 0.5 * self.generator.weight.square()
+            zero = flow_loss.new_tensor(0.0)
+            return flow_loss, flow_loss.detach(), zero, flow_loss, zero
+
+    objective = g_loop._stage2_objective_from_config(
+        {
+            "stage1": {"epochs": 0},
+            "stage2": {
+                "epochs": 1,
+                "stage2_objective": {
+                    "type": "point_projected_two_step",
+                    "flow_condition": "embedding",
+                    "sample_condition": "embedding",
+                    "lambda_repr": 0.5,
+                    "point_weight": 1.0,
+                    "repr_learning_rate": 0.01,
+                    "projection_eps": 1.0e-12,
+                    "optimizer_type": "sgd",
+                    "repr_step_ratio_cap": 10.0,
+                },
+            },
+        }
+    )
+    module = DummyTrainingModule()
+    optimizer = torch.optim.SGD(module.generator.parameters(), lr=0.1)
+
+    g_loop._run_projected_stage2_batch(
+        training_module=module,
+        optimizer=optimizer,
+        images=torch.zeros(2, 3, 16, 16),
+        z=torch.eye(2),
+        sample_ids=["a", "b"],
+        lambda_cycle=0.0,
+        amp_ctx=nullcontext(),
+        grad_clip_norm=None,
+        ema=None,
+        stage2_objective=objective,
+        flow_condition="embedding",
+    )
+
+    assert module.encode_calls == 1
+    assert len(module.encoded_values) == 3
+    assert all(torch.equal(value, module.encoded_values[0]) for value in module.encoded_values[1:])
+
+
 def test_latent_decoded_eval_samples_are_float32_clamped_before_validation_detector() -> None:
     from torch import nn
     import torch.nn.functional as F

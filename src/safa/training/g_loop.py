@@ -10,7 +10,13 @@ import os
 import subprocess
 import sys
 from contextlib import nullcontext
-from safa.data.feature_dataset import FeatureAlignedAffectNet, ManyToManyFeatureAlignedAffectNet
+from safa.data.feature_dataset import (
+    BALANCED_EPOCH_CYCLE_PAIRING,
+    LEGACY_CYCLIC_PAIRING,
+    PAIRING_STRATEGIES,
+    FeatureAlignedAffectNet,
+    ManyToManyFeatureAlignedAffectNet,
+)
 from safa.evaluation.metrics import (
     DEFAULT_DENSE_GRAM_MAX_SAMPLES,
     compute_validation_relation_metrics,
@@ -131,6 +137,7 @@ class _Stage2ObjectiveRuntime:
     relation_weight: float
     offdiag_only: bool
     flow_condition: str = _FLOW_CONDITION_EMBEDDING
+    sample_condition: str = _FLOW_CONDITION_EMBEDDING
     repr_learning_rate: float | None = None
     projection_eps: float | None = None
     cagrad_c: float | None = None
@@ -251,7 +258,17 @@ class _GeneratorTrainingStep:
                     )
                 return state
 
-            def forward(self, images, z, sample_ids, use_cycle: bool, lambda_cycle: float, flow_condition: str | None = None, noise_generator=None):
+            def forward(
+                self,
+                images,
+                z,
+                sample_ids,
+                use_cycle: bool,
+                lambda_cycle: float,
+                flow_condition: str | None = None,
+                noise_generator=None,
+                encoded_flow_images=None,
+            ):
                 effective_flow_condition = self._effective_flow_condition(use_cycle=use_cycle, flow_condition=flow_condition)
                 cycle_loss = z.new_tensor(0.0)
                 if use_cycle:
@@ -328,7 +345,13 @@ class _GeneratorTrainingStep:
                                 self.last_loss_metrics[_k] = float(_v.detach().cpu()) if hasattr(_v, "detach") else float(_v)
                             return total_loss_peft, flow_mse_peft, cycle_zero_peft.detach(), flow_loss_peft, repr_loss_peft
                         if self.stage2_objective.type == "fm_only_probe" or self.stage2_objective.type == _LORA_SWEEP:
-                            flow_loss, flow_metrics = self._compute_flow_loss(images, z, effective_flow_condition, noise_generator=noise_generator)
+                            flow_loss, flow_metrics = self._compute_flow_loss(
+                                images,
+                                z,
+                                effective_flow_condition,
+                                noise_generator=noise_generator,
+                                encoded_flow_images=encoded_flow_images,
+                            )
                             self._batch_idx += 1
                             secondary_loss = flow_loss.new_tensor(0.0)
                             _sweep_obj_type = "lora_sweep" if self.stage2_objective.type == _LORA_SWEEP else "fm_only_probe"
@@ -344,7 +367,13 @@ class _GeneratorTrainingStep:
                         repr_loss, repr_metrics = self._compute_repr_loss(z, sample_ids, cycle_steps=cycle_steps, images=images)
                         self._batch_idx += 1
                         if self.stage2_objective.type == "gram_weighted_sum":
-                            flow_loss, flow_metrics = self._compute_flow_loss(images, z, effective_flow_condition, noise_generator=noise_generator)
+                            flow_loss, flow_metrics = self._compute_flow_loss(
+                                images,
+                                z,
+                                effective_flow_condition,
+                                noise_generator=noise_generator,
+                                encoded_flow_images=encoded_flow_images,
+                            )
                             loss = flow_loss + self.stage2_objective.lambda_repr * repr_loss
                             loss_metrics = self._stage2_repr_loss_metrics(
                                 flow_loss,
@@ -371,7 +400,13 @@ class _GeneratorTrainingStep:
                             self.last_loss_metrics = loss_metrics
                             return loss, flow_loss.detach(), repr_loss.detach(), flow_loss, repr_loss
                         if self.stage2_objective.type in _PROJECTED_STAGE2_OBJECTIVES or self.stage2_objective.type in _CAGRAD_STAGE2_OBJECTIVES:
-                            flow_loss, flow_metrics = self._compute_flow_loss(images, z, effective_flow_condition, noise_generator=noise_generator)
+                            flow_loss, flow_metrics = self._compute_flow_loss(
+                                images,
+                                z,
+                                effective_flow_condition,
+                                noise_generator=noise_generator,
+                                encoded_flow_images=encoded_flow_images,
+                            )
                             loss_metrics = self._stage2_repr_loss_metrics(
                                 flow_loss,
                                 cycle_loss,
@@ -404,7 +439,13 @@ class _GeneratorTrainingStep:
                     e0_out = self.e0(normalize_for_e0(generated_for_e0))
                     cycle_loss = cosine_cycle_loss(e0_out["embedding"], z)
                     self._batch_idx += 1
-                flow_loss, flow_metrics = self._compute_flow_loss(images, z, effective_flow_condition, noise_generator=noise_generator)
+                flow_loss, flow_metrics = self._compute_flow_loss(
+                    images,
+                    z,
+                    effective_flow_condition,
+                    noise_generator=noise_generator,
+                    encoded_flow_images=encoded_flow_images,
+                )
                 loss, loss_metrics = self._combine_losses(flow_loss, cycle_loss, use_cycle=use_cycle, lambda_cycle=lambda_cycle)
                 loss_metrics["flow_condition"] = effective_flow_condition
                 self.last_loss_metrics = loss_metrics
@@ -419,9 +460,16 @@ class _GeneratorTrainingStep:
                     return self.stage2_objective.flow_condition
                 return _FLOW_CONDITION_EMBEDDING
 
-            def _compute_flow_loss(self, images, z, flow_condition: str, noise_generator=None):
+            def _compute_flow_loss(
+                self,
+                images,
+                z,
+                flow_condition: str,
+                noise_generator=None,
+                encoded_flow_images=None,
+            ):
                 condition_z = self._flow_condition_z(z, flow_condition)
-                flow_images = self._encode_flow_images(images)
+                flow_images = encoded_flow_images if encoded_flow_images is not None else self._encode_flow_images(images)
                 return self.generator.flow_matching_loss(flow_images, condition_z, generator=noise_generator)
 
             def _encode_flow_images(self, images):
@@ -444,8 +492,14 @@ class _GeneratorTrainingStep:
                     z.dtype,
                     channels=_generator_sample_channels(self.generator_config),
                 )
+                sample_condition = getattr(
+                    self.stage2_objective,
+                    "sample_condition",
+                    self.stage2_objective.flow_condition,
+                )
+                sample_z = self._flow_condition_z(z, sample_condition)
                 generated = self.generator.sample(
-                    z,
+                    sample_z,
                     steps=cycle_steps,
                     checkpoint_steps=True,
                     x_init=x_init,
@@ -523,6 +577,7 @@ class _GeneratorTrainingStep:
                     "flow_loss_normalized": float(flow_loss.detach().cpu()),
                     "cycle_loss_normalized": 0.0,
                     "flow_condition": flow_condition,
+                    "sample_condition": self.stage2_objective.sample_condition,
                     "loss_weighting_type": self.loss_weighting.type,
                 }
 
@@ -695,6 +750,7 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
         context,
         required=objective_type in {"gram_weighted_sum", *_PROJECTED_STAGE2_OBJECTIVES, *_CAGRAD_STAGE2_OBJECTIVES, "fm_only_probe"},
     )
+    sample_condition = _sample_condition_from_config(payload, context, default=flow_condition)
     if objective_type == _PEFT_FM:
         # PEFT objective: parse and return _PEFTStage2Objective.
         beta_preserve = _optional_numeric(payload, "beta_preserve", context, default=0.5)
@@ -778,6 +834,7 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
             relation_weight=0.0,
             offdiag_only=True,
             flow_condition=flow_condition,
+            sample_condition=sample_condition,
         )
     lambda_lpips = _optional_numeric(payload, "lambda_lpips", context, default=0.0)
     if lambda_lpips < 0.0:
@@ -831,6 +888,7 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
                 relation_weight=0.0,
                 offdiag_only=False,
                 flow_condition=flow_condition,
+                sample_condition=sample_condition,
                 cagrad_c=float(cagrad_c),
                 fm_descent_floor_fraction=float(floor_fraction),
                 famo_beta=float(famo_beta),
@@ -859,6 +917,7 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
                 relation_weight=0.0,
                 offdiag_only=False,
                 flow_condition=flow_condition,
+                sample_condition=sample_condition,
                 projection_eps=float(projection_eps),
                 cagrad_c=float(cagrad_c),
                 fm_descent_floor_fraction=float(floor_fraction),
@@ -885,6 +944,7 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
             relation_weight=0.0,
             offdiag_only=False,
             flow_condition=flow_condition,
+            sample_condition=sample_condition,
             repr_learning_rate=float(repr_learning_rate),
             projection_eps=float(projection_eps),
             optimizer_type=pu_optimizer_type,
@@ -931,6 +991,7 @@ def _stage2_objective_from_config(stages: dict) -> _Stage2ObjectiveRuntime | Non
         relation_weight=float(relation_weight),
         offdiag_only=offdiag_only,
         flow_condition=flow_condition,
+        sample_condition=sample_condition,
         repr_learning_rate=None if repr_learning_rate is None else float(repr_learning_rate),
         projection_eps=None if projection_eps is None else float(projection_eps),
         optimizer_type=pu_optimizer_type,
@@ -949,6 +1010,15 @@ def _flow_condition_from_config(payload: dict, context: str, *, required: bool =
         return _FLOW_CONDITION_EMBEDDING
     value = _require_field(payload, "flow_condition", context)
     _validate_flow_condition(value, f"{context}.flow_condition")
+    return str(value)
+
+
+def _sample_condition_from_config(payload: dict, context: str, *, default: str) -> str:
+    if "sample_condition" not in payload:
+        _validate_flow_condition(default, f"{context}.flow_condition")
+        return str(default)
+    value = _require_field(payload, "sample_condition", context)
+    _validate_flow_condition(value, f"{context}.sample_condition")
     return str(value)
 
 
@@ -1032,6 +1102,15 @@ def _flow_condition_for_stage(stages: dict, stage_name: str, stage2_objective: _
         return stage2_objective.flow_condition
     required = int(stage.get("epochs", 0)) > 0
     return _flow_condition_from_config(stage, f"stages.{stage_name}", required=required)
+
+
+def _sample_condition_for_stage(stages: dict, stage_name: str, stage2_objective: _Stage2ObjectiveRuntime | None) -> str:
+    if stage_name == "stage2" and stage2_objective is not None:
+        value = getattr(stage2_objective, "sample_condition", stage2_objective.flow_condition)
+        _validate_flow_condition(value, "stages.stage2.stage2_objective.sample_condition")
+        return str(value)
+    return _flow_condition_for_stage(stages, stage_name, stage2_objective)
+
 
 def _require_positive_int(config: dict, field: str, context: str) -> int:
     value = _require_field(config, field, context)
@@ -1392,6 +1471,60 @@ def _build_train_loader(train_set, *, train_sampler, batch_config: _BatchConfig,
     )
 
 
+class _EpochPairingSampler:
+    """Attach the pairing epoch to every dataset index sent to worker processes."""
+
+    def __init__(self, sampler, *, seed: int):
+        self.sampler = sampler
+        self.seed = int(seed)
+        self.epoch = 0
+        self._seed_random_sampler()
+
+    def __iter__(self):
+        epoch = self.epoch
+        return ((epoch, int(index)) for index in self.sampler)
+
+    def __len__(self) -> int:
+        return len(self.sampler)
+
+    def set_epoch(self, epoch: int) -> None:
+        if type(epoch) is not int or epoch < 0:
+            raise ValueError(f"pairing epoch must be a non-negative int, got {epoch!r}")
+        self.epoch = epoch
+        if hasattr(self.sampler, "set_epoch"):
+            self.sampler.set_epoch(epoch)
+        else:
+            self._seed_random_sampler()
+
+    def _seed_random_sampler(self) -> None:
+        generator = getattr(self.sampler, "generator", None)
+        if generator is not None:
+            generator.manual_seed(self.seed + self.epoch)
+
+
+def _build_train_sampler(train_set, *, distributed: DistributedContext, seed: int):
+    import torch
+    from torch.utils.data import DistributedSampler, RandomSampler
+
+    sampler = (
+        DistributedSampler(
+            train_set,
+            num_replicas=distributed.world_size,
+            rank=distributed.rank,
+            shuffle=True,
+            seed=seed,
+            drop_last=False,
+        )
+        if distributed.enabled
+        else None
+    )
+    if getattr(train_set, "pairing_strategy", LEGACY_CYCLIC_PAIRING) != BALANCED_EPOCH_CYCLE_PAIRING:
+        return sampler
+    if sampler is None:
+        sampler = RandomSampler(train_set, generator=torch.Generator())
+    return _EpochPairingSampler(sampler, seed=seed)
+
+
 def _coerce_many_to_many_int(value, field: str) -> int:
     if type(value) is int:
         return value
@@ -1427,6 +1560,12 @@ def _build_train_feature_dataset(config: dict, transform):
     pairs_per_source = _coerce_many_to_many_int(many_to_many.get("pairs_per_source", 1), "pairs_per_source")
     if pairs_per_source <= 0:
         raise ValueError(f"many_to_many.pairs_per_source must be positive, got {pairs_per_source}")
+    pairing_strategy = many_to_many.get("pairing_strategy", LEGACY_CYCLIC_PAIRING)
+    if not isinstance(pairing_strategy, str) or pairing_strategy not in PAIRING_STRATEGIES:
+        raise ValueError(
+            f"many_to_many.pairing_strategy must be one of {sorted(PAIRING_STRATEGIES)}, "
+            f"got {pairing_strategy!r}"
+        )
 
     return ManyToManyFeatureAlignedAffectNet(
         source_index_path=config["train_index"],
@@ -1435,13 +1574,13 @@ def _build_train_feature_dataset(config: dict, transform):
         target_index_path=many_to_many["target_index"],
         pairing_seed=pairing_seed,
         pairs_per_source=pairs_per_source,
+        pairing_strategy=pairing_strategy,
         transform=transform,
     )
 
 
 def train_g_from_config(config: dict) -> dict:
     import torch
-    from torch.utils.data import DistributedSampler
     from torch.nn.parallel import DistributedDataParallel
     from tqdm import tqdm
 
@@ -1620,17 +1759,10 @@ def train_g_from_config(config: dict) -> dict:
         config,
         transform=generator_image_transform(_generator_image_transform_size(config)),
     )
-    train_sampler = (
-        DistributedSampler(
-            train_set,
-            num_replicas=distributed.world_size,
-            rank=distributed.rank,
-            shuffle=True,
-            seed=int(config["seed"]),
-            drop_last=False,
-        )
-        if distributed.enabled
-        else None
+    train_sampler = _build_train_sampler(
+        train_set,
+        distributed=distributed,
+        seed=int(config["seed"]),
     )
     train_loader = _build_train_loader(train_set, train_sampler=train_sampler, batch_config=batch_config, num_workers=num_workers)
     validation_loader = _build_validation_loader(config) if distributed.is_main else None
@@ -1707,6 +1839,7 @@ def train_g_from_config(config: dict) -> dict:
                 cleanup_distributed(distributed)
                 raise RuntimeError("Stage 2 is blocked by the Stage 1 face detection gate; see manifest.json on rank 0")
         stage_flow_condition = _flow_condition_for_stage(stages, stage_name, stage2_objective)
+        stage_sample_condition = _sample_condition_for_stage(stages, stage_name, stage2_objective)
         epochs = int(stages[stage_name]["epochs"])
         start_stage_epoch = _resume_stage_start_epoch(stage_name, stages, resume_progress)
         stage_epoch = start_stage_epoch - 1
@@ -1921,7 +2054,7 @@ def train_g_from_config(config: dict) -> dict:
                         sampling_seed=sampling_seed,
                         use_amp=use_amp,
                         ema_config=ema_config,
-                        flow_condition=stage_flow_condition,
+                        flow_condition=stage_sample_condition,
                         latent_codec=latent_codec,
                     )
                 _attach_validation_metrics(metrics, raw_validation_metrics, ema_validation_metrics)
@@ -1944,7 +2077,7 @@ def train_g_from_config(config: dict) -> dict:
                         sampling_seed=sampling_seed,
                         use_amp=use_amp,
                         ema_config=ema_config,
-                        flow_condition=stage_flow_condition,
+                        flow_condition=stage_sample_condition,
                         latent_codec=latent_codec,
                     )
                 )
@@ -2450,10 +2583,13 @@ def _validate_train_g_config(config: dict) -> None:
     _best_model(config, ema_config)
     loss_weighting = _loss_weighting_runtime_from_config(config)
     stage2_objective = _stage2_objective_from_config(stages)
+    _validate_independent_prior_m2m(config, generator_config, stage2_objective)
     if stage2_objective is None and _requires_medium_v2_stage2_objective(config, stages):
         raise ValueError("medium_v2 Stage 2 configs require stages.stage2.stage2_objective")
     _flow_condition_for_stage(stages, "stage1", stage2_objective)
     _flow_condition_for_stage(stages, "stage2", stage2_objective)
+    _sample_condition_for_stage(stages, "stage1", stage2_objective)
+    _sample_condition_for_stage(stages, "stage2", stage2_objective)
     if stage2_objective is not None and loss_weighting.type != "legacy":
         raise ValueError("stage2_objective M2/M3 runs must not use loss_weighting/UW")
     if loss_weighting.type == "uncertainty":
@@ -2483,6 +2619,32 @@ def _validate_train_g_config(config: dict) -> None:
     _validate_quality_eval_configs(config, stages)
     if int(_require_field(stages["stage2"], "epochs", "stages.stage2")) > 0:
         _validate_stage2_validation_config(config)
+
+
+def _validate_independent_prior_m2m(
+    config: dict,
+    generator_config: FlowGeneratorConfig,
+    stage2_objective: _Stage2ObjectiveRuntime | None,
+) -> None:
+    many_to_many = config.get("many_to_many")
+    if not isinstance(many_to_many, dict) or many_to_many.get("semantics") != "independent_prior":
+        return
+    context = "many_to_many.semantics='independent_prior'"
+    if many_to_many.get("enabled") is not True:
+        raise ValueError(f"{context} requires many_to_many.enabled=true")
+    if stage2_objective is None or stage2_objective.type != _POINT_PROJECTED_TWO_STEP:
+        raise ValueError(f"{context} requires stage2_objective.type={_POINT_PROJECTED_TWO_STEP!r}")
+    objective_payload = config["stages"]["stage2"]["stage2_objective"]
+    if stage2_objective.flow_condition != _FLOW_CONDITION_LEARNED_NULL:
+        raise ValueError(f"{context} requires stage2_objective.flow_condition={_FLOW_CONDITION_LEARNED_NULL!r}")
+    if "sample_condition" not in objective_payload:
+        raise ValueError(f"{context} requires explicit stage2_objective.sample_condition={_FLOW_CONDITION_EMBEDDING!r}")
+    if stage2_objective.sample_condition != _FLOW_CONDITION_EMBEDDING:
+        raise ValueError(f"{context} requires stage2_objective.sample_condition={_FLOW_CONDITION_EMBEDDING!r}")
+    if not math.isclose(stage2_objective.lambda_lpips, 0.0, rel_tol=0.0, abs_tol=1.0e-12):
+        raise ValueError(f"{context} requires stage2_objective.lambda_lpips=0")
+    if not generator_config.learned_null_condition:
+        raise ValueError(f"{context} requires generator.learned_null_condition=true")
 
 
 def _require_mapping(config: dict, field: str, context: str) -> dict:
@@ -3424,6 +3586,15 @@ def _run_projected_stage2_batch(
         raise RuntimeError("projected two-step objective requires repr_learning_rate and projection_eps")
     training_state = unwrap_model(training_module)
     params = _trainable_parameter_list(training_state.generator.parameters())
+    encoded_flow_images = None
+    if getattr(training_state, "latent_codec", None) is not None:
+        with amp_ctx:
+            encoded_flow_images = training_state._encode_flow_images(images)
+    encoded_flow_kwargs = (
+        {"encoded_flow_images": encoded_flow_images}
+        if encoded_flow_images is not None
+        else {}
+    )
 
     # Shared noise generator: reset seed before each forward call so all
     # forward passes in this batch sample identical (x_0, t).
@@ -3442,6 +3613,7 @@ def _run_projected_stage2_batch(
             lambda_cycle,
             flow_condition=flow_condition,
             noise_generator=noise_gen,
+            **encoded_flow_kwargs,
         )
     _assert_finite_training_scalars(flow_loss, flow_mse, flow_loss_raw)
     pre_flow_loss_value = float(flow_loss.detach().cpu())
@@ -3471,6 +3643,7 @@ def _run_projected_stage2_batch(
             lambda_cycle,
             flow_condition=flow_condition,
             noise_generator=noise_gen,
+            **encoded_flow_kwargs,
         )
     assert_finite_tensor("m3_flow_loss_guard", flow_loss_guard)
     flow_loss_guard_value = float(flow_loss_guard.detach().cpu())
@@ -3489,6 +3662,7 @@ def _run_projected_stage2_batch(
             lambda_cycle,
             flow_condition=flow_condition,
             noise_generator=noise_gen,
+            **encoded_flow_kwargs,
         )
     _assert_finite_training_scalars(repr_loss, flow_mse_guard, repr_detached)
     repr_loss.backward()
@@ -3567,6 +3741,7 @@ def _run_projected_stage2_batch(
                         lambda_cycle,
                         flow_condition=flow_condition,
                         noise_generator=noise_gen,
+                        **encoded_flow_kwargs,
                     )
                     after_flow_loss = float(after_losses[3].detach().cpu())
                 actual_fm_delta = after_flow_loss - flow_loss_guard_value
@@ -3650,6 +3825,7 @@ def _run_projected_stage2_batch(
                         lambda_cycle,
                         flow_condition=flow_condition,
                         noise_generator=noise_gen,
+                        **encoded_flow_kwargs,
                     )
                     after_flow_loss = float(after_losses[3].detach().cpu())
                 actual_fm_delta = after_flow_loss - flow_loss_guard_value

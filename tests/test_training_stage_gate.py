@@ -336,6 +336,7 @@ class StageGateTests(unittest.TestCase):
                     "target_index": "target.jsonl",
                     "pairing_seed": 7,
                     "pairs_per_source": 2,
+                    "pairing_strategy": "balanced_epoch_cycle",
                 },
             }
         )
@@ -358,8 +359,54 @@ class StageGateTests(unittest.TestCase):
             "target_index_path": "target.jsonl",
             "pairing_seed": 7,
             "pairs_per_source": 2,
+            "pairing_strategy": "balanced_epoch_cycle",
             "transform": transform,
         })])
+
+    def test_balanced_many_to_many_train_sampler_emits_epoch_index_tuples(self) -> None:
+        from types import SimpleNamespace
+
+        from safa.training import g_loop
+
+        class DummyBalancedDataset:
+            pairing_strategy = "balanced_epoch_cycle"
+
+            def __len__(self) -> int:
+                return 5
+
+        sampler = g_loop._build_train_sampler(
+            DummyBalancedDataset(),
+            distributed=SimpleNamespace(enabled=False),
+            seed=19,
+        )
+
+        epoch_zero_indices = list(sampler)
+        self.assertEqual({epoch for epoch, _ in epoch_zero_indices}, {0})
+        self.assertEqual(sorted(index for _, index in epoch_zero_indices), list(range(5)))
+
+        sampler.set_epoch(4)
+        epoch_four_indices = list(sampler)
+        self.assertEqual({epoch for epoch, _ in epoch_four_indices}, {4})
+        self.assertEqual(sorted(index for _, index in epoch_four_indices), list(range(5)))
+
+    def test_legacy_train_dataset_keeps_default_loader_shuffle(self) -> None:
+        from types import SimpleNamespace
+
+        from safa.training import g_loop
+
+        class DummyLegacyDataset:
+            pairing_strategy = "legacy_cyclic"
+
+            def __len__(self) -> int:
+                return 3
+
+        sampler = g_loop._build_train_sampler(
+            DummyLegacyDataset(),
+            distributed=SimpleNamespace(enabled=False),
+            seed=23,
+        )
+
+        self.assertIsNone(sampler)
 
 
     def test_quality_eval_loader_uses_explicit_non_persistent_workers(self) -> None:
