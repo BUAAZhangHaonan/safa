@@ -44,6 +44,7 @@ def test_r7_matrix_plan_has_four_pinned_train_and_eval_contracts() -> None:
         gpu_states=_idle_gpu_states(module),
     )
 
+    assert plan.allow_busy_gpus is False
     assert [run.physical_gpu for run in plan.runs] == [0, 1, 2, 3]
     assert len({run.config for run in plan.runs}) == 4
     assert len({run.checkpoint for run in plan.runs}) == 4
@@ -131,11 +132,19 @@ def test_r7_matrix_supervisor_waits_for_all_runs_and_records_failures(monkeypatc
             "--phase",
             "all",
             "--execute",
+            "--allow-busy-gpus",
         ]
+    )
+    gpu_states = _idle_gpu_states(module)
+    gpu_states[0] = module.GpuState(
+        index=0,
+        uuid="GPU-0",
+        free_memory_mib=22000,
+        compute_processes=("pid=2197322 python",),
     )
     plan = module.validate_preflight(
         module.build_matrix_plan(args),
-        gpu_states=_idle_gpu_states(module),
+        gpu_states=gpu_states,
     )
     plan = replace(plan, log_dir=tmp_path / "logs")
     return_codes = iter([0, 7, 0, 0])
@@ -161,6 +170,8 @@ def test_r7_matrix_supervisor_waits_for_all_runs_and_records_failures(monkeypatc
     assert len(processes) == 4
     status = json.loads((plan.log_dir / "matrix_status.json").read_text(encoding="utf-8"))
     assert status["overall_status"] == "failed"
+    assert status["allow_busy_gpus"] is True
+    assert status["external_compute_processes"] == {"0": ["pid=2197322 python"]}
     assert [run["exit_code"] for run in status["runs"]] == [0, 7, 0, 0]
     assert [run["status"] for run in status["runs"]] == ["passed", "failed", "passed", "passed"]
 
@@ -188,6 +199,43 @@ def test_r7_matrix_preflight_rejects_busy_or_low_memory_gpus() -> None:
         assert "20000 MiB" in str(exc)
     else:
         raise AssertionError("low-memory GPU passed preflight")
+
+
+def test_r7_matrix_authorized_busy_gpu_still_requires_memory_and_binds_uuid() -> None:
+    module = _load_script()
+    args = module.parse_args(
+        [
+            "--repo-root",
+            str(REPO_ROOT),
+            "--python",
+            sys.executable,
+            "--dry-run",
+            "--allow-busy-gpus",
+        ]
+    )
+    plan = module.build_matrix_plan(args)
+    states = _idle_gpu_states(module)
+    states[0] = module.GpuState(
+        index=0,
+        uuid="GPU-busy-0",
+        free_memory_mib=22000,
+        compute_processes=("pid=2197322 python",),
+    )
+
+    bound_plan = module.validate_preflight(plan, gpu_states=states)
+
+    assert bound_plan.allow_busy_gpus is True
+    assert bound_plan.runs[0].gpu_uuid == "GPU-busy-0"
+    assert bound_plan.runs[0].env["CUDA_VISIBLE_DEVICES"] == "GPU-busy-0"
+    assert bound_plan.external_compute_processes == {0: ("pid=2197322 python",)}
+
+    states[0] = replace(states[0], free_memory_mib=19999)
+    try:
+        module.validate_preflight(plan, gpu_states=states)
+    except RuntimeError as exc:
+        assert "20000 MiB" in str(exc)
+    else:
+        raise AssertionError("authorized busy GPU bypassed the memory floor")
 
 
 def test_r7_matrix_artifact_preflight_refuses_overwrite_and_eval_without_checkpoint(tmp_path: Path) -> None:

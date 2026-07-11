@@ -53,6 +53,8 @@ class MatrixPlan:
     phase: str
     execute: bool
     preflight_only: bool
+    allow_busy_gpus: bool
+    external_compute_processes: Mapping[int, tuple[str, ...]]
     log_dir: Path
     lock_path: Path
     runs: tuple[RunContract, ...]
@@ -70,6 +72,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--execute", action="store_true")
     parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument(
+        "--allow-busy-gpus",
+        action="store_true",
+        help="Allow authorized sharing of GPUs with existing compute processes.",
+    )
     return parser.parse_args(argv)
 
 
@@ -117,6 +124,8 @@ def build_matrix_plan(args: argparse.Namespace) -> MatrixPlan:
         phase=phase,
         execute=bool(args.execute),
         preflight_only=bool(args.preflight_only),
+        allow_busy_gpus=bool(args.allow_busy_gpus),
+        external_compute_processes={},
         log_dir=log_dir,
         lock_path=Path("artifacts/r7_independent_prior_matrix.lock"),
         runs=tuple(runs),
@@ -170,7 +179,7 @@ def validate_preflight(
                 raise FileNotFoundError(f"{run.config} references missing {field}: {value!r}")
     validate_artifact_paths(plan)
     states = gpu_states if gpu_states is not None else query_gpu_states()
-    _validate_gpu_states(states)
+    _validate_gpu_states(states, allow_busy_gpus=plan.allow_busy_gpus)
     return _bind_gpu_uuids(plan, states)
 
 
@@ -249,18 +258,22 @@ def query_gpu_states() -> dict[int, GpuState]:
     }
 
 
-def _validate_gpu_states(states: Mapping[int, GpuState]) -> None:
+def _validate_gpu_states(
+    states: Mapping[int, GpuState],
+    *,
+    allow_busy_gpus: bool,
+) -> None:
     for index in range(4):
         state = states.get(index)
         if state is None:
             raise RuntimeError(f"nvidia-smi did not report required GPU {index}")
-        if state.compute_processes:
-            details = ", ".join(state.compute_processes)
-            raise RuntimeError(f"GPU {index} has an external compute process: {details}")
         if state.free_memory_mib < 20000:
             raise RuntimeError(
                 f"GPU {index} requires at least 20000 MiB free memory, got {state.free_memory_mib} MiB"
             )
+        if state.compute_processes and not allow_busy_gpus:
+            details = ", ".join(state.compute_processes)
+            raise RuntimeError(f"GPU {index} has an external compute process: {details}")
 
 
 def _bind_gpu_uuids(plan: MatrixPlan, states: Mapping[int, GpuState]) -> MatrixPlan:
@@ -270,7 +283,16 @@ def _bind_gpu_uuids(plan: MatrixPlan, states: Mapping[int, GpuState]) -> MatrixP
         env = dict(run.env)
         env["CUDA_VISIBLE_DEVICES"] = state.uuid
         runs.append(replace(run, gpu_uuid=state.uuid, env=env))
-    return replace(plan, runs=tuple(runs))
+    external_compute_processes = {
+        index: state.compute_processes
+        for index, state in states.items()
+        if index in range(4) and state.compute_processes
+    }
+    return replace(
+        plan,
+        runs=tuple(runs),
+        external_compute_processes=external_compute_processes,
+    )
 
 
 def build_process_command(run: RunContract, plan: MatrixPlan) -> tuple[str, ...]:
@@ -290,6 +312,9 @@ def render_dry_run(plan: MatrixPlan) -> str:
     lines = ["DRY RUN: no commands executed and no files or directories written."]
     lines.append(f"repo_root: {plan.repo_root}")
     lines.append(f"phase: {plan.phase}")
+    lines.append(f"allow_busy_gpus: {str(plan.allow_busy_gpus).lower()}")
+    if plan.external_compute_processes:
+        lines.append(f"external_compute_processes: {dict(plan.external_compute_processes)}")
     for run in plan.runs:
         env_text = " ".join(f"{key}={value}" for key, value in run.env.items())
         lines.append(f"[gpu{run.physical_gpu}] {env_text}")
@@ -381,6 +406,11 @@ def _write_status(
     payload = {
         "phase": plan.phase,
         "overall_status": overall_status,
+        "allow_busy_gpus": plan.allow_busy_gpus,
+        "external_compute_processes": {
+            str(index): list(processes)
+            for index, processes in sorted(plan.external_compute_processes.items())
+        },
         "runs": statuses,
     }
     if launch_error is not None:
