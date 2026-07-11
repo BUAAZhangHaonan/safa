@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import json
 import tempfile
 from pathlib import Path
@@ -289,6 +290,351 @@ class FeatureDatasetTests(unittest.TestCase):
                     transform=None,
                 )
                 _ = dataset[0]
+
+    def test_balanced_epoch_cycle_is_a_derangement_in_every_epoch_round(self) -> None:
+        import torch
+
+        from safa.data.feature_dataset import ManyToManyFeatureAlignedAffectNet
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample_ids = ["sample-a", "sample-b", "sample-c", "sample-d"]
+            source_index_path, target_index_path, cache_dir, checkpoint_path, _ = self._write_many_to_many_fixture(
+                root,
+                source_records=[
+                    (sample_id, 0, (10 + index, 20 + index, 30 + index))
+                    for index, sample_id in enumerate(sample_ids)
+                ],
+                target_records=[
+                    (sample_id, 0, (110 + index, 120 + index, 130 + index))
+                    for index, sample_id in enumerate(reversed(sample_ids))
+                ],
+                features=torch.eye(len(sample_ids), 4, dtype=torch.float32),
+            )
+            dataset = ManyToManyFeatureAlignedAffectNet(
+                source_index_path=source_index_path,
+                target_index_path=target_index_path,
+                source_feature_dir=cache_dir,
+                e0_checkpoint=checkpoint_path,
+                pairing_seed=5,
+                pairs_per_source=2,
+                pairing_strategy="balanced_epoch_cycle",
+                transform=None,
+            )
+
+            for epoch in range(4):
+                for pair_round in range(2):
+                    items = [
+                        dataset[(epoch, source_index * dataset.pairs_per_source + pair_round)]
+                        for source_index in range(len(sample_ids))
+                    ]
+                    self.assertEqual(
+                        {item["prior_sample_id"] for item in items},
+                        set(sample_ids),
+                    )
+                    self.assertTrue(
+                        all(item["source_sample_id"] != item["prior_sample_id"] for item in items)
+                    )
+
+    def test_balanced_epoch_cycle_rotates_deterministically_after_restore(self) -> None:
+        import torch
+
+        from safa.data.feature_dataset import ManyToManyFeatureAlignedAffectNet
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample_ids = ["sample-a", "sample-b", "sample-c", "sample-d"]
+            source_index_path, target_index_path, cache_dir, checkpoint_path, _ = self._write_many_to_many_fixture(
+                root,
+                source_records=[
+                    (sample_id, 0, (10 + index, 20 + index, 30 + index))
+                    for index, sample_id in enumerate(sample_ids)
+                ],
+                target_records=[
+                    (sample_id, 0, (110 + index, 120 + index, 130 + index))
+                    for index, sample_id in enumerate(sample_ids)
+                ],
+                features=torch.eye(len(sample_ids), 4, dtype=torch.float32),
+            )
+
+            def build_dataset(pairing_seed: int = 7):
+                return ManyToManyFeatureAlignedAffectNet(
+                    source_index_path=source_index_path,
+                    target_index_path=target_index_path,
+                    source_feature_dir=cache_dir,
+                    e0_checkpoint=checkpoint_path,
+                    pairing_seed=pairing_seed,
+                    pairs_per_source=1,
+                    pairing_strategy="balanced_epoch_cycle",
+                    transform=None,
+                )
+
+            dataset = build_dataset()
+            restored_dataset = build_dataset()
+
+            def assignments(current_dataset, epoch: int) -> tuple[str, ...]:
+                return tuple(
+                    current_dataset[(epoch, source_index)]["prior_sample_id"]
+                    for source_index in range(len(sample_ids))
+                )
+
+            epoch_assignments = [assignments(dataset, epoch) for epoch in range(4)]
+            self.assertEqual(len(set(epoch_assignments[:3])), 3)
+            self.assertEqual(epoch_assignments[3], epoch_assignments[0])
+            self.assertEqual(
+                epoch_assignments,
+                [assignments(restored_dataset, epoch) for epoch in range(4)],
+            )
+            self.assertNotEqual(epoch_assignments[0], assignments(build_dataset(pairing_seed=8), 0))
+
+    def test_balanced_epoch_cycle_balances_distinct_target_buckets(self) -> None:
+        import torch
+
+        from safa.data.feature_dataset import ManyToManyFeatureAlignedAffectNet
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_ids = [f"source-{index}" for index in range(5)]
+            target_ids = [f"prior-{index}" for index in range(3)]
+            source_index_path, target_index_path, cache_dir, checkpoint_path, _ = self._write_many_to_many_fixture(
+                root,
+                source_records=[
+                    (sample_id, 0, (10 + index, 20 + index, 30 + index))
+                    for index, sample_id in enumerate(source_ids)
+                ],
+                target_records=[
+                    (sample_id, 0, (110 + index, 120 + index, 130 + index))
+                    for index, sample_id in enumerate(target_ids)
+                ],
+                features=torch.eye(len(source_ids), len(source_ids), dtype=torch.float32),
+            )
+            dataset = ManyToManyFeatureAlignedAffectNet(
+                source_index_path=source_index_path,
+                target_index_path=target_index_path,
+                source_feature_dir=cache_dir,
+                e0_checkpoint=checkpoint_path,
+                pairing_seed=2,
+                pairing_strategy="balanced_epoch_cycle",
+                transform=None,
+            )
+
+            aggregate_counts = Counter()
+            for epoch in range(len(target_ids)):
+                counts = Counter(
+                    dataset[(epoch, source_index)]["prior_sample_id"]
+                    for source_index in range(len(source_ids))
+                )
+                self.assertEqual(set(counts), set(target_ids))
+                self.assertEqual(sorted(counts.values()), [1, 2, 2])
+                aggregate_counts.update(counts)
+            self.assertEqual(set(aggregate_counts.values()), {len(source_ids)})
+
+    def test_balanced_epoch_cycle_never_self_pairs_overlapping_unequal_sets(self) -> None:
+        import torch
+
+        from safa.data.feature_dataset import ManyToManyFeatureAlignedAffectNet
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_ids = ["shared-a", "shared-b", "source-c", "source-d", "source-e"]
+            target_ids = ["shared-a", "shared-b", "prior-c"]
+            source_index_path, target_index_path, cache_dir, checkpoint_path, _ = self._write_many_to_many_fixture(
+                root,
+                source_records=[
+                    (sample_id, 0, (10 + index, 20 + index, 30 + index))
+                    for index, sample_id in enumerate(source_ids)
+                ],
+                target_records=[
+                    (sample_id, 0, (110 + index, 120 + index, 130 + index))
+                    for index, sample_id in enumerate(target_ids)
+                ],
+                features=torch.eye(len(source_ids), len(source_ids), dtype=torch.float32),
+            )
+            dataset = ManyToManyFeatureAlignedAffectNet(
+                source_index_path=source_index_path,
+                target_index_path=target_index_path,
+                source_feature_dir=cache_dir,
+                e0_checkpoint=checkpoint_path,
+                pairing_seed=0,
+                pairs_per_source=2,
+                pairing_strategy="balanced_epoch_cycle",
+                transform=None,
+            )
+
+            for epoch in range(6):
+                for index in range(len(dataset)):
+                    item = dataset[(epoch, index)]
+                    self.assertNotEqual(item["source_sample_id"], item["prior_sample_id"])
+
+    def test_balanced_epoch_cycle_returns_explicit_prior_metadata(self) -> None:
+        import torch
+
+        from safa.data.feature_dataset import ManyToManyFeatureAlignedAffectNet
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_index_path, target_index_path, cache_dir, checkpoint_path, _ = self._write_many_to_many_fixture(
+                root,
+                source_records=[("sample-a", 0, (10, 20, 30)), ("sample-b", 0, (40, 50, 60))],
+                target_records=[("sample-a", 0, (110, 120, 130)), ("sample-b", 0, (140, 150, 160))],
+                features=torch.eye(2, 4, dtype=torch.float32),
+            )
+            dataset = ManyToManyFeatureAlignedAffectNet(
+                source_index_path=source_index_path,
+                target_index_path=target_index_path,
+                source_feature_dir=cache_dir,
+                e0_checkpoint=checkpoint_path,
+                pairing_seed=3,
+                pairs_per_source=2,
+                pairing_strategy="balanced_epoch_cycle",
+                transform=None,
+            )
+
+            item = dataset[(4, 1)]
+
+            self.assertEqual(item["prior_sample_id"], item["target_sample_id"])
+            self.assertNotEqual(item["source_sample_id"], item["prior_sample_id"])
+            self.assertEqual(item["pairing_epoch"], 4)
+            self.assertEqual(item["pair_round"], 1)
+            self.assertEqual(item["pairing_strategy"], "balanced_epoch_cycle")
+            self.assertEqual(
+                item["pair_id"],
+                f'{item["source_sample_id"]}__to__{item["prior_sample_id"]}__round1__epoch4',
+            )
+
+    def test_legacy_cyclic_int_index_behavior_is_unchanged(self) -> None:
+        import torch
+
+        from safa.data.feature_dataset import ManyToManyFeatureAlignedAffectNet
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_index_path, target_index_path, cache_dir, checkpoint_path, _ = self._write_many_to_many_fixture(
+                root,
+                source_records=[("source-0", 0, (10, 20, 30))],
+                target_records=[
+                    ("source-0", 0, (110, 120, 130)),
+                    ("prior-a", 0, (140, 150, 160)),
+                    ("prior-b", 0, (170, 180, 190)),
+                ],
+                features=torch.eye(1, 4, dtype=torch.float32),
+            )
+            default_dataset = ManyToManyFeatureAlignedAffectNet(
+                source_index_path=source_index_path,
+                target_index_path=target_index_path,
+                source_feature_dir=cache_dir,
+                e0_checkpoint=checkpoint_path,
+                pairing_seed=0,
+                pairs_per_source=2,
+                transform=None,
+            )
+            explicit_legacy_dataset = ManyToManyFeatureAlignedAffectNet(
+                source_index_path=source_index_path,
+                target_index_path=target_index_path,
+                source_feature_dir=cache_dir,
+                e0_checkpoint=checkpoint_path,
+                pairing_seed=0,
+                pairs_per_source=2,
+                pairing_strategy="legacy_cyclic",
+                transform=None,
+            )
+
+            default_items = [default_dataset[index] for index in range(len(default_dataset))]
+            explicit_items = [explicit_legacy_dataset[index] for index in range(len(explicit_legacy_dataset))]
+
+            self.assertEqual(
+                [{key: item[key] for key in item if key not in {"image", "z"}} for item in default_items],
+                [{key: item[key] for key in item if key not in {"image", "z"}} for item in explicit_items],
+            )
+            self.assertEqual(
+                set(default_items[0]),
+                {
+                    "image",
+                    "z",
+                    "label",
+                    "sample_id",
+                    "source_sample_id",
+                    "target_sample_id",
+                    "source_label",
+                    "target_label",
+                    "pair_id",
+                },
+            )
+
+    def test_many_to_many_dataset_rejects_unknown_pairing_strategy(self) -> None:
+        import torch
+
+        from safa.data.feature_dataset import ManyToManyFeatureAlignedAffectNet
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_index_path, target_index_path, cache_dir, checkpoint_path, _ = self._write_many_to_many_fixture(
+                root,
+                source_records=[("sample-a", 0, (10, 20, 30))],
+                target_records=[("sample-b", 0, (110, 120, 130))],
+                features=torch.eye(1, 4, dtype=torch.float32),
+            )
+
+            for pairing_strategy in ("unknown", None, []):
+                with self.subTest(pairing_strategy=pairing_strategy):
+                    with self.assertRaisesRegex(ValueError, "pairing_strategy"):
+                        ManyToManyFeatureAlignedAffectNet(
+                            source_index_path=source_index_path,
+                            target_index_path=target_index_path,
+                            source_feature_dir=cache_dir,
+                            e0_checkpoint=checkpoint_path,
+                            pairing_strategy=pairing_strategy,
+                            transform=None,
+                        )
+
+    def test_balanced_epoch_cycle_rejects_negative_epoch(self) -> None:
+        import torch
+
+        from safa.data.feature_dataset import ManyToManyFeatureAlignedAffectNet
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_index_path, target_index_path, cache_dir, checkpoint_path, _ = self._write_many_to_many_fixture(
+                root,
+                source_records=[("sample-a", 0, (10, 20, 30))],
+                target_records=[("sample-b", 0, (110, 120, 130))],
+                features=torch.eye(1, 4, dtype=torch.float32),
+            )
+            dataset = ManyToManyFeatureAlignedAffectNet(
+                source_index_path=source_index_path,
+                target_index_path=target_index_path,
+                source_feature_dir=cache_dir,
+                e0_checkpoint=checkpoint_path,
+                pairing_strategy="balanced_epoch_cycle",
+                transform=None,
+            )
+
+            with self.assertRaisesRegex(ValueError, "epoch"):
+                _ = dataset[(-1, 0)]
+
+    def test_balanced_epoch_cycle_rejects_duplicate_sample_ids(self) -> None:
+        import torch
+
+        from safa.data.feature_dataset import ManyToManyFeatureAlignedAffectNet
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_index_path, target_index_path, cache_dir, checkpoint_path, _ = self._write_many_to_many_fixture(
+                root,
+                source_records=[("source-a", 0, (10, 20, 30)), ("source-b", 0, (40, 50, 60))],
+                target_records=[("duplicate", 0, (110, 120, 130)), ("duplicate", 0, (140, 150, 160))],
+                features=torch.eye(2, 4, dtype=torch.float32),
+            )
+
+            with self.assertRaisesRegex(ValueError, "unique sample_id.*target"):
+                ManyToManyFeatureAlignedAffectNet(
+                    source_index_path=source_index_path,
+                    target_index_path=target_index_path,
+                    source_feature_dir=cache_dir,
+                    e0_checkpoint=checkpoint_path,
+                    pairing_strategy="balanced_epoch_cycle",
+                    transform=None,
+                )
 
 
 if __name__ == "__main__":
