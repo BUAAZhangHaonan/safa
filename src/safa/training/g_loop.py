@@ -2084,7 +2084,6 @@ def train_g_from_config(config: dict) -> dict:
                 if stage_name == "stage1" and raw_validation_metrics is not None and raw_validation_metrics.get("face_detect_ge1_rate") is not None:
                     baseline_detection_rate = raw_validation_metrics["face_detect_ge1_rate"]
                     threshold = float(stages["stage1"]["face_detection_threshold"])
-                    stable_epochs = int(stages["stage1"]["stable_epochs"])
                     if baseline_detection_rate >= threshold:
                         stage1_stable_hits += 1
                         metrics["stage1_stable_hits"] = stage1_stable_hits
@@ -2632,6 +2631,11 @@ def _validate_independent_prior_m2m(
     context = "many_to_many.semantics='independent_prior'"
     if many_to_many.get("enabled") is not True:
         raise ValueError(f"{context} requires many_to_many.enabled=true")
+    if many_to_many.get("pairing_strategy") != BALANCED_EPOCH_CYCLE_PAIRING:
+        raise ValueError(
+            f"{context} requires explicit many_to_many.pairing_strategy="
+            f"{BALANCED_EPOCH_CYCLE_PAIRING!r}"
+        )
     if stage2_objective is None or stage2_objective.type != _POINT_PROJECTED_TWO_STEP:
         raise ValueError(f"{context} requires stage2_objective.type={_POINT_PROJECTED_TWO_STEP!r}")
     objective_payload = config["stages"]["stage2"]["stage2_objective"]
@@ -3216,8 +3220,6 @@ def _clip_projected_gradients(projected_gradients: list, max_norm: float) -> lis
 
 
 def _save_parameters(params: list) -> list:
-    import torch
-
     return [p.data.detach().clone() for p in params]
 
 

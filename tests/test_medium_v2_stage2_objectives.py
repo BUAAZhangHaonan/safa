@@ -296,6 +296,7 @@ def test_independent_prior_m2m_requires_null_fm_embedding_sampling_and_zero_lpip
     path = REPO_ROOT / "configs" / "medium_v2" / "experiments" / "r6_m2m_full_pu_l05_lr5e5_gpu2.yaml"
     config = yaml.safe_load(path.read_text(encoding="utf-8"))
     config["many_to_many"]["semantics"] = "independent_prior"
+    config["many_to_many"]["pairing_strategy"] = "balanced_epoch_cycle"
     objective = config["stages"]["stage2"]["stage2_objective"]
     objective["flow_condition"] = "learned_null_condition"
     objective["sample_condition"] = "embedding"
@@ -316,6 +317,15 @@ def test_independent_prior_m2m_requires_null_fm_embedding_sampling_and_zero_lpip
     bad_lpips = copy.deepcopy(config)
     bad_lpips["stages"]["stage2"]["stage2_objective"]["lambda_lpips"] = 0.1
     invalid.append((bad_lpips, "lambda_lpips"))
+    missing_pairing_strategy = copy.deepcopy(config)
+    del missing_pairing_strategy["many_to_many"]["pairing_strategy"]
+    invalid.append((missing_pairing_strategy, "pairing_strategy"))
+    legacy_pairing_strategy = copy.deepcopy(config)
+    legacy_pairing_strategy["many_to_many"]["pairing_strategy"] = "legacy_cyclic"
+    invalid.append((legacy_pairing_strategy, "pairing_strategy"))
+    unknown_pairing_strategy = copy.deepcopy(config)
+    unknown_pairing_strategy["many_to_many"]["pairing_strategy"] = "unknown"
+    invalid.append((unknown_pairing_strategy, "pairing_strategy"))
 
     for bad_config, field in invalid:
         with pytest.raises(ValueError, match=field):
