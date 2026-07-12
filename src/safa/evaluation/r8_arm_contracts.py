@@ -11,6 +11,7 @@ ALGORITHM_FIELDS = (
     "step_size",
     "eta",
     "projection",
+    "typical_delta",
     "num_optim_iters",
     "num_updates",
     "guided_steps",

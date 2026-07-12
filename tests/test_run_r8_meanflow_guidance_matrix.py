@@ -861,18 +861,23 @@ def test_full_merge_is_idempotent_and_recovers_partial_owned_output(tmp_path: Pa
     assert victim.is_file()
 
 
-@pytest.mark.parametrize(("field", "old_value"), [("step_size", 3.0), ("eta", 0.5)])
-def test_full_preflight_rejects_old_winner_completion_with_different_step_or_eta(
-    tmp_path: Path, field: str, old_value: float
+@pytest.mark.parametrize(
+    ("config_index", "field", "old_value"),
+    [(0, "step_size", 3.0), (0, "eta", 0.5), (2, "typical_delta", 0.1)],
+)
+def test_full_preflight_rejects_old_winner_completion_with_different_algorithm_field(
+    tmp_path: Path, config_index: int, field: str, old_value: float
 ) -> None:
     module = _load_script()
-    locked_config = yaml.safe_load((REPO_ROOT / module.NOISE_CONFIGS[0]).read_text())
+    config_path = module.NOISE_CONFIGS[config_index]
+    locked_config = yaml.safe_load((REPO_ROOT / config_path).read_text())
     locked_digest = canonical_arm_config_digest(locked_config)
     old_digest = canonical_arm_config_digest({**locked_config, field: old_value})
+    assert old_digest != locked_digest
     contract = {
         "winner": {
             "arm_id": "noise-winner",
-            "config": str(module.NOISE_CONFIGS[0]),
+            "config": str(config_path),
             "arm_config_sha256": locked_digest,
         },
         "visual_review": {"reviewed_sample_count": 64, "passed": True},

@@ -453,7 +453,10 @@ def test_heldout_refuses_an_old_result_even_without_a_marker(tmp_path: Path) -> 
         module.evaluate_heldout(tmp_path, device="cpu", batch_size=1)
 
 
-@pytest.mark.parametrize(("field", "old_value"), [("step_size", 3.0), ("eta", 0.5)])
+@pytest.mark.parametrize(
+    ("field", "old_value"),
+    [("step_size", 3.0), ("eta", 0.5), ("typical_delta", 0.1)],
+)
 def test_heldout_does_not_start_for_old_same_mode_winner_completion(
     tmp_path: Path, field: str, old_value: float
 ) -> None:
@@ -468,8 +471,17 @@ def test_heldout_does_not_start_for_old_same_mode_winner_completion(
         "t_cut": 0.25,
         "schedule_contract_sha256": "9" * 64,
     }
+    if field == "typical_delta":
+        locked_config = {
+            "mode": "initial_noise",
+            "projection": "typical_shell",
+            "typical_delta": 0.05,
+            "eta": 1.0,
+            "num_updates": 16,
+        }
     locked_digest = module.canonical_arm_config_digest(locked_config)
     old_digest = module.canonical_arm_config_digest({**locked_config, field: old_value})
+    assert old_digest != locked_digest
     (tmp_path / "selection.json").write_text(
         json.dumps(
             {

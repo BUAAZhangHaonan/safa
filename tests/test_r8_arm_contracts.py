@@ -65,3 +65,18 @@ def test_arm_digest_rejects_same_mode_with_different_algorithm_variant() -> None
         ("checkpoint_sha256", "8" * 64),
     ):
         assert canonical_arm_config_digest({**config, field: value}) != original
+
+
+def test_noise_shell_typical_delta_is_part_of_arm_digest() -> None:
+    shell = {
+        **_config(),
+        "mode": "initial_noise",
+        "projection": "typical_shell",
+        "eta": 1.0,
+        "num_updates": 16,
+        "typical_delta": 0.05,
+    }
+
+    assert canonical_arm_config_digest(shell) != canonical_arm_config_digest(
+        {**shell, "typical_delta": 0.1}
+    )
