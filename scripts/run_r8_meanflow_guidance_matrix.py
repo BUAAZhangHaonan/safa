@@ -14,6 +14,7 @@ import shlex
 import shutil
 import statistics
 import subprocess
+import time
 from typing import Any, Mapping, Sequence
 
 import yaml
@@ -62,6 +63,7 @@ FULL_VISUAL_EVIDENCE = ROOT / "full/visual_evidence.json"
 QUALITY_SCRIPT = Path("scripts/eval_generation_quality.py")
 GUIDANCE_SCRIPT = Path("scripts/run_meanflow_flow_map_guidance.py")
 MIN_FREE_MEMORY_MIB = 12000
+PROCESS_POLL_INTERVAL_SECONDS = 0.05
 
 
 @dataclass(frozen=True)
@@ -756,22 +758,34 @@ def launch_matrix(plan: MatrixPlan) -> int:
             start_next(gpu)
         peer_failed = False
         while active:
-            gpu = min(active)
-            index, run, process, run_started = active[gpu]
-            exit_code = int(process.wait())
-            rows_by_index[index] = _status_row(
-                run,
-                pid=getattr(process, "pid", None),
-                started_at=run_started,
-                exit_code=exit_code,
-                status="passed" if exit_code == 0 else "failed",
-            )
-            del active[gpu]
-            if exit_code != 0:
+            completed = []
+            for gpu, (index, run, process, run_started) in list(active.items()):
+                exit_code = process.poll()
+                if exit_code is not None:
+                    completed.append(
+                        (gpu, index, run, process, run_started, int(exit_code))
+                    )
+            if not completed:
+                time.sleep(PROCESS_POLL_INTERVAL_SECONDS)
+                continue
+            for gpu, _, _, process, _, _ in completed:
+                process.wait()
+                del active[gpu]
+            if any(exit_code != 0 for _, _, _, _, _, exit_code in completed):
                 peer_failed = True
                 terminate_active("terminated_after_peer_failure")
+            for gpu, index, run, process, run_started, exit_code in completed:
+                rows_by_index[index] = _status_row(
+                    run,
+                    pid=getattr(process, "pid", None),
+                    started_at=run_started,
+                    exit_code=exit_code,
+                    status="passed" if exit_code == 0 else "failed",
+                )
+            if peer_failed:
                 break
-            start_next(gpu)
+            for gpu, *_ in completed:
+                start_next(gpu)
     except BaseException as exc:
         terminate_active("terminated_after_launch_error")
         represented = set(rows_by_index)

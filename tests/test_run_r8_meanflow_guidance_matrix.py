@@ -332,6 +332,9 @@ def test_matrix_calibration_uses_one_owned_output_per_arm_and_four_gpu_queues(
             processes.append(self)
 
         def wait(self):
+            return self.returncode
+
+        def poll(self):
             active_gpus.remove(self.gpu)
             return self.returncode
 
@@ -342,6 +345,100 @@ def test_matrix_calibration_uses_one_owned_output_per_arm_and_four_gpu_queues(
     assert max_active == 4
     assert all(run.output_dir == module.ROOT / "calibration" / run.arm_ids[0] for run in plan.runs)
     assert all(len(run.arm_ids) == 1 for run in plan.runs)
+
+
+def test_matrix_refills_fast_gpu_queues_without_waiting_for_gpu_zero(
+    tmp_path: Path,
+) -> None:
+    module = _load_script()
+    source_plan = module.build_matrix_plan(
+        _args(module, "--phase", "calibrate"), semigroup_gate=_passing_gate(module)
+    )
+    selected = []
+    for gpu in range(4):
+        gpu_runs = [run for run in source_plan.runs if run.physical_gpu == gpu][:4]
+        for queue_index, run in enumerate(gpu_runs):
+            start_path = tmp_path / f"gpu{gpu}_{queue_index}.start"
+            end_path = tmp_path / f"gpu{gpu}_{queue_index}.end"
+            delay = 0.9 if gpu == 0 and queue_index == 0 else (0.05 if gpu == 0 else 0.2)
+            selected.append(
+                replace(
+                    run,
+                    command=(
+                        "/bin/bash",
+                        "-lc",
+                        f"date +%s%N > {start_path}; sleep {delay}; date +%s%N > {end_path}",
+                    ),
+                    output_dir=tmp_path / f"out_gpu{gpu}_{queue_index}",
+                    log_path=tmp_path / f"gpu{gpu}_{queue_index}.log",
+                )
+            )
+    plan = replace(
+        source_plan,
+        repo_root=tmp_path,
+        runs=tuple(selected),
+        status_dir=tmp_path / "status",
+    )
+
+    started = time.monotonic()
+    assert module.launch_matrix(plan) == 0
+    elapsed = time.monotonic() - started
+
+    gpu0_first_end = int((tmp_path / "gpu0_0.end").read_text(encoding="utf-8"))
+    assert elapsed < 1.8
+    for gpu in range(1, 4):
+        fast_second_start = int(
+            (tmp_path / f"gpu{gpu}_1.start").read_text(encoding="utf-8")
+        )
+        assert fast_second_start < gpu0_first_end
+
+
+def test_matrix_fast_peer_failure_immediately_terminates_slow_sessions(
+    tmp_path: Path,
+) -> None:
+    module = _load_script()
+    source_plan = module.build_matrix_plan(_args(module, "--phase", "semigroup"))
+    runs = []
+    pid_paths = []
+    for gpu, run in enumerate(source_plan.runs):
+        if gpu == 1:
+            command = ("/bin/bash", "-lc", "sleep 0.1; exit 7")
+        else:
+            pid_path = tmp_path / f"gpu{gpu}.child_pid"
+            pid_paths.append(pid_path)
+            command = (
+                "/bin/bash",
+                "-lc",
+                f"sleep 5 & echo $! > {pid_path}; wait",
+            )
+        runs.append(
+            replace(
+                run,
+                command=command,
+                output_dir=tmp_path / f"out_gpu{gpu}",
+                log_path=tmp_path / f"gpu{gpu}.log",
+            )
+        )
+    plan = replace(
+        source_plan,
+        repo_root=tmp_path,
+        runs=tuple(runs),
+        status_dir=tmp_path / "status",
+    )
+
+    started = time.monotonic()
+    assert module.launch_matrix(plan) == 1
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 2.0
+    status = json.loads((tmp_path / "status/matrix_status.json").read_text(encoding="utf-8"))
+    assert status["runs"][1]["exit_code"] == 7
+    for pid_path in pid_paths:
+        child_pid = int(pid_path.read_text(encoding="utf-8"))
+        deadline = time.monotonic() + 1.0
+        while Path(f"/proc/{child_pid}").exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not Path(f"/proc/{child_pid}").exists()
 
 
 def test_matrix_failed_semigroup_replaces_all_four_arms_with_noise_configs() -> None:
@@ -503,6 +600,9 @@ def test_matrix_records_exit_codes_peak_memory_and_external_processes(
             processes.append(self)
 
         def wait(self):
+            return self.returncode
+
+        def poll(self):
             return self.returncode
 
     monkeypatch.setattr(module.subprocess, "Popen", FakeProcess)
@@ -831,14 +931,17 @@ def test_execute_plan_keyboard_interrupt_reaps_session_before_unlock(
             self.interrupted = False
 
         def wait(self, *args, **kwargs):
-            if not self.interrupted and not args and not kwargs:
+            return self._process.wait(*args, **kwargs)
+
+        def poll(self):
+            if not self.interrupted:
                 self.interrupted = True
                 deadline = time.monotonic() + 5.0
                 while not child_pid_path.is_file() and time.monotonic() < deadline:
                     time.sleep(0.01)
                 assert (tmp_path / "matrix.lock").is_file()
                 raise KeyboardInterrupt
-            return self._process.wait(*args, **kwargs)
+            return self._process.poll()
 
         def terminate(self):
             self._process.terminate()
