@@ -573,8 +573,15 @@ def resolve_locked_schedule(
         raise ValueError("FMRG guidance requires a locked schedule_manifest")
     manifest_path = Path(str(manifest_value))
     manifest = _read_json_mapping(manifest_path, "locked schedule manifest")
+    if manifest.get("schema_version") != 2:
+        raise ValueError("locked schedule manifest must use schema_version=2")
     if manifest.get("gate_passed") is not True:
         raise ValueError("locked schedule manifest must record gate_passed=true")
+    schedule_contract_sha256 = _require_sha256(
+        manifest.get("schedule_contract_sha256"), "schedule_contract_sha256"
+    )
+    if _schedule_contract_sha256(manifest) != schedule_contract_sha256:
+        raise ValueError("locked schedule contract SHA256 does not match its canonical payload")
     manifest_hash = manifest.get("checkpoint_sha256")
     if manifest_hash != checkpoint_sha256:
         raise ValueError(
@@ -595,17 +602,63 @@ def resolve_locked_schedule(
     guided = [1.0 - index * (1.0 - t_cut) / 3.0 for index in range(4)]
     unguided = [t_cut, t_cut / 2.0, 0.0]
     guided[-1] = t_cut
+    if manifest.get("guided_steps") != 3 or manifest.get("unguided_tail_intervals") != 2:
+        raise ValueError("locked schedule must register exactly 3 guided and 2 unguided intervals")
+    for field, expected in (("guided_times", guided), ("unguided_times", unguided)):
+        if not _float_sequences_equal(manifest.get(field), expected):
+            raise ValueError(f"locked schedule {field} disagrees with the uniform schedule")
     for field, expected in (("guided_times", guided), ("unguided_times", unguided)):
         if field in config and not _float_sequences_equal(config[field], expected):
             raise ValueError(f"config {field} disagrees with the locked uniform schedule")
+    report_path = _locked_path_binding(config, manifest, "semigroup_report")
+    report_sha256 = _require_sha256(
+        manifest.get("semigroup_report_sha256"), "semigroup_report_sha256"
+    )
+    if _digest_path(report_path) != report_sha256:
+        raise ValueError("locked semigroup report SHA256 does not match the report file")
+    sample_manifest_path = _locked_path_binding(config, manifest, "sample_id_manifest")
+    sample_manifest_sha256 = _require_sha256(
+        manifest.get("sample_id_manifest_sha256"), "sample_id_manifest_sha256"
+    )
+    if _digest_path(sample_manifest_path) != sample_manifest_sha256:
+        raise ValueError("locked sample manifest SHA256 does not match the manifest file")
     return {
         "manifest": str(manifest_path),
+        "manifest_sha256": _digest_path(manifest_path),
+        "schedule_contract_sha256": schedule_contract_sha256,
         "checkpoint_sha256": checkpoint_sha256,
+        "semigroup_report": str(report_path),
+        "semigroup_report_sha256": report_sha256,
+        "sample_id_manifest": str(sample_manifest_path),
+        "sample_id_manifest_sha256": sample_manifest_sha256,
         "t_cut": t_cut,
         "guided_times": guided,
         "unguided_times": unguided,
         "gate_passed": True,
     }
+
+
+def _schedule_contract_sha256(payload: Mapping[str, Any]) -> str:
+    contract = dict(payload)
+    contract.pop("schedule_contract_sha256", None)
+    encoded = json.dumps(
+        _json_safe(contract), sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _locked_path_binding(
+    config: Mapping[str, Any], manifest: Mapping[str, Any], field: str
+) -> Path:
+    config_value = config.get(field)
+    manifest_value = manifest.get(field)
+    if not config_value or not manifest_value:
+        raise ValueError(f"locked schedule requires {field} in both config and manifest")
+    config_path = Path(str(config_value))
+    manifest_path = Path(str(manifest_value))
+    if config_path.resolve() != manifest_path.resolve():
+        raise ValueError(f"config {field} disagrees with the locked schedule")
+    return config_path
 
 
 def read_ordered_sample_manifest(path: str | Path) -> list[dict[str, Any]]:

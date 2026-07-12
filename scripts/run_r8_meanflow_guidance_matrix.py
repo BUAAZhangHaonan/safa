@@ -9,6 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
+import signal
 import shlex
 import shutil
 import statistics
@@ -543,12 +544,47 @@ def validate_artifact_paths(plan: MatrixPlan) -> None:
         output = _resolve(plan.repo_root, run.output_dir)
         if not output.exists():
             continue
+        if run.family == "full_native_winner":
+            _validate_full_shard_root(output, run)
+            continue
         if (output / "resume_contract.json").is_file() or (output / "completion.json").is_file():
             continue
         if run.family in {"official_flow_map1", "official_flow_map2", "paper_algorithm_split"}:
             if output == _resolve(plan.repo_root, ROOT / "calibration"):
                 continue
         raise FileExistsError(f"refusing to overwrite existing R8 output directory: {output}")
+
+
+def _validate_full_shard_root(output: Path, run: RunContract) -> None:
+    if not output.is_dir():
+        raise FileExistsError(f"full shard output is not a directory: {output}")
+    unexpected = sorted(path.name for path in output.iterdir() if path.name not in {"native", "winner"})
+    if unexpected:
+        raise FileExistsError(f"full shard output contains unowned entries: {unexpected!r}")
+    for arm_id in ("native", "winner"):
+        child = output / arm_id
+        if not child.exists():
+            continue
+        completion_path = child / "completion.json"
+        resume_path = child / "resume_contract.json"
+        if not completion_path.is_file() and not resume_path.is_file():
+            raise FileExistsError(
+                f"full shard child lacks a resume/completion contract: {child}"
+            )
+        if completion_path.is_file():
+            completion = _read_json(completion_path, "full shard completion")
+            if completion.get("status") != "complete":
+                raise ValueError(f"full shard completion is not complete: {completion_path}")
+        if resume_path.is_file():
+            resume = _read_json(resume_path, "full shard resume contract")
+            shard = resume.get("shard")
+            if not isinstance(shard, Mapping) or (
+                shard.get("index") != run.shard_index or shard.get("count") != run.num_shards
+            ):
+                raise ValueError(f"full shard resume contract has the wrong shard owner: {resume_path}")
+            expected_mode = "native" if arm_id == "native" else None
+            if expected_mode is not None and resume.get("mode") != expected_mode:
+                raise ValueError(f"full native resume contract has the wrong mode: {resume_path}")
 
 
 def query_gpu_states() -> dict[int, GpuState]:
@@ -671,8 +707,7 @@ def launch_matrix(plan: MatrixPlan) -> int:
         failed_index = len(processes)
         rows = []
         for run, process, run_started in processes:
-            process.terminate()
-            exit_code = int(process.wait())
+            exit_code = _terminate_process_group(process)
             rows.append(
                 _status_row(
                     run,
@@ -712,7 +747,7 @@ def launch_matrix(plan: MatrixPlan) -> int:
         )
         return 1
     rows = []
-    for run, process, run_started in processes:
+    for index, (run, process, run_started) in enumerate(processes):
         exit_code = int(process.wait())
         rows.append(
             _status_row(
@@ -723,15 +758,59 @@ def launch_matrix(plan: MatrixPlan) -> int:
                 status="passed" if exit_code == 0 else "failed",
             )
         )
+        if exit_code != 0:
+            for peer_run, peer_process, peer_started in processes[index + 1 :]:
+                peer_exit_code = _terminate_process_group(peer_process)
+                rows.append(
+                    _status_row(
+                        peer_run,
+                        pid=getattr(peer_process, "pid", None),
+                        started_at=peer_started,
+                        exit_code=peer_exit_code,
+                        status="terminated_after_peer_failure",
+                    )
+                )
+            break
     failed = any(row["exit_code"] != 0 for row in rows)
     _write_matrix_status(
         status_dir,
         plan,
         rows,
         started_at=started_at,
-        overall_status="failed" if failed else "passed",
+        overall_status="failed" if failed else "children_passed_pending_finalize",
     )
     return 1 if failed else 0
+
+
+def _terminate_process_group(process: Any, *, terminate_timeout: float = 5.0) -> int:
+    """Terminate the session created for one matrix command, including its children."""
+    pid = getattr(process, "pid", None)
+    try:
+        if not isinstance(pid, int) or pid <= 0:
+            raise ProcessLookupError
+        os.killpg(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        terminate = getattr(process, "terminate", None)
+        if callable(terminate):
+            terminate()
+    try:
+        try:
+            return int(process.wait(timeout=terminate_timeout))
+        except TypeError:
+            return int(process.wait())
+    except subprocess.TimeoutExpired:
+        try:
+            if not isinstance(pid, int) or pid <= 0:
+                raise ProcessLookupError
+            os.killpg(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            kill = getattr(process, "kill", None)
+            if callable(kill):
+                kill()
+        try:
+            return int(process.wait(timeout=terminate_timeout))
+        except TypeError:
+            return int(process.wait())
 
 
 def _status_row(
@@ -762,9 +841,11 @@ def _status_row(
 def run_peak_memory(run: RunContract) -> dict[str, int | None]:
     allocated: list[int] = []
     reserved: list[int] = []
-    roots = [run.output_dir]
-    for root in roots:
-        path = Path(root) / "generation_result.json"
+    root = Path(run.output_dir)
+    paths = [root / "generation_result.json"]
+    if root.is_dir():
+        paths.extend(root.glob("**/generation_result.json"))
+    for path in sorted(set(paths)):
         if not path.is_file():
             continue
         payload = _read_json(path, "generation result")
@@ -821,31 +902,63 @@ def merge_semigroup_shards(
     checkpoint_sha256: str,
 ) -> dict[str, Any]:
     manifest_ids = _read_manifest_ids(manifest_path)
+    if len(manifest_ids) != 64:
+        raise ValueError("semigroup manifest must contain exactly 64 ordered sample IDs")
+    if len(shard_paths) != 4:
+        raise ValueError("semigroup merge requires exactly four shard files")
+    registered_splits = {"0.25", "0.5", "0.75"}
     rows_by_id: dict[str, Mapping[str, Any]] = {}
     duplicate_ids: list[str] = []
-    for path in shard_paths:
+    shard_contracts = []
+    shard_rows: list[list[Mapping[str, Any]]] = []
+    for shard_index, path in enumerate(shard_paths):
         payload = _read_json(path, "semigroup shard")
         rows = payload.get("rows")
         if not isinstance(rows, list):
             raise ValueError(f"semigroup shard missing rows: {path}")
+        if len(rows) != 16:
+            raise ValueError(
+                f"missing semigroup rows: shard {shard_index} must contain exactly 16 rows"
+            )
+        validated_rows: list[Mapping[str, Any]] = []
         for row in rows:
             if not isinstance(row, Mapping) or not isinstance(row.get("sample_id"), str):
                 raise ValueError(f"invalid semigroup row in {path}")
+            splits = row.get("splits")
+            if not isinstance(splits, Mapping) or set(map(str, splits)) != registered_splits:
+                raise ValueError(
+                    "every semigroup row must contain exactly the registered split set "
+                    "{0.25,0.5,0.75}"
+                )
             sample_id = str(row["sample_id"])
             if sample_id in rows_by_id:
                 duplicate_ids.append(sample_id)
             rows_by_id[sample_id] = row
+            validated_rows.append(row)
+        shard_rows.append(validated_rows)
     if duplicate_ids:
         raise ValueError(f"duplicate semigroup sample IDs: {sorted(set(duplicate_ids))!r}")
+    for shard_index, (path, rows) in enumerate(zip(shard_paths, shard_rows, strict=True)):
+        actual_ids = [str(row["sample_id"]) for row in rows]
+        expected_ids = manifest_ids[shard_index::4]
+        if actual_ids != expected_ids:
+            raise ValueError(
+                f"semigroup shard {shard_index} IDs do not match the exact modulo-4 order"
+            )
+        shard_contracts.append(
+            {
+                "shard_index": shard_index,
+                "sample_count": 16,
+                "ordered_sample_id_sha256": _sample_id_digest(actual_ids),
+                "semigroup_sha256": _sha256_file(path),
+            }
+        )
     missing = sorted(set(manifest_ids) - set(rows_by_id))
     extra = sorted(set(rows_by_id) - set(manifest_ids))
     if missing or extra:
         raise ValueError(f"missing semigroup IDs {missing!r}; extra IDs {extra!r}")
     candidates = []
-    split_keys = sorted(
-        {str(key) for row in rows_by_id.values() for key in row.get("splits", {})},
-        key=float,
-    )
+    split_keys = sorted(registered_splits, key=float)
     for split_key in split_keys:
         split_rows = [rows_by_id[sample_id]["splits"][split_key] for sample_id in manifest_ids]
         residuals = [_finite_metric(row["latent_residual"], "latent_residual") for row in split_rows]
@@ -889,6 +1002,8 @@ def merge_semigroup_shards(
         "sample_count": len(manifest_ids),
         "sample_id_manifest": str(manifest_path),
         "sample_id_manifest_sha256": _sha256_file(manifest_path),
+        "ordered_sample_id_sha256": _sample_id_digest(manifest_ids),
+        "shards": shard_contracts,
         "selection_rule": "smallest_numeric_t_cut_passing_all_registered_thresholds",
         "thresholds": dict(thresholds),
         "candidates": candidates,
@@ -905,6 +1020,7 @@ def load_full_contract(selection_path: Path, visual_review_path: Path) -> dict[s
     winner = selection.get("winner")
     if not isinstance(winner, Mapping) or not winner.get("config"):
         raise ValueError("selection must contain a locked winner config")
+    _require_sha256(winner.get("config_sha256"), "winner config SHA256")
     manifest_count = int(selection.get("full_sample_count", 2048))
     manifest_sha = str(selection.get("full_sample_id_manifest_sha256", FULL_MANIFEST_SHA256))
     return {
@@ -928,6 +1044,13 @@ def _validate_full_contract(contract: Mapping[str, Any]) -> None:
         raise ValueError("full phase requires exactly 2048 samples")
     if contract.get("manifest_sha256") != FULL_MANIFEST_SHA256:
         raise ValueError("full phase manifest digest does not match the registered 2048 IDs")
+    if _winner_is_fmrg(contract):
+        _winner_t_cut(contract)
+        schedule_value = winner.get("schedule_manifest")
+        if Path(str(schedule_value)) != SCHEDULE_MANIFEST:
+            raise ValueError("FMRG winner schedule_manifest must be the locked R8 schedule")
+        _require_sha256(winner.get("schedule_manifest_sha256"), "winner schedule manifest SHA256")
+        _require_sha256(winner.get("schedule_contract_sha256"), "winner schedule contract SHA256")
 
 
 def materialize_locked_manifests(repo_root: Path) -> None:
@@ -960,8 +1083,43 @@ def materialize_full_runtime_configs(plan: MatrixPlan) -> None:
     if plan.phase != "full" or plan.full_contract is None:
         return
     native = _load_yaml(plan.repo_root / NATIVE_CONFIG)
-    winner_path = Path(str(plan.full_contract["winner"]["config"]))
-    winner = _load_yaml(plan.repo_root / winner_path)
+    winner_contract = plan.full_contract["winner"]
+    winner_path = Path(str(winner_contract["config"]))
+    winner_source = _resolve(plan.repo_root, winner_path)
+    expected_config_sha = winner_contract.get("config_sha256")
+    if expected_config_sha is not None and _sha256_file(winner_source) != _require_sha256(
+        expected_config_sha, "winner config SHA256"
+    ):
+        raise ValueError("locked winner config SHA256 disagrees with the selection contract")
+    winner = _load_yaml(winner_source)
+    if _winner_is_fmrg(plan.full_contract):
+        schedule_path = _resolve(plan.repo_root, Path(str(winner_contract["schedule_manifest"])))
+        expected_schedule_sha = _require_sha256(
+            winner_contract["schedule_manifest_sha256"], "winner schedule manifest SHA256"
+        )
+        if _sha256_file(schedule_path) != expected_schedule_sha:
+            raise ValueError("locked schedule file SHA256 disagrees with the selection contract")
+        schedule = _read_json(schedule_path, "locked schedule manifest")
+        schedule_contract_sha = _schedule_contract_digest(schedule)
+        if schedule_contract_sha != _require_sha256(
+            winner_contract["schedule_contract_sha256"], "winner schedule contract SHA256"
+        ) or schedule_contract_sha != schedule.get("schedule_contract_sha256"):
+            raise ValueError("locked schedule contract digest disagrees with the selection contract")
+        t_cut = _winner_t_cut(plan.full_contract)
+        if not math.isclose(
+            _finite_open_unit(schedule.get("t_cut"), "locked schedule t_cut"),
+            float(t_cut),
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
+        ):
+            raise ValueError("locked schedule t_cut disagrees with the selection contract")
+        winner.update(
+            {
+                "t_cut": t_cut,
+                "schedule_manifest": str(SCHEDULE_MANIFEST),
+                "semigroup_report": str(SEMIGROUP_GATE),
+            }
+        )
     runtime_dir = plan.repo_root / ROOT / "full/runtime_configs"
     for arm_id, payload in (("native", native), ("winner", winner)):
         resolved = dict(payload)
@@ -999,10 +1157,43 @@ def execute_plan(plan: MatrixPlan) -> int:
         result = launch_matrix(bound)
         if result != 0:
             return result
-        return finalize_phase(bound)
+        try:
+            finalize_result = finalize_phase(bound)
+        except Exception as exc:
+            _update_matrix_status(
+                bound,
+                overall_status="failed",
+                finalize_error=f"{type(exc).__name__}: {exc}",
+            )
+            return 1
+        if finalize_result == 0:
+            _update_matrix_status(bound, overall_status="passed")
+        elif finalize_result == 2:
+            _update_matrix_status(bound, overall_status="awaiting_direct_visual_review")
+        else:
+            _update_matrix_status(
+                bound,
+                overall_status="failed",
+                finalize_error=f"finalize_phase returned {finalize_result}",
+            )
+        return finalize_result
     finally:
         os.close(fd)
         lock.unlink(missing_ok=True)
+
+
+def _update_matrix_status(
+    plan: MatrixPlan, *, overall_status: str, finalize_error: str | None = None
+) -> None:
+    path = _resolve(plan.repo_root, plan.status_dir) / "matrix_status.json"
+    payload = _read_json(path, "matrix status")
+    payload["overall_status"] = overall_status
+    payload["finalized_at"] = _timestamp()
+    if finalize_error is not None:
+        payload["finalize_error"] = finalize_error
+    else:
+        payload.pop("finalize_error", None)
+    _atomic_write_json(path, payload)
 
 
 def finalize_phase(plan: MatrixPlan) -> int:
@@ -1036,11 +1227,15 @@ def finalize_phase(plan: MatrixPlan) -> int:
             }
             _atomic_write_json(plan.repo_root / SEMIGROUP_GATE_DRAFT, draft)
             return 2
-        _atomic_write_json(plan.repo_root / SEMIGROUP_GATE, report, exclusive=True)
+        gate_path = plan.repo_root / SEMIGROUP_GATE
+        _atomic_write_json(gate_path, report, exclusive=True)
         if report["gate_passed"]:
             _atomic_write_json(
                 plan.repo_root / SCHEDULE_MANIFEST,
-                _schedule_payload(report),
+                _schedule_payload(
+                    report,
+                    semigroup_report_sha256=_sha256_file(gate_path),
+                ),
                 exclusive=True,
             )
         return 0
@@ -1050,48 +1245,144 @@ def finalize_phase(plan: MatrixPlan) -> int:
 
 
 def finalize_full_outputs(plan: MatrixPlan) -> None:
+    arm_completions: dict[str, Mapping[str, Any]] = {}
     for arm_id in ("native", "winner"):
         combined = plan.repo_root / ROOT / f"full/merged/{arm_id}"
-        _merge_full_arm(plan.repo_root, arm_id, combined)
-        command = build_quality_command(
-            python=plan.python,
-            output_dir=ROOT / f"full/merged/{arm_id}",
-            manifest=FULL_MANIFEST,
-        )
-        subprocess.run(command, cwd=plan.repo_root, check=True, env={**os.environ, "PYTHONPATH": "src"})
+        arm_completions[arm_id] = _merge_full_arm(plan.repo_root, arm_id, combined)
+        quality_path = combined / "quality.json"
+        if not quality_path.is_file():
+            command = build_quality_command(
+                python=plan.python,
+                output_dir=ROOT / f"full/merged/{arm_id}",
+                manifest=FULL_MANIFEST,
+            )
+            subprocess.run(
+                command,
+                cwd=plan.repo_root,
+                check=True,
+                env={**os.environ, "PYTHONPATH": "src"},
+            )
+        _read_json(quality_path, f"full {arm_id} quality result")
+    completion = {
+        "schema_version": 1,
+        "status": "complete",
+        "sample_id_manifest_sha256": _sha256_file(plan.repo_root / FULL_MANIFEST),
+        "arms": {
+            arm_id: {
+                "merge_contract_sha256": arm_completions[arm_id]["merge_contract_sha256"],
+                "quality_sha256": _sha256_file(
+                    plan.repo_root / ROOT / f"full/merged/{arm_id}/quality.json"
+                ),
+            }
+            for arm_id in ("native", "winner")
+        },
+    }
+    _write_or_validate_json(
+        plan.repo_root / ROOT / "full/finalization_completion.json", completion
+    )
 
 
-def _merge_full_arm(repo_root: Path, arm_id: str, combined: Path) -> None:
-    if combined.exists():
-        raise FileExistsError(f"refusing to overwrite merged full arm: {combined}")
+def _merge_full_arm(repo_root: Path, arm_id: str, combined: Path) -> dict[str, Any]:
     expected_ids = _read_manifest_ids(repo_root / FULL_MANIFEST)
     rows_by_id: dict[str, dict[str, Any]] = {}
+    shard_contracts = []
     for gpu in range(4):
-        path = repo_root / ROOT / f"full/shards/shard_{gpu}/{arm_id}/per_sample.jsonl"
-        for row in _read_jsonl(path):
+        shard_root = repo_root / ROOT / f"full/shards/shard_{gpu}/{arm_id}"
+        completion_path = shard_root / "completion.json"
+        completion = _read_json(completion_path, f"full {arm_id} shard completion")
+        if completion.get("status") != "complete":
+            raise ValueError(f"full {arm_id} shard {gpu} completion is not complete")
+        path = shard_root / "per_sample.jsonl"
+        shard_rows = _read_jsonl(path)
+        expected_shard_ids = expected_ids[gpu::4]
+        actual_shard_ids = [str(row.get("sample_id", "")) for row in shard_rows]
+        if actual_shard_ids != expected_shard_ids:
+            raise ValueError(
+                f"full {arm_id} shard {gpu} does not match the exact modulo-4 manifest order"
+            )
+        if int(completion.get("sample_count", -1)) != len(shard_rows):
+            raise ValueError(f"full {arm_id} shard {gpu} completion sample count disagrees")
+        shard_contracts.append(
+            {
+                "shard_index": gpu,
+                "completion_sha256": _sha256_file(completion_path),
+                "per_sample_sha256": _sha256_file(path),
+                "ordered_sample_id_sha256": _sample_id_digest(actual_shard_ids),
+            }
+        )
+        for row in shard_rows:
             sample_id = row.get("sample_id")
             if not isinstance(sample_id, str) or sample_id in rows_by_id:
                 raise ValueError(f"duplicate or invalid full {arm_id} sample ID: {sample_id!r}")
             rows_by_id[sample_id] = row
     if set(rows_by_id) != set(expected_ids):
-        raise ValueError(f"full {arm_id} shards do not cover exactly 2048 locked IDs")
-    generated = combined / "generated_images"
-    generated.mkdir(parents=True, exist_ok=False)
-    output_rows = []
-    for ordinal, sample_id in enumerate(expected_ids):
-        row = rows_by_id[sample_id]
-        source_value = row.get("generated", row.get("generated_image_path"))
+        raise ValueError(f"full {arm_id} shards do not cover exactly the locked manifest IDs")
+    source_rows = []
+    for sample_id in expected_ids:
+        source_value = rows_by_id[sample_id].get(
+            "generated", rows_by_id[sample_id].get("generated_image_path")
+        )
         source = Path(str(source_value))
         if not source.is_absolute():
             source = repo_root / source
+        if not source.is_file():
+            raise FileNotFoundError(f"full {arm_id} generated image does not exist: {source}")
+        source_rows.append((sample_id, source, _sha256_file(source)))
+    source_manifest_sha256 = hashlib.sha256(
+        "".join(
+            f"{sample_id}\t{source}\t{digest}\n"
+            for sample_id, source, digest in source_rows
+        ).encode("utf-8")
+    ).hexdigest()
+    merge_contract = {
+        "schema_version": 1,
+        "arm_id": arm_id,
+        "sample_count": len(expected_ids),
+        "sample_id_manifest_sha256": _sha256_file(repo_root / FULL_MANIFEST),
+        "ordered_sample_id_sha256": _sample_id_digest(expected_ids),
+        "ordered_source_image_manifest_sha256": source_manifest_sha256,
+        "shards": shard_contracts,
+    }
+    merge_contract["merge_contract_sha256"] = _canonical_contract_digest(
+        merge_contract, "merge_contract_sha256"
+    )
+    if combined.exists() and not (combined / "merge_contract.json").is_file():
+        if not combined.is_dir() or any(combined.iterdir()):
+            raise FileExistsError(f"merged full arm lacks its ownership contract: {combined}")
+    combined.mkdir(parents=True, exist_ok=True)
+    _write_or_validate_json(combined / "merge_contract.json", merge_contract)
+    generated = combined / "generated_images"
+    generated.mkdir(parents=True, exist_ok=True)
+    output_rows = []
+    image_manifest_lines = []
+    for ordinal, (sample_id, source, source_sha256) in enumerate(source_rows):
+        row = rows_by_id[sample_id]
         suffix = source.suffix.lower() or ".png"
         target = generated / f"{ordinal:06d}{suffix}"
-        shutil.copy2(source, target)
+        if target.exists():
+            if not target.is_file() or _sha256_file(target) != source_sha256:
+                raise ValueError(f"existing merged image disagrees with its source: {target}")
+        else:
+            shutil.copy2(source, target)
         output_rows.append({**row, "generated": str(target)})
-    (combined / "per_sample.jsonl").write_text(
-        "".join(json.dumps(row, sort_keys=True) + "\n" for row in output_rows),
-        encoding="utf-8",
+        image_manifest_lines.append(f"{sample_id}\t{target.name}\t{source_sha256}\n")
+    per_sample_content = "".join(
+        json.dumps(row, sort_keys=True) + "\n" for row in output_rows
     )
+    _write_or_validate_text(combined / "per_sample.jsonl", per_sample_content)
+    completion = {
+        "schema_version": 1,
+        "status": "complete",
+        "arm_id": arm_id,
+        "sample_count": len(expected_ids),
+        "merge_contract_sha256": merge_contract["merge_contract_sha256"],
+        "per_sample_sha256": hashlib.sha256(per_sample_content.encode("utf-8")).hexdigest(),
+        "ordered_image_manifest_sha256": hashlib.sha256(
+            "".join(image_manifest_lines).encode("utf-8")
+        ).hexdigest(),
+    }
+    _write_or_validate_json(combined / "completion.json", completion)
+    return completion
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1158,25 +1449,41 @@ def _winner_is_fmrg(contract: Mapping[str, Any]) -> bool:
 def _winner_t_cut(contract: Mapping[str, Any]) -> float | None:
     if not _winner_is_fmrg(contract):
         return None
-    return _finite_open_unit(contract.get("winner", {}).get("t_cut"), "winner t_cut")
+    value = contract.get("winner", {}).get("t_cut")
+    if value is None:
+        raise ValueError("FMRG winner is missing the locked t_cut")
+    return _finite_open_unit(value, "winner t_cut")
 
 
-def _schedule_payload(report: Mapping[str, Any]) -> dict[str, Any]:
+def _schedule_payload(
+    report: Mapping[str, Any], *, semigroup_report_sha256: str
+) -> dict[str, Any]:
     t_cut = _finite_open_unit(report["selected_t_cut"], "selected t_cut")
     guided = [1.0 - index * (1.0 - t_cut) / 3.0 for index in range(4)]
     guided[-1] = t_cut
-    return {
-        "schema_version": 1,
+    payload = {
+        "schema_version": 2,
         "gate_passed": True,
         "checkpoint_sha256": CHECKPOINT_SHA256,
-        "semigroup_report_sha256": _canonical_json_sha256(report),
+        "semigroup_report": str(SEMIGROUP_GATE),
+        "semigroup_report_sha256": semigroup_report_sha256,
+        "sample_id_manifest": str(report["sample_id_manifest"]),
         "sample_id_manifest_sha256": report["sample_id_manifest_sha256"],
         "t_cut": t_cut,
         "guided_steps": 3,
         "guided_times": guided,
+        "unguided_tail_intervals": 2,
         "unguided_times": [t_cut, t_cut / 2.0, 0.0],
         "selection_rule": report["selection_rule"],
     }
+    payload["schedule_contract_sha256"] = _schedule_contract_digest(payload)
+    return payload
+
+
+def _schedule_contract_digest(payload: Mapping[str, Any]) -> str:
+    contract = dict(payload)
+    contract.pop("schedule_contract_sha256", None)
+    return _canonical_json_sha256(contract)
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -1266,6 +1573,23 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any], *, exclusive: boo
     os.replace(temporary, path)
 
 
+def _write_or_validate_json(path: Path, payload: Mapping[str, Any]) -> None:
+    expected = json.loads(json.dumps(payload, allow_nan=False))
+    if path.exists():
+        if not path.is_file() or _read_json(path, path.name) != expected:
+            raise ValueError(f"existing owned artifact disagrees with its contract: {path}")
+        return
+    _atomic_write_json(path, payload, exclusive=True)
+
+
+def _write_or_validate_text(path: Path, content: str) -> None:
+    if path.exists():
+        if not path.is_file() or path.read_text(encoding="utf-8") != content:
+            raise ValueError(f"existing owned artifact disagrees with its contract: {path}")
+        return
+    _write_locked_text(path, content, None)
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -1279,8 +1603,23 @@ def _canonical_json_sha256(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _canonical_contract_digest(payload: Mapping[str, Any], digest_field: str) -> str:
+    contract = dict(payload)
+    contract.pop(digest_field, None)
+    return _canonical_json_sha256(contract)
+
+
+def _sample_id_digest(sample_ids: Sequence[str]) -> str:
+    return hashlib.sha256(
+        "".join(f"{sample_id}\n" for sample_id in sample_ids).encode("utf-8")
+    ).hexdigest()
+
+
 def _finite_metric(value: Any, label: str) -> float:
-    result = float(value)
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid {label}: {value!r}") from exc
     if not math.isfinite(result):
         raise ValueError(f"non-finite semigroup {label}: {value!r}")
     return result
@@ -1291,6 +1630,13 @@ def _finite_open_unit(value: Any, label: str) -> float:
     if not 0.0 < result < 1.0:
         raise ValueError(f"{label} must be within (0,1), got {result!r}")
     return result
+
+
+def _require_sha256(value: Any, label: str) -> str:
+    text = str(value)
+    if len(text) != 64 or any(character not in "0123456789abcdef" for character in text):
+        raise ValueError(f"{label} must be a lowercase SHA256 digest")
+    return text
 
 
 def _percentile(values: Sequence[float], fraction: float) -> float:

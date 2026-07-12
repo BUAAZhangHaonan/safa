@@ -4,7 +4,9 @@ from dataclasses import replace
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import sys
+import time
 
 import pytest
 import yaml
@@ -486,3 +488,205 @@ def test_matrix_terminates_started_children_after_partial_launch_failure(
     status = json.loads((plan.status_dir / "matrix_status.json").read_text(encoding="utf-8"))
     assert status["overall_status"] == "failed"
     assert "launch failed" in status["launch_error"]
+
+
+def test_fmrg_full_plan_requires_and_uses_locked_tcut_and_schedule_digest() -> None:
+    module = _load_script()
+    contract = {
+        "winner": {
+            "arm_id": "official",
+            "config": str(module.FLOW_MAP1_CONFIG),
+            "mode": "official_head_current_xt",
+            "t_cut": 0.25,
+            "schedule_manifest": str(module.SCHEDULE_MANIFEST),
+            "schedule_manifest_sha256": "d" * 64,
+            "schedule_contract_sha256": "e" * 64,
+        },
+        "visual_review": {"reviewed_sample_count": 64, "passed": True},
+        "manifest_count": 2048,
+        "manifest_sha256": module.FULL_MANIFEST_SHA256,
+    }
+
+    plan = module.build_matrix_plan(
+        _args(module, "--phase", "full"), full_contract=contract
+    )
+
+    assert plan.schedule_manifest == module.SCHEDULE_MANIFEST
+    assert all("--t-cut 0.25" in " ".join(run.command) for run in plan.runs)
+    missing = {**contract, "winner": {**contract["winner"]}}
+    missing["winner"].pop("t_cut")
+    with pytest.raises(ValueError, match="t_cut"):
+        module.build_matrix_plan(_args(module, "--phase", "full"), full_contract=missing)
+
+
+def test_semigroup_merge_requires_registered_splits_and_four_exact_modulo_shards(
+    tmp_path: Path,
+) -> None:
+    module = _load_script()
+    paths, manifest = _write_semigroup_shards(tmp_path)
+    payload = json.loads(paths[0].read_text(encoding="utf-8"))
+    payload["rows"][0]["splits"]["0.125"] = dict(payload["rows"][0]["splits"]["0.25"])
+    paths[0].write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="registered split"):
+        module.merge_semigroup_shards(
+            paths,
+            manifest_path=manifest,
+            thresholds={"median": 0.1, "p90": 0.2, "endpoint_e0_cosine": 0.95},
+            visual_pass_by_split={"0.25": True, "0.5": True, "0.75": True},
+            checkpoint_sha256=module.CHECKPOINT_SHA256,
+        )
+
+    paths, manifest = _write_semigroup_shards(tmp_path / "short")
+    payload = json.loads(paths[3].read_text(encoding="utf-8"))
+    payload["rows"].pop()
+    paths[3].write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="16"):
+        module.merge_semigroup_shards(
+            paths,
+            manifest_path=manifest,
+            thresholds={"median": 0.1, "p90": 0.2, "endpoint_e0_cosine": 0.95},
+            visual_pass_by_split={"0.25": True, "0.5": True, "0.75": True},
+            checkpoint_sha256=module.CHECKPOINT_SHA256,
+        )
+
+
+def test_schedule_payload_binds_report_manifest_times_and_self_digest(tmp_path: Path) -> None:
+    module = _load_script()
+    paths, manifest = _write_semigroup_shards(tmp_path)
+    report = module.merge_semigroup_shards(
+        paths,
+        manifest_path=manifest,
+        thresholds={"median": 0.1, "p90": 0.2, "endpoint_e0_cosine": 0.95},
+        visual_pass_by_split={"0.25": True, "0.5": True, "0.75": True},
+        checkpoint_sha256=module.CHECKPOINT_SHA256,
+    )
+
+    schedule = module._schedule_payload(report, semigroup_report_sha256="f" * 64)
+
+    assert schedule["guided_steps"] == 3
+    assert schedule["unguided_tail_intervals"] == 2
+    assert schedule["guided_times"] == [1.0, 0.75, 0.5, 0.25]
+    assert schedule["unguided_times"] == [0.25, 0.125, 0.0]
+    assert schedule["semigroup_report_sha256"] == "f" * 64
+    assert schedule["sample_id_manifest_sha256"] == module._sha256_file(manifest)
+    assert module._schedule_contract_digest(schedule) == schedule["schedule_contract_sha256"]
+
+
+def test_peak_memory_recurses_over_every_owned_arm(tmp_path: Path) -> None:
+    module = _load_script()
+    plan = module.build_matrix_plan(
+        _args(module, "--phase", "calibrate"), semigroup_gate=_passing_gate(module)
+    )
+    run = replace(plan.runs[0], output_dir=tmp_path)
+    for name, allocated, reserved in (("first", 10, 20), ("nested/second", 30, 25)):
+        path = tmp_path / name / "generation_result.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "max_memory": {
+                        "allocated_bytes": allocated,
+                        "reserved_bytes": reserved,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    assert module.run_peak_memory(run) == {"allocated": 30, "reserved": 25}
+
+
+def test_terminate_process_group_reaps_shell_and_child(tmp_path: Path) -> None:
+    module = _load_script()
+    child_pid_path = tmp_path / "child.pid"
+    process = subprocess.Popen(
+        [
+            "/bin/bash",
+            "-lc",
+            f"sleep 60 & echo $! > {child_pid_path}; wait",
+        ],
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 5.0
+    while not child_pid_path.is_file() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+
+    module._terminate_process_group(process, terminate_timeout=1.0)
+
+    assert process.poll() is not None
+    deadline = time.monotonic() + 2.0
+    while Path(f"/proc/{child_pid}").exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not Path(f"/proc/{child_pid}").exists()
+
+
+def test_execute_plan_marks_finalize_failure_not_passed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    module = _load_script()
+    plan = replace(
+        module.build_matrix_plan(_args(module, "--phase", "semigroup", "--execute")),
+        repo_root=tmp_path,
+        status_dir=Path("status"),
+        lock_path=Path("matrix.lock"),
+    )
+    monkeypatch.setattr(module, "validate_artifact_paths", lambda value: None)
+    monkeypatch.setattr(module, "validate_preflight", lambda value: value)
+    monkeypatch.setattr(module, "materialize_locked_manifests", lambda value: None)
+    monkeypatch.setattr(module, "materialize_full_runtime_configs", lambda value: None)
+
+    def fake_launch(value):
+        status = value.repo_root / value.status_dir / "matrix_status.json"
+        status.parent.mkdir(parents=True)
+        status.write_text(
+            json.dumps({"overall_status": "children_passed_pending_finalize"}),
+            encoding="utf-8",
+        )
+        return 0
+
+    monkeypatch.setattr(module, "launch_matrix", fake_launch)
+    monkeypatch.setattr(module, "finalize_phase", lambda value: (_ for _ in ()).throw(RuntimeError("merge failed")))
+
+    assert module.execute_plan(plan) == 1
+    status = json.loads((tmp_path / "status/matrix_status.json").read_text(encoding="utf-8"))
+    assert status["overall_status"] == "failed"
+    assert "merge failed" in status["finalize_error"]
+
+
+def test_full_merge_is_idempotent_and_recovers_partial_owned_output(tmp_path: Path) -> None:
+    module = _load_script()
+    manifest = tmp_path / module.FULL_MANIFEST
+    manifest.parent.mkdir(parents=True)
+    ids = [f"sample-{index}" for index in range(4)]
+    manifest.write_text(
+        "".join(json.dumps({"sample_id": sample_id}) + "\n" for sample_id in ids),
+        encoding="utf-8",
+    )
+    for gpu, sample_id in enumerate(ids):
+        shard = tmp_path / module.ROOT / f"full/shards/shard_{gpu}/native"
+        generated = shard / f"{gpu}.png"
+        generated.parent.mkdir(parents=True)
+        generated.write_bytes(f"image-{gpu}".encode())
+        (shard / "per_sample.jsonl").write_text(
+            json.dumps({"sample_id": sample_id, "generated": str(generated)}) + "\n",
+            encoding="utf-8",
+        )
+        (shard / "completion.json").write_text(
+            json.dumps({"status": "complete", "sample_count": 1}), encoding="utf-8"
+        )
+    combined = tmp_path / module.ROOT / "full/merged/native"
+
+    first = module._merge_full_arm(tmp_path, "native", combined)
+    second = module._merge_full_arm(tmp_path, "native", combined)
+    assert first == second
+    completion = json.loads((combined / "completion.json").read_text(encoding="utf-8"))
+    assert completion["status"] == "complete"
+
+    (combined / "completion.json").unlink()
+    victim = next((combined / "generated_images").iterdir())
+    victim.unlink()
+    resumed = module._merge_full_arm(tmp_path, "native", combined)
+    assert resumed["status"] == "complete"
+    assert victim.is_file()

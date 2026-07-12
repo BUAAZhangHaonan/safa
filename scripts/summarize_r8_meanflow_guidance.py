@@ -109,10 +109,18 @@ def validate_calibration_arm(
     nfe = _integer(_nested(generation, ("nfe", "candidate"), "candidate NFE"), "candidate NFE")
     if nfe <= 0:
         raise ValueError(f"arm {arm_id}: candidate NFE must be positive")
+    mode = str(generation.get("mode", ""))
+    schedule_contract = _fmrg_schedule_contract(
+        arm_id=arm_id,
+        mode=mode,
+        generation=generation,
+        config=config,
+        checkpoint_sha256=checkpoint_sha,
+    )
 
     row = {
         "arm_id": arm_id,
-        "mode": str(generation.get("mode", "")),
+        "mode": mode,
         "sample_count": generation_count,
         "sample_id_sha256": generation_digest,
         "checkpoint_sha256": checkpoint_sha,
@@ -143,6 +151,7 @@ def validate_calibration_arm(
         "config": dict(config),
         "generation_result": dict(generation),
         "quality_result": dict(quality),
+        **schedule_contract,
     }
     reasons = []
     if row["e0_delta"] < 0.02:
@@ -178,27 +187,36 @@ def select_calibration_winner(rows: Sequence[Mapping[str, Any]]) -> dict[str, An
         ),
     )
     winner = ranked[0]
+    winner_contract = {
+        key: winner[key]
+        for key in (
+            "arm_id",
+            "mode",
+            "e0_cosine",
+            "edev_cosine",
+            "severe_failure_count",
+            "sharpness_retention",
+            "nfe",
+            "checkpoint_sha256",
+            "sample_id_sha256",
+            "seed",
+        )
+    }
+    for key in (
+        "t_cut",
+        "schedule_manifest",
+        "schedule_manifest_sha256",
+        "schedule_contract_sha256",
+    ):
+        if key in winner:
+            winner_contract[key] = winner[key]
     return {
         "selection_rule": (
             "higher E0 cosine, higher Edev cosine, fewer severe visual failures, "
             "higher Sharpness retention, lower NFE, lexical arm ID"
         ),
         "fid_policy": "64-sample FID is diagnostic only",
-        "winner": {
-            key: winner[key]
-            for key in (
-                "arm_id",
-                "mode",
-                "e0_cosine",
-                "edev_cosine",
-                "severe_failure_count",
-                "sharpness_retention",
-                "nfe",
-                "checkpoint_sha256",
-                "sample_id_sha256",
-                "seed",
-            )
-        },
+        "winner": winner_contract,
         "eligible_arm_ids": [str(row["arm_id"]) for row in ranked],
     }
 
@@ -432,6 +450,65 @@ def _heldout_improvements(heldout: Mapping[str, Any]) -> dict[str, bool]:
         )
         result[name] = winner > native
     return result
+
+
+def _fmrg_schedule_contract(
+    *,
+    arm_id: str,
+    mode: str,
+    generation: Mapping[str, Any],
+    config: Mapping[str, Any],
+    checkpoint_sha256: str,
+) -> dict[str, Any]:
+    if mode not in {"official_head_current_xt", "paper_algorithm_split"}:
+        return {}
+    schedule = generation.get("schedule")
+    if not isinstance(schedule, Mapping):
+        raise ValueError(f"arm {arm_id}: FMRG generation is missing its locked schedule")
+    if schedule.get("checkpoint_sha256") != checkpoint_sha256:
+        raise ValueError(f"arm {arm_id}: locked schedule checkpoint SHA256 disagrees")
+    t_cut = _finite(schedule.get("t_cut"), "locked schedule t_cut")
+    config_t_cut = _finite(config.get("t_cut"), "config t_cut")
+    if not 0.0 < t_cut < 1.0 or not math.isclose(
+        config_t_cut, t_cut, rel_tol=0.0, abs_tol=1.0e-12
+    ):
+        raise ValueError(f"arm {arm_id}: config t_cut disagrees with the locked schedule")
+    guided = [
+        1.0,
+        1.0 - (1.0 - t_cut) / 3.0,
+        1.0 - 2.0 * (1.0 - t_cut) / 3.0,
+        t_cut,
+    ]
+    unguided = [t_cut, t_cut / 2.0, 0.0]
+    if not _float_sequences_equal(schedule.get("guided_times"), guided):
+        raise ValueError(f"arm {arm_id}: locked guided schedule is not the registered 3-step schedule")
+    if not _float_sequences_equal(schedule.get("unguided_times"), unguided):
+        raise ValueError(f"arm {arm_id}: locked unguided schedule is not the registered 2-step tail")
+    manifest = str(schedule.get("manifest", ""))
+    if not manifest or str(config.get("schedule_manifest", "")) != manifest:
+        raise ValueError(f"arm {arm_id}: schedule manifest path disagrees with the resolved config")
+    return {
+        "t_cut": t_cut,
+        "schedule_manifest": manifest,
+        "schedule_manifest_sha256": _sha(
+            schedule.get("manifest_sha256"), "schedule manifest SHA256"
+        ),
+        "schedule_contract_sha256": _sha(
+            schedule.get("schedule_contract_sha256"), "schedule contract SHA256"
+        ),
+    }
+
+
+def _float_sequences_equal(value: Any, expected: Sequence[float]) -> bool:
+    if not isinstance(value, (list, tuple)) or len(value) != len(expected):
+        return False
+    try:
+        return all(
+            math.isclose(float(actual), target, rel_tol=0.0, abs_tol=1.0e-12)
+            for actual, target in zip(value, expected, strict=True)
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 def _reject_heldout_outputs(payload: Mapping[str, Any]) -> None:

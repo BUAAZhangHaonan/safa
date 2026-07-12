@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import importlib.util
 from dataclasses import replace
@@ -218,14 +219,58 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
     path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
 
 
-def test_locked_schedule_is_uniform_and_rejects_t_cut_or_hash_disagreement(tmp_path: Path) -> None:
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _schedule_contract_sha256(payload: dict) -> str:
+    contract = dict(payload)
+    contract.pop("schedule_contract_sha256", None)
+    encoded = json.dumps(contract, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _write_locked_schedule_fixture(tmp_path: Path) -> tuple[Path, dict]:
+    sample_manifest = tmp_path / "sample_ids.jsonl"
+    _write_jsonl(sample_manifest, [{"sample_id": "sample-0"}])
+    report_path = tmp_path / "semigroup_gate.json"
+    report = {
+        "gate_passed": True,
+        "checkpoint_sha256": "a" * 64,
+        "selected_t_cut": 0.25,
+    }
+    _write_json(report_path, report)
     schedule_path = tmp_path / "schedule.json"
-    _write_json(
-        schedule_path,
-        {"t_cut": 0.25, "checkpoint_sha256": "a" * 64, "gate_passed": True},
-    )
+    schedule = {
+        "schema_version": 2,
+        "gate_passed": True,
+        "checkpoint_sha256": "a" * 64,
+        "semigroup_report": str(report_path),
+        "semigroup_report_sha256": _file_sha256(report_path),
+        "sample_id_manifest": str(sample_manifest),
+        "sample_id_manifest_sha256": _file_sha256(sample_manifest),
+        "t_cut": 0.25,
+        "guided_steps": 3,
+        "guided_times": [1.0, 0.75, 0.5, 0.25],
+        "unguided_tail_intervals": 2,
+        "unguided_times": [0.25, 0.125, 0.0],
+        "selection_rule": "smallest_numeric_t_cut_passing_all_registered_thresholds",
+    }
+    schedule["schedule_contract_sha256"] = _schedule_contract_sha256(schedule)
+    _write_json(schedule_path, schedule)
+    config = {
+        "t_cut": 0.25,
+        "schedule_manifest": str(schedule_path),
+        "semigroup_report": str(report_path),
+        "sample_id_manifest": str(sample_manifest),
+    }
+    return schedule_path, config
+
+
+def test_locked_schedule_is_uniform_and_rejects_t_cut_or_hash_disagreement(tmp_path: Path) -> None:
+    schedule_path, config = _write_locked_schedule_fixture(tmp_path)
     schedule = resolve_locked_schedule(
-        {"t_cut": 0.25, "schedule_manifest": str(schedule_path)},
+        config,
         checkpoint_sha256="a" * 64,
         explicit_t_cut=0.25,
     )
@@ -239,10 +284,32 @@ def test_locked_schedule_is_uniform_and_rejects_t_cut_or_hash_disagreement(tmp_p
     ):
         with pytest.raises(ValueError, match=message):
             resolve_locked_schedule(
-                {"t_cut": config_t_cut, "schedule_manifest": str(schedule_path)},
+                {**config, "t_cut": config_t_cut},
                 checkpoint_sha256=checkpoint_hash,
                 explicit_t_cut=explicit_t_cut,
             )
+
+
+def test_locked_schedule_rejects_report_manifest_or_self_digest_tampering(tmp_path: Path) -> None:
+    schedule_path, config = _write_locked_schedule_fixture(tmp_path)
+    report_path = Path(config["semigroup_report"])
+    sample_manifest = Path(config["sample_id_manifest"])
+
+    report_path.write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="semigroup report SHA256"):
+        resolve_locked_schedule(config, checkpoint_sha256="a" * 64)
+
+    schedule_path, config = _write_locked_schedule_fixture(tmp_path)
+    sample_manifest.write_text('{"sample_id":"replacement"}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="sample manifest SHA256"):
+        resolve_locked_schedule(config, checkpoint_sha256="a" * 64)
+
+    schedule_path, config = _write_locked_schedule_fixture(tmp_path)
+    payload = json.loads(schedule_path.read_text(encoding="utf-8"))
+    payload["guided_times"][1] = 0.7
+    _write_json(schedule_path, payload)
+    with pytest.raises(ValueError, match="schedule contract SHA256"):
+        resolve_locked_schedule(config, checkpoint_sha256="a" * 64)
 
 
 def test_asset_contract_locks_all_r8_assets_features_and_input_manifest(

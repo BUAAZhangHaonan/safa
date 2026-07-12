@@ -11,6 +11,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CHECKPOINT_SHA256 = "4690717781db58a6021d57d124300a9b212f0a5043cf3028fb5de4d9c835cc4d"
 SAMPLE_DIGEST = "a" * 64
+SCHEDULE_FILE_SHA256 = "d" * 64
+SCHEDULE_CONTRACT_SHA256 = "e" * 64
 
 
 def _load_script(name: str):
@@ -50,10 +52,22 @@ def _generation(
         "nfe": {"candidate": 5, "matched_native": 1},
         "timing": {"images_per_second": 1.25, "wall_seconds": 51.2},
         "max_memory": {"allocated_bytes": 10_000, "reserved_bytes": 20_000},
+        "schedule": {
+            "manifest": "artifacts/r8_meanflow_flow_map_guidance/semigroup/locked_schedule_manifest.json",
+            "manifest_sha256": SCHEDULE_FILE_SHA256,
+            "schedule_contract_sha256": SCHEDULE_CONTRACT_SHA256,
+            "checkpoint_sha256": CHECKPOINT_SHA256,
+            "t_cut": 0.25,
+            "guided_times": [1.0, 0.75, 0.5, 0.25],
+            "unguided_times": [0.25, 0.125, 0.0],
+            "gate_passed": True,
+        },
         "config": {
             "experiment_name": "arm",
             "sampling_seed": 1337,
             "checkpoint_sha256": CHECKPOINT_SHA256,
+            "t_cut": 0.25,
+            "schedule_manifest": "artifacts/r8_meanflow_flow_map_guidance/semigroup/locked_schedule_manifest.json",
             "heldout_e1_checkpoint": "metadata-only-e1.pt",
             "heldout_e2_checkpoint": "metadata-only-e2.pt",
         },
@@ -194,6 +208,22 @@ def test_calibration_winner_order_is_deterministic() -> None:
         module.select_calibration_winner(
             [module.validate_calibration_arm("failed", _generation(e0=0.50), _quality(), _review())]
         )
+
+
+def test_calibration_selection_locks_fmrg_tcut_and_schedule_digests() -> None:
+    module = _load_script("summarize_r8_meanflow_guidance")
+    row = module.validate_calibration_arm("official", _generation(), _quality(), _review())
+
+    selection = module.select_calibration_winner([row])
+
+    assert selection["winner"]["t_cut"] == 0.25
+    assert selection["winner"]["schedule_manifest_sha256"] == SCHEDULE_FILE_SHA256
+    assert selection["winner"]["schedule_contract_sha256"] == SCHEDULE_CONTRACT_SHA256
+
+    missing = _generation()
+    missing.pop("schedule")
+    with pytest.raises(ValueError, match="schedule"):
+        module.validate_calibration_arm("official", missing, _quality(), _review())
 
 
 def test_calibration_selection_rejects_cross_arm_sample_membership_mismatch() -> None:
