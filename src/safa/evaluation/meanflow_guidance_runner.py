@@ -38,6 +38,7 @@ EXPECTED_VAE_PATH = "artifacts/checkpoints/external/sd-vae-ft-ema"
 EXPECTED_VAE_SCALING_FACTOR = 0.18215
 EXPECTED_STAGE = "stage2"
 EXPECTED_STAGE_EPOCH = 1652
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 EXPECTED_MODEL_CONFIG: dict[str, Any] = {
     "model_type": "meanflow_sit",
     "sit_patch_size": 4,
@@ -232,6 +233,156 @@ def validate_guidance_config(config: Mapping[str, Any]) -> dict[str, Any]:
         if field in resolved and resolved[field] != expected:
             raise ValueError(f"guidance config {field} must be {expected!r}, got {resolved[field]!r}")
     return resolved
+
+
+def _prepare_sharded_guidance_config(
+    config: Mapping[str, Any],
+    *,
+    shard_index: int,
+    num_shards: int,
+) -> dict[str, Any]:
+    _validate_shard_coordinates(shard_index, num_shards)
+    cache_path, allowed_roots = _resolve_asset_digest_cache(config, num_shards=num_shards)
+    resolved = validate_guidance_config(config)
+    if cache_path is None:
+        return resolved
+    resolved["asset_digest_cache"] = str(cache_path)
+    explicit_root = config.get("asset_digest_cache_root")
+    if explicit_root:
+        resolved["asset_digest_cache_root"] = str(
+            _repository_relative_candidate(explicit_root).resolve(strict=False)
+        )
+    if num_shards > 1:
+        _register_shard_asset_cache_contract(
+            resolved,
+            cache_path=cache_path,
+            allowed_roots=allowed_roots,
+            shard_index=shard_index,
+            num_shards=num_shards,
+        )
+    return resolved
+
+
+def _validate_shard_coordinates(shard_index: int, num_shards: int) -> None:
+    if isinstance(num_shards, bool) or not isinstance(num_shards, int) or num_shards <= 0:
+        raise ValueError(f"num_shards must be a positive integer, got {num_shards!r}")
+    if (
+        isinstance(shard_index, bool)
+        or not isinstance(shard_index, int)
+        or not 0 <= shard_index < num_shards
+    ):
+        raise ValueError(f"shard_index must be in [0,{num_shards}), got {shard_index!r}")
+
+
+def _resolve_asset_digest_cache(
+    config: Mapping[str, Any], *, num_shards: int
+) -> tuple[Path | None, tuple[Path, ...]]:
+    cache_value = config.get("asset_digest_cache")
+    if not cache_value or not str(cache_value).strip():
+        if num_shards > 1:
+            raise ValueError("num_shards > 1 requires a non-empty shared asset_digest_cache")
+        return None, (REPOSITORY_ROOT,)
+
+    repository_root = REPOSITORY_ROOT.resolve()
+    allowed_roots = [repository_root]
+    explicit_root_value = config.get("asset_digest_cache_root")
+    if explicit_root_value:
+        explicit_root = _repository_relative_candidate(explicit_root_value)
+        if explicit_root.is_symlink():
+            raise ValueError(f"asset_digest_cache_root must not be a symlink: {explicit_root}")
+        if explicit_root.exists() and not explicit_root.is_dir():
+            raise ValueError(f"asset_digest_cache_root must be a directory: {explicit_root}")
+        allowed_roots.append(explicit_root.resolve(strict=False))
+
+    cache_candidate = _repository_relative_candidate(cache_value)
+    _require_asset_cache_target(cache_candidate, tuple(allowed_roots), "asset_digest_cache")
+    cache_path = cache_candidate.resolve(strict=False)
+    if cache_path.exists() and not cache_path.is_file():
+        raise ValueError(f"asset_digest_cache must be a file path: {cache_path}")
+    return cache_path, tuple(allowed_roots)
+
+
+def _repository_relative_candidate(value: Any) -> Path:
+    path = Path(str(value))
+    if not path.is_absolute():
+        path = REPOSITORY_ROOT / path
+    return Path(os.path.abspath(path))
+
+
+def _require_asset_cache_target(path: Path, allowed_roots: Sequence[Path], label: str) -> None:
+    if path.is_symlink():
+        raise ValueError(f"{label} must not be a symlink: {path}")
+    resolved = path.resolve(strict=False)
+    matched_root = None
+    for root in allowed_roots:
+        root_resolved = root.resolve(strict=False)
+        try:
+            resolved.relative_to(root_resolved)
+        except ValueError:
+            continue
+        matched_root = root_resolved
+        break
+    if matched_root is None:
+        raise ValueError(f"{label} must be inside the repository or an explicitly allowed root")
+
+    relative = resolved.relative_to(matched_root)
+    cursor = matched_root
+    if cursor.is_symlink():
+        raise ValueError(f"{label} allowed root must not be a symlink: {cursor}")
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise ValueError(f"{label} contains a symlink path component: {cursor}")
+
+
+def _register_shard_asset_cache_contract(
+    config: Mapping[str, Any],
+    *,
+    cache_path: Path,
+    allowed_roots: Sequence[Path],
+    shard_index: int,
+    num_shards: int,
+) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    contract_path = cache_path.with_name(f"{cache_path.name}.shards.json")
+    lock_path = cache_path.with_name(f"{cache_path.name}.lock")
+    for path, label in (
+        (cache_path, "asset_digest_cache"),
+        (contract_path, "shard asset cache contract"),
+        (lock_path, "asset digest cache lock"),
+    ):
+        _require_asset_cache_target(path, allowed_roots, label)
+
+    contract = {
+        "num_shards": int(num_shards),
+        "config": _json_safe(dict(config)),
+    }
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            if contract_path.exists():
+                payload = _read_json_mapping(contract_path, "shard asset cache contract")
+                if payload.get("contract") != contract:
+                    raise ValueError("existing shard asset cache contract disagrees")
+                registered = payload.get("registered_shards")
+                if not isinstance(registered, list):
+                    raise ValueError("invalid shard asset cache contract registrations")
+                registered_shards = {int(value) for value in registered}
+                if any(not 0 <= value < num_shards for value in registered_shards):
+                    raise ValueError("invalid shard asset cache contract registrations")
+            else:
+                registered_shards = set()
+            registered_shards.add(int(shard_index))
+            _atomic_write_json(
+                contract_path,
+                {
+                    "schema_version": 1,
+                    "contract": contract,
+                    "registered_shards": sorted(registered_shards),
+                },
+            )
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def asset_contract_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -1101,7 +1252,11 @@ def run_guidance_from_config(
     _require_contained(output, completion_path, "completion marker")
     if completion_path.exists():
         raise FileExistsError(f"refusing to replace completed output: {completion_path}")
-    resolved = validate_guidance_config(config)
+    resolved = _prepare_sharded_guidance_config(
+        config,
+        shard_index=shard_index,
+        num_shards=num_shards,
+    )
     from safa.data.feature_dataset import FeatureAlignedAffectNet
     from safa.training.transforms import generator_image_transform
     from safa.utils.device import require_cuda_device

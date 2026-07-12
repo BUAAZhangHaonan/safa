@@ -334,6 +334,91 @@ def test_completion_marker_is_checked_before_config_validation_or_asset_hashing(
         run_guidance_from_config({}, output_dir=output)
 
 
+def test_multishard_requires_cache_before_hash_or_nfe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hash_calls = 0
+    nfe_calls = 0
+
+    def counted_hash(config):
+        nonlocal hash_calls
+        hash_calls += 1
+        return config
+
+    def counted_nfe(**kwargs):
+        nonlocal nfe_calls
+        nfe_calls += 1
+        return kwargs
+
+    monkeypatch.setattr(runner_module, "asset_contract_from_config", counted_hash)
+    monkeypatch.setattr(runner_module, "execute_guidance_mode", counted_nfe)
+    config = {**_r8_guidance_config(), "device": "cuda:0"}
+
+    with pytest.raises(ValueError, match="asset_digest_cache"):
+        run_guidance_from_config(
+            config,
+            output_dir=tmp_path / "shard-0",
+            shard_index=0,
+            num_shards=4,
+        )
+
+    assert hash_calls == 0
+    assert nfe_calls == 0
+
+
+def test_shared_cache_must_be_in_repo_or_explicit_asset_root(tmp_path: Path) -> None:
+    outside_cache = tmp_path / "cache" / "digests.json"
+    config = {**_r8_guidance_config(), "asset_digest_cache": str(outside_cache)}
+
+    with pytest.raises(ValueError, match="allowed.*root"):
+        runner_module._prepare_sharded_guidance_config(config, shard_index=0, num_shards=4)
+
+    resolved = runner_module._prepare_sharded_guidance_config(
+        {**config, "asset_digest_cache_root": str(tmp_path)},
+        shard_index=0,
+        num_shards=4,
+    )
+    assert resolved["asset_digest_cache"] == str(outside_cache.resolve())
+
+
+def test_four_shards_share_one_exact_cache_contract(tmp_path: Path) -> None:
+    cache = tmp_path / "shared" / "digests.json"
+    config = {
+        **_r8_guidance_config(),
+        "asset_digest_cache": str(cache),
+        "asset_digest_cache_root": str(tmp_path),
+    }
+
+    for shard_index in range(4):
+        runner_module._prepare_sharded_guidance_config(
+            config,
+            shard_index=shard_index,
+            num_shards=4,
+        )
+
+    contract_path = cache.with_name(f"{cache.name}.shards.json")
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    assert contract["registered_shards"] == [0, 1, 2, 3]
+    assert contract["contract"]["num_shards"] == 4
+
+    with pytest.raises(ValueError, match="shard asset cache contract"):
+        runner_module._prepare_sharded_guidance_config(
+            {**config, "sampling_seed": 1338},
+            shard_index=3,
+            num_shards=4,
+        )
+
+
+def test_single_shard_does_not_require_asset_digest_cache() -> None:
+    resolved = runner_module._prepare_sharded_guidance_config(
+        _r8_guidance_config(),
+        shard_index=0,
+        num_shards=1,
+    )
+
+    assert "asset_digest_cache" not in resolved
+
+
 class _DifferentiableVAE(nn.Module):
     def __init__(self) -> None:
         super().__init__()
