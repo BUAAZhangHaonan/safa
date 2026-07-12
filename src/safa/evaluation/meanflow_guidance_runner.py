@@ -26,6 +26,10 @@ from safa.guidance.meanflow_flow_map import (
     semigroup_probe,
 )
 from safa.training.losses import normalize_for_e0
+from safa.evaluation.r8_arm_contracts import (
+    canonical_arm_config_digest,
+    require_arm_config_digest,
+)
 from safa.utils.sampling import make_x_init_for_sample_ids
 
 
@@ -616,12 +620,21 @@ def resolve_locked_schedule(
     )
     if _digest_path(report_path) != report_sha256:
         raise ValueError("locked semigroup report SHA256 does not match the report file")
-    sample_manifest_path = _locked_path_binding(config, manifest, "sample_id_manifest")
-    sample_manifest_sha256 = _require_sha256(
-        manifest.get("sample_id_manifest_sha256"), "sample_id_manifest_sha256"
+    sample_manifest_path = _locked_path_binding(
+        config, manifest, "semigroup_sample_id_manifest"
     )
+    sample_manifest_sha256 = _require_sha256(
+        manifest.get("semigroup_sample_id_manifest_sha256"),
+        "semigroup_sample_id_manifest_sha256",
+    )
+    config_semigroup_sha256 = _require_sha256(
+        config.get("semigroup_sample_id_manifest_sha256"),
+        "config semigroup_sample_id_manifest_sha256",
+    )
+    if config_semigroup_sha256 != sample_manifest_sha256:
+        raise ValueError("config semigroup sample manifest SHA256 disagrees with locked schedule")
     if _digest_path(sample_manifest_path) != sample_manifest_sha256:
-        raise ValueError("locked sample manifest SHA256 does not match the manifest file")
+        raise ValueError("locked semigroup sample manifest SHA256 does not match the manifest file")
     return {
         "manifest": str(manifest_path),
         "manifest_sha256": _digest_path(manifest_path),
@@ -629,13 +642,25 @@ def resolve_locked_schedule(
         "checkpoint_sha256": checkpoint_sha256,
         "semigroup_report": str(report_path),
         "semigroup_report_sha256": report_sha256,
-        "sample_id_manifest": str(sample_manifest_path),
-        "sample_id_manifest_sha256": sample_manifest_sha256,
+        "semigroup_sample_id_manifest": str(sample_manifest_path),
+        "semigroup_sample_id_manifest_sha256": sample_manifest_sha256,
         "t_cut": t_cut,
         "guided_times": guided,
         "unguided_times": unguided,
         "gate_passed": True,
     }
+
+
+def _bind_arm_config_digest(config: Mapping[str, Any]) -> dict[str, Any]:
+    resolved = dict(config)
+    computed = canonical_arm_config_digest(resolved)
+    declared = resolved.get("arm_config_sha256")
+    if declared is not None and require_arm_config_digest(declared) != computed:
+        raise ValueError(
+            "declared arm config SHA256 disagrees with the canonical algorithm/asset contract"
+        )
+    resolved["arm_config_sha256"] = computed
+    return resolved
 
 
 def _schedule_contract_sha256(payload: Mapping[str, Any]) -> str:
@@ -832,6 +857,7 @@ def run_guidance_records(
     resolved_config = dict(config)
     resolved_config["mode"] = mode
     resolved_config.pop("route", None)
+    resolved_config = _bind_arm_config_digest(resolved_config)
     generated_dir = output / "generated_images"
     native_dir = output / "native_images"
     per_sample_path = output / "per_sample.jsonl"
@@ -933,6 +959,7 @@ def run_guidance_records(
         "seed": int(resolved_config.get("sampling_seed", resolved_config.get("seed", 0))),
         "schedule": resolved_config.get("locked_schedule"),
         "mode": mode,
+        "arm_config_sha256": resolved_config["arm_config_sha256"],
         "config": resolved_config,
         "sample_id_sha256": _sample_id_digest(expected_ids),
         "shard": {
@@ -1267,6 +1294,7 @@ def run_guidance_records(
         "schema_version": 1,
         "status": "complete",
         "mode": mode,
+        "arm_config_sha256": resolved_config["arm_config_sha256"],
         "checkpoint": {
             "path": str(runtime.checkpoint_path),
             "sha256": runtime.checkpoint_sha256,
@@ -1315,6 +1343,7 @@ def run_guidance_records(
             "status": "complete",
             "sample_count": len(expected_ids),
             "sample_id_sha256": _sample_id_digest(expected_ids),
+            "arm_config_sha256": resolved_config["arm_config_sha256"],
             "generation_result": str(generation_result_path),
             "run_manifest": str(run_manifest_path),
         },
@@ -1370,6 +1399,7 @@ def run_guidance_from_config(
         )
         _validate_semigroup_gate(resolved, checkpoint_sha256, schedule["t_cut"])
         resolved["locked_schedule"] = schedule
+    resolved = _bind_arm_config_digest(resolved)
     dataset = FeatureAlignedAffectNet(
         resolved["index"],
         resolved["features"],
@@ -1455,6 +1485,7 @@ def _preflight_existing_resume_contract(
         "input_sample_manifest": asset_contract["sample_manifest"],
         "heldout_e1": asset_contract["heldout_e1"],
         "heldout_e2": asset_contract["heldout_e2"],
+        "arm_config_sha256": config["arm_config_sha256"],
         "seed": int(config["sampling_seed"]),
         "schedule": config.get("locked_schedule"),
         "mode": config["mode"],
@@ -1480,6 +1511,7 @@ def _preflight_existing_resume_contract(
         "input_sample_manifest": existing.get("input_sample_manifest"),
         "heldout_e1": existing.get("heldout_e1"),
         "heldout_e2": existing.get("heldout_e2"),
+        "arm_config_sha256": existing.get("arm_config_sha256"),
         "seed": existing.get("seed"),
         "schedule": existing.get("schedule"),
         "mode": existing.get("mode"),

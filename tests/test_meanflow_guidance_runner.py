@@ -36,6 +36,7 @@ from safa.evaluation.meanflow_guidance_runner import (  # noqa: E402
     validate_guidance_config,
 )
 from safa.evaluation import meanflow_guidance_runner as runner_module  # noqa: E402
+from safa.evaluation.r8_arm_contracts import canonical_arm_config_digest  # noqa: E402
 from safa.guidance.meanflow_flow_map import freeze_guidance_stack  # noqa: E402
 from safa.training.latent_codec import LatentCodec, LatentCodecConfig  # noqa: E402
 from safa.training.losses import normalize_for_e0  # noqa: E402
@@ -231,8 +232,10 @@ def _schedule_contract_sha256(payload: dict) -> str:
 
 
 def _write_locked_schedule_fixture(tmp_path: Path) -> tuple[Path, dict]:
-    sample_manifest = tmp_path / "sample_ids.jsonl"
+    sample_manifest = tmp_path / "semigroup_sample_ids.jsonl"
     _write_jsonl(sample_manifest, [{"sample_id": "sample-0"}])
+    current_manifest = tmp_path / "current_generation_sample_ids.jsonl"
+    _write_jsonl(current_manifest, [{"sample_id": "full-0"}, {"sample_id": "full-1"}])
     report_path = tmp_path / "semigroup_gate.json"
     report = {
         "gate_passed": True,
@@ -247,8 +250,8 @@ def _write_locked_schedule_fixture(tmp_path: Path) -> tuple[Path, dict]:
         "checkpoint_sha256": "a" * 64,
         "semigroup_report": str(report_path),
         "semigroup_report_sha256": _file_sha256(report_path),
-        "sample_id_manifest": str(sample_manifest),
-        "sample_id_manifest_sha256": _file_sha256(sample_manifest),
+        "semigroup_sample_id_manifest": str(sample_manifest),
+        "semigroup_sample_id_manifest_sha256": _file_sha256(sample_manifest),
         "t_cut": 0.25,
         "guided_steps": 3,
         "guided_times": [1.0, 0.75, 0.5, 0.25],
@@ -262,7 +265,9 @@ def _write_locked_schedule_fixture(tmp_path: Path) -> tuple[Path, dict]:
         "t_cut": 0.25,
         "schedule_manifest": str(schedule_path),
         "semigroup_report": str(report_path),
-        "sample_id_manifest": str(sample_manifest),
+        "semigroup_sample_id_manifest": str(sample_manifest),
+        "semigroup_sample_id_manifest_sha256": _file_sha256(sample_manifest),
+        "sample_id_manifest": str(current_manifest),
     }
     return schedule_path, config
 
@@ -277,6 +282,9 @@ def test_locked_schedule_is_uniform_and_rejects_t_cut_or_hash_disagreement(tmp_p
 
     assert schedule["guided_times"] == [1.0, 0.75, 0.5, 0.25]
     assert schedule["unguided_times"] == [0.25, 0.125, 0.0]
+    assert schedule["semigroup_sample_id_manifest"] == config[
+        "semigroup_sample_id_manifest"
+    ]
     for config_t_cut, explicit_t_cut, checkpoint_hash, message in (
         (0.5, 0.25, "a" * 64, "t_cut"),
         (0.25, 0.5, "a" * 64, "t_cut"),
@@ -293,7 +301,7 @@ def test_locked_schedule_is_uniform_and_rejects_t_cut_or_hash_disagreement(tmp_p
 def test_locked_schedule_rejects_report_manifest_or_self_digest_tampering(tmp_path: Path) -> None:
     schedule_path, config = _write_locked_schedule_fixture(tmp_path)
     report_path = Path(config["semigroup_report"])
-    sample_manifest = Path(config["sample_id_manifest"])
+    sample_manifest = Path(config["semigroup_sample_id_manifest"])
 
     report_path.write_text("{}", encoding="utf-8")
     with pytest.raises(ValueError, match="semigroup report SHA256"):
@@ -809,6 +817,12 @@ def test_runner_writes_bound_rows_generation_result_and_prevents_overwrite(tmp_p
     assert all(Path(row["generated"]).is_file() for row in rows)
     assert manifest["checkpoint"]["sha256"] == "c" * 64
     assert manifest["checkpoint"]["weight_source"] == "ema_model_state_dict"
+    assert manifest["arm_config_sha256"] == canonical_arm_config_digest(config)
+    assert manifest["resume_contract"]["arm_config_sha256"] == manifest[
+        "arm_config_sha256"
+    ]
+    completion = json.loads((output_dir / "completion.json").read_text())
+    assert completion["arm_config_sha256"] == manifest["arm_config_sha256"]
     assert manifest["nfe"] == {"candidate": 1, "matched_native": 1}
     assert manifest["resume_contract"]["target_features"]["digest"] == "4" * 64
     assert manifest["resume_contract"]["input_sample_manifest"]["sha256"] == "5" * 64

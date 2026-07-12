@@ -7,6 +7,8 @@ import sys
 
 import pytest
 
+from safa.evaluation.r8_arm_contracts import canonical_arm_config_digest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CHECKPOINT_SHA256 = "4690717781db58a6021d57d124300a9b212f0a5043cf3028fb5de4d9c835cc4d"
@@ -36,7 +38,7 @@ def _generation(
     edev: float = 0.62,
     native_edev: float = 0.60,
 ) -> dict:
-    return {
+    payload = {
         "status": "complete",
         "mode": "official_head_current_xt",
         "checkpoint": {"sha256": CHECKPOINT_SHA256},
@@ -64,6 +66,7 @@ def _generation(
         },
         "config": {
             "experiment_name": "arm",
+            "mode": "official_head_current_xt",
             "sampling_seed": 1337,
             "checkpoint_sha256": CHECKPOINT_SHA256,
             "t_cut": 0.25,
@@ -72,6 +75,13 @@ def _generation(
             "heldout_e2_checkpoint": "metadata-only-e2.pt",
         },
     }
+    payload["arm_config_sha256"] = canonical_arm_config_digest(
+        {
+            **payload["config"],
+            "schedule_contract_sha256": SCHEDULE_CONTRACT_SHA256,
+        }
+    )
+    return payload
 
 
 def _quality(*, fid: float = 50.0, sharpness: float = 310.0) -> dict:
@@ -219,6 +229,12 @@ def test_calibration_selection_locks_fmrg_tcut_and_schedule_digests() -> None:
     assert selection["winner"]["t_cut"] == 0.25
     assert selection["winner"]["schedule_manifest_sha256"] == SCHEDULE_FILE_SHA256
     assert selection["winner"]["schedule_contract_sha256"] == SCHEDULE_CONTRACT_SHA256
+    assert selection["winner"]["arm_config_sha256"] == module.canonical_arm_config_digest(
+        {
+            **_generation()["config"],
+            "schedule_contract_sha256": SCHEDULE_CONTRACT_SHA256,
+        }
+    )
 
     missing = _generation()
     missing.pop("schedule")
@@ -364,7 +380,11 @@ def test_heldout_contract_requires_locked_winner_exact_manifests_and_one_shot_ma
 ) -> None:
     module = _load_script("eval_r8_heldout_encoders")
     selection = {
-        "winner": {"arm_id": "winner", "config_sha256": "c" * 64},
+        "winner": {
+            "arm_id": "winner",
+            "config_sha256": "c" * 64,
+            "arm_config_sha256": "a" * 64,
+        },
         "winner_locked_before_heldout": True,
         "checkpoint_sha256": CHECKPOINT_SHA256,
         "full_sample_count": 2048,
@@ -387,6 +407,7 @@ def test_heldout_contract_requires_locked_winner_exact_manifests_and_one_shot_ma
     contract = module.validate_heldout_contract(selection, native, winner)
     assert contract["sample_count"] == 2048
     assert contract["contract_sha256"] == module._contract_sha256(contract)
+    assert contract["winner_arm_config_sha256"] == "a" * 64
 
     marker = tmp_path / "heldout_protocol_marker.json"
     claimed = module.claim_protocol_marker(marker, contract)
@@ -430,3 +451,57 @@ def test_heldout_refuses_an_old_result_even_without_a_marker(tmp_path: Path) -> 
 
     with pytest.raises(FileExistsError, match="stale"):
         module.evaluate_heldout(tmp_path, device="cpu", batch_size=1)
+
+
+@pytest.mark.parametrize(("field", "old_value"), [("step_size", 3.0), ("eta", 0.5)])
+def test_heldout_does_not_start_for_old_same_mode_winner_completion(
+    tmp_path: Path, field: str, old_value: float
+) -> None:
+    module = _load_script("eval_r8_heldout_encoders")
+    locked_config = {
+        "mode": "official_head_current_xt",
+        "sample_mode": "flow_map1",
+        "optimization_mode": "official_adam",
+        "step_size": 1.0,
+        "eta": 0.25,
+        "num_optim_iters": 1,
+        "t_cut": 0.25,
+        "schedule_contract_sha256": "9" * 64,
+    }
+    locked_digest = module.canonical_arm_config_digest(locked_config)
+    old_digest = module.canonical_arm_config_digest({**locked_config, field: old_value})
+    (tmp_path / "selection.json").write_text(
+        json.dumps(
+            {
+                "winner": {
+                    "arm_id": "winner",
+                    "config_sha256": "c" * 64,
+                    "arm_config_sha256": locked_digest,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    finalization = tmp_path / "full/finalization_completion.json"
+    finalization.parent.mkdir(parents=True)
+    finalization.write_text(json.dumps({"status": "complete"}), encoding="utf-8")
+    winner_root = tmp_path / "full/merged/winner"
+    winner_root.mkdir(parents=True)
+    (winner_root / "completion.json").write_text(
+        json.dumps({"status": "complete", "arm_config_sha256": old_digest}),
+        encoding="utf-8",
+    )
+    (winner_root / "generation_result.json").write_text(
+        json.dumps(
+            {
+                "status": "complete",
+                "arm_config_sha256": old_digest,
+                "config": {**locked_config, field: old_value},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="locked winner arm config"):
+        module.evaluate_heldout(tmp_path, device="cpu", batch_size=1)
+    assert not (tmp_path / "heldout_protocol_marker.json").exists()

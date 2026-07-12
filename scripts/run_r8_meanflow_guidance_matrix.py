@@ -19,6 +19,10 @@ from typing import Any, Mapping, Sequence
 import yaml
 
 from safa.evaluation.meanflow_guidance_runner import validate_guidance_config
+from safa.evaluation.r8_arm_contracts import (
+    canonical_arm_config_digest,
+    require_arm_config_digest,
+)
 from safa.evaluation.r8_visual_evidence import (
     build_visual_evidence_contract,
     validate_visual_review_arm,
@@ -554,7 +558,7 @@ def validate_artifact_paths(plan: MatrixPlan) -> None:
         if not output.exists():
             continue
         if run.family == "full_native_winner":
-            _validate_full_shard_root(output, run)
+            _validate_full_shard_root(output, run, plan)
             continue
         if (output / "resume_contract.json").is_file() or (output / "completion.json").is_file():
             continue
@@ -564,7 +568,7 @@ def validate_artifact_paths(plan: MatrixPlan) -> None:
         raise FileExistsError(f"refusing to overwrite existing R8 output directory: {output}")
 
 
-def _validate_full_shard_root(output: Path, run: RunContract) -> None:
+def _validate_full_shard_root(output: Path, run: RunContract, plan: MatrixPlan) -> None:
     if not output.is_dir():
         raise FileExistsError(f"full shard output is not a directory: {output}")
     unexpected = sorted(path.name for path in output.iterdir() if path.name not in {"native", "winner"})
@@ -584,6 +588,11 @@ def _validate_full_shard_root(output: Path, run: RunContract) -> None:
             completion = _read_json(completion_path, "full shard completion")
             if completion.get("status") != "complete":
                 raise ValueError(f"full shard completion is not complete: {completion_path}")
+            expected_arm_digest = _full_arm_config_digest(plan, arm_id)
+            if completion.get("arm_config_sha256") != expected_arm_digest:
+                raise ValueError(
+                    f"full {arm_id} completion disagrees with the locked winner arm config"
+                )
         if resume_path.is_file():
             resume = _read_json(resume_path, "full shard resume contract")
             shard = resume.get("shard")
@@ -594,6 +603,21 @@ def _validate_full_shard_root(output: Path, run: RunContract) -> None:
             expected_mode = "native" if arm_id == "native" else None
             if expected_mode is not None and resume.get("mode") != expected_mode:
                 raise ValueError(f"full native resume contract has the wrong mode: {resume_path}")
+            if resume.get("arm_config_sha256") != _full_arm_config_digest(plan, arm_id):
+                raise ValueError(
+                    f"full {arm_id} resume disagrees with the locked winner arm config"
+                )
+
+
+def _full_arm_config_digest(plan: MatrixPlan, arm_id: str) -> str:
+    if arm_id == "winner":
+        if plan.full_contract is None:
+            raise ValueError("full winner requires a locked full contract")
+        return require_arm_config_digest(
+            plan.full_contract["winner"].get("arm_config_sha256"),
+            "winner arm config SHA256",
+        )
+    return canonical_arm_config_digest(_load_yaml(plan.repo_root / NATIVE_CONFIG))
 
 
 def query_gpu_states() -> dict[int, GpuState]:
@@ -1033,6 +1057,7 @@ def load_full_contract(selection_path: Path, visual_review_path: Path) -> dict[s
     if not isinstance(winner, Mapping) or not winner.get("config"):
         raise ValueError("selection must contain a locked winner config")
     _require_sha256(winner.get("config_sha256"), "winner config SHA256")
+    require_arm_config_digest(winner.get("arm_config_sha256"), "winner arm config SHA256")
     manifest_count = int(selection.get("full_sample_count", 2048))
     manifest_sha = str(selection.get("full_sample_id_manifest_sha256", FULL_MANIFEST_SHA256))
     return {
@@ -1174,6 +1199,7 @@ def _validate_full_contract(contract: Mapping[str, Any]) -> None:
     winner = contract.get("winner")
     if not isinstance(winner, Mapping) or not winner.get("config"):
         raise ValueError("full phase requires a locked winner config")
+    require_arm_config_digest(winner.get("arm_config_sha256"), "winner arm config SHA256")
     visual = contract.get("visual_review")
     if not isinstance(visual, Mapping) or int(visual.get("reviewed_sample_count", -1)) != 64:
         raise ValueError("full phase requires a 64-sample visual review")
@@ -1225,12 +1251,17 @@ def materialize_full_runtime_configs(plan: MatrixPlan) -> None:
     winner_contract = plan.full_contract["winner"]
     winner_path = Path(str(winner_contract["config"]))
     winner_source = _resolve(plan.repo_root, winner_path)
+    expected_arm_config_sha256 = require_arm_config_digest(
+        winner_contract.get("arm_config_sha256"), "winner arm config SHA256"
+    )
     expected_config_sha = winner_contract.get("config_sha256")
     if expected_config_sha is not None and _sha256_file(winner_source) != _require_sha256(
         expected_config_sha, "winner config SHA256"
     ):
         raise ValueError("locked winner config SHA256 disagrees with the selection contract")
     winner = _load_yaml(winner_source)
+    if canonical_arm_config_digest(winner) != expected_arm_config_sha256:
+        raise ValueError("locked winner canonical arm config SHA256 disagrees with selection")
     if _winner_is_fmrg(plan.full_contract):
         schedule_path = _resolve(plan.repo_root, Path(str(winner_contract["schedule_manifest"])))
         expected_schedule_sha = _require_sha256(
@@ -1257,6 +1288,13 @@ def materialize_full_runtime_configs(plan: MatrixPlan) -> None:
                 "t_cut": t_cut,
                 "schedule_manifest": str(SCHEDULE_MANIFEST),
                 "semigroup_report": str(SEMIGROUP_GATE),
+                "semigroup_sample_id_manifest": schedule[
+                    "semigroup_sample_id_manifest"
+                ],
+                "semigroup_sample_id_manifest_sha256": schedule[
+                    "semigroup_sample_id_manifest_sha256"
+                ],
+                "schedule_contract_sha256": schedule_contract_sha,
             }
         )
     runtime_dir = plan.repo_root / ROOT / "full/runtime_configs"
@@ -1272,6 +1310,10 @@ def materialize_full_runtime_configs(plan: MatrixPlan) -> None:
                 "contact_sheets": False,
             }
         )
+        arm_config_sha256 = canonical_arm_config_digest(resolved)
+        if arm_id == "winner" and arm_config_sha256 != expected_arm_config_sha256:
+            raise ValueError("full runtime winner arm config SHA256 changed during materialization")
+        resolved["arm_config_sha256"] = arm_config_sha256
         validate_guidance_config(resolved)
         _write_locked_text(
             runtime_dir / f"{arm_id}.yaml",
@@ -1400,7 +1442,12 @@ def finalize_full_outputs(plan: MatrixPlan) -> int:
     arm_completions: dict[str, Mapping[str, Any]] = {}
     for arm_id in ("native", "winner"):
         combined = plan.repo_root / ROOT / f"full/merged/{arm_id}"
-        arm_completions[arm_id] = _merge_full_arm(plan.repo_root, arm_id, combined)
+        arm_completions[arm_id] = _merge_full_arm(
+            plan.repo_root,
+            arm_id,
+            combined,
+            expected_arm_config_sha256=_full_arm_config_digest(plan, arm_id),
+        )
         quality_path = combined / "quality.json"
         if not quality_path.is_file():
             command = build_quality_command(
@@ -1431,6 +1478,7 @@ def finalize_full_outputs(plan: MatrixPlan) -> int:
         "arms": {
             arm_id: {
                 "merge_contract_sha256": arm_completions[arm_id]["merge_contract_sha256"],
+                "arm_config_sha256": arm_completions[arm_id]["arm_config_sha256"],
                 "quality_sha256": _sha256_file(
                     plan.repo_root / ROOT / f"full/merged/{arm_id}/quality.json"
                 ),
@@ -1499,7 +1547,16 @@ def _build_full_visual_evidence(plan: MatrixPlan) -> dict[str, Any]:
     return payload
 
 
-def _merge_full_arm(repo_root: Path, arm_id: str, combined: Path) -> dict[str, Any]:
+def _merge_full_arm(
+    repo_root: Path,
+    arm_id: str,
+    combined: Path,
+    *,
+    expected_arm_config_sha256: str,
+) -> dict[str, Any]:
+    expected_arm_config_sha256 = require_arm_config_digest(
+        expected_arm_config_sha256, f"full {arm_id} arm config SHA256"
+    )
     expected_ids = _read_manifest_ids(repo_root / FULL_MANIFEST)
     rows_by_id: dict[str, dict[str, Any]] = {}
     shard_contracts = []
@@ -1520,6 +1577,8 @@ def _merge_full_arm(repo_root: Path, arm_id: str, combined: Path) -> dict[str, A
             )
         if int(completion.get("sample_count", -1)) != len(shard_rows):
             raise ValueError(f"full {arm_id} shard {gpu} completion sample count disagrees")
+        if completion.get("arm_config_sha256") != expected_arm_config_sha256:
+            raise ValueError(f"full {arm_id} shard {gpu} locked arm config SHA256 disagrees")
         generation_path = shard_root / "generation_result.json"
         generation = _read_json(generation_path, f"full {arm_id} shard generation")
         if generation.get("status") != "complete" or generation.get("sample_count") != len(
@@ -1534,6 +1593,12 @@ def _merge_full_arm(repo_root: Path, arm_id: str, combined: Path) -> dict[str, A
         config = generation.get("config")
         if not isinstance(config, Mapping) or config.get("sampling_seed", config.get("seed")) != 1337:
             raise ValueError(f"full {arm_id} shard {gpu} sampling seed disagrees")
+        if config.get("mode") != generation.get("mode"):
+            raise ValueError(f"full {arm_id} shard {gpu} generation/config modes disagree")
+        if generation.get("arm_config_sha256") != expected_arm_config_sha256 or (
+            canonical_arm_config_digest(config) != expected_arm_config_sha256
+        ):
+            raise ValueError(f"full {arm_id} shard {gpu} canonical arm config SHA256 disagrees")
         generation_contracts.append(generation)
         shard_contracts.append(
             {
@@ -1576,6 +1641,7 @@ def _merge_full_arm(repo_root: Path, arm_id: str, combined: Path) -> dict[str, A
     merge_contract = {
         "schema_version": 1,
         "arm_id": arm_id,
+        "arm_config_sha256": expected_arm_config_sha256,
         "sample_count": len(expected_ids),
         "sample_id_manifest_sha256": _sha256_file(repo_root / FULL_MANIFEST),
         "ordered_sample_id_sha256": _sample_id_digest(expected_ids),
@@ -1619,6 +1685,7 @@ def _merge_full_arm(repo_root: Path, arm_id: str, combined: Path) -> dict[str, A
         "schema_version": 1,
         "status": "complete",
         "mode": first_generation["mode"],
+        "arm_config_sha256": expected_arm_config_sha256,
         "checkpoint": first_generation["checkpoint"],
         "sample_count": len(expected_ids),
         "sample_id_sha256": _sample_id_digest(expected_ids),
@@ -1638,6 +1705,7 @@ def _merge_full_arm(repo_root: Path, arm_id: str, combined: Path) -> dict[str, A
         "schema_version": 1,
         "status": "complete",
         "arm_id": arm_id,
+        "arm_config_sha256": expected_arm_config_sha256,
         "sample_count": len(expected_ids),
         "merge_contract_sha256": merge_contract["merge_contract_sha256"],
         "per_sample_sha256": hashlib.sha256(per_sample_content.encode("utf-8")).hexdigest(),
@@ -1687,8 +1755,13 @@ def _dry_run_gate() -> dict[str, Any]:
 
 
 def _dry_run_full_contract() -> dict[str, Any]:
+    config = _load_yaml(Path(__file__).resolve().parents[1] / NOISE_CONFIGS[0])
     return {
-        "winner": {"arm_id": "dry_run_winner", "config": str(NOISE_CONFIGS[0])},
+        "winner": {
+            "arm_id": "dry_run_winner",
+            "config": str(NOISE_CONFIGS[0]),
+            "arm_config_sha256": canonical_arm_config_digest(config),
+        },
         "visual_review": {"reviewed_sample_count": 64, "passed": True},
         "manifest_count": 2048,
         "manifest_sha256": FULL_MANIFEST_SHA256,
@@ -1732,8 +1805,8 @@ def _schedule_payload(
         "checkpoint_sha256": CHECKPOINT_SHA256,
         "semigroup_report": str(SEMIGROUP_GATE),
         "semigroup_report_sha256": semigroup_report_sha256,
-        "sample_id_manifest": str(report["sample_id_manifest"]),
-        "sample_id_manifest_sha256": report["sample_id_manifest_sha256"],
+        "semigroup_sample_id_manifest": str(report["sample_id_manifest"]),
+        "semigroup_sample_id_manifest_sha256": report["sample_id_manifest_sha256"],
         "t_cut": t_cut,
         "guided_steps": 3,
         "guided_times": guided,

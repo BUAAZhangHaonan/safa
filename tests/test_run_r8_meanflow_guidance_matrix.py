@@ -11,6 +11,9 @@ import time
 import pytest
 import yaml
 
+from safa.evaluation.meanflow_guidance_runner import resolve_locked_schedule
+from safa.evaluation.r8_arm_contracts import canonical_arm_config_digest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -361,7 +364,13 @@ def test_matrix_full_requires_2048_samples_and_visual_review(tmp_path: Path) -> 
 def test_matrix_full_shards_locked_native_and_winner_across_four_gpus() -> None:
     module = _load_script()
     contract = {
-        "winner": {"arm_id": "winner", "config": str(module.NOISE_CONFIGS[0])},
+        "winner": {
+            "arm_id": "winner",
+            "config": str(module.NOISE_CONFIGS[0]),
+            "arm_config_sha256": canonical_arm_config_digest(
+                yaml.safe_load((REPO_ROOT / module.NOISE_CONFIGS[0]).read_text())
+            ),
+        },
         "visual_review": {"reviewed_sample_count": 64, "passed": True},
         "manifest_count": 2048,
         "manifest_sha256": module.FULL_MANIFEST_SHA256,
@@ -508,6 +517,7 @@ def test_fmrg_full_plan_requires_and_uses_locked_tcut_and_schedule_digest() -> N
             "schedule_manifest": str(module.SCHEDULE_MANIFEST),
             "schedule_manifest_sha256": "d" * 64,
             "schedule_contract_sha256": "e" * 64,
+            "arm_config_sha256": "f" * 64,
         },
         "visual_review": {"reviewed_sample_count": 64, "passed": True},
         "manifest_count": 2048,
@@ -524,6 +534,112 @@ def test_fmrg_full_plan_requires_and_uses_locked_tcut_and_schedule_digest() -> N
     missing["winner"].pop("t_cut")
     with pytest.raises(ValueError, match="t_cut"):
         module.build_matrix_plan(_args(module, "--phase", "full"), full_contract=missing)
+
+
+@pytest.mark.parametrize("winner_source_name", ["FLOW_MAP1_CONFIG", "PAPER_CONFIG"])
+def test_materialized_full_fmrg_keeps_semigroup_schedule_manifest_independent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    winner_source_name: str,
+) -> None:
+    module = _load_script()
+    winner_source = getattr(module, winner_source_name)
+    for relative in (module.NATIVE_CONFIG, winner_source):
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text((REPO_ROOT / relative).read_text(encoding="utf-8"), encoding="utf-8")
+    semigroup_manifest = tmp_path / module.CALIBRATION_MANIFEST
+    semigroup_manifest.parent.mkdir(parents=True, exist_ok=True)
+    semigroup_manifest.write_text('{"sample_id":"semigroup-0"}\n', encoding="utf-8")
+    report_path = tmp_path / module.SEMIGROUP_GATE
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        json.dumps(
+            {
+                "gate_passed": True,
+                "checkpoint_sha256": module.CHECKPOINT_SHA256,
+                "selected_t_cut": 0.25,
+            }
+        ),
+        encoding="utf-8",
+    )
+    schedule = {
+        "schema_version": 2,
+        "gate_passed": True,
+        "checkpoint_sha256": module.CHECKPOINT_SHA256,
+        "semigroup_report": str(module.SEMIGROUP_GATE),
+        "semigroup_report_sha256": module._sha256_file(report_path),
+        "semigroup_sample_id_manifest": str(module.CALIBRATION_MANIFEST),
+        "semigroup_sample_id_manifest_sha256": module._sha256_file(semigroup_manifest),
+        "t_cut": 0.25,
+        "guided_steps": 3,
+        "guided_times": [1.0, 0.75, 0.5, 0.25],
+        "unguided_tail_intervals": 2,
+        "unguided_times": [0.25, 0.125, 0.0],
+        "selection_rule": "test",
+    }
+    schedule["schedule_contract_sha256"] = module._schedule_contract_digest(schedule)
+    schedule_path = tmp_path / module.SCHEDULE_MANIFEST
+    schedule_path.write_text(json.dumps(schedule), encoding="utf-8")
+    winner_config = yaml.safe_load((tmp_path / winner_source).read_text(encoding="utf-8"))
+    winner_config.update(
+        {
+            "t_cut": 0.25,
+            "schedule_manifest": str(module.SCHEDULE_MANIFEST),
+            "semigroup_report": str(module.SEMIGROUP_GATE),
+            "semigroup_sample_id_manifest": str(module.CALIBRATION_MANIFEST),
+            "semigroup_sample_id_manifest_sha256": module._sha256_file(
+                semigroup_manifest
+            ),
+            "schedule_contract_sha256": schedule["schedule_contract_sha256"],
+        }
+    )
+    locked_path = tmp_path / "locked_winner.yaml"
+    locked_path.write_text(yaml.safe_dump(winner_config, sort_keys=False), encoding="utf-8")
+    winner = {
+        "arm_id": "locked-winner",
+        "config": str(locked_path.relative_to(tmp_path)),
+        "config_sha256": module._sha256_file(locked_path),
+        "arm_config_sha256": canonical_arm_config_digest(winner_config),
+        "mode": winner_config["mode"],
+        "t_cut": 0.25,
+        "schedule_manifest": str(module.SCHEDULE_MANIFEST),
+        "schedule_manifest_sha256": module._sha256_file(schedule_path),
+        "schedule_contract_sha256": schedule["schedule_contract_sha256"],
+    }
+    args = _args(module, "--phase", "full")
+    args.repo_root = tmp_path
+    plan = module.build_matrix_plan(
+        args,
+        full_contract={
+            "winner": winner,
+            "visual_review": {"reviewed_sample_count": 64, "passed": True},
+            "manifest_count": 2048,
+            "manifest_sha256": module.FULL_MANIFEST_SHA256,
+        },
+    )
+    module.materialize_full_runtime_configs(plan)
+    runtime = yaml.safe_load(
+        (tmp_path / module.ROOT / "full/runtime_configs/winner.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert runtime["sample_id_manifest"] == str(module.FULL_MANIFEST)
+    assert runtime["semigroup_sample_id_manifest"] == str(module.CALIBRATION_MANIFEST)
+    assert runtime["arm_config_sha256"] == winner["arm_config_sha256"]
+    assert canonical_arm_config_digest(runtime) == winner["arm_config_sha256"]
+    monkeypatch.chdir(tmp_path)
+    resolved = resolve_locked_schedule(
+        runtime, checkpoint_sha256=module.CHECKPOINT_SHA256, explicit_t_cut=0.25
+    )
+    assert resolved["semigroup_sample_id_manifest_sha256"] == module._sha256_file(
+        semigroup_manifest
+    )
+    semigroup_manifest.write_text('{"sample_id":"tampered"}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="semigroup sample manifest SHA256"):
+        resolve_locked_schedule(
+            runtime, checkpoint_sha256=module.CHECKPOINT_SHA256, explicit_t_cut=0.25
+        )
 
 
 def test_semigroup_merge_requires_registered_splits_and_four_exact_modulo_shards(
@@ -576,7 +692,9 @@ def test_schedule_payload_binds_report_manifest_times_and_self_digest(tmp_path: 
     assert schedule["guided_times"] == [1.0, 0.75, 0.5, 0.25]
     assert schedule["unguided_times"] == [0.25, 0.125, 0.0]
     assert schedule["semigroup_report_sha256"] == "f" * 64
-    assert schedule["sample_id_manifest_sha256"] == module._sha256_file(manifest)
+    assert schedule["semigroup_sample_id_manifest_sha256"] == module._sha256_file(
+        manifest
+    )
     assert module._schedule_contract_digest(schedule) == schedule["schedule_contract_sha256"]
 
 
@@ -664,6 +782,8 @@ def test_execute_plan_marks_finalize_failure_not_passed(
 
 def test_full_merge_is_idempotent_and_recovers_partial_owned_output(tmp_path: Path) -> None:
     module = _load_script()
+    native_config = {"mode": "native", "sampling_seed": 1337}
+    native_digest = canonical_arm_config_digest(native_config)
     manifest = tmp_path / module.FULL_MANIFEST
     manifest.parent.mkdir(parents=True)
     ids = [f"sample-{index}" for index in range(4)]
@@ -689,7 +809,14 @@ def test_full_merge_is_idempotent_and_recovers_partial_owned_output(tmp_path: Pa
             encoding="utf-8",
         )
         (shard / "completion.json").write_text(
-            json.dumps({"status": "complete", "sample_count": 1}), encoding="utf-8"
+            json.dumps(
+                {
+                    "status": "complete",
+                    "sample_count": 1,
+                    "arm_config_sha256": native_digest,
+                }
+            ),
+            encoding="utf-8",
         )
         (shard / "generation_result.json").write_text(
             json.dumps(
@@ -705,16 +832,21 @@ def test_full_merge_is_idempotent_and_recovers_partial_owned_output(tmp_path: Pa
                     },
                     "sample_count": 1,
                     "sample_id_sha256": module._sample_id_digest([sample_id]),
+                    "arm_config_sha256": native_digest,
                     "schedule": None,
-                    "config": {"sampling_seed": 1337},
+                    "config": native_config,
                 }
             ),
             encoding="utf-8",
         )
     combined = tmp_path / module.ROOT / "full/merged/native"
 
-    first = module._merge_full_arm(tmp_path, "native", combined)
-    second = module._merge_full_arm(tmp_path, "native", combined)
+    first = module._merge_full_arm(
+        tmp_path, "native", combined, expected_arm_config_sha256=native_digest
+    )
+    second = module._merge_full_arm(
+        tmp_path, "native", combined, expected_arm_config_sha256=native_digest
+    )
     assert first == second
     completion = json.loads((combined / "completion.json").read_text(encoding="utf-8"))
     assert completion["status"] == "complete"
@@ -722,6 +854,48 @@ def test_full_merge_is_idempotent_and_recovers_partial_owned_output(tmp_path: Pa
     (combined / "completion.json").unlink()
     victim = next((combined / "generated_images").iterdir())
     victim.unlink()
-    resumed = module._merge_full_arm(tmp_path, "native", combined)
+    resumed = module._merge_full_arm(
+        tmp_path, "native", combined, expected_arm_config_sha256=native_digest
+    )
     assert resumed["status"] == "complete"
     assert victim.is_file()
+
+
+@pytest.mark.parametrize(("field", "old_value"), [("step_size", 3.0), ("eta", 0.5)])
+def test_full_preflight_rejects_old_winner_completion_with_different_step_or_eta(
+    tmp_path: Path, field: str, old_value: float
+) -> None:
+    module = _load_script()
+    locked_config = yaml.safe_load((REPO_ROOT / module.NOISE_CONFIGS[0]).read_text())
+    locked_digest = canonical_arm_config_digest(locked_config)
+    old_digest = canonical_arm_config_digest({**locked_config, field: old_value})
+    contract = {
+        "winner": {
+            "arm_id": "noise-winner",
+            "config": str(module.NOISE_CONFIGS[0]),
+            "arm_config_sha256": locked_digest,
+        },
+        "visual_review": {"reviewed_sample_count": 64, "passed": True},
+        "manifest_count": 2048,
+        "manifest_sha256": module.FULL_MANIFEST_SHA256,
+    }
+    plan = module.build_matrix_plan(
+        _args(module, "--phase", "full"), full_contract=contract
+    )
+    output = tmp_path / "shard_0"
+    winner = output / "winner"
+    winner.mkdir(parents=True)
+    (winner / "completion.json").write_text(
+        json.dumps(
+            {
+                "status": "complete",
+                "sample_count": 512,
+                "arm_config_sha256": old_digest,
+            }
+        ),
+        encoding="utf-8",
+    )
+    plan = replace(plan, runs=(replace(plan.runs[0], output_dir=output),))
+
+    with pytest.raises(ValueError, match="locked winner arm config"):
+        module.validate_artifact_paths(plan)

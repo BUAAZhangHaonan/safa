@@ -18,6 +18,10 @@ from safa.evaluation.encoder_generalization import (
     multi_encoder_median,
     within_encoder_generalization,
 )
+from safa.evaluation.r8_arm_contracts import (
+    canonical_arm_config_digest,
+    require_arm_config_digest,
+)
 
 
 CHECKPOINT_SHA256 = "4690717781db58a6021d57d124300a9b212f0a5043cf3028fb5de4d9c835cc4d"
@@ -70,6 +74,9 @@ def validate_heldout_contract(
     contract = {
         "winner_arm_id": str(winner["arm_id"]),
         "winner_config_sha256": _sha(winner.get("config_sha256"), "winner config SHA256"),
+        "winner_arm_config_sha256": require_arm_config_digest(
+            winner.get("arm_config_sha256"), "winner arm config SHA256"
+        ),
         "checkpoint_sha256": CHECKPOINT_SHA256,
         "sample_count": 2048,
         "sample_id_sha256": expected_digest,
@@ -123,6 +130,7 @@ def evaluate_heldout(root: Path, *, device: str, batch_size: int) -> dict[str, A
     finalization = _read_json(finalization_path, "full finalization completion")
     if finalization.get("status") != "complete":
         raise ValueError("held-out evaluation requires completed full visual/quality finalization")
+    _validate_locked_winner_output_contract(root, selection)
     manifest_path = root / "manifests/full_2048.jsonl"
     if _sha256_file(manifest_path) != FULL_MANIFEST_FILE_SHA256:
         raise ValueError("full 2048 manifest file digest mismatch")
@@ -217,6 +225,40 @@ def evaluate_heldout(root: Path, *, device: str, batch_size: int) -> dict[str, A
         )
         _atomic_write_json(marker_path, marker)
         raise
+
+
+def _validate_locked_winner_output_contract(
+    root: Path, selection: Mapping[str, Any]
+) -> str:
+    winner = selection.get("winner")
+    if not isinstance(winner, Mapping):
+        raise ValueError("held-out evaluation requires a locked winner contract")
+    expected = require_arm_config_digest(
+        winner.get("arm_config_sha256"), "locked winner arm config SHA256"
+    )
+    winner_root = root / "full/merged/winner"
+    completion = _read_json(winner_root / "completion.json", "winner merge completion")
+    generation = _read_json(
+        winner_root / "generation_result.json", "winner merged generation result"
+    )
+    if completion.get("status") != "complete" or generation.get("status") != "complete":
+        raise ValueError("held-out evaluation requires complete locked winner outputs")
+    if completion.get("arm_config_sha256") != expected or generation.get(
+        "arm_config_sha256"
+    ) != expected:
+        raise ValueError("locked winner arm config SHA256 disagrees with completed output")
+    config = generation.get("config")
+    if not isinstance(config, Mapping) or canonical_arm_config_digest(config) != expected:
+        raise ValueError("locked winner arm config canonical payload disagrees")
+    finalization = _read_json(
+        root / "full/finalization_completion.json", "full finalization completion"
+    )
+    winner_finalization = finalization.get("arms", {}).get("winner")
+    if not isinstance(winner_finalization, Mapping) or winner_finalization.get(
+        "arm_config_sha256"
+    ) != expected:
+        raise ValueError("full finalization locked winner arm config SHA256 disagrees")
+    return expected
 
 
 def extract_encoder_batch(

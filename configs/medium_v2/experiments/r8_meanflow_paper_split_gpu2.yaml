@@ -40,6 +40,8 @@ features: artifacts/e0_features/val_face_mixed_e14_e0_medium_v1
 features_digest: 287b8163f093f290e75e8ef09fbbedc986e6934ab0ac458ad786e655889fbe45
 sample_id_manifest: artifacts/r8_meanflow_flow_map_guidance/manifests/calibration_64.jsonl
 sample_id_manifest_sha256: ffc1f04f671533ee1498f4b03565826920afcc4e5c6ab244fc6f9b7aa680f964
+semigroup_sample_id_manifest: artifacts/r8_meanflow_flow_map_guidance/manifests/calibration_64.jsonl
+semigroup_sample_id_manifest_sha256: ffc1f04f671533ee1498f4b03565826920afcc4e5c6ab244fc6f9b7aa680f964
 calibration_sample_id_manifest: artifacts/r8_meanflow_flow_map_guidance/manifests/calibration_64.jsonl
 calibration_sample_id_manifest_sha256: ffc1f04f671533ee1498f4b03565826920afcc4e5c6ab244fc6f9b7aa680f964
 full_sample_id_manifest: artifacts/r8_meanflow_flow_map_guidance/manifests/full_2048.jsonl
@@ -56,4 +58,3 @@ contact_sheets: true
 contact_sheet_rows: 8
 quality_metrics: [fid, kid, niqe, sharpness]
 calibration_metrics: [e0_cosine, edev_cosine, kid, niqe, sharpness]
-

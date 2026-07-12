@@ -152,6 +152,12 @@ def test_r8_guided_configs_resolve_one_locked_uniform_schedule(tmp_path: Path) -
         "artifacts/r8_meanflow_flow_map_guidance/semigroup/locked_schedule_manifest.json"
     )
     assert {configs[name]["schedule_manifest"] for name in guided_names} == {expected_manifest}
+    assert {
+        configs[name]["semigroup_sample_id_manifest"] for name in guided_names
+    } == {CALIBRATION_MANIFEST}
+    assert {
+        configs[name]["semigroup_sample_id_manifest_sha256"] for name in guided_names
+    } == {CALIBRATION_MANIFEST_SHA256}
 
     report = tmp_path / "semigroup_gate.json"
     report.write_text(json.dumps({"gate_passed": True}), encoding="utf-8")
@@ -164,8 +170,10 @@ def test_r8_guided_configs_resolve_one_locked_uniform_schedule(tmp_path: Path) -
         "checkpoint_sha256": EXPECTED_HASHES["checkpoint_sha256"],
         "semigroup_report": str(report),
         "semigroup_report_sha256": hashlib.sha256(report.read_bytes()).hexdigest(),
-        "sample_id_manifest": str(samples),
-        "sample_id_manifest_sha256": hashlib.sha256(samples.read_bytes()).hexdigest(),
+        "semigroup_sample_id_manifest": str(samples),
+        "semigroup_sample_id_manifest_sha256": hashlib.sha256(
+            samples.read_bytes()
+        ).hexdigest(),
         "t_cut": 0.25,
         "guided_steps": 3,
         "guided_times": [1.0, 0.75, 0.5, 0.25],
@@ -180,7 +188,10 @@ def test_r8_guided_configs_resolve_one_locked_uniform_schedule(tmp_path: Path) -
             **configs[name],
             "schedule_manifest": str(manifest),
             "semigroup_report": str(report),
-            "sample_id_manifest": str(samples),
+            "semigroup_sample_id_manifest": str(samples),
+            "semigroup_sample_id_manifest_sha256": hashlib.sha256(
+                samples.read_bytes()
+            ).hexdigest(),
             "t_cut": 0.25,
         }
         schedule = resolve_locked_schedule(

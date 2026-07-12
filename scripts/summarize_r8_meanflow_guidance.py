@@ -14,6 +14,10 @@ from typing import Any, Mapping, Sequence
 import yaml
 
 from safa.evaluation.r8_visual_evidence import validate_visual_review_arm
+from safa.evaluation.r8_arm_contracts import (
+    canonical_arm_config_digest,
+    require_arm_config_digest,
+)
 
 
 CHECKPOINT_SHA256 = "4690717781db58a6021d57d124300a9b212f0a5043cf3028fb5de4d9c835cc4d"
@@ -80,6 +84,8 @@ def validate_calibration_arm(
     config = generation.get("config")
     if not isinstance(config, Mapping):
         raise ValueError(f"arm {arm_id}: missing resolved config")
+    if str(config.get("mode", "")) != str(generation.get("mode", "")):
+        raise ValueError(f"arm {arm_id}: generation/config modes disagree")
     seed = _integer(config.get("sampling_seed", config.get("seed")), "sampling seed")
     if seed != 1337:
         raise ValueError(f"arm {arm_id}: sampling seed must be 1337")
@@ -122,6 +128,17 @@ def validate_calibration_arm(
         config=config,
         checkpoint_sha256=checkpoint_sha,
     )
+    digest_config = dict(config)
+    if schedule_contract:
+        digest_config["schedule_contract_sha256"] = schedule_contract[
+            "schedule_contract_sha256"
+        ]
+    arm_config_sha256 = canonical_arm_config_digest(digest_config)
+    generation_arm_digest = require_arm_config_digest(
+        generation.get("arm_config_sha256"), f"arm {arm_id} config SHA256"
+    )
+    if generation_arm_digest != arm_config_sha256:
+        raise ValueError(f"arm {arm_id}: generation arm config SHA256 disagrees")
 
     row = {
         "arm_id": arm_id,
@@ -130,6 +147,7 @@ def validate_calibration_arm(
         "sample_id_sha256": generation_digest,
         "checkpoint_sha256": checkpoint_sha,
         "seed": seed,
+        "arm_config_sha256": arm_config_sha256,
         "fid": _finite(quality.get("fid"), "FID"),
         "kid_mean": _finite(quality.get("kid_mean"), "KID mean"),
         "kid_std": _finite(quality.get("kid_std"), "KID std"),
@@ -205,6 +223,7 @@ def select_calibration_winner(rows: Sequence[Mapping[str, Any]]) -> dict[str, An
             "checkpoint_sha256",
             "sample_id_sha256",
             "seed",
+            "arm_config_sha256",
         )
     }
     for key in (
@@ -446,6 +465,8 @@ def summarize_full(root: Path) -> dict[str, Any]:
             "merge_contract_sha256"
         ) != result.get(
             "merge_contract_sha256"
+        ) or arm_finalization.get("arm_config_sha256") != result.get(
+            "arm_config_sha256"
         ) or arm_finalization.get("quality_sha256") != _sha256_file(
             root / f"full/merged/{arm_id}/quality.json"
         ):
@@ -484,6 +505,14 @@ def _validate_full_selection(selection: Mapping[str, Any], root: Path) -> None:
     config_path = Path(str(winner.get("config", "")))
     if _sha256_file(config_path) != _sha(winner.get("config_sha256"), "winner config SHA256"):
         raise ValueError("full selection winner config file SHA256 disagrees")
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    if not isinstance(config, Mapping):
+        raise ValueError("full selection winner config must be a mapping")
+    locked_arm_digest = require_arm_config_digest(
+        winner.get("arm_config_sha256"), "winner arm config SHA256"
+    )
+    if canonical_arm_config_digest(config) != locked_arm_digest:
+        raise ValueError("full selection winner canonical arm config SHA256 disagrees")
 
 
 def _validate_full_result_contracts(
@@ -505,6 +534,8 @@ def _validate_full_result_contracts(
     winner_contract = selection["winner"]
     if winner.get("mode") != winner_contract.get("mode"):
         raise ValueError("full winner mode disagrees with the locked selection")
+    if winner.get("arm_config_sha256") != winner_contract.get("arm_config_sha256"):
+        raise ValueError("full winner arm config SHA256 disagrees with locked selection")
     if winner_contract.get("mode") in {"official_head_current_xt", "paper_algorithm_split"}:
         schedule = winner.get("schedule")
         if not isinstance(schedule, Mapping):
@@ -545,6 +576,10 @@ def _validate_heldout_result_contract(
         raise ValueError("held-out protocol marker result SHA256 disagrees")
     if contract.get("winner_config_sha256") != selection["winner"].get("config_sha256"):
         raise ValueError("held-out winner config contract disagrees with selection")
+    if contract.get("winner_arm_config_sha256") != selection["winner"].get(
+        "arm_config_sha256"
+    ):
+        raise ValueError("held-out winner arm config digest disagrees with selection")
     if contract.get("sample_id_sha256") != selection.get("full_sample_id_sha256"):
         raise ValueError("held-out sample-ID contract disagrees with selection")
     if contract.get("full_finalization_sha256") != _sha256_file(
@@ -591,6 +626,14 @@ def _full_quality_row(path: Path, *, e0_key: str) -> dict[str, Any]:
         raise ValueError(f"{e0_key} per-sample file SHA256 disagrees with completion")
     if completion.get("generation_result_sha256") != _sha256_file(generation_path):
         raise ValueError(f"{e0_key} generation file SHA256 disagrees with completion")
+    arm_config_sha256 = require_arm_config_digest(
+        generation.get("arm_config_sha256"), f"{e0_key} arm config SHA256"
+    )
+    if completion.get("arm_config_sha256") != arm_config_sha256:
+        raise ValueError(f"{e0_key} completion arm config SHA256 disagrees")
+    config = generation.get("config")
+    if not isinstance(config, Mapping) or canonical_arm_config_digest(config) != arm_config_sha256:
+        raise ValueError(f"{e0_key} canonical arm config SHA256 disagrees")
     if completion.get("merge_contract_sha256") != merge_contract.get(
         "merge_contract_sha256"
     ):
@@ -624,6 +667,7 @@ def _full_quality_row(path: Path, *, e0_key: str) -> dict[str, Any]:
         "seed": 1337,
         "schedule": generation.get("schedule"),
         "merge_contract_sha256": merge_contract.get("merge_contract_sha256"),
+        "arm_config_sha256": arm_config_sha256,
     }
 
 
