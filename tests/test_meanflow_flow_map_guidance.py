@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,8 @@ from safa.guidance.meanflow_flow_map import (  # noqa: E402
     CountedFlowMap,
     assert_guidance_stack_frozen,
     freeze_guidance_stack,
+    sample_official_head_current_xt,
+    sample_paper_algorithm_split,
     select_t_cut,
     semigroup_probe,
     symmetric_relative_l2,
@@ -66,6 +69,122 @@ class _CodecWhoseParametersMustNotBeRead:
 
     def parameters(self):
         raise AssertionError("inspect codec.vae.parameters(), not codec.parameters()")
+
+
+class _TracedAffineFlowGenerator(nn.Module):
+    def __init__(self, velocity: float = 0.5) -> None:
+        super().__init__()
+        self.velocity = nn.Parameter(torch.tensor(velocity))
+        self.calls: list[tuple[float, float, torch.Tensor]] = []
+
+    def flow_map(self, x, z, *, t, r):
+        del z
+        t_value = float(torch.as_tensor(t).flatten()[0])
+        r_value = float(torch.as_tensor(r).flatten()[0])
+        self.calls.append((t_value, r_value, x.detach().clone()))
+        return x - (t_value - r_value) * self.velocity
+
+
+class _NormalizedIdentityCodec:
+    def __init__(self) -> None:
+        self.vae = nn.Linear(1, 1, bias=False)
+
+    def decode(self, latent):
+        mean = latent.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
+        std = latent.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
+        return latent * std + mean
+
+
+class _NanGradient(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, value):
+        del ctx
+        return value.clone()
+
+    @staticmethod
+    def backward(ctx, gradient):
+        del ctx
+        return torch.full_like(gradient, float("nan"))
+
+
+class _NanBackwardEncoder(nn.Module):
+    def forward(self, image):
+        return {"embedding": _NanGradient.apply(image.flatten(1))}
+
+
+GUIDED_TIMES = [1.0, 0.75, 0.5, 0.25]
+UNGUIDED_TIMES = [0.25, 0.125, 0.0]
+
+
+def _guidance_inputs(batch_size: int = 2):
+    values = torch.linspace(-1.0, 1.0, batch_size * 3 * 2 * 2)
+    x_init = values.reshape(batch_size, 3, 2, 2)
+    condition = torch.zeros(batch_size, 4)
+    target = torch.flip(x_init.flatten(1), dims=(1,))
+    return x_init, condition, target
+
+
+def _frozen_guidance_stack():
+    generator = _TracedAffineFlowGenerator()
+    codec = _NormalizedIdentityCodec()
+    e0 = _IdentityEncoder()
+    freeze_guidance_stack(generator, codec, e0)
+    return generator, codec, e0
+
+
+def _run_official(
+    *,
+    sample_mode="flow_map1",
+    optimization_mode="paper_normalized_direct_autograd",
+    num_optim_iters=1,
+    step_size=0.5,
+    guided_times=GUIDED_TIMES,
+    unguided_times=UNGUIDED_TIMES,
+    e0=None,
+):
+    generator, codec, default_e0 = _frozen_guidance_stack()
+    if e0 is not None:
+        default_e0 = e0.eval().requires_grad_(False)
+    x_init, condition, target = _guidance_inputs()
+    counted = CountedFlowMap(generator)
+    result = sample_official_head_current_xt(
+        flow_map=counted,
+        codec=codec,
+        e0=default_e0,
+        x_init=x_init,
+        transport_condition=condition,
+        target_z0=target,
+        guided_times=guided_times,
+        unguided_times=unguided_times,
+        sample_mode=sample_mode,
+        optimization_mode=optimization_mode,
+        num_optim_iters=num_optim_iters,
+        step_size=step_size,
+    )
+    return result, generator, codec, default_e0, x_init
+
+
+def _run_paper(
+    *,
+    step_size=0.5,
+    guided_times=GUIDED_TIMES,
+    unguided_times=UNGUIDED_TIMES,
+):
+    generator, codec, e0 = _frozen_guidance_stack()
+    x_init, condition, target = _guidance_inputs()
+    counted = CountedFlowMap(generator)
+    result = sample_paper_algorithm_split(
+        flow_map=counted,
+        codec=codec,
+        e0=e0,
+        x_init=x_init,
+        transport_condition=condition,
+        target_z0=target,
+        guided_times=guided_times,
+        unguided_times=unguided_times,
+        step_size=step_size,
+    )
+    return result, generator
 
 
 def test_freeze_guidance_stack_disables_parameter_gradients() -> None:
@@ -180,3 +299,195 @@ def test_assert_guidance_stack_checks_codec_vae_not_codec_parameters() -> None:
     e0 = _IdentityEncoder().eval().requires_grad_(False)
 
     assert_guidance_stack_frozen(generator, codec, e0)
+
+
+def test_official_current_xt_takes_endpoint_gradient_at_xt_before_advance() -> None:
+    _, generator, _, _, x_init = _run_official(sample_mode="flow_map2")
+
+    endpoint_t, endpoint_r, endpoint_x = generator.calls[0]
+    step_t, step_r, step_x = generator.calls[1]
+    assert (endpoint_t, endpoint_r) == (1.0, 0.0)
+    assert (step_t, step_r) == (1.0, 0.75)
+    assert torch.equal(endpoint_x, x_init)
+    assert torch.equal(step_x, x_init)
+
+
+def test_official_current_xt_flow_map1_reuses_endpoint_velocity() -> None:
+    _, generator, _, _, _ = _run_official(
+        sample_mode="flow_map1",
+        guided_times=[1.0, 0.5],
+        unguided_times=[0.5, 0.0],
+    )
+
+    assert [(t, r) for t, r, _ in generator.calls] == [(1.0, 0.0), (0.5, 0.0)]
+
+
+def test_official_current_xt_flow_map2_uses_distinct_endpoint_and_step_maps() -> None:
+    _, generator, _, _, _ = _run_official(
+        sample_mode="flow_map2",
+        guided_times=[1.0, 0.5],
+        unguided_times=[0.5, 0.0],
+    )
+
+    assert [(t, r) for t, r, _ in generator.calls] == [(1.0, 0.0), (1.0, 0.5), (0.5, 0.0)]
+
+
+@pytest.mark.parametrize("optimization_mode", ["official_adam", "paper_normalized_direct_autograd"])
+def test_official_current_xt_supports_adam_and_normalized_direct_modes(optimization_mode) -> None:
+    result, _, _, _, _ = _run_official(optimization_mode=optimization_mode)
+
+    assert torch.isfinite(result.latent).all()
+    assert result.diagnostics["optimization_mode"] == optimization_mode
+
+
+def test_safa_uniform_schedule_flow_map1_nopt1_is_five_nfe() -> None:
+    result, _, _, _, _ = _run_official(sample_mode="flow_map1")
+
+    assert result.nfe == 5
+
+
+def test_safa_uniform_schedule_flow_map2_nopt1_is_eight_nfe() -> None:
+    result, _, _, _, _ = _run_official(sample_mode="flow_map2")
+
+    assert result.nfe == 8
+
+
+def test_official_adam_uses_interval_decay_one_minus_i_over_four() -> None:
+    result, _, _, _, _ = _run_official(optimization_mode="official_adam", step_size=4.0)
+
+    assert result.diagnostics["adam_learning_rates"] == [4.0, 3.0, 2.0]
+
+
+def test_official_adam_nopt_gt_one_refreshes_endpoint_at_updated_xt() -> None:
+    _, generator, _, _, _ = _run_official(
+        optimization_mode="official_adam",
+        num_optim_iters=2,
+        guided_times=[1.0, 0.5],
+        unguided_times=[0.5, 0.0],
+    )
+
+    first = generator.calls[0]
+    second = generator.calls[1]
+    assert (first[0], first[1]) == (1.0, 0.0)
+    assert (second[0], second[1]) == (1.0, 0.0)
+    assert not torch.equal(first[2], second[2])
+
+
+def test_normalized_mode_has_no_adam_state_or_lr_decay() -> None:
+    result, _, _, _, _ = _run_official(optimization_mode="paper_normalized_direct_autograd")
+
+    assert result.diagnostics["uses_adam"] is False
+    assert result.diagnostics["adam_learning_rates"] == []
+
+
+def test_official_current_xt_finishes_with_official_unguided_tail_order() -> None:
+    _, generator, _, _, _ = _run_official(sample_mode="flow_map1")
+
+    assert [(t, r) for t, r, _ in generator.calls[-2:]] == [(0.25, 0.125), (0.125, 0.0)]
+
+
+def test_official_current_xt_leaves_generator_codec_and_e0_unchanged() -> None:
+    result, generator, codec, e0, _ = _run_official(optimization_mode="official_adam")
+
+    assert torch.equal(generator.velocity, torch.tensor(0.5))
+    assert all(parameter.grad is None for parameter in generator.parameters())
+    assert all(parameter.grad is None for parameter in codec.vae.parameters())
+    assert all(parameter.grad is None for parameter in e0.parameters())
+    assert_guidance_stack_frozen(generator, codec, e0)
+    assert torch.isfinite(result.latent).all()
+
+
+def test_official_current_xt_fails_on_non_finite_gradient() -> None:
+    with pytest.raises(FloatingPointError, match="non-finite representation gradient"):
+        _run_official(e0=_NanBackwardEncoder())
+
+
+def test_paper_split_transports_to_xs_before_endpoint_gradient() -> None:
+    generator, codec, e0 = _frozen_guidance_stack()
+    x_init, condition, target = _guidance_inputs()
+    sample_paper_algorithm_split(
+        flow_map=CountedFlowMap(generator),
+        codec=codec,
+        e0=e0,
+        x_init=x_init,
+        transport_condition=condition,
+        target_z0=target,
+        guided_times=[1.0, 0.5],
+        unguided_times=[0.5, 0.0],
+        step_size=0.5,
+    )
+
+    first_t, first_r, first_x = generator.calls[0]
+    second_t, second_r, second_x = generator.calls[1]
+    assert (first_t, first_r) == (1.0, 0.5)
+    assert (second_t, second_r) == (0.5, 0.0)
+    assert torch.equal(first_x, x_init)
+    assert torch.equal(second_x, x_init - 0.25)
+
+
+def test_paper_split_iterates_both_shared_unguided_tail_segments() -> None:
+    result, generator = _run_paper()
+
+    assert [(t, r) for t, r, _ in generator.calls[-2:]] == [(0.25, 0.125), (0.125, 0.0)]
+    assert result.nfe == len(generator.calls)
+
+
+def test_paper_split_nfe_matches_counted_calls() -> None:
+    result, generator = _run_paper()
+
+    assert result.nfe == 8
+    assert result.nfe == len(generator.calls)
+
+
+def test_b1_and_b2_receive_identical_guided_and_unguided_times() -> None:
+    official, _, _, _, _ = _run_official()
+    paper, _ = _run_paper()
+
+    assert official.diagnostics["guided_times"] == paper.diagnostics["guided_times"] == GUIDED_TIMES
+    assert official.diagnostics["unguided_times"] == paper.diagnostics["unguided_times"] == UNGUIDED_TIMES
+
+
+def test_paper_split_normalizes_gradient_per_sample() -> None:
+    _, generator = _run_paper(step_size=0.5)
+    first_input = generator.calls[0][2]
+    x_bar = first_input - 0.125
+    next_interval_input = generator.calls[2][2]
+    correction_norm = (x_bar - next_interval_input).flatten(1).norm(dim=1)
+    velocity_norm = torch.full_like(correction_norm, 0.5 * math.sqrt(x_bar[0].numel()))
+
+    assert torch.allclose(correction_norm, 0.25 * 0.5 * velocity_norm, atol=1.0e-6)
+
+
+def test_paper_split_reduces_tiny_representation_loss() -> None:
+    result, generator = _run_paper(step_size=1.0)
+    x_init, _, target = _guidance_inputs()
+    codec = _NormalizedIdentityCodec()
+    e0 = _IdentityEncoder().eval().requires_grad_(False)
+    from safa.training.losses import normalize_for_e0
+
+    native = x_init - generator.velocity.detach()
+    native_embedding = e0(normalize_for_e0(codec.decode(native)))["embedding"]
+    final_embedding = e0(normalize_for_e0(codec.decode(result.latent)))["embedding"]
+    native_loss = 1.0 - torch.cosine_similarity(native_embedding, target, dim=1).mean()
+    final_loss = 1.0 - torch.cosine_similarity(final_embedding, target, dim=1).mean()
+
+    assert final_loss < native_loss
+
+
+@pytest.mark.parametrize("variant", ["official", "paper"])
+def test_fmrg_variants_reject_non_decreasing_schedule(variant) -> None:
+    with pytest.raises(ValueError, match="strictly decreasing"):
+        if variant == "official":
+            _run_official(guided_times=[1.0, 0.5, 0.6], unguided_times=[0.6, 0.0])
+        else:
+            _run_paper(guided_times=[1.0, 0.5, 0.6], unguided_times=[0.6, 0.0])
+
+
+@pytest.mark.parametrize("variant", ["official", "paper"])
+@pytest.mark.parametrize("step_size", [0.0, -0.1])
+def test_fmrg_variants_reject_non_positive_step_size(variant, step_size) -> None:
+    with pytest.raises(ValueError, match="step_size must be positive"):
+        if variant == "official":
+            _run_official(step_size=step_size)
+        else:
+            _run_paper(step_size=step_size)
