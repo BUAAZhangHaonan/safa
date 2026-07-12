@@ -353,10 +353,22 @@ def optimize_initial_noise(
 
 
 def select_t_cut(candidate_reports, registered_thresholds) -> float | None:
-    ordered = sorted(candidate_reports, key=lambda report: float(report["t_cut"]))
-    for report in ordered:
+    validated: list[tuple[float, Any]] = []
+    seen: set[float] = set()
+    for report in candidate_reports:
+        try:
+            t_cut = float(report["t_cut"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("every candidate report must contain a numeric t_cut") from exc
+        if not math.isfinite(t_cut) or not 0.0 < t_cut < 1.0:
+            raise ValueError(f"candidate t_cut must be finite and within (0,1), got {t_cut!r}")
+        if t_cut in seen:
+            raise ValueError(f"duplicate t_cut candidate {t_cut}")
+        seen.add(t_cut)
+        validated.append((t_cut, report))
+    for t_cut, report in sorted(validated, key=lambda item: item[0]):
         if all(_threshold_passes(report.get(field), requirement) for field, requirement in registered_thresholds.items()):
-            return float(report["t_cut"])
+            return t_cut
     return None
 
 

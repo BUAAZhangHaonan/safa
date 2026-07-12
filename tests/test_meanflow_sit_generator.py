@@ -89,8 +89,13 @@ def test_meanflow_flow_map_1_to_0_matches_native_sample() -> None:
     generator = build_generator(config)
     z = torch.randn(2, 16)
     x_init = torch.randn(2, 3, 16, 16)
+    with torch.no_grad():
+        generator.vector_field.final_layer.linear.weight.normal_()
+        generator.vector_field.final_layer.linear.bias.normal_()
+    r = torch.zeros(2)
+    t = torch.ones(2)
 
-    expected = generator.sample(z, x_init=x_init, clamp_output=False)
+    expected = x_init - generator.vector_field(x_init, r, t, z)
     actual = generator.flow_map(x_init, z, t=1.0, r=0.0)
 
     assert torch.equal(actual, expected)
@@ -104,8 +109,14 @@ def test_meanflow_pixel_flow_map_matches_sample_after_data_space_conversion() ->
     generator = build_generator(config)
     z = torch.randn(2, 16)
     x_init = torch.randn(2, 3, 16, 16)
+    with torch.no_grad():
+        generator.vector_field.final_layer.linear.weight.normal_()
+        generator.vector_field.final_layer.linear.bias.normal_()
+    r = torch.zeros(2)
+    t = torch.ones(2)
 
-    expected = generator.sample(z, x_init=x_init, clamp_output=False)
+    expected_model = x_init - generator.vector_field(x_init, r, t, z)
+    expected = generator._model_to_data_space(expected_model, clamp_output=False)
     model_space = generator.flow_map(x_init, z, t=1.0, r=0.0)
     actual = generator._model_to_data_space(model_space, clamp_output=False)
 

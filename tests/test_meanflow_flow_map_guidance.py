@@ -88,6 +88,17 @@ class _TracedAffineFlowGenerator(nn.Module):
         return x - (t_value - r_value) * self.velocity
 
 
+class _NonlinearVelocityFlowGenerator(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(()))
+
+    def flow_map(self, x, z, *, t, r):
+        del z
+        horizon = float(torch.as_tensor(t).flatten()[0] - torch.as_tensor(r).flatten()[0])
+        return x - horizon * self.scale * x.square()
+
+
 class _NormalizedIdentityCodec:
     def __init__(self) -> None:
         self.vae = nn.Linear(1, 1, bias=False)
@@ -190,6 +201,40 @@ def _run_paper(
     return result, generator
 
 
+def _analytic_endpoint_gradient(x: torch.Tensor) -> torch.Tensor:
+    endpoint = x - x.square()
+    endpoint_norm = endpoint.flatten(1).norm(dim=1).view(-1, 1, 1, 1)
+    first = endpoint[:, :1]
+    gradient_y = endpoint * first / endpoint_norm.pow(3)
+    gradient_y[:, :1] -= endpoint_norm.reciprocal()
+    return gradient_y * (1.0 - 2.0 * x)
+
+
+def _run_nonlinear_official(optimization_mode: str):
+    generator = _NonlinearVelocityFlowGenerator()
+    codec = _NormalizedIdentityCodec()
+    e0 = _IdentityEncoder()
+    freeze_guidance_stack(generator, codec, e0)
+    x_init = torch.tensor([[[[0.2]], [[0.4]], [[0.6]]]])
+    condition = torch.zeros(1, 4)
+    target = torch.tensor([[1.0, 0.0, 0.0]])
+    result = sample_official_head_current_xt(
+        flow_map=CountedFlowMap(generator),
+        codec=codec,
+        e0=e0,
+        x_init=x_init,
+        transport_condition=condition,
+        target_z0=target,
+        guided_times=[1.0, 0.5],
+        unguided_times=[0.5, 0.0],
+        sample_mode="flow_map1",
+        optimization_mode=optimization_mode,
+        num_optim_iters=1,
+        step_size=0.1,
+    )
+    return result, x_init
+
+
 def test_freeze_guidance_stack_disables_parameter_gradients() -> None:
     generator = _ExponentialFlowGenerator()
     codec = _IdentityCodec()
@@ -271,6 +316,25 @@ def test_t_cut_selection_returns_gate_failure_when_none_pass() -> None:
     thresholds = {"median": {"max": 0.1}, "visual_pass": True}
 
     assert select_t_cut(reports, thresholds) is None
+
+
+@pytest.mark.parametrize("t_cut", [float("nan"), float("inf"), -0.1, 0.0, 1.0, 1.1])
+def test_t_cut_selection_rejects_non_finite_or_boundary_candidate(t_cut) -> None:
+    reports = [{"t_cut": t_cut, "visual_pass": True}]
+
+    with pytest.raises(ValueError, match=r"finite and within \(0,1\)"):
+        select_t_cut(reports, {"visual_pass": True})
+
+
+def test_t_cut_selection_rejects_duplicate_candidates_before_sorting() -> None:
+    reports = [
+        {"t_cut": 0.5, "visual_pass": True},
+        {"t_cut": 0.25, "visual_pass": True},
+        {"t_cut": 0.5, "visual_pass": False},
+    ]
+
+    with pytest.raises(ValueError, match="duplicate t_cut"):
+        select_t_cut(reports, {"visual_pass": True})
 
 
 def test_t_cut_selection_has_no_manual_tie_break_input() -> None:
@@ -403,6 +467,27 @@ def test_official_current_xt_leaves_generator_codec_and_e0_unchanged() -> None:
 def test_official_current_xt_fails_on_non_finite_gradient() -> None:
     with pytest.raises(FloatingPointError, match="non-finite representation gradient"):
         _run_official(e0=_NanBackwardEncoder())
+
+
+def test_official_normalized_update_matches_analytic_nonlinear_state_and_sign() -> None:
+    result, x_init = _run_nonlinear_official("paper_normalized_direct_autograd")
+    gradient = _analytic_endpoint_gradient(x_init)
+    velocity = x_init.square()
+    correction = 0.1 * gradient * velocity.norm() / gradient.norm()
+    guided_state = x_init - 0.5 * (velocity + correction)
+    expected = guided_state - 0.5 * guided_state.square()
+
+    assert torch.allclose(result.latent, expected, atol=1.0e-7, rtol=1.0e-6)
+
+
+def test_official_adam_update_matches_analytic_nonlinear_state_and_sign() -> None:
+    result, x_init = _run_nonlinear_official("official_adam")
+    gradient = _analytic_endpoint_gradient(x_init)
+    adam_delta = 0.1 * gradient / (gradient.abs() + 1.0e-8)
+    guided_state = x_init - 0.5 * (x_init.square() + adam_delta)
+    expected = guided_state - 0.5 * guided_state.square()
+
+    assert torch.allclose(result.latent, expected, atol=1.0e-7, rtol=1.0e-6)
 
 
 def test_paper_split_transports_to_xs_before_endpoint_gradient() -> None:
