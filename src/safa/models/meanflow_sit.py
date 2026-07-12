@@ -3,6 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 import importlib
 import math
+from numbers import Real
 import warnings
 from pathlib import Path
 from typing import Any
@@ -359,14 +360,22 @@ def build_meanflow_sit_generator(config):
             else:
                 self._validate_x_init(x_init, z)
                 x = x_init
-            r = torch.zeros(z.shape[0], device=z.device, dtype=z.dtype)
-            t = torch.ones(z.shape[0], device=z.device, dtype=z.dtype)
-            mean_velocity = self.vector_field(x, r, t, z)
-            x = x - mean_velocity
+            x = self.flow_map(x, z, t=1.0, r=0.0)
             # DDP: keep null_condition.embedding in autograd graph even when unused
             if self.null_condition is not None:
                 x = x + 0.0 * self.null_condition.embedding.sum()
             return self._model_to_data_space(x, clamp_output=clamp_output)
+
+        def flow_map(self, x, z, *, t, r):
+            self._validate_z(z)
+            self._validate_x_init(x, z)
+            t_batch = self._expand_flow_time("t", t, z)
+            r_batch = self._expand_flow_time("r", r, z)
+            if torch.any(r_batch > t_batch).item():
+                raise ValueError("MeanFlow flow_map requires r <= t for every sample")
+            horizon = (t_batch - r_batch).view(-1, 1, 1, 1)
+            velocity = self.vector_field(x, r_batch, t_batch, z)
+            return x - horizon * velocity
 
         def flow_matching_loss(self, x_1, z, generator=None):
             self._validate_z(z)
@@ -524,6 +533,24 @@ def build_meanflow_sit_generator(config):
                 raise ValueError(f"x_init device must match z device {z.device}, got {x_init.device}")
             if x_init.dtype != z.dtype:
                 raise TypeError(f"x_init dtype must match z dtype {z.dtype}, got {x_init.dtype}")
+
+        @staticmethod
+        def _expand_flow_time(name, value, z):
+            if isinstance(value, torch.Tensor):
+                time = value.to(device=z.device, dtype=z.dtype)
+            elif isinstance(value, Real):
+                time = torch.tensor(value, device=z.device, dtype=z.dtype)
+            else:
+                raise TypeError(f"{name} must be a number or torch.Tensor, got {type(value).__name__}")
+            if time.ndim == 0:
+                time = time.expand(z.shape[0])
+            elif time.ndim != 1 or time.shape[0] != z.shape[0]:
+                raise ValueError(
+                    f"{name} must be a number, scalar tensor, or tensor with shape [{z.shape[0]}], got {tuple(time.shape)}"
+                )
+            if not torch.isfinite(time).all().item() or torch.any((time < 0.0) | (time > 1.0)).item():
+                raise ValueError(f"MeanFlow flow_map {name} must be finite and within [0,1]")
+            return time
 
     return _MeanFlowSiTGenerator()
 

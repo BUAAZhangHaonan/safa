@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import tempfile
 from pathlib import Path
 
@@ -78,6 +79,85 @@ def test_meanflow_sit_forward_loss_and_one_step_sample_shapes() -> None:
     assert metrics["meanflow_jvp_mode"] == "torch_func"
     assert torch.isfinite(metrics["meanflow_raw_mse"])
     assert any(parameter.grad is not None for parameter in generator.parameters())
+
+
+def test_meanflow_flow_map_1_to_0_matches_native_sample() -> None:
+    from safa.models.generator import build_generator
+
+    config = _tiny_meanflow_sit_config()
+    config["sit_data_space"] = "latent"
+    generator = build_generator(config)
+    z = torch.randn(2, 16)
+    x_init = torch.randn(2, 3, 16, 16)
+
+    expected = generator.sample(z, x_init=x_init, clamp_output=False)
+    actual = generator.flow_map(x_init, z, t=1.0, r=0.0)
+
+    assert torch.equal(actual, expected)
+
+
+def test_meanflow_pixel_flow_map_matches_sample_after_data_space_conversion() -> None:
+    from safa.models.generator import build_generator
+
+    config = _tiny_meanflow_sit_config()
+    config["sit_data_space"] = "pixel"
+    generator = build_generator(config)
+    z = torch.randn(2, 16)
+    x_init = torch.randn(2, 3, 16, 16)
+
+    expected = generator.sample(z, x_init=x_init, clamp_output=False)
+    model_space = generator.flow_map(x_init, z, t=1.0, r=0.0)
+    actual = generator._model_to_data_space(model_space, clamp_output=False)
+
+    assert torch.equal(actual, expected)
+
+
+def test_meanflow_flow_map_accepts_per_sample_times_and_input_gradient() -> None:
+    from safa.models.generator import build_generator
+
+    config = _tiny_meanflow_sit_config()
+    config["sit_data_space"] = "latent"
+    generator = build_generator(config)
+    z = torch.randn(2, 16)
+    x = torch.randn(2, 3, 16, 16, requires_grad=True)
+    t = torch.tensor([1.0, 0.75])
+    r = torch.tensor([0.5, 0.25])
+
+    output = generator.flow_map(x, z, t=t, r=r)
+    output.square().mean().backward()
+
+    assert tuple(output.shape) == tuple(x.shape)
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()
+
+
+@pytest.mark.parametrize(
+    ("t", "r", "message"),
+    [
+        (-0.1, 0.0, "within [0,1]"),
+        (1.1, 0.0, "within [0,1]"),
+        (0.25, 0.5, "r <= t"),
+    ],
+)
+def test_meanflow_flow_map_rejects_invalid_interval(t, r, message) -> None:
+    from safa.models.generator import build_generator
+
+    generator = build_generator(_tiny_meanflow_sit_config())
+    with pytest.raises(ValueError, match=re.escape(message)):
+        generator.flow_map(torch.randn(2, 3, 16, 16), torch.randn(2, 16), t=t, r=r)
+
+
+def test_meanflow_flow_map_rejects_time_tensor_with_wrong_batch_length() -> None:
+    from safa.models.generator import build_generator
+
+    generator = build_generator(_tiny_meanflow_sit_config())
+    with pytest.raises(ValueError, match=r"t must be a number, scalar tensor, or tensor with shape \[2\]"):
+        generator.flow_map(
+            torch.randn(2, 3, 16, 16),
+            torch.randn(2, 16),
+            t=torch.ones(3),
+            r=0.0,
+        )
 
 
 def test_meanflow_sit_null_condition_and_embedding_shape_errors_are_clear() -> None:
