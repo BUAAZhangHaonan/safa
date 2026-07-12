@@ -19,6 +19,11 @@ from typing import Any, Mapping, Sequence
 import yaml
 
 from safa.evaluation.meanflow_guidance_runner import validate_guidance_config
+from safa.evaluation.r8_visual_evidence import (
+    build_visual_evidence_contract,
+    validate_visual_review_arm,
+    write_contact_sheets,
+)
 
 
 DEFAULT_PYTHON = "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python"
@@ -44,8 +49,12 @@ SEMIGROUP_GATE = ROOT / "semigroup/semigroup_gate.json"
 SEMIGROUP_GATE_DRAFT = ROOT / "semigroup/semigroup_gate_draft.json"
 SCHEDULE_MANIFEST = ROOT / "semigroup/locked_schedule_manifest.json"
 SEMIGROUP_VISUAL_REVIEW = ROOT / "semigroup/visual_review.json"
+SEMIGROUP_VISUAL_EVIDENCE = ROOT / "semigroup/visual_evidence.json"
 SELECTION = ROOT / "selection.json"
 VISUAL_REVIEW = ROOT / "visual_review.json"
+CALIBRATION_VISUAL_EVIDENCE = ROOT / "calibration/visual_evidence.json"
+FULL_VISUAL_REVIEW = ROOT / "full/visual_review.json"
+FULL_VISUAL_EVIDENCE = ROOT / "full/visual_evidence.json"
 QUALITY_SCRIPT = Path("scripts/eval_generation_quality.py")
 GUIDANCE_SCRIPT = Path("scripts/run_meanflow_flow_map_guidance.py")
 MIN_FREE_MEMORY_MIB = 12000
@@ -1017,6 +1026,9 @@ def load_full_contract(selection_path: Path, visual_review_path: Path) -> dict[s
         raise ValueError("visual_review must contain exactly 64 reviewed samples")
     if visual.get("passed") is not True:
         raise ValueError("visual_review must pass before the full run")
+    evidence_path = selection_path.parent / "calibration/visual_evidence.json"
+    evidence = _load_required_json(evidence_path, "calibration visual evidence")
+    _validate_multi_arm_review(visual, evidence, require_passed=True)
     winner = selection.get("winner")
     if not isinstance(winner, Mapping) or not winner.get("config"):
         raise ValueError("selection must contain a locked winner config")
@@ -1028,6 +1040,133 @@ def load_full_contract(selection_path: Path, visual_review_path: Path) -> dict[s
         "visual_review": visual,
         "manifest_count": manifest_count,
         "manifest_sha256": manifest_sha,
+    }
+
+
+def _build_calibration_visual_evidence(plan: MatrixPlan) -> dict[str, Any]:
+    manifest_path = plan.repo_root / CALIBRATION_MANIFEST
+    arm_ids = sorted({arm_id for run in plan.runs for arm_id in run.arm_ids})
+    arms = {}
+    for arm_id in arm_ids:
+        arm_root = plan.repo_root / ROOT / "calibration" / arm_id
+        rows = _read_jsonl(arm_root / "per_sample.jsonl")
+        visual_rows = [
+            {
+                "sample_id": row.get("sample_id"),
+                "source": row.get("source"),
+                "native": row.get("native"),
+                "candidate": row.get("generated"),
+            }
+            for row in rows
+        ]
+        page_manifest = _read_json(
+            arm_root / "contact_sheet_columns.json", f"{arm_id} contact sheet manifest"
+        )
+        if page_manifest.get("columns") != ["source", "native", "candidate"]:
+            raise ValueError(f"calibration arm {arm_id} contact sheet columns disagree")
+        arms[arm_id] = build_visual_evidence_contract(
+            manifest_path=manifest_path,
+            rows=visual_rows,
+            pages=page_manifest.get("pages", ()),
+            columns=("source", "native", "candidate"),
+            expected_count=64,
+        )
+    payload = {
+        "schema_version": 1,
+        "sample_count": 64,
+        "sample_id_manifest": str(manifest_path),
+        "sample_id_manifest_sha256": _sha256_file(manifest_path),
+        "arms": arms,
+    }
+    _write_or_validate_json(plan.repo_root / CALIBRATION_VISUAL_EVIDENCE, payload)
+    return payload
+
+
+def _build_semigroup_visual_evidence(plan: MatrixPlan) -> dict[str, Any]:
+    manifest_path = plan.repo_root / CALIBRATION_MANIFEST
+    manifest_ids = _read_manifest_ids(manifest_path)
+    rows_by_id = {}
+    for gpu in range(4):
+        path = plan.repo_root / ROOT / f"semigroup/shards/shard_{gpu}/per_sample.jsonl"
+        for row in _read_jsonl(path):
+            sample_id = str(row.get("sample_id", ""))
+            if not sample_id or sample_id in rows_by_id:
+                raise ValueError("semigroup visual rows contain an invalid or duplicate sample ID")
+            rows_by_id[sample_id] = row
+    if set(rows_by_id) != set(manifest_ids):
+        raise ValueError("semigroup visual rows do not cover the locked 64-sample manifest")
+    arms = {}
+    for split_key in ("0.25", "0.5", "0.75"):
+        visual_rows = []
+        for sample_id in manifest_ids:
+            row = rows_by_id[sample_id]
+            splits = row.get("semigroup")
+            if not isinstance(splits, Mapping) or split_key not in splits:
+                raise ValueError(f"semigroup visual row is missing split {split_key}")
+            visual_rows.append(
+                {
+                    "sample_id": sample_id,
+                    "source": row.get("source"),
+                    "native": row.get("generated"),
+                    "candidate": splits[split_key].get("decoded_image"),
+                }
+            )
+        page_dir = (
+            plan.repo_root
+            / ROOT
+            / "semigroup/visual_evidence/contact_sheets"
+            / f"t_cut_{split_key.replace('.', 'p')}"
+        )
+        pages = write_contact_sheets(
+            page_dir,
+            visual_rows,
+            columns=("source", "native", "candidate"),
+        )
+        arms[split_key] = build_visual_evidence_contract(
+            manifest_path=manifest_path,
+            rows=visual_rows,
+            pages=pages,
+            columns=("source", "native", "candidate"),
+            expected_count=64,
+        )
+    payload = {
+        "schema_version": 1,
+        "sample_count": 64,
+        "sample_id_manifest": str(manifest_path),
+        "sample_id_manifest_sha256": _sha256_file(manifest_path),
+        "arms": arms,
+    }
+    _write_or_validate_json(plan.repo_root / SEMIGROUP_VISUAL_EVIDENCE, payload)
+    return payload
+
+
+def _validate_multi_arm_review(
+    review: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    *,
+    require_passed: bool,
+) -> dict[str, Any]:
+    if int(review.get("reviewed_sample_count", -1)) != int(evidence.get("sample_count", -2)):
+        raise ValueError("visual review count disagrees with locked visual evidence")
+    review_arms = review.get("arms")
+    evidence_arms = evidence.get("arms")
+    if not isinstance(review_arms, Mapping) or not isinstance(evidence_arms, Mapping):
+        raise ValueError("visual review and evidence must contain arm mappings")
+    if set(review_arms) != set(evidence_arms):
+        raise ValueError("visual review arm IDs must exactly match visual evidence arm IDs")
+    normalized = {
+        arm_id: validate_visual_review_arm(review_arms[arm_id], evidence_arms[arm_id])
+        for arm_id in sorted(evidence_arms)
+    }
+    all_passed = all(arm["passed"] for arm in normalized.values())
+    if review.get("passed") is not all_passed:
+        raise ValueError("visual review top-level passed field disagrees with arm decisions")
+    if require_passed and not all_passed:
+        raise ValueError("visual review must pass before continuing")
+    return {
+        "reviewed_sample_count": int(evidence["sample_count"]),
+        "passed": all_passed,
+        "arms": normalized,
     }
 
 
@@ -1203,11 +1342,16 @@ def finalize_phase(plan: MatrixPlan) -> int:
             for gpu in range(4)
         ]
         visual_path = plan.repo_root / SEMIGROUP_VISUAL_REVIEW
+        evidence = _build_semigroup_visual_evidence(plan)
         visual = _read_json(visual_path, "semigroup visual review") if visual_path.is_file() else {}
-        visual_splits = visual.get("splits", {}) if isinstance(visual, Mapping) else {}
+        normalized_visual = (
+            _validate_multi_arm_review(visual, evidence, require_passed=False)
+            if visual_path.is_file()
+            else {"arms": {}}
+        )
         visual_pass = {
-            str(key): bool(value.get("visual_pass")) if isinstance(value, Mapping) else bool(value)
-            for key, value in visual_splits.items()
+            str(key): bool(value["passed"])
+            for key, value in normalized_visual["arms"].items()
         }
         config = _load_yaml(plan.repo_root / SEMIGROUP_CONFIG)
         report = merge_semigroup_shards(
@@ -1239,12 +1383,20 @@ def finalize_phase(plan: MatrixPlan) -> int:
                 exclusive=True,
             )
         return 0
+    if plan.phase == "calibrate":
+        evidence = _build_calibration_visual_evidence(plan)
+        visual_path = plan.repo_root / VISUAL_REVIEW
+        if not visual_path.is_file():
+            return 2
+        visual = _read_json(visual_path, "calibration visual review")
+        _validate_multi_arm_review(visual, evidence, require_passed=True)
+        return 0
     if plan.phase == "full":
-        finalize_full_outputs(plan)
+        return finalize_full_outputs(plan)
     return 0
 
 
-def finalize_full_outputs(plan: MatrixPlan) -> None:
+def finalize_full_outputs(plan: MatrixPlan) -> int:
     arm_completions: dict[str, Mapping[str, Any]] = {}
     for arm_id in ("native", "winner"):
         combined = plan.repo_root / ROOT / f"full/merged/{arm_id}"
@@ -1263,10 +1415,19 @@ def finalize_full_outputs(plan: MatrixPlan) -> None:
                 env={**os.environ, "PYTHONPATH": "src"},
             )
         _read_json(quality_path, f"full {arm_id} quality result")
+    evidence = _build_full_visual_evidence(plan)
+    visual_path = plan.repo_root / FULL_VISUAL_REVIEW
+    if not visual_path.is_file():
+        return 2
+    visual = _read_json(visual_path, "full visual review")
+    normalized_visual = _validate_multi_arm_review(visual, evidence, require_passed=True)
     completion = {
         "schema_version": 1,
         "status": "complete",
         "sample_id_manifest_sha256": _sha256_file(plan.repo_root / FULL_MANIFEST),
+        "visual_evidence_sha256": _sha256_file(plan.repo_root / FULL_VISUAL_EVIDENCE),
+        "visual_review_sha256": _sha256_file(visual_path),
+        "visual_review": normalized_visual,
         "arms": {
             arm_id: {
                 "merge_contract_sha256": arm_completions[arm_id]["merge_contract_sha256"],
@@ -1280,12 +1441,69 @@ def finalize_full_outputs(plan: MatrixPlan) -> None:
     _write_or_validate_json(
         plan.repo_root / ROOT / "full/finalization_completion.json", completion
     )
+    return 0
+
+
+def _build_full_visual_evidence(plan: MatrixPlan) -> dict[str, Any]:
+    manifest_path = plan.repo_root / CALIBRATION_MANIFEST
+    review_ids = _read_manifest_ids(manifest_path)
+    full_ids = _read_manifest_ids(plan.repo_root / FULL_MANIFEST)
+    if full_ids[:64] != review_ids:
+        raise ValueError("full visual review IDs must be the locked first 64 full-manifest IDs")
+    native_rows = {
+        str(row.get("sample_id", "")): row
+        for row in _read_jsonl(plan.repo_root / ROOT / "full/merged/native/per_sample.jsonl")
+    }
+    winner_rows = {
+        str(row.get("sample_id", "")): row
+        for row in _read_jsonl(plan.repo_root / ROOT / "full/merged/winner/per_sample.jsonl")
+    }
+    visual_rows = []
+    for sample_id in review_ids:
+        native = native_rows.get(sample_id)
+        winner = winner_rows.get(sample_id)
+        if native is None or winner is None or native.get("source") != winner.get("source"):
+            raise ValueError("full visual native/winner source bindings disagree")
+        visual_rows.append(
+            {
+                "sample_id": sample_id,
+                "source": winner.get("source"),
+                "native": native.get("generated"),
+                "candidate": winner.get("generated"),
+            }
+        )
+    page_dir = plan.repo_root / ROOT / "full/visual_evidence/contact_sheets"
+    pages = write_contact_sheets(
+        page_dir,
+        visual_rows,
+        columns=("source", "native", "candidate"),
+    )
+    winner_id = str(plan.full_contract["winner"]["arm_id"])
+    arm = build_visual_evidence_contract(
+        manifest_path=manifest_path,
+        rows=visual_rows,
+        pages=pages,
+        columns=("source", "native", "candidate"),
+        expected_count=64,
+    )
+    payload = {
+        "schema_version": 1,
+        "sample_count": 64,
+        "sample_id_manifest": str(manifest_path),
+        "sample_id_manifest_sha256": _sha256_file(manifest_path),
+        "full_sample_id_manifest": str(plan.repo_root / FULL_MANIFEST),
+        "full_sample_id_manifest_sha256": _sha256_file(plan.repo_root / FULL_MANIFEST),
+        "arms": {winner_id: arm},
+    }
+    _write_or_validate_json(plan.repo_root / FULL_VISUAL_EVIDENCE, payload)
+    return payload
 
 
 def _merge_full_arm(repo_root: Path, arm_id: str, combined: Path) -> dict[str, Any]:
     expected_ids = _read_manifest_ids(repo_root / FULL_MANIFEST)
     rows_by_id: dict[str, dict[str, Any]] = {}
     shard_contracts = []
+    generation_contracts = []
     for gpu in range(4):
         shard_root = repo_root / ROOT / f"full/shards/shard_{gpu}/{arm_id}"
         completion_path = shard_root / "completion.json"
@@ -1302,11 +1520,27 @@ def _merge_full_arm(repo_root: Path, arm_id: str, combined: Path) -> dict[str, A
             )
         if int(completion.get("sample_count", -1)) != len(shard_rows):
             raise ValueError(f"full {arm_id} shard {gpu} completion sample count disagrees")
+        generation_path = shard_root / "generation_result.json"
+        generation = _read_json(generation_path, f"full {arm_id} shard generation")
+        if generation.get("status") != "complete" or generation.get("sample_count") != len(
+            shard_rows
+        ):
+            raise ValueError(f"full {arm_id} shard {gpu} generation contract is incomplete")
+        if generation.get("sample_id_sha256") != _sample_id_digest(actual_shard_ids):
+            raise ValueError(f"full {arm_id} shard {gpu} generation sample digest disagrees")
+        checkpoint = generation.get("checkpoint")
+        if not isinstance(checkpoint, Mapping) or checkpoint.get("sha256") != CHECKPOINT_SHA256:
+            raise ValueError(f"full {arm_id} shard {gpu} checkpoint contract disagrees")
+        config = generation.get("config")
+        if not isinstance(config, Mapping) or config.get("sampling_seed", config.get("seed")) != 1337:
+            raise ValueError(f"full {arm_id} shard {gpu} sampling seed disagrees")
+        generation_contracts.append(generation)
         shard_contracts.append(
             {
                 "shard_index": gpu,
                 "completion_sha256": _sha256_file(completion_path),
                 "per_sample_sha256": _sha256_file(path),
+                "generation_result_sha256": _sha256_file(generation_path),
                 "ordered_sample_id_sha256": _sample_id_digest(actual_shard_ids),
             }
         )
@@ -1317,6 +1551,11 @@ def _merge_full_arm(repo_root: Path, arm_id: str, combined: Path) -> dict[str, A
             rows_by_id[sample_id] = row
     if set(rows_by_id) != set(expected_ids):
         raise ValueError(f"full {arm_id} shards do not cover exactly the locked manifest IDs")
+    first_generation = generation_contracts[0]
+    for generation in generation_contracts[1:]:
+        for field in ("mode", "checkpoint", "schedule", "config"):
+            if generation.get(field) != first_generation.get(field):
+                raise ValueError(f"full {arm_id} shard generation {field} contracts disagree")
     source_rows = []
     for sample_id in expected_ids:
         source_value = rows_by_id[sample_id].get(
@@ -1370,6 +1609,31 @@ def _merge_full_arm(repo_root: Path, arm_id: str, combined: Path) -> dict[str, A
         json.dumps(row, sort_keys=True) + "\n" for row in output_rows
     )
     _write_or_validate_text(combined / "per_sample.jsonl", per_sample_content)
+    candidate_values = [
+        _finite_metric(row.get("candidate_cosine"), "candidate cosine") for row in output_rows
+    ]
+    native_values = [
+        _finite_metric(row.get("native_cosine"), "native cosine") for row in output_rows
+    ]
+    merged_generation = {
+        "schema_version": 1,
+        "status": "complete",
+        "mode": first_generation["mode"],
+        "checkpoint": first_generation["checkpoint"],
+        "sample_count": len(expected_ids),
+        "sample_id_sha256": _sample_id_digest(expected_ids),
+        "sample_id_manifest": str(repo_root / FULL_MANIFEST),
+        "sample_id_manifest_sha256": _sha256_file(repo_root / FULL_MANIFEST),
+        "seed": 1337,
+        "schedule": first_generation.get("schedule"),
+        "config": first_generation["config"],
+        "cosine": {
+            "candidate_e0_target": _finite_summary(candidate_values),
+            "native_e0_target": _finite_summary(native_values),
+        },
+        "shards": shard_contracts,
+    }
+    _write_or_validate_json(combined / "generation_result.json", merged_generation)
     completion = {
         "schema_version": 1,
         "status": "complete",
@@ -1377,6 +1641,7 @@ def _merge_full_arm(repo_root: Path, arm_id: str, combined: Path) -> dict[str, A
         "sample_count": len(expected_ids),
         "merge_contract_sha256": merge_contract["merge_contract_sha256"],
         "per_sample_sha256": hashlib.sha256(per_sample_content.encode("utf-8")).hexdigest(),
+        "generation_result_sha256": _sha256_file(combined / "generation_result.json"),
         "ordered_image_manifest_sha256": hashlib.sha256(
             "".join(image_manifest_lines).encode("utf-8")
         ).hexdigest(),
@@ -1650,6 +1915,17 @@ def _percentile(values: Sequence[float], fraction: float) -> float:
         return float(ordered[lower])
     weight = position - lower
     return float(ordered[lower] * (1.0 - weight) + ordered[upper] * weight)
+
+
+def _finite_summary(values: Sequence[float]) -> dict[str, float]:
+    if not values or any(not math.isfinite(value) for value in values):
+        raise ValueError("cannot summarize empty or non-finite full cosine values")
+    return {
+        "mean": float(statistics.mean(values)),
+        "median": float(statistics.median(values)),
+        "min": float(min(values)),
+        "max": float(max(values)),
+    }
 
 
 def _timestamp() -> str:

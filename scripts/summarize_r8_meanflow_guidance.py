@@ -13,6 +13,8 @@ from typing import Any, Mapping, Sequence
 
 import yaml
 
+from safa.evaluation.r8_visual_evidence import validate_visual_review_arm
+
 
 CHECKPOINT_SHA256 = "4690717781db58a6021d57d124300a9b212f0a5043cf3028fb5de4d9c835cc4d"
 FULL_MANIFEST_SHA256 = "7f830ad3f84089bcf83d092fbffaf2b5c3335cf68a4b397f04b65f362f79ae5b"
@@ -25,6 +27,9 @@ ALLOWED_VISUAL_CATEGORIES = frozenset(
         "broken_global_structure",
         "broken_global_face_or_image_structure",
         "large_non_image_texture_region",
+        "repeated_tiled_face_or_image_pattern",
+        "near_uniform_or_blank_frame",
+        "severe_saturation_or_clipping_destroying_global_structure",
     }
 )
 TABLE_FIELDS = (
@@ -227,11 +232,21 @@ def summarize_calibration(root: Path) -> dict[str, Any]:
     if not visual_path.is_file():
         raise FileNotFoundError(f"required visual_review.json does not exist: {visual_path}")
     visual = _read_json(visual_path, "visual_review")
-    if visual.get("reviewed_sample_count") != 64:
+    evidence = _read_json(root / "calibration/visual_evidence.json", "calibration visual evidence")
+    if visual.get("reviewed_sample_count") != 64 or evidence.get("sample_count") != 64:
         raise ValueError("visual_review must record exactly 64 reviewed samples")
     reviews = visual.get("arms")
-    if not isinstance(reviews, Mapping):
-        raise ValueError("visual_review must contain an arms mapping")
+    evidence_arms = evidence.get("arms")
+    if not isinstance(reviews, Mapping) or not isinstance(evidence_arms, Mapping):
+        raise ValueError("visual_review and evidence must contain arms mappings")
+    if set(reviews) != set(evidence_arms):
+        raise ValueError("visual_review arm IDs must exactly match visual evidence")
+    normalized_reviews = {
+        arm_id: validate_visual_review_arm(reviews[arm_id], evidence_arms[arm_id])
+        for arm_id in reviews
+    }
+    if visual.get("passed") is not all(review["passed"] for review in normalized_reviews.values()):
+        raise ValueError("visual_review top-level pass disagrees with reviewed arms")
     calibration = root / "calibration"
     if not calibration.is_dir():
         raise FileNotFoundError(f"calibration directory does not exist: {calibration}")
@@ -243,10 +258,10 @@ def summarize_calibration(root: Path) -> dict[str, Any]:
     if not arm_dirs:
         raise ValueError("no completed R8 calibration arms were found")
     arm_ids = {path.name for path in arm_dirs}
-    if set(reviews) != arm_ids:
+    if set(normalized_reviews) != arm_ids:
         raise ValueError(
             "visual_review arm IDs must exactly match completed calibration arm IDs: "
-            f"completed={sorted(arm_ids)!r} reviewed={sorted(reviews)!r}"
+            f"completed={sorted(arm_ids)!r} reviewed={sorted(normalized_reviews)!r}"
         )
     rows = []
     for arm_dir in arm_dirs:
@@ -257,7 +272,9 @@ def summarize_calibration(root: Path) -> dict[str, Any]:
                 "mean": _native_sharpness_mean(arm_dir / "per_sample.jsonl")
             }
         rows.append(
-            validate_calibration_arm(arm_dir.name, generation, quality, reviews[arm_dir.name])
+            validate_calibration_arm(
+                arm_dir.name, generation, quality, normalized_reviews[arm_dir.name]
+            )
         )
     selection = select_calibration_winner(rows)
     winner_row = next(row for row in rows if row["arm_id"] == selection["winner"]["arm_id"])
@@ -355,6 +372,8 @@ def classify_full_result(
         "heldout_e1_e2": all(heldout_improvements.values()),
         "visual": severe <= 3,
         "finite": bool(native.get("all_finite")) and bool(winner.get("all_finite")),
+        "contracts": bool(native.get("contract_validated"))
+        and bool(winner.get("contract_validated")),
     }
     directional_checks = {
         "e0_delta": _finite(winner["e0_cosine"], "winner E0 cosine")
@@ -364,6 +383,8 @@ def classify_full_result(
         >= 0.80 * _finite(native["sharpness_mean"], "native Sharpness"),
         "visual_safety": severe <= 6,
         "finite": bool(native.get("all_finite")) and bool(winner.get("all_finite")),
+        "contracts": bool(native.get("contract_validated"))
+        and bool(winner.get("contract_validated")),
     }
     if all(solved_checks.values()):
         label = "solved"
@@ -383,14 +404,54 @@ def summarize_full(root: Path) -> dict[str, Any]:
     root = Path(root)
     selection = _read_json(root / "selection.json", "selection")
     heldout = _read_json(root / "heldout_e1_e2.json", "held-out evaluation")
-    visual = _read_json(root / "visual_review.json", "visual_review")
-    winner_id = str(_nested(selection, ("winner", "arm_id"), "winner arm ID"))
-    severe = _integer(
-        _nested(visual, ("arms", winner_id, "severe_failure_count"), "winner severe count"),
-        "winner severe count",
+    marker = _read_json(root / "heldout_protocol_marker.json", "held-out protocol marker")
+    visual_path = root / "full/visual_review.json"
+    visual = _read_json(visual_path, "full visual_review")
+    visual_evidence_path = root / "full/visual_evidence.json"
+    visual_evidence = _read_json(visual_evidence_path, "full visual evidence")
+    finalization = _read_json(
+        root / "full/finalization_completion.json", "full finalization completion"
     )
+    winner_id = str(_nested(selection, ("winner", "arm_id"), "winner arm ID"))
+    _validate_full_selection(selection, root)
+    evidence_arms = visual_evidence.get("arms")
+    review_arms = visual.get("arms")
+    if not isinstance(evidence_arms, Mapping) or set(evidence_arms) != {winner_id}:
+        raise ValueError("full visual evidence must contain exactly the locked winner arm")
+    if not isinstance(review_arms, Mapping) or set(review_arms) != {winner_id}:
+        raise ValueError("full visual review must contain exactly the locked winner arm")
+    normalized_review = validate_visual_review_arm(
+        review_arms[winner_id], evidence_arms[winner_id]
+    )
+    if visual.get("reviewed_sample_count") != 64 or visual.get("passed") is not True:
+        raise ValueError("full visual review must pass exactly 64 locked samples")
+    severe = normalized_review["severe_failure_count"]
+    if finalization.get("status") != "complete":
+        raise ValueError("full finalization completion marker is not complete")
+    if finalization.get("sample_id_manifest_sha256") != _sha256_file(
+        root / "manifests/full_2048.jsonl"
+    ):
+        raise ValueError("full finalization manifest SHA256 disagrees")
+    if finalization.get("visual_evidence_sha256") != _sha256_file(visual_evidence_path):
+        raise ValueError("full finalization visual evidence SHA256 disagrees")
+    if finalization.get("visual_review_sha256") != _sha256_file(visual_path):
+        raise ValueError("full finalization visual review SHA256 disagrees")
     native = _full_quality_row(root / "full/merged/native", e0_key="native")
     winner = _full_quality_row(root / "full/merged/winner", e0_key="candidate")
+    for arm_id, result in (("native", native), ("winner", winner)):
+        arm_finalization = _nested(
+            finalization, ("arms", arm_id), f"full {arm_id} finalization contract"
+        )
+        if not isinstance(arm_finalization, Mapping) or arm_finalization.get(
+            "merge_contract_sha256"
+        ) != result.get(
+            "merge_contract_sha256"
+        ) or arm_finalization.get("quality_sha256") != _sha256_file(
+            root / f"full/merged/{arm_id}/quality.json"
+        ):
+            raise ValueError(f"full {arm_id} finalization assets disagree")
+    _validate_full_result_contracts(selection, native, winner, root)
+    _validate_heldout_result_contract(selection, heldout, marker, root)
     decision = classify_full_result(native, winner, heldout, severe_failure_count=severe)
     payload = {
         "schema_version": 1,
@@ -404,28 +465,165 @@ def summarize_full(root: Path) -> dict[str, Any]:
     return payload
 
 
+def _validate_full_selection(selection: Mapping[str, Any], root: Path) -> None:
+    if selection.get("checkpoint_sha256") != CHECKPOINT_SHA256:
+        raise ValueError("full selection checkpoint SHA256 disagrees")
+    if selection.get("full_sample_count") != 2048:
+        raise ValueError("full selection must lock exactly 2048 samples")
+    manifest_path = root / "manifests/full_2048.jsonl"
+    if selection.get("full_sample_id_manifest_sha256") != _sha256_file(manifest_path):
+        raise ValueError("full selection manifest file SHA256 disagrees")
+    manifest_ids = [str(row.get("sample_id", "")) for row in _read_jsonl(manifest_path)]
+    if len(manifest_ids) != 2048 or len(set(manifest_ids)) != 2048:
+        raise ValueError("full selection manifest must contain exactly 2048 unique IDs")
+    if selection.get("full_sample_id_sha256") != _sample_id_digest(manifest_ids):
+        raise ValueError("full selection ordered sample-ID digest disagrees")
+    winner = selection.get("winner")
+    if not isinstance(winner, Mapping):
+        raise ValueError("full selection is missing the locked winner")
+    config_path = Path(str(winner.get("config", "")))
+    if _sha256_file(config_path) != _sha(winner.get("config_sha256"), "winner config SHA256"):
+        raise ValueError("full selection winner config file SHA256 disagrees")
+
+
+def _validate_full_result_contracts(
+    selection: Mapping[str, Any],
+    native: Mapping[str, Any],
+    winner: Mapping[str, Any],
+    root: Path,
+) -> None:
+    manifest_ids = [
+        str(row["sample_id"]) for row in _read_jsonl(root / "manifests/full_2048.jsonl")
+    ]
+    expected_sample_digest = _sample_id_digest(manifest_ids)
+    if native.get("sample_id_sha256") != expected_sample_digest or winner.get(
+        "sample_id_sha256"
+    ) != expected_sample_digest:
+        raise ValueError("full native/winner sample-ID contracts disagree with the locked manifest")
+    if native.get("mode") != "native" or native.get("schedule") is not None:
+        raise ValueError("full native result must use native mode without a guidance schedule")
+    winner_contract = selection["winner"]
+    if winner.get("mode") != winner_contract.get("mode"):
+        raise ValueError("full winner mode disagrees with the locked selection")
+    if winner_contract.get("mode") in {"official_head_current_xt", "paper_algorithm_split"}:
+        schedule = winner.get("schedule")
+        if not isinstance(schedule, Mapping):
+            raise ValueError("full FMRG winner is missing the locked schedule")
+        for field in ("schedule_manifest_sha256", "schedule_contract_sha256"):
+            schedule_field = "manifest_sha256" if field == "schedule_manifest_sha256" else field
+            if schedule.get(schedule_field) != winner_contract.get(field):
+                raise ValueError(f"full winner {field} disagrees with selection")
+        if not math.isclose(
+            _finite(schedule.get("t_cut"), "full winner schedule t_cut"),
+            _finite(winner_contract.get("t_cut"), "selection winner t_cut"),
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
+        ):
+            raise ValueError("full winner t_cut disagrees with selection")
+
+
+def _validate_heldout_result_contract(
+    selection: Mapping[str, Any],
+    heldout: Mapping[str, Any],
+    marker: Mapping[str, Any],
+    root: Path,
+) -> None:
+    contract = heldout.get("contract")
+    if not isinstance(contract, Mapping):
+        raise ValueError("held-out result is missing its prospective contract")
+    contract_sha = _canonical_contract_sha256(contract, "contract_sha256")
+    if contract.get("contract_sha256") != contract_sha:
+        raise ValueError("held-out result contract canonical SHA256 disagrees")
+    if marker.get("status") != "complete" or marker.get("contract_sha256") != contract_sha:
+        raise ValueError("held-out protocol marker/result contract digests disagree")
+    if marker.get("contract") != contract:
+        raise ValueError("held-out protocol marker contract payload disagrees with result")
+    result_path = root / "heldout_e1_e2.json"
+    if Path(str(marker.get("result", ""))).resolve() != result_path.resolve():
+        raise ValueError("held-out protocol marker result path disagrees")
+    if marker.get("result_sha256") != _sha256_file(result_path):
+        raise ValueError("held-out protocol marker result SHA256 disagrees")
+    if contract.get("winner_config_sha256") != selection["winner"].get("config_sha256"):
+        raise ValueError("held-out winner config contract disagrees with selection")
+    if contract.get("sample_id_sha256") != selection.get("full_sample_id_sha256"):
+        raise ValueError("held-out sample-ID contract disagrees with selection")
+    if contract.get("full_finalization_sha256") != _sha256_file(
+        root / "full/finalization_completion.json"
+    ):
+        raise ValueError("held-out full finalization contract was replaced")
+    for arm_id in ("native", "winner"):
+        per_sample = root / f"full/merged/{arm_id}/per_sample.jsonl"
+        if _nested(
+            contract, (arm_id, "per_sample_sha256"), f"held-out {arm_id} per-sample SHA"
+        ) != _sha256_file(per_sample):
+            raise ValueError(f"held-out {arm_id} per-sample evidence was replaced")
+        if _nested(
+            contract,
+            (arm_id, "ordered_image_manifest_sha256"),
+            f"held-out {arm_id} ordered image manifest SHA",
+        ) != _ordered_image_manifest_sha256(per_sample):
+            raise ValueError(f"held-out {arm_id} generated image evidence was replaced")
+
+
 def _full_quality_row(path: Path, *, e0_key: str) -> dict[str, Any]:
     quality = _read_json(path / "quality.json", f"{e0_key} quality")
     generation_path = path / "generation_result.json"
-    if generation_path.is_file():
-        generation = _read_json(generation_path, f"{e0_key} generation")
-        cosine_key = "native_e0_target" if e0_key == "native" else "candidate_e0_target"
-        e0_cosine = _summary_mean(generation["cosine"], cosine_key)
-    else:
-        per_sample_key = "native_cosine" if e0_key == "native" else "candidate_cosine"
-        values = [
-            _finite(row.get(per_sample_key), f"{e0_key} per-sample cosine")
-            for row in _read_jsonl(path / "per_sample.jsonl")
-        ]
-        if not values:
-            raise ValueError(f"{e0_key} merged per-sample manifest contains no rows")
-        e0_cosine = sum(values) / len(values)
+    generation = _read_json(generation_path, f"{e0_key} generation")
+    completion = _read_json(path / "completion.json", f"{e0_key} merge completion")
+    merge_contract = _read_json(path / "merge_contract.json", f"{e0_key} merge contract")
+    per_sample_path = path / "per_sample.jsonl"
+    rows = _read_jsonl(per_sample_path)
+    if len(rows) != 2048 or generation.get("sample_count") != 2048:
+        raise ValueError(f"{e0_key} full generation must contain exactly 2048 samples")
+    if quality.get("num_generated") != 2048 or quality.get("num_real") != 2048:
+        raise ValueError(f"{e0_key} full quality must contain exactly 2048 generated/real samples")
+    if quality.get("sample_id_count") != 2048:
+        raise ValueError(f"{e0_key} quality manifest must contain exactly 2048 IDs")
+    ordered_ids = [str(row.get("sample_id", "")) for row in rows]
+    sample_digest = _sample_id_digest(ordered_ids)
+    if generation.get("sample_id_sha256") != sample_digest or quality.get(
+        "sample_id_sha256"
+    ) != sample_digest:
+        raise ValueError(f"{e0_key} generation/quality ordered sample digests disagree")
+    if completion.get("status") != "complete" or completion.get("sample_count") != 2048:
+        raise ValueError(f"{e0_key} merge completion contract is incomplete")
+    if completion.get("per_sample_sha256") != _sha256_file(per_sample_path):
+        raise ValueError(f"{e0_key} per-sample file SHA256 disagrees with completion")
+    if completion.get("generation_result_sha256") != _sha256_file(generation_path):
+        raise ValueError(f"{e0_key} generation file SHA256 disagrees with completion")
+    if completion.get("merge_contract_sha256") != merge_contract.get(
+        "merge_contract_sha256"
+    ):
+        raise ValueError(f"{e0_key} merge completion/contract digests disagree")
+    checkpoint = generation.get("checkpoint")
+    if not isinstance(checkpoint, Mapping) or checkpoint.get("sha256") != CHECKPOINT_SHA256:
+        raise ValueError(f"{e0_key} checkpoint SHA256 is not the locked epoch-1652 checkpoint")
+    expected_checkpoint_state = {
+        "stage": "stage2",
+        "stage_epoch_1based": 1652,
+        "sit_patch_size": 4,
+        "weight_source": "ema_model_state_dict",
+    }
+    for field, expected in expected_checkpoint_state.items():
+        if checkpoint.get(field) != expected:
+            raise ValueError(f"{e0_key} checkpoint state field {field} disagrees")
+    if generation.get("seed") != 1337:
+        raise ValueError(f"{e0_key} full generation seed must be 1337")
+    cosine_key = "native_e0_target" if e0_key == "native" else "candidate_e0_target"
+    e0_cosine = _summary_mean(generation["cosine"], cosine_key)
     return {
         "fid": _finite(quality["fid"], "FID"),
         "kid_mean": _finite(quality["kid_mean"], "KID"),
         "sharpness_mean": _nested_finite(quality, ("sharpness", "mean"), "Sharpness"),
         "e0_cosine": e0_cosine,
         "all_finite": True,
+        "contract_validated": True,
+        "mode": generation.get("mode"),
+        "sample_id_sha256": sample_digest,
+        "checkpoint": dict(checkpoint),
+        "seed": 1337,
+        "schedule": generation.get("schedule"),
+        "merge_contract_sha256": merge_contract.get("merge_contract_sha256"),
     }
 
 
@@ -674,6 +872,28 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _sample_id_digest(sample_ids: Sequence[str]) -> str:
+    return hashlib.sha256(
+        "".join(f"{sample_id}\n" for sample_id in sample_ids).encode("utf-8")
+    ).hexdigest()
+
+
+def _ordered_image_manifest_sha256(per_sample_path: Path) -> str:
+    lines = []
+    for row in _read_jsonl(per_sample_path):
+        sample_id = str(row.get("sample_id", ""))
+        generated = Path(str(row.get("generated", "")))
+        lines.append(f"{sample_id}\t{generated}\t{_sha256_file(generated)}\n")
+    return hashlib.sha256("".join(lines).encode("utf-8")).hexdigest()
+
+
+def _canonical_contract_sha256(payload: Mapping[str, Any], digest_field: str) -> str:
+    contract = dict(payload)
+    contract.pop(digest_field, None)
+    encoded = json.dumps(contract, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _fmt(value: Any) -> str:

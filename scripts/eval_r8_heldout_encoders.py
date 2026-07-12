@@ -48,6 +48,12 @@ def validate_heldout_contract(
         raise ValueError("held-out selection checkpoint SHA256 mismatch")
     if selection.get("full_sample_count") != 2048:
         raise ValueError("held-out selection must lock exactly 2048 samples")
+    manifest_file_sha256 = _sha(
+        selection.get("full_sample_id_manifest_sha256"),
+        "selection full manifest file SHA256",
+    )
+    if manifest_file_sha256 != FULL_MANIFEST_FILE_SHA256:
+        raise ValueError("selection full manifest file SHA256 is not the registered manifest")
     expected_digest = _sha(
         selection.get("full_sample_id_sha256"), "selection full sample-ID digest"
     )
@@ -56,20 +62,41 @@ def validate_heldout_contract(
             raise ValueError(f"held-out {label} manifest must contain exactly 2048 samples")
         if _sha(payload.get("sample_id_sha256"), f"{label} sample-ID digest") != expected_digest:
             raise ValueError(f"held-out {label} sample-ID digest disagrees with locked selection")
-    return {
+        _sha(payload.get("per_sample_sha256"), f"{label} per-sample SHA256")
+        _sha(
+            payload.get("ordered_image_manifest_sha256"),
+            f"{label} ordered image manifest SHA256",
+        )
+    contract = {
         "winner_arm_id": str(winner["arm_id"]),
         "winner_config_sha256": _sha(winner.get("config_sha256"), "winner config SHA256"),
         "checkpoint_sha256": CHECKPOINT_SHA256,
         "sample_count": 2048,
         "sample_id_sha256": expected_digest,
+        "sample_id_manifest_sha256": manifest_file_sha256,
+        "native": {
+            "per_sample_sha256": native_manifest["per_sample_sha256"],
+            "ordered_image_manifest_sha256": native_manifest[
+                "ordered_image_manifest_sha256"
+            ],
+        },
+        "winner": {
+            "per_sample_sha256": winner_manifest["per_sample_sha256"],
+            "ordered_image_manifest_sha256": winner_manifest[
+                "ordered_image_manifest_sha256"
+            ],
+        },
     }
+    contract["contract_sha256"] = _contract_sha256(contract)
+    return contract
 
 
 def claim_protocol_marker(path: Path, contract: Mapping[str, Any]) -> dict[str, Any]:
     marker = {
         "schema_version": 1,
-        "status": "claimed_before_first_heldout_forward",
-        "claimed_at": _timestamp(),
+        "status": "started",
+        "started_at": _timestamp(),
+        "contract_sha256": _sha(contract.get("contract_sha256"), "contract SHA256"),
         "contract": dict(contract),
         "encoders": {
             name: {"path": str(metadata["path"]), "sha256": metadata["sha256"]}
@@ -87,22 +114,29 @@ def claim_protocol_marker(path: Path, contract: Mapping[str, Any]) -> dict[str, 
 
 def evaluate_heldout(root: Path, *, device: str, batch_size: int) -> dict[str, Any]:
     root = Path(root)
+    marker_path = root / "heldout_protocol_marker.json"
+    output = root / "heldout_e1_e2.json"
+    if marker_path.exists() or output.exists():
+        raise FileExistsError("refusing a second or stale held-out evaluation artifact")
     selection = _read_json(root / "selection.json", "locked selection")
+    finalization_path = root / "full/finalization_completion.json"
+    finalization = _read_json(finalization_path, "full finalization completion")
+    if finalization.get("status") != "complete":
+        raise ValueError("held-out evaluation requires completed full visual/quality finalization")
     manifest_path = root / "manifests/full_2048.jsonl"
     if _sha256_file(manifest_path) != FULL_MANIFEST_FILE_SHA256:
         raise ValueError("full 2048 manifest file digest mismatch")
     sample_ids = _read_manifest_ids(manifest_path)
     if len(sample_ids) != 2048:
         raise ValueError("held-out evaluation requires exactly 2048 manifest IDs")
-    sample_id_sha = _sample_id_digest(sample_ids)
     index_rows = _read_jsonl(Path("data/index/val_face_mixed_e14.jsonl"))
     index_by_id = _unique_rows(index_rows, "real index")
     if set(sample_ids) - set(index_by_id):
         raise ValueError("real index does not cover every held-out manifest ID")
-    native_rows = _read_generated_rows(root / "full/merged/native/per_sample.jsonl", sample_ids)
-    winner_rows = _read_generated_rows(root / "full/merged/winner/per_sample.jsonl", sample_ids)
-    native_manifest = {"sample_count": len(native_rows), "sample_id_sha256": sample_id_sha}
-    winner_manifest = {"sample_count": len(winner_rows), "sample_id_sha256": sample_id_sha}
+    native_path = root / "full/merged/native/per_sample.jsonl"
+    winner_path = root / "full/merged/winner/per_sample.jsonl"
+    native_rows, native_manifest = read_generated_evidence(native_path, sample_ids)
+    winner_rows, winner_manifest = read_generated_evidence(winner_path, sample_ids)
     contract = validate_heldout_contract(selection, native_manifest, winner_manifest)
     winner_config = Path(str(selection["winner"].get("config", "")))
     if _sha256_file(winner_config) != contract["winner_config_sha256"]:
@@ -111,14 +145,15 @@ def evaluate_heldout(root: Path, *, device: str, batch_size: int) -> dict[str, A
         {
             "sample_id_manifest": str(manifest_path),
             "sample_id_manifest_sha256": FULL_MANIFEST_FILE_SHA256,
-            "native_per_sample": str(root / "full/merged/native/per_sample.jsonl"),
-            "winner_per_sample": str(root / "full/merged/winner/per_sample.jsonl"),
+            "native_per_sample": str(native_path),
+            "winner_per_sample": str(winner_path),
+            "full_finalization_sha256": _sha256_file(finalization_path),
         }
     )
+    contract["contract_sha256"] = _contract_sha256(contract)
     for name, metadata in ENCODERS.items():
         if _sha256_file(metadata["path"]) != metadata["sha256"]:
             raise ValueError(f"fixed held-out encoder SHA256 mismatch: {name}")
-    marker_path = root / "heldout_protocol_marker.json"
     marker = claim_protocol_marker(marker_path, contract)
 
     source_paths = [Path(str(index_by_id[sample_id]["image_path"])) for sample_id in sample_ids]
@@ -160,12 +195,12 @@ def evaluate_heldout(root: Path, *, device: str, batch_size: int) -> dict[str, A
                 ),
             },
         }
-        output = root / "heldout_e1_e2.json"
         _write_exclusive_json(output, payload)
         marker.update(
             {
                 "status": "complete",
                 "completed_at": _timestamp(),
+                "contract_sha256": contract["contract_sha256"],
                 "result": str(output),
                 "result_sha256": _sha256_file(output),
             }
@@ -265,15 +300,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-def _read_generated_rows(path: Path, expected_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
-    rows = _unique_rows(_read_jsonl(path), str(path))
-    if set(rows) != set(expected_ids):
-        raise ValueError(f"generated per-sample IDs do not exactly match locked manifest: {path}")
+def read_generated_evidence(
+    path: Path, expected_ids: Sequence[str]
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    ordered_rows = _read_jsonl(path)
+    actual_ids = [str(row.get("sample_id", "")) for row in ordered_rows]
+    if actual_ids != list(expected_ids):
+        raise ValueError(f"generated per-sample order does not exactly match locked manifest: {path}")
+    rows = _unique_rows(ordered_rows, str(path))
+    image_manifest_lines = []
     for sample_id in expected_ids:
-        generated = rows[sample_id].get("generated")
+        generated = rows[str(sample_id)].get("generated")
         if not isinstance(generated, str) or not Path(generated).is_file():
             raise FileNotFoundError(f"generated image is missing for {sample_id!r}: {generated!r}")
-    return rows
+        image_manifest_lines.append(
+            f"{sample_id}\t{generated}\t{_sha256_file(Path(generated))}\n"
+        )
+    evidence = {
+        "sample_count": len(ordered_rows),
+        "sample_id_sha256": _sample_id_digest([str(value) for value in expected_ids]),
+        "per_sample_sha256": _sha256_file(path),
+        "ordered_image_manifest_sha256": hashlib.sha256(
+            "".join(image_manifest_lines).encode("utf-8")
+        ).hexdigest(),
+    }
+    return rows, evidence
 
 
 def _unique_rows(rows: Sequence[Mapping[str, Any]], label: str) -> dict[str, dict[str, Any]]:
@@ -328,6 +379,13 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 def _sample_id_digest(sample_ids: Sequence[str]) -> str:
     return hashlib.sha256("".join(f"{sample_id}\n" for sample_id in sample_ids).encode()).hexdigest()
+
+
+def _contract_sha256(contract: Mapping[str, Any]) -> str:
+    payload = dict(contract)
+    payload.pop("contract_sha256", None)
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _sha(value: Any, label: str) -> str:

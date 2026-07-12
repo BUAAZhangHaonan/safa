@@ -249,7 +249,7 @@ def _write_arm(root: Path, arm_id: str, generation: dict, quality: dict) -> None
 
 
 def test_calibration_summary_requires_visual_review_and_writes_json_csv_markdown(
-    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     module = _load_script("summarize_r8_meanflow_guidance")
     _write_arm(tmp_path, "arm-a", _generation(e0=0.57), _quality(fid=55.0))
@@ -260,8 +260,21 @@ def test_calibration_summary_requires_visual_review_and_writes_json_csv_markdown
 
     visual = {
         "reviewed_sample_count": 64,
-        "arms": {"arm-a": _review(severe=1), "arm-b": _review(severe=2)},
+        "passed": True,
+        "arms": {
+            "arm-a": {**_review(severe=1), "passed": True},
+            "arm-b": {**_review(severe=2), "passed": True},
+        },
     }
+    evidence = {"sample_count": 64, "arms": {"arm-a": {}, "arm-b": {}}}
+    (tmp_path / "calibration/visual_evidence.json").write_text(
+        json.dumps(evidence), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        module,
+        "validate_visual_review_arm",
+        lambda review, locked: {**review, "reviewed_sample_count": 64},
+    )
     (tmp_path / "visual_review.json").write_text(json.dumps(visual), encoding="utf-8")
     selection = module.summarize_calibration(tmp_path)
 
@@ -281,6 +294,7 @@ def _full_arm(*, fid: float, kid: float, sharpness: float, e0: float) -> dict:
         "sharpness_mean": sharpness,
         "e0_cosine": e0,
         "all_finite": True,
+        "contract_validated": True,
     }
 
 
@@ -327,7 +341,7 @@ def test_full_decision_labels_solved_directional_and_failed_exactly() -> None:
     assert failed["label"] == "failed"
 
 
-def test_full_summary_reads_merged_per_sample_cosine_without_generation_manifest(
+def test_full_summary_rejects_missing_merged_generation_contract(
     tmp_path: Path,
 ) -> None:
     module = _load_script("summarize_r8_meanflow_guidance")
@@ -341,11 +355,8 @@ def test_full_summary_reads_merged_per_sample_cosine_without_generation_manifest
         "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
     )
 
-    winner = module._full_quality_row(tmp_path, e0_key="candidate")
-    native = module._full_quality_row(tmp_path, e0_key="native")
-
-    assert winner["e0_cosine"] == pytest.approx(0.6)
-    assert native["e0_cosine"] == pytest.approx(0.5)
+    with pytest.raises(FileNotFoundError, match="generation"):
+        module._full_quality_row(tmp_path, e0_key="candidate")
 
 
 def test_heldout_contract_requires_locked_winner_exact_manifests_and_one_shot_marker(
@@ -357,16 +368,30 @@ def test_heldout_contract_requires_locked_winner_exact_manifests_and_one_shot_ma
         "winner_locked_before_heldout": True,
         "checkpoint_sha256": CHECKPOINT_SHA256,
         "full_sample_count": 2048,
+        "full_sample_id_manifest_sha256": module.FULL_MANIFEST_FILE_SHA256,
         "full_sample_id_sha256": SAMPLE_DIGEST,
     }
-    native = {"sample_count": 2048, "sample_id_sha256": SAMPLE_DIGEST}
-    winner = {"sample_count": 2048, "sample_id_sha256": SAMPLE_DIGEST}
+    native = {
+        "sample_count": 2048,
+        "sample_id_sha256": SAMPLE_DIGEST,
+        "per_sample_sha256": "d" * 64,
+        "ordered_image_manifest_sha256": "e" * 64,
+    }
+    winner = {
+        "sample_count": 2048,
+        "sample_id_sha256": SAMPLE_DIGEST,
+        "per_sample_sha256": "1" * 64,
+        "ordered_image_manifest_sha256": "2" * 64,
+    }
 
     contract = module.validate_heldout_contract(selection, native, winner)
     assert contract["sample_count"] == 2048
+    assert contract["contract_sha256"] == module._contract_sha256(contract)
 
     marker = tmp_path / "heldout_protocol_marker.json"
-    module.claim_protocol_marker(marker, contract)
+    claimed = module.claim_protocol_marker(marker, contract)
+    assert claimed["status"] == "started"
+    assert claimed["contract_sha256"] == contract["contract_sha256"]
     with pytest.raises(FileExistsError, match="second"):
         module.claim_protocol_marker(marker, contract)
 
@@ -374,3 +399,34 @@ def test_heldout_contract_requires_locked_winner_exact_manifests_and_one_shot_ma
         module.validate_heldout_contract(
             selection, {**native, "sample_count": 2047}, winner
         )
+
+
+def test_heldout_generated_evidence_rejects_order_and_binds_each_image(tmp_path: Path) -> None:
+    module = _load_script("eval_r8_heldout_encoders")
+    ids = ["a", "b", "c"]
+    rows = []
+    for sample_id in ids:
+        image = tmp_path / f"{sample_id}.png"
+        image.write_bytes(f"image-{sample_id}".encode())
+        rows.append({"sample_id": sample_id, "generated": str(image)})
+    path = tmp_path / "per_sample.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    by_id, evidence = module.read_generated_evidence(path, ids)
+
+    assert list(by_id) == ids
+    assert evidence["per_sample_sha256"] == module._sha256_file(path)
+    assert len(evidence["ordered_image_manifest_sha256"]) == 64
+    path.write_text(
+        "".join(json.dumps(row) + "\n" for row in reversed(rows)), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="order"):
+        module.read_generated_evidence(path, ids)
+
+
+def test_heldout_refuses_an_old_result_even_without_a_marker(tmp_path: Path) -> None:
+    module = _load_script("eval_r8_heldout_encoders")
+    (tmp_path / "heldout_e1_e2.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="stale"):
+        module.evaluate_heldout(tmp_path, device="cpu", batch_size=1)

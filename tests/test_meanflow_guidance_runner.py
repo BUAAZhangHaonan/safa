@@ -1290,7 +1290,9 @@ def test_semigroup_mode_writes_per_sample_semigroup_json(tmp_path: Path) -> None
         "decoded_pixel_l1",
         "decoded_psnr",
         "endpoint_e0_cosine",
+        "decoded_image",
     }
+    assert Path(payload["rows"][0]["splits"]["0.25"]["decoded_image"]).is_file()
 
 
 def test_guidance_cli_accepts_required_config_output_and_shard_controls() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -152,19 +153,36 @@ def test_r8_guided_configs_resolve_one_locked_uniform_schedule(tmp_path: Path) -
     )
     assert {configs[name]["schedule_manifest"] for name in guided_names} == {expected_manifest}
 
+    report = tmp_path / "semigroup_gate.json"
+    report.write_text(json.dumps({"gate_passed": True}), encoding="utf-8")
+    samples = tmp_path / "samples.jsonl"
+    samples.write_text('{"sample_id":"sample-0"}\n', encoding="utf-8")
     manifest = tmp_path / "locked_schedule_manifest.json"
-    manifest.write_text(
-        json.dumps(
-            {
-                "gate_passed": True,
-                "checkpoint_sha256": EXPECTED_HASHES["checkpoint_sha256"],
-                "t_cut": 0.25,
-            }
-        ),
-        encoding="utf-8",
-    )
+    payload = {
+        "schema_version": 2,
+        "gate_passed": True,
+        "checkpoint_sha256": EXPECTED_HASHES["checkpoint_sha256"],
+        "semigroup_report": str(report),
+        "semigroup_report_sha256": hashlib.sha256(report.read_bytes()).hexdigest(),
+        "sample_id_manifest": str(samples),
+        "sample_id_manifest_sha256": hashlib.sha256(samples.read_bytes()).hexdigest(),
+        "t_cut": 0.25,
+        "guided_steps": 3,
+        "guided_times": [1.0, 0.75, 0.5, 0.25],
+        "unguided_tail_intervals": 2,
+        "unguided_times": [0.25, 0.125, 0.0],
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    payload["schedule_contract_sha256"] = hashlib.sha256(canonical.encode()).hexdigest()
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
     for name in guided_names:
-        config = {**configs[name], "schedule_manifest": str(manifest), "t_cut": 0.25}
+        config = {
+            **configs[name],
+            "schedule_manifest": str(manifest),
+            "semigroup_report": str(report),
+            "sample_id_manifest": str(samples),
+            "t_cut": 0.25,
+        }
         schedule = resolve_locked_schedule(
             config,
             checkpoint_sha256=EXPECTED_HASHES["checkpoint_sha256"],

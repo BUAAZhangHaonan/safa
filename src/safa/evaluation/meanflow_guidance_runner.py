@@ -839,6 +839,7 @@ def run_guidance_records(
     generation_result_path = output / "generation_result.json"
     sample_manifest_path = output / "sample_id_manifest.jsonl"
     semigroup_path = output / "semigroup.json"
+    semigroup_split_dir = output / "semigroup_split_images"
     resume_contract_path = output / "resume_contract.json"
     session_history_path = output / "session_history.jsonl"
     session_journal_path = output / "session_journal.json"
@@ -861,7 +862,7 @@ def run_guidance_records(
     if mode != "native":
         owned_paths.append(native_dir)
     if mode == "semigroup":
-        owned_paths.append(semigroup_path)
+        owned_paths.extend((semigroup_path, semigroup_split_dir))
     if contact_enabled:
         owned_paths.extend(
             [output / "contact_sheets", output / "contact_sheet_columns.json"]
@@ -884,6 +885,8 @@ def run_guidance_records(
     _prepare_owned_directory(output, generated_dir, "generated image directory")
     if mode != "native":
         _prepare_owned_directory(output, native_dir, "native image directory")
+    if mode == "semigroup":
+        _prepare_owned_directory(output, semigroup_split_dir, "semigroup split image directory")
     if contact_enabled and (output / "contact_sheets").exists():
         _prepare_owned_directory(output, output / "contact_sheets", "contact sheet directory")
 
@@ -960,6 +963,15 @@ def run_guidance_records(
 
     completed_rows = _read_optional_jsonl(per_sample_path)
     expected_bindings = _expected_row_bindings(selected, generated_dir, native_dir, mode)
+    semigroup_split_bindings = (
+        _expected_semigroup_split_bindings(
+            selected,
+            semigroup_split_dir,
+            resolved_config.get("split_times", (0.25, 0.5, 0.75)),
+        )
+        if mode == "semigroup"
+        else []
+    )
     for binding in expected_bindings:
         _require_contained(output, Path(str(binding["generated"])), "generated image")
         if mode != "native":
@@ -974,6 +986,10 @@ def run_guidance_records(
         completed_count=completed_count,
         mode=mode,
     )
+    if mode == "semigroup":
+        _validate_semigroup_split_state(
+            completed_rows, semigroup_split_bindings, semigroup_split_dir
+        )
 
     schedule = resolved_config.get("locked_schedule")
     if schedule is not None and not isinstance(schedule, Mapping):
@@ -1100,6 +1116,9 @@ def run_guidance_records(
                     codec=runtime.codec,
                     e0=runtime.e0,
                     direct_images=generated,
+                    split_image_bindings=semigroup_split_bindings[
+                        completed_count + batch_start : completed_count + batch_start + len(batch)
+                    ],
                 )
             }
         for local_index, sample_id in enumerate(sample_ids):
@@ -1488,12 +1507,15 @@ def _validate_semigroup_gate(config: Mapping[str, Any], checkpoint_hash: str, t_
         raise ValueError("semigroup report selected t_cut disagrees with the locked schedule")
 
 
-def _semigroup_batch_rows(*, result, sample_ids, codec, e0, direct_images) -> list[dict[str, Any]]:
+def _semigroup_batch_rows(
+    *, result, sample_ids, codec, e0, direct_images, split_image_bindings
+) -> list[dict[str, Any]]:
     report = result.diagnostics["semigroup"]
     rows = [{"sample_id": sample_id, "splits": {}} for sample_id in sample_ids]
     with torch.no_grad():
         direct_embedding = e0(normalize_for_e0(direct_images))["embedding"]
         for split, endpoints in report["split_endpoints"].items():
+            split_key = str(float(split))
             split_images = codec.decode(endpoints)
             split_embedding = e0(normalize_for_e0(split_images))["embedding"]
             pixel_l1 = (direct_images - split_images).abs().flatten(1).mean(dim=1)
@@ -1502,11 +1524,14 @@ def _semigroup_batch_rows(*, result, sample_ids, codec, e0, direct_images) -> li
             cosine = F.cosine_similarity(direct_embedding, split_embedding, dim=1)
             residual = report["residuals"][split]
             for index, row in enumerate(rows):
-                row["splits"][str(float(split))] = {
+                decoded_image = Path(str(split_image_bindings[index][split_key]))
+                _atomic_save_image(split_images[index], decoded_image)
+                row["splits"][split_key] = {
                     "latent_residual": float(residual[index].detach().cpu()),
                     "decoded_pixel_l1": float(pixel_l1[index].detach().cpu()),
                     "decoded_psnr": float(psnr[index].detach().cpu()),
                     "endpoint_e0_cosine": float(cosine[index].detach().cpu()),
+                    "decoded_image": str(decoded_image),
                 }
     return rows
 
@@ -1542,6 +1567,40 @@ def _expected_row_bindings(selected, generated_dir: Path, native_dir: Path, mode
             }
         )
     return bindings
+
+
+def _expected_semigroup_split_bindings(selected, output_dir: Path, split_times):
+    split_keys = [str(float(value)) for value in split_times]
+    if set(split_keys) != {"0.25", "0.5", "0.75"} or len(split_keys) != 3:
+        raise ValueError("semigroup split image bindings require registered splits 0.25,0.5,0.75")
+    bindings = []
+    for ordinal, record in enumerate(selected):
+        filename = f"{ordinal:08d}__{_safe_sample_id(str(record['sample_id']))}.png"
+        bindings.append(
+            {
+                split_key: str(output_dir / f"t_cut_{split_key.replace('.', 'p')}" / filename)
+                for split_key in split_keys
+            }
+        )
+    return bindings
+
+
+def _validate_semigroup_split_state(rows, expected_bindings, output_dir: Path) -> None:
+    expected_paths = {
+        Path(path).resolve() for binding in expected_bindings for path in binding.values()
+    }
+    actual_paths = {path.resolve() for path in output_dir.glob("**/*") if path.is_file()}
+    if actual_paths - expected_paths:
+        raise ValueError("semigroup split image directory contains unowned files")
+    for index, row in enumerate(rows):
+        splits = row.get("semigroup")
+        if not isinstance(splits, Mapping) or set(splits) != set(expected_bindings[index]):
+            raise ValueError("resumed semigroup row has the wrong registered split set")
+        for split_key, expected_path in expected_bindings[index].items():
+            if splits[split_key].get("decoded_image") != expected_path:
+                raise ValueError("resumed semigroup decoded image binding disagrees")
+            if not Path(expected_path).is_file():
+                raise FileNotFoundError("resumed semigroup decoded image is missing")
 
 
 def _validate_resume_rows(rows, expected_bindings) -> None:
@@ -1623,7 +1682,7 @@ def _validate_output_entries(output: Path, *, mode: str, contact_sheets: bool) -
     if mode != "native":
         allowed.add("native_images")
     if mode == "semigroup":
-        allowed.add("semigroup.json")
+        allowed.update({"semigroup.json", "semigroup_split_images"})
     if contact_sheets:
         allowed.update({"contact_sheets", "contact_sheet_columns.json"})
     extras = sorted(

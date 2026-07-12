@@ -258,7 +258,9 @@ def test_matrix_semigroup_merge_sorts_and_locks_smallest_full_pass(tmp_path: Pat
     assert [row["t_cut"] for row in report["candidates"]] == [0.25, 0.5, 0.75]
 
 
-def test_matrix_semigroup_waits_for_direct_visual_review_before_gate(tmp_path: Path) -> None:
+def test_matrix_semigroup_waits_for_direct_visual_review_before_gate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     module = _load_script()
     source_paths, source_manifest = _write_semigroup_shards(tmp_path / "source")
     manifest = tmp_path / module.CALIBRATION_MANIFEST
@@ -285,6 +287,11 @@ def test_matrix_semigroup_waits_for_direct_visual_review_before_gate(tmp_path: P
     plan = replace(
         module.build_matrix_plan(_args(module, "--phase", "semigroup")),
         repo_root=tmp_path,
+    )
+    monkeypatch.setattr(
+        module,
+        "_build_semigroup_visual_evidence",
+        lambda value: {"sample_count": 64, "arms": {}},
     )
 
     assert module.finalize_phase(plan) == 2
@@ -670,11 +677,39 @@ def test_full_merge_is_idempotent_and_recovers_partial_owned_output(tmp_path: Pa
         generated.parent.mkdir(parents=True)
         generated.write_bytes(f"image-{gpu}".encode())
         (shard / "per_sample.jsonl").write_text(
-            json.dumps({"sample_id": sample_id, "generated": str(generated)}) + "\n",
+            json.dumps(
+                {
+                    "sample_id": sample_id,
+                    "generated": str(generated),
+                    "candidate_cosine": 0.5,
+                    "native_cosine": 0.5,
+                }
+            )
+            + "\n",
             encoding="utf-8",
         )
         (shard / "completion.json").write_text(
             json.dumps({"status": "complete", "sample_count": 1}), encoding="utf-8"
+        )
+        (shard / "generation_result.json").write_text(
+            json.dumps(
+                {
+                    "status": "complete",
+                    "mode": "native",
+                    "checkpoint": {
+                        "sha256": module.CHECKPOINT_SHA256,
+                        "stage": "stage2",
+                        "stage_epoch_1based": 1652,
+                        "sit_patch_size": 4,
+                        "weight_source": "ema_model_state_dict",
+                    },
+                    "sample_count": 1,
+                    "sample_id_sha256": module._sample_id_digest([sample_id]),
+                    "schedule": None,
+                    "config": {"sampling_seed": 1337},
+                }
+            ),
+            encoding="utf-8",
         )
     combined = tmp_path / module.ROOT / "full/merged/native"
 
