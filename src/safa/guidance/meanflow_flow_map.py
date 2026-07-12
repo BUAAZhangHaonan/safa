@@ -65,14 +65,22 @@ def semigroup_probe(flow_map, x_init, condition, split_times) -> dict[str, Any]:
         raise ValueError("split_times must be strictly increasing and within (0,1)")
 
     initial_nfe = flow_map.nfe
-    direct = flow_map(x_init, condition, t=1.0, r=0.0)
     split_endpoints: dict[float, torch.Tensor] = {}
     residuals: dict[float, torch.Tensor] = {}
-    for split in splits:
-        intermediate = flow_map(x_init, condition, t=1.0, r=split)
-        endpoint = flow_map(intermediate, condition, t=split, r=0.0)
-        split_endpoints[split] = endpoint
-        residuals[split] = symmetric_relative_l2(direct, endpoint)
+    with torch.no_grad():
+        direct = _finite_tensor("semigroup direct endpoint", flow_map(x_init, condition, t=1.0, r=0.0)).detach()
+        for split in splits:
+            intermediate = _finite_tensor(
+                "semigroup intermediate state",
+                flow_map(x_init, condition, t=1.0, r=split),
+            ).detach()
+            endpoint = _finite_tensor(
+                "semigroup split endpoint",
+                flow_map(intermediate, condition, t=split, r=0.0),
+            ).detach()
+            residual = _finite_tensor("semigroup residual", symmetric_relative_l2(direct, endpoint)).detach()
+            split_endpoints[split] = endpoint
+            residuals[split] = residual
     return {
         "direct_endpoint": direct,
         "split_endpoints": split_endpoints,
@@ -108,6 +116,8 @@ def sample_official_head_current_xt(
         raise ValueError(f"unsupported sample_mode {sample_mode!r}")
     if optimization_mode not in {"official_adam", "paper_normalized_direct_autograd"}:
         raise ValueError(f"unsupported optimization_mode {optimization_mode!r}")
+    if optimization_mode == "official_adam" and len(guided) != 4:
+        raise ValueError("official_adam requires exactly four guided times for the locked three-interval schedule")
     if isinstance(num_optim_iters, bool) or int(num_optim_iters) != num_optim_iters or num_optim_iters <= 0:
         raise ValueError(f"num_optim_iters must be a positive integer, got {num_optim_iters!r}")
     if optimization_mode == "paper_normalized_direct_autograd" and num_optim_iters != 1:
@@ -150,15 +160,17 @@ def sample_official_head_current_xt(
             current = before.clone().requires_grad_(True)
             endpoint = flow_map(current, transport_condition, t=t, r=0.0)
             endpoint_velocity = (current - endpoint) / t
-            if sample_mode == "flow_map1":
-                step_velocity = endpoint_velocity
-            else:
-                step_endpoint = flow_map(current, transport_condition, t=t, r=s)
-                step_velocity = (current - step_endpoint) / (t - s)
             loss = _representation_loss(endpoint, codec, e0, target_z0)
             loss_history.append(float(loss.detach()))
             gradient = torch.autograd.grad(loss, current, only_inputs=True)[0]
             gradient = _finite_tensor("representation gradient", gradient)
+            if sample_mode == "flow_map1":
+                step_velocity = endpoint_velocity
+            else:
+                with torch.no_grad():
+                    step_source = current.detach()
+                    step_endpoint = flow_map(step_source, transport_condition, t=t, r=s)
+                    step_velocity = (step_source - step_endpoint) / (t - s)
             delta_xt = step_size * normalize_per_sample_to_velocity_norm(gradient, step_velocity)
 
         state = before - (t - s) * (step_velocity.detach() + delta_xt)

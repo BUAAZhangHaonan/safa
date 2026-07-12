@@ -99,6 +99,30 @@ class _NonlinearVelocityFlowGenerator(nn.Module):
         return x - horizon * self.scale * x.square()
 
 
+class _GraphAuditFlowGenerator(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(()))
+        self.calls: list[tuple[float, float, bool, bool, bool]] = []
+
+    def flow_map(self, x, z, *, t, r):
+        del z
+        t_value = float(torch.as_tensor(t).flatten()[0])
+        r_value = float(torch.as_tensor(r).flatten()[0])
+        velocity = self.scale * (x.square() + r_value)
+        output = x - (t_value - r_value) * velocity
+        self.calls.append(
+            (t_value, r_value, torch.is_grad_enabled(), x.requires_grad, output.requires_grad)
+        )
+        return output
+
+
+class _NaNFlowGenerator(nn.Module):
+    def flow_map(self, x, z, *, t, r):
+        del z, t, r
+        return torch.full_like(x, float("nan"))
+
+
 class _NormalizedIdentityCodec:
     def __init__(self) -> None:
         self.vae = nn.Linear(1, 1, bias=False)
@@ -201,13 +225,13 @@ def _run_paper(
     return result, generator
 
 
-def _analytic_endpoint_gradient(x: torch.Tensor) -> torch.Tensor:
-    endpoint = x - x.square()
+def _analytic_endpoint_gradient(x: torch.Tensor, t: float = 1.0) -> torch.Tensor:
+    endpoint = x - t * x.square()
     endpoint_norm = endpoint.flatten(1).norm(dim=1).view(-1, 1, 1, 1)
     first = endpoint[:, :1]
     gradient_y = endpoint * first / endpoint_norm.pow(3)
     gradient_y[:, :1] -= endpoint_norm.reciprocal()
-    return gradient_y * (1.0 - 2.0 * x)
+    return gradient_y * (1.0 - 2.0 * t * x)
 
 
 def _run_nonlinear_official(optimization_mode: str):
@@ -218,6 +242,8 @@ def _run_nonlinear_official(optimization_mode: str):
     x_init = torch.tensor([[[[0.2]], [[0.4]], [[0.6]]]])
     condition = torch.zeros(1, 4)
     target = torch.tensor([[1.0, 0.0, 0.0]])
+    guided_times = GUIDED_TIMES if optimization_mode == "official_adam" else [1.0, 0.5]
+    unguided_times = UNGUIDED_TIMES if optimization_mode == "official_adam" else [0.5, 0.0]
     result = sample_official_head_current_xt(
         flow_map=CountedFlowMap(generator),
         codec=codec,
@@ -225,8 +251,8 @@ def _run_nonlinear_official(optimization_mode: str):
         x_init=x_init,
         transport_condition=condition,
         target_z0=target,
-        guided_times=[1.0, 0.5],
-        unguided_times=[0.5, 0.0],
+        guided_times=guided_times,
+        unguided_times=unguided_times,
         sample_mode="flow_map1",
         optimization_mode=optimization_mode,
         num_optim_iters=1,
@@ -279,6 +305,28 @@ def test_semigroup_probe_reports_each_requested_split() -> None:
     assert list(report["residuals"]) == [0.2, 0.6]
     assert tuple(report["direct_endpoint"].shape) == (2, 1, 2, 2)
     assert report["nfe"] == 5
+
+
+def test_semigroup_probe_detaches_outputs_without_freezing_model_parameters() -> None:
+    generator = _ExponentialFlowGenerator()
+    counted = CountedFlowMap(generator)
+    x_init = torch.randn(2, 1, 2, 2, requires_grad=True)
+    report = semigroup_probe(counted, x_init, torch.zeros(2, 2), [0.5])
+
+    tensors = [
+        report["direct_endpoint"],
+        *report["split_endpoints"].values(),
+        *report["residuals"].values(),
+    ]
+    assert generator.scale.requires_grad
+    assert all(not tensor.requires_grad and tensor.grad_fn is None for tensor in tensors)
+
+
+def test_semigroup_probe_rejects_non_finite_flow_output() -> None:
+    counted = CountedFlowMap(_NaNFlowGenerator())
+
+    with pytest.raises(FloatingPointError, match="non-finite semigroup"):
+        semigroup_probe(counted, torch.ones(1, 1, 1, 1), torch.zeros(1, 1), [0.5])
 
 
 @pytest.mark.parametrize("split_times", [[0.5, 0.25], [0.0, 0.5], [0.5, 1.0], [0.5, 0.5]])
@@ -429,8 +477,6 @@ def test_official_adam_nopt_gt_one_refreshes_endpoint_at_updated_xt() -> None:
     _, generator, _, _, _ = _run_official(
         optimization_mode="official_adam",
         num_optim_iters=2,
-        guided_times=[1.0, 0.5],
-        unguided_times=[0.5, 0.0],
     )
 
     first = generator.calls[0]
@@ -482,12 +528,80 @@ def test_official_normalized_update_matches_analytic_nonlinear_state_and_sign() 
 
 def test_official_adam_update_matches_analytic_nonlinear_state_and_sign() -> None:
     result, x_init = _run_nonlinear_official("official_adam")
-    gradient = _analytic_endpoint_gradient(x_init)
-    adam_delta = 0.1 * gradient / (gradient.abs() + 1.0e-8)
-    guided_state = x_init - 0.5 * (x_init.square() + adam_delta)
-    expected = guided_state - 0.5 * guided_state.square()
+    expected = x_init
+    for interval_index, (t, s) in enumerate(zip(GUIDED_TIMES, GUIDED_TIMES[1:])):
+        gradient = _analytic_endpoint_gradient(expected, t=t)
+        learning_rate = 0.1 * (1.0 - interval_index / 4.0)
+        adam_delta = learning_rate * gradient / (gradient.abs() + 1.0e-8)
+        expected = expected - (t - s) * (expected.square() + adam_delta)
+    for t, r in zip(UNGUIDED_TIMES, UNGUIDED_TIMES[1:]):
+        expected = expected - (t - r) * expected.square()
 
     assert torch.allclose(result.latent, expected, atol=1.0e-7, rtol=1.0e-6)
+
+
+def test_official_normalized_flow_map2_detaches_step_map_and_matches_reference() -> None:
+    generator = _GraphAuditFlowGenerator()
+    codec = _NormalizedIdentityCodec()
+    e0 = _IdentityEncoder()
+    freeze_guidance_stack(generator, codec, e0)
+    x_init = torch.tensor([[[[0.2]], [[0.4]], [[0.6]]]])
+    condition = torch.zeros(1, 4)
+    target = torch.tensor([[1.0, 0.0, 0.0]])
+
+    result = sample_official_head_current_xt(
+        flow_map=CountedFlowMap(generator),
+        codec=codec,
+        e0=e0,
+        x_init=x_init,
+        transport_condition=condition,
+        target_z0=target,
+        guided_times=[1.0, 0.5],
+        unguided_times=[0.5, 0.0],
+        sample_mode="flow_map2",
+        optimization_mode="paper_normalized_direct_autograd",
+        num_optim_iters=1,
+        step_size=0.1,
+    )
+
+    gradient = _analytic_endpoint_gradient(x_init)
+    step_velocity = x_init.square() + 0.5
+    correction = 0.1 * gradient * step_velocity.norm() / gradient.norm()
+    guided_state = x_init - 0.5 * (step_velocity + correction)
+    expected = guided_state - 0.5 * guided_state.square()
+    assert torch.allclose(result.latent, expected, atol=1.0e-7, rtol=1.0e-6)
+    assert generator.calls[0][2:] == (True, True, True)
+    assert generator.calls[1][2:] == (False, False, False)
+
+
+@pytest.mark.parametrize(
+    ("guided_times", "unguided_times"),
+    [
+        ([1.0, 0.75, 0.5], [0.5, 0.0]),
+        ([1.0, 0.8, 0.6, 0.4, 0.2], [0.2, 0.0]),
+    ],
+)
+def test_official_adam_rejects_unlocked_schedule_before_any_nfe(guided_times, unguided_times) -> None:
+    generator, codec, e0 = _frozen_guidance_stack()
+    x_init, condition, target = _guidance_inputs()
+    counted = CountedFlowMap(generator)
+
+    with pytest.raises(ValueError, match="exactly four guided times"):
+        sample_official_head_current_xt(
+            flow_map=counted,
+            codec=codec,
+            e0=e0,
+            x_init=x_init,
+            transport_condition=condition,
+            target_z0=target,
+            guided_times=guided_times,
+            unguided_times=unguided_times,
+            sample_mode="flow_map1",
+            optimization_mode="official_adam",
+            num_optim_iters=1,
+            step_size=0.5,
+        )
+    assert counted.nfe == 0
 
 
 def test_paper_split_transports_to_xs_before_endpoint_gradient() -> None:
