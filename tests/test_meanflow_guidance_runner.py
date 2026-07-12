@@ -22,12 +22,14 @@ from safa.evaluation.meanflow_guidance_runner import (  # noqa: E402
     aggregate_session_memory,
     asset_contract_from_config,
     build_frozen_runtime,
+    cached_asset_digest,
     deterministic_shard,
     execute_guidance_mode,
     load_ema_generator,
     read_ordered_sample_manifest,
     resolve_locked_schedule,
     resume_remaining_ids,
+    run_guidance_from_config,
     run_guidance_records,
     validate_checkpoint_contract,
     validate_guidance_config,
@@ -286,6 +288,50 @@ def test_asset_contract_locks_all_r8_assets_features_and_input_manifest(
 
     with pytest.raises(ValueError, match="E0.*digest"):
         asset_contract_from_config({**config, "e0_sha256": "9" * 64})
+
+
+def test_shared_digest_cache_hashes_once_and_invalidates_on_stat_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hashlib
+
+    asset = tmp_path / "asset.bin"
+    asset.write_bytes(b"first")
+    cache = tmp_path / "digests.json"
+    real_digest = runner_module._digest_path
+    calls = 0
+
+    def counted_digest(path):
+        nonlocal calls
+        calls += 1
+        return real_digest(path)
+
+    monkeypatch.setattr(runner_module, "_digest_path", counted_digest)
+    first_digest = hashlib.sha256(b"first").hexdigest()
+    for _ in range(4):
+        assert cached_asset_digest(asset, first_digest, cache) == first_digest
+    assert calls == 1
+
+    asset.write_bytes(b"second-content")
+    second_digest = hashlib.sha256(b"second-content").hexdigest()
+    assert cached_asset_digest(asset, second_digest, cache) == second_digest
+    assert calls == 2
+
+
+def test_completion_marker_is_checked_before_config_validation_or_asset_hashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "complete"
+    output.mkdir()
+    (output / "completion.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        runner_module,
+        "asset_contract_from_config",
+        lambda config: pytest.fail("completed run must not hash assets"),
+    )
+
+    with pytest.raises(FileExistsError, match="completed output"):
+        run_guidance_from_config({}, output_dir=output)
 
 
 class _DifferentiableVAE(nn.Module):
@@ -714,6 +760,36 @@ def test_candidate_writes_matched_native_edev_traces_and_pil_contact_sheets(tmp_
         assert page.getpixel((0, 0)) == (0, 50, 100)
 
 
+@pytest.mark.parametrize("batch_size", [4, 3])
+def test_runner_serializes_initial_noise_channel_diagnostics_per_sample(
+    tmp_path: Path, batch_size: int
+) -> None:
+    output = tmp_path / f"diagnostics-{batch_size}"
+    run_guidance_records(
+        config={
+            "mode": "initial_noise",
+            "sampling_seed": 5,
+            "image_size": 2,
+            "batch_size": batch_size,
+            "num_updates": 1,
+            "eta": 0.25,
+            "projection": "fixed_radius",
+            "phase": "full",
+        },
+        records=_generation_records(tmp_path, count=batch_size),
+        runtime=_guidance_runtime(),
+        output_dir=output,
+        shard_index=0,
+        num_shards=1,
+    )
+
+    rows = [json.loads(line) for line in (output / "per_sample.jsonl").read_text().splitlines()]
+    assert len(rows) == batch_size
+    assert all(len(row["route_diagnostics"]["channel_mean"]) == 4 for row in rows)
+    assert all(len(row["route_diagnostics"]["channel_std"]) == 4 for row in rows)
+    assert all("final_noise" not in row["route_diagnostics"] for row in rows)
+
+
 def test_resume_replaces_only_exact_crash_orphan_and_aggregates_all_rows(tmp_path: Path) -> None:
     runtime = _guidance_runtime()
     records = _generation_records(tmp_path, count=3)
@@ -741,7 +817,7 @@ def test_resume_replaces_only_exact_crash_orphan_and_aggregates_all_rows(tmp_pat
     orphan_native = Path(rows[-1]["native"])
     expected_candidate = orphan_candidate.read_bytes()
     expected_native = orphan_native.read_bytes()
-    for artifact in ("run_manifest.json", "generation_result.json"):
+    for artifact in ("run_manifest.json", "generation_result.json", "completion.json"):
         (output_dir / artifact).unlink()
     _write_jsonl(output_dir / "per_sample.jsonl", rows[:-1])
 
@@ -795,6 +871,9 @@ def test_real_png_before_row_crash_window_resumes_transactionally(
 
     def crash_before_row(path, row):
         if Path(path).name == "per_sample.jsonl":
+            (output / ".tmp-per-sample-interrupted.jsonl").write_text(
+                '{"half"', encoding="utf-8"
+            )
             raise RuntimeError("injected row commit crash")
         return real_append(path, row)
 
@@ -812,6 +891,7 @@ def test_real_png_before_row_crash_window_resumes_transactionally(
     assert len(list((output / "native_images").glob("*.png"))) == 1
     assert not (output / "per_sample.jsonl").exists()
     assert (output / "session_journal.json").is_file()
+    assert (output / ".tmp-per-sample-interrupted.jsonl").is_file()
 
     monkeypatch.setattr(runner_module, "_append_jsonl", real_append)
     result = run_guidance_records(
@@ -827,6 +907,107 @@ def test_real_png_before_row_crash_window_resumes_transactionally(
     assert len(rows) == 1 and rows[0]["ordinal"] == 0
     assert result["timing"]["session_count"] == 2
     assert not (output / "session_journal.json").exists()
+    assert not (output / ".tmp-per-sample-interrupted.jsonl").exists()
+
+
+def test_session_history_commit_is_idempotent_when_unlink_crashes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "history-crash"
+    real_unlink = Path.unlink
+    injected = False
+
+    def crash_after_history(path, *args, **kwargs):
+        nonlocal injected
+        if (
+            Path(path) == output / "session_journal.json"
+            and (output / "session_history.jsonl").exists()
+            and not injected
+        ):
+            injected = True
+            raise RuntimeError("injected journal unlink crash")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", crash_after_history)
+    with pytest.raises(RuntimeError, match="journal unlink crash"):
+        run_guidance_records(
+            config={"mode": "native", "sampling_seed": 4, "image_size": 2, "phase": "full"},
+            records=_generation_records(tmp_path, count=1),
+            runtime=_guidance_runtime(),
+            output_dir=output,
+            shard_index=0,
+            num_shards=1,
+        )
+    first_history = [
+        json.loads(line) for line in (output / "session_history.jsonl").read_text().splitlines()
+    ]
+    assert len(first_history) == 1
+    assert (output / "session_journal.json").is_file()
+
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    result = run_guidance_records(
+        config={"mode": "native", "sampling_seed": 4, "image_size": 2, "phase": "full"},
+        records=_generation_records(tmp_path, count=1),
+        runtime=_guidance_runtime(),
+        output_dir=output,
+        shard_index=0,
+        num_shards=1,
+    )
+    final_history = [
+        json.loads(line) for line in (output / "session_history.jsonl").read_text().splitlines()
+    ]
+    session_ids = [row["session_id"] for row in final_history]
+    assert len(final_history) == result["timing"]["session_count"] == 2
+    assert len(session_ids) == len(set(session_ids))
+
+
+def test_partial_finalization_between_result_jsons_rebuilds_until_completion_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "partial-final"
+    real_atomic_json = runner_module._atomic_write_json
+    injected = False
+
+    def fail_between_final_jsons(path, payload, **kwargs):
+        nonlocal injected
+        if Path(path).name == "run_manifest.json" and not injected:
+            injected = True
+            raise RuntimeError("injected finalization crash")
+        return real_atomic_json(path, payload, **kwargs)
+
+    monkeypatch.setattr(runner_module, "_atomic_write_json", fail_between_final_jsons)
+    with pytest.raises(RuntimeError, match="finalization crash"):
+        run_guidance_records(
+            config={"mode": "native", "sampling_seed": 2, "image_size": 2, "phase": "full"},
+            records=_generation_records(tmp_path, count=1),
+            runtime=_guidance_runtime(),
+            output_dir=output,
+            shard_index=0,
+            num_shards=1,
+        )
+    assert (output / "generation_result.json").is_file()
+    assert not (output / "completion.json").exists()
+
+    monkeypatch.setattr(runner_module, "_atomic_write_json", real_atomic_json)
+    result = run_guidance_records(
+        config={"mode": "native", "sampling_seed": 2, "image_size": 2, "phase": "full"},
+        records=_generation_records(tmp_path, count=1),
+        runtime=_guidance_runtime(),
+        output_dir=output,
+        shard_index=0,
+        num_shards=1,
+    )
+    assert result["status"] == "complete"
+    assert (output / "completion.json").is_file()
+    with pytest.raises(FileExistsError, match="completed output"):
+        run_guidance_records(
+            config={"mode": "native", "sampling_seed": 2, "image_size": 2, "phase": "full"},
+            records=_generation_records(tmp_path, count=1),
+            runtime=_guidance_runtime(),
+            output_dir=output,
+            shard_index=0,
+            num_shards=1,
+        )
 
 
 def test_resume_rejects_swapped_row_bindings_and_unowned_png(tmp_path: Path) -> None:
@@ -843,7 +1024,7 @@ def test_resume_rejects_swapped_row_bindings_and_unowned_png(tmp_path: Path) -> 
         num_shards=1,
     )
     rows = [json.loads(line) for line in (output_dir / "per_sample.jsonl").read_text().splitlines()]
-    for artifact in ("run_manifest.json", "generation_result.json"):
+    for artifact in ("run_manifest.json", "generation_result.json", "completion.json"):
         (output_dir / artifact).unlink()
     rows[0]["source"], rows[1]["source"] = rows[1]["source"], rows[0]["source"]
     _write_jsonl(output_dir / "per_sample.jsonl", rows)
@@ -887,6 +1068,25 @@ def test_native_mode_rejects_unowned_native_directory(tmp_path: Path) -> None:
             shard_index=0,
             num_shards=1,
         )
+
+
+def test_runner_rejects_owned_subdirectory_symlink_escape(tmp_path: Path) -> None:
+    output = tmp_path / "symlink-run"
+    external = tmp_path / "external"
+    output.mkdir()
+    external.mkdir()
+    (output / "generated_images").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        run_guidance_records(
+            config={"mode": "native", "sampling_seed": 1, "phase": "full"},
+            records=_generation_records(tmp_path, count=1),
+            runtime=_guidance_runtime(),
+            output_dir=output,
+            shard_index=0,
+            num_shards=1,
+        )
+    assert list(external.iterdir()) == []
 
 
 

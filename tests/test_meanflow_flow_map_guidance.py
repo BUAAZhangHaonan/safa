@@ -751,6 +751,9 @@ def _run_noise_oracle(*, num_updates=8, eta=0.25, projection="fixed_radius", x_i
     default_x, condition, target = _guidance_inputs()
     if x_init is None:
         x_init = default_x
+    elif x_init.shape[0] != default_x.shape[0]:
+        condition = torch.zeros(x_init.shape[0], condition.shape[1])
+        target = torch.flip(x_init.flatten(1), dims=(1,))
     counted = CountedFlowMap(generator)
     result = optimize_initial_noise(
         flow_map=counted,
@@ -792,6 +795,17 @@ def test_noise_oracle_reports_updates_plus_one_nfe() -> None:
     result, generator, _, _, _ = _run_noise_oracle(num_updates=8)
 
     assert result.nfe == 9
+
+
+@pytest.mark.parametrize("batch_size", [4, 3])
+def test_noise_oracle_channel_diagnostics_preserve_batch_axis(batch_size: int) -> None:
+    result, generator, _, _, _ = _run_noise_oracle(
+        num_updates=1,
+        x_init=torch.randn(batch_size, 3, 2, 2),
+    )
+
+    assert result.diagnostics["channel_mean"].shape == (batch_size, 3)
+    assert result.diagnostics["channel_std"].shape == (batch_size, 3)
     assert result.nfe == len(generator.calls)
 
 

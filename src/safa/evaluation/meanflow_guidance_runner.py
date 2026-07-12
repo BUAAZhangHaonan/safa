@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import fcntl
 import hashlib
 import json
 import math
@@ -10,6 +11,7 @@ import re
 import tempfile
 import time
 from typing import Any, Iterable, Mapping, Sequence
+import uuid
 
 import torch
 import torch.nn.functional as F
@@ -278,17 +280,24 @@ def asset_contract_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
     sample_manifest_path = Path(str(config["sample_id_manifest"]))
     heldout_e1_path = Path(str(config["heldout_e1_checkpoint"]))
     heldout_e2_path = Path(str(config["heldout_e2_checkpoint"]))
-    checkpoint_digest = _digest_path(checkpoint_path)
-    e0_digest = _digest_path(e0_path)
-    edev_digest = _digest_path(edev_path)
-    vae_digest = _digest_path(vae_path)
-    index_digest = _digest_path(index_path)
-    features_digest = _digest_path(features_path)
-    sample_manifest_digest = _digest_path(sample_manifest_path)
+    cache_path = config.get("asset_digest_cache")
+
+    def digest(path: Path, expected_field: str) -> str:
+        if cache_path:
+            return cached_asset_digest(path, str(config[expected_field]), str(cache_path))
+        return _digest_path(path)
+
+    checkpoint_digest = digest(checkpoint_path, "checkpoint_sha256")
+    e0_digest = digest(e0_path, "e0_sha256")
+    edev_digest = digest(edev_path, "edev_sha256")
+    vae_digest = digest(vae_path, "vae_digest")
+    index_digest = digest(index_path, "index_sha256")
+    features_digest = digest(features_path, "features_digest")
+    sample_manifest_digest = digest(sample_manifest_path, "sample_id_manifest_sha256")
     ordered_manifest_rows = read_ordered_sample_manifest(sample_manifest_path)
     ordered_manifest_ids = [str(row["sample_id"]) for row in ordered_manifest_rows]
-    heldout_e1_digest = _digest_path(heldout_e1_path)
-    heldout_e2_digest = _digest_path(heldout_e2_path)
+    heldout_e1_digest = digest(heldout_e1_path, "heldout_e1_sha256")
+    heldout_e2_digest = digest(heldout_e2_path, "heldout_e2_sha256")
     _validate_expected_digest(config, ("checkpoint_sha256",), checkpoint_digest, "checkpoint")
     _validate_expected_digest(config, ("e0_sha256",), e0_digest, "E0")
     _validate_expected_digest(config, ("edev_sha256",), edev_digest, "Edev")
@@ -629,9 +638,34 @@ def run_guidance_records(
     resume_contract_path = output / "resume_contract.json"
     session_history_path = output / "session_history.jsonl"
     session_journal_path = output / "session_journal.json"
+    completion_path = output / "completion.json"
 
     phase = str(resolved_config.get("phase", "full"))
     contact_enabled = _contact_sheets_enabled(resolved_config)
+    _require_safe_output_root(output)
+    owned_paths = [
+        generated_dir,
+        per_sample_path,
+        run_manifest_path,
+        generation_result_path,
+        sample_manifest_path,
+        resume_contract_path,
+        session_history_path,
+        session_journal_path,
+        completion_path,
+    ]
+    if mode != "native":
+        owned_paths.append(native_dir)
+    if mode == "semigroup":
+        owned_paths.append(semigroup_path)
+    if contact_enabled:
+        owned_paths.extend(
+            [output / "contact_sheets", output / "contact_sheet_columns.json"]
+        )
+    for path in owned_paths:
+        _require_contained(output, path, "guidance output")
+    if completion_path.exists():
+        raise FileExistsError(f"refusing to replace completed output: {completion_path}")
     _validate_output_entries(
         output,
         mode=mode,
@@ -641,13 +675,13 @@ def run_guidance_records(
         raise ValueError("calibration guidance requires a frozen Edev checkpoint")
     if phase != "calibration" and runtime.edev is not None:
         raise ValueError("Edev must not be loaded or scored outside calibration")
-    completed_artifacts = [path for path in (run_manifest_path, generation_result_path) if path.exists()]
-    if completed_artifacts:
-        raise FileExistsError(f"refusing to replace completed output: {completed_artifacts[0]}")
     output.mkdir(parents=True, exist_ok=True)
-    generated_dir.mkdir(parents=True, exist_ok=True)
+    _require_safe_output_root(output)
+    _prepare_owned_directory(output, generated_dir, "generated image directory")
     if mode != "native":
-        native_dir.mkdir(parents=True, exist_ok=True)
+        _prepare_owned_directory(output, native_dir, "native image directory")
+    if contact_enabled and (output / "contact_sheets").exists():
+        _prepare_owned_directory(output, output / "contact_sheets", "contact sheet directory")
 
     resume_contract = {
         "checkpoint": {
@@ -707,6 +741,7 @@ def run_guidance_records(
             raise ValueError("existing resume contract disagrees with the fixed run contract")
     else:
         _atomic_write_json(resume_contract_path, resume_contract, exclusive=True)
+    _cleanup_known_temps(output)
 
     expected_manifest_rows = [
         {"ordinal": ordinal, "sample_id": row["sample_id"], "source": str(row["source"])}
@@ -721,6 +756,10 @@ def run_guidance_records(
 
     completed_rows = _read_optional_jsonl(per_sample_path)
     expected_bindings = _expected_row_bindings(selected, generated_dir, native_dir, mode)
+    for binding in expected_bindings:
+        _require_contained(output, Path(str(binding["generated"])), "generated image")
+        if mode != "native":
+            _require_contained(output, Path(str(binding["native"])), "native image")
     _validate_resume_rows(completed_rows, expected_bindings)
     completed_count = len(completed_rows)
     remaining_records = selected[completed_count:]
@@ -743,12 +782,20 @@ def run_guidance_records(
     _validate_session_history(sessions)
     if session_journal_path.exists():
         recovered = _read_json_mapping(session_journal_path, "session journal")
-        if int(recovered.get("session_index", -1)) != len(sessions):
-            raise ValueError("session journal index does not follow session history")
-        recovered["recovered_after_crash"] = True
-        _append_jsonl(session_history_path, recovered)
+        _validate_session_history([recovered], require_contiguous_indices=False)
+        recovered_id = str(recovered["session_id"])
+        existing_by_id = {str(session["session_id"]): session for session in sessions}
+        if recovered_id in existing_by_id:
+            if not _same_session(existing_by_id[recovered_id], recovered):
+                raise ValueError("session journal disagrees with its committed history row")
+        else:
+            if int(recovered.get("session_index", -1)) != len(sessions):
+                raise ValueError("session journal index does not follow session history")
+            recovered["recovered_after_crash"] = True
+            _append_jsonl(session_history_path, recovered)
+            sessions.append(recovered)
         session_journal_path.unlink()
-        sessions.append(recovered)
+        _fsync_directory(output)
         _validate_session_history(sessions)
     _cuda_reset(runtime.device)
     session_candidate_seconds = 0.0
@@ -756,9 +803,11 @@ def run_guidance_records(
     session_row_io_seconds = 0.0
     session_artifact_io_seconds = 0.0
     session_index = len(sessions)
+    session_id = uuid.uuid4().hex
     _atomic_write_json(
         session_journal_path,
         _session_snapshot(
+            session_id=session_id,
             session_index=session_index,
             generated_count=0,
             resumed_count=completed_count,
@@ -882,6 +931,7 @@ def run_guidance_records(
             _atomic_write_json(
                 session_journal_path,
                 _session_snapshot(
+                    session_id=session_id,
                     session_index=session_index,
                     generated_count=committed_this_session,
                     resumed_count=completed_count,
@@ -898,6 +948,7 @@ def run_guidance_records(
             _atomic_write_json(
                 session_journal_path,
                 _session_snapshot(
+                    session_id=session_id,
                     session_index=session_index,
                     generated_count=committed_this_session,
                     resumed_count=completed_count,
@@ -944,6 +995,7 @@ def run_guidance_records(
         )
     session_artifact_io_seconds += time.perf_counter() - artifact_io_started
     session = _session_snapshot(
+        session_id=session_id,
         session_index=session_index,
         generated_count=generated_count,
         resumed_count=completed_count,
@@ -957,6 +1009,7 @@ def run_guidance_records(
     _atomic_write_json(session_journal_path, session)
     _append_jsonl(session_history_path, session)
     session_journal_path.unlink()
+    _fsync_directory(output)
     sessions = _read_optional_jsonl(session_history_path)
     _validate_session_history(sessions)
     timing = _aggregate_timing(final_rows, sessions, completed_count, generated_count)
@@ -1014,10 +1067,23 @@ def run_guidance_records(
             else str(output / "contact_sheet_columns.json"),
             "generation_result": str(generation_result_path),
             "run_manifest": str(run_manifest_path),
+            "completion": str(completion_path),
         },
     }
     _atomic_write_json(generation_result_path, manifest)
     _atomic_write_json(run_manifest_path, manifest)
+    _atomic_write_json(
+        completion_path,
+        {
+            "schema_version": 1,
+            "status": "complete",
+            "sample_count": len(expected_ids),
+            "sample_id_sha256": _sample_id_digest(expected_ids),
+            "generation_result": str(generation_result_path),
+            "run_manifest": str(run_manifest_path),
+        },
+        exclusive=True,
+    )
     return manifest
 
 
@@ -1029,6 +1095,12 @@ def run_guidance_from_config(
     num_shards: int = 1,
     explicit_t_cut: float | None = None,
 ) -> dict[str, Any]:
+    output = Path(output_dir)
+    completion_path = output / "completion.json"
+    _require_safe_output_root(output)
+    _require_contained(output, completion_path, "completion marker")
+    if completion_path.exists():
+        raise FileExistsError(f"refusing to replace completed output: {completion_path}")
     resolved = validate_guidance_config(config)
     from safa.data.feature_dataset import FeatureAlignedAffectNet
     from safa.training.transforms import generator_image_transform
@@ -1058,11 +1130,6 @@ def run_guidance_from_config(
         )
         _validate_semigroup_gate(resolved, checkpoint_sha256, schedule["t_cut"])
         resolved["locked_schedule"] = schedule
-    output_manifest = Path(output_dir) / "run_manifest.json"
-    output_result = Path(output_dir) / "generation_result.json"
-    if output_manifest.exists() or output_result.exists():
-        raise FileExistsError(f"refusing to replace completed output: {output_manifest}")
-
     dataset = FeatureAlignedAffectNet(
         resolved["index"],
         resolved["features"],
@@ -1330,6 +1397,7 @@ def _validate_output_entries(output: Path, *, mode: str, contact_sheets: bool) -
         "resume_contract.json",
         "session_history.jsonl",
         "session_journal.json",
+        "completion.json",
     }
     if mode != "native":
         allowed.add("native_images")
@@ -1337,9 +1405,78 @@ def _validate_output_entries(output: Path, *, mode: str, contact_sheets: bool) -
         allowed.add("semigroup.json")
     if contact_sheets:
         allowed.update({"contact_sheets", "contact_sheet_columns.json"})
-    extras = sorted(path.name for path in output.iterdir() if path.name not in allowed)
+    extras = sorted(
+        path.name
+        for path in output.iterdir()
+        if path.name not in allowed and not path.name.startswith(".tmp-")
+    )
     if extras:
         raise ValueError(f"output contains unexpected files: {extras!r}")
+
+
+def _require_safe_output_root(output: Path) -> None:
+    if output.is_symlink():
+        raise ValueError(f"guidance output root must not be a symlink: {output}")
+    if output.exists() and not output.is_dir():
+        raise ValueError(f"guidance output root must be a directory: {output}")
+
+
+def _require_contained(root: Path, target: Path, label: str) -> None:
+    _require_safe_output_root(root)
+    root_absolute = Path(os.path.abspath(root))
+    target_absolute = Path(os.path.abspath(target))
+    try:
+        relative = target_absolute.relative_to(root_absolute)
+    except ValueError as exc:
+        raise ValueError(f"{label} escapes the guidance output root: {target}") from exc
+
+    cursor = root_absolute
+    if cursor.is_symlink():
+        raise ValueError(f"guidance output root must not be a symlink: {root}")
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise ValueError(f"{label} contains a symlink path component: {cursor}")
+
+    root_resolved = root_absolute.resolve(strict=False)
+    target_resolved = target_absolute.resolve(strict=False)
+    try:
+        target_resolved.relative_to(root_resolved)
+    except ValueError as exc:
+        raise ValueError(f"{label} resolves outside the guidance output root: {target}") from exc
+
+
+def _prepare_owned_directory(root: Path, directory: Path, label: str) -> None:
+    _require_contained(root, directory, label)
+    if directory.exists() and not directory.is_dir():
+        raise ValueError(f"{label} must be a directory: {directory}")
+    directory.mkdir(parents=True, exist_ok=True)
+    _require_contained(root, directory, label)
+
+
+def _cleanup_known_temps(output: Path) -> None:
+    removed = False
+    for current, directory_names, file_names in os.walk(output, topdown=True, followlinks=False):
+        current_path = Path(current)
+        for name in directory_names:
+            child = current_path / name
+            if child.is_symlink():
+                raise ValueError(f"guidance output contains a symlink directory: {child}")
+            if name.startswith(".tmp-"):
+                raise ValueError(f"guidance output temporary entry is not a file: {child}")
+        for name in file_names:
+            child = current_path / name
+            if child.is_symlink():
+                raise ValueError(f"guidance output contains a symlink file: {child}")
+            if not name.startswith(".tmp-"):
+                continue
+            _require_contained(output, child, "temporary guidance output")
+            if not child.is_file():
+                raise ValueError(f"guidance output temporary entry is not a file: {child}")
+            child.unlink()
+            removed = True
+    if removed:
+        _fsync_directory(output)
 
 
 def _sample_channels(generator, config: Mapping[str, Any]) -> int:
@@ -1364,8 +1501,9 @@ def _per_sample_diagnostics(value: Any, index: int, batch_size: int) -> Any:
         detached = value.detach().cpu()
         if detached.ndim == 0:
             return float(detached)
-        if detached.ndim == 1 and detached.shape[0] == batch_size:
-            return float(detached[index])
+        if detached.ndim in {1, 2} and detached.shape[0] == batch_size:
+            selected = detached[index]
+            return float(selected) if selected.ndim == 0 else selected.tolist()
         return None
     if isinstance(value, Mapping):
         result = {}
@@ -1405,7 +1543,7 @@ def _atomic_save_image(image: torch.Tensor, path: Path) -> None:
 def _atomic_save_pil(image, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = tempfile.NamedTemporaryFile(
-        prefix=f".{path.stem}.", suffix=".png", dir=path.parent, delete=False
+        prefix=f".tmp-{path.stem}-", suffix=".png", dir=path.parent, delete=False
     )
     temporary = Path(handle.name)
     handle.close()
@@ -1414,6 +1552,7 @@ def _atomic_save_pil(image, path: Path) -> None:
         with temporary.open("rb") as reader:
             os.fsync(reader.fileno())
         os.replace(temporary, path)
+        _fsync_directory(path.parent)
     finally:
         if temporary.exists():
             temporary.unlink()
@@ -1448,7 +1587,7 @@ def _write_contact_sheets(rows, output: Path, *, rows_per_page: int, tile_size: 
     from PIL import Image
 
     contact_dir = output / "contact_sheets"
-    contact_dir.mkdir(parents=True, exist_ok=True)
+    _prepare_owned_directory(output, contact_dir, "contact sheet directory")
     pages = []
     expected_pages = math.ceil(len(rows) / rows_per_page)
     expected_names = {f"page_{index:03d}.png" for index in range(expected_pages)}
@@ -1468,6 +1607,7 @@ def _write_contact_sheets(rows, output: Path, *, rows_per_page: int, tile_size: 
                     )
                 sheet.paste(tile, (column * tile_size, row_index * tile_size))
         path = contact_dir / f"page_{page_index:03d}.png"
+        _require_contained(output, path, "contact sheet page")
         _atomic_save_pil(sheet, path)
         pages.append(
             {
@@ -1478,7 +1618,9 @@ def _write_contact_sheets(rows, output: Path, *, rows_per_page: int, tile_size: 
             }
         )
     manifest = {"columns": ["source", "native", "candidate"], "pages": pages}
-    _atomic_write_json(output / "contact_sheet_columns.json", manifest)
+    manifest_path = output / "contact_sheet_columns.json"
+    _require_contained(output, manifest_path, "contact sheet manifest")
+    _atomic_write_json(manifest_path, manifest)
     return manifest
 
 
@@ -1506,18 +1648,52 @@ def _read_optional_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def _append_jsonl(path: Path, row: Mapping[str, Any]) -> None:
-    with path.open("a", encoding="utf-8", newline="\n") as handle:
-        handle.write(json.dumps(_json_safe(dict(row)), sort_keys=True, allow_nan=False) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+    rows = _read_optional_jsonl(path)
+    _atomic_replace_jsonl(path, [*rows, dict(row)])
 
 
 def _write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]], *, mode: str = "w") -> None:
-    with path.open(mode, encoding="utf-8", newline="\n") as handle:
-        for row in rows:
-            handle.write(json.dumps(_json_safe(dict(row)), sort_keys=True, allow_nan=False) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+    if mode not in {"w", "x"}:
+        raise ValueError(f"unsupported JSONL write mode: {mode!r}")
+    if mode == "x" and path.exists():
+        raise FileExistsError(f"refusing to replace existing JSONL: {path}")
+    _atomic_replace_jsonl(path, rows, exclusive=mode == "x")
+
+
+def _atomic_replace_jsonl(
+    path: Path,
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    exclusive: bool = False,
+) -> None:
+    if exclusive and path.exists():
+        raise FileExistsError(f"refusing to replace existing JSONL: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        newline="\n",
+        prefix=f".tmp-{path.stem}-",
+        suffix=".jsonl",
+        dir=path.parent,
+        delete=False,
+    )
+    temporary = Path(handle.name)
+    try:
+        with handle:
+            for row in rows:
+                handle.write(
+                    json.dumps(_json_safe(dict(row)), sort_keys=True, allow_nan=False) + "\n"
+                )
+            handle.flush()
+            os.fsync(handle.fileno())
+        if exclusive and path.exists():
+            raise FileExistsError(f"refusing to replace existing JSONL: {path}")
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -1533,24 +1709,38 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any], *, exclusive: boo
         raise FileExistsError(f"refusing to replace existing JSON: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = tempfile.NamedTemporaryFile(
-        prefix=f".{path.stem}.", suffix=".json", dir=path.parent, delete=False
+        mode="w",
+        encoding="utf-8",
+        newline="\n",
+        prefix=f".tmp-{path.stem}-",
+        suffix=".json",
+        dir=path.parent,
+        delete=False,
     )
     temporary = Path(handle.name)
-    handle.close()
     try:
-        temporary.write_text(
-            json.dumps(_json_safe(dict(payload)), indent=2, sort_keys=True, allow_nan=False)
-            + "\n",
-            encoding="utf-8",
-        )
-        with temporary.open("rb") as reader:
-            os.fsync(reader.fileno())
+        with handle:
+            handle.write(
+                json.dumps(_json_safe(dict(payload)), indent=2, sort_keys=True, allow_nan=False)
+                + "\n"
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
         if exclusive and path.exists():
             raise FileExistsError(f"refusing to replace existing JSON: {path}")
         os.replace(temporary, path)
+        _fsync_directory(path.parent)
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+def _fsync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _json_safe(value: Any) -> Any:
@@ -1638,6 +1828,79 @@ def _digest_path(path: Path) -> str:
     return digest.hexdigest()
 
 
+def cached_asset_digest(path: str | Path, expected_digest: str, cache_path: str | Path) -> str:
+    asset = Path(path)
+    expected = _require_sha256(expected_digest, "expected_digest")
+    cache = Path(cache_path)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = cache.with_name(f"{cache.name}.lock")
+    fingerprint = _stat_fingerprint(asset)
+    key_payload = {
+        "path": str(asset.resolve()),
+        "expected_digest": expected,
+        "stat_fingerprint": fingerprint,
+    }
+    key = hashlib.sha256(
+        json.dumps(key_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            payload = _read_digest_cache(cache)
+            entry = payload.get(key)
+            if isinstance(entry, Mapping) and entry.get("digest") == expected:
+                if _stat_fingerprint(asset) == fingerprint:
+                    return expected
+            actual = _digest_path(asset)
+            if actual != expected:
+                raise ValueError(
+                    f"asset digest mismatch for {asset}: expected={expected} actual={actual}"
+                )
+            payload[key] = {**key_payload, "digest": actual}
+            _atomic_write_json(cache, payload)
+            return actual
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _read_digest_cache(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    payload = _read_json_mapping(path, "asset digest cache")
+    return dict(payload)
+
+
+def _stat_fingerprint(path: Path) -> list[dict[str, Any]]:
+    if path.is_symlink():
+        raise ValueError(f"asset fingerprint rejects symlink: {path}")
+    if path.is_file():
+        items = [(".", path)]
+    elif path.is_dir():
+        items = [
+            (item.relative_to(path).as_posix(), item)
+            for item in sorted(path.rglob("*"))
+            if item.is_file() or item.is_symlink()
+        ]
+    else:
+        raise FileNotFoundError(f"asset path does not exist: {path}")
+    fingerprint = []
+    for relative, item in items:
+        if item.is_symlink():
+            raise ValueError(f"asset fingerprint rejects symlink entry: {item}")
+        stat = item.stat()
+        fingerprint.append(
+            {
+                "relative": relative,
+                "device": int(stat.st_dev),
+                "inode": int(stat.st_ino),
+                "size": int(stat.st_size),
+                "mtime_ns": int(stat.st_mtime_ns),
+                "ctime_ns": int(stat.st_ctime_ns),
+            }
+        )
+    return fingerprint
+
+
 def _validate_expected_digest(
     config: Mapping[str, Any], fields: Sequence[str], actual: str, label: str
 ) -> None:
@@ -1673,6 +1936,7 @@ def _single_row_value(rows, field: str) -> int:
 
 def _session_snapshot(
     *,
+    session_id: str,
     session_index: int,
     generated_count: int,
     resumed_count: int,
@@ -1686,6 +1950,7 @@ def _session_snapshot(
     allocated, reserved = _cuda_peak_memory(device)
     generation_seconds = candidate_generation_seconds + native_generation_seconds
     return {
+        "session_id": str(session_id),
         "session_index": int(session_index),
         "generated_count": int(generated_count),
         "resumed_count": int(resumed_count),
@@ -1703,8 +1968,9 @@ def _session_snapshot(
     }
 
 
-def _validate_session_history(sessions) -> None:
+def _validate_session_history(sessions, *, require_contiguous_indices: bool = True) -> None:
     required = {
+        "session_id",
         "session_index",
         "generated_count",
         "resumed_count",
@@ -1717,17 +1983,32 @@ def _validate_session_history(sessions) -> None:
         "wall_seconds",
         "max_memory",
     }
+    session_ids: set[str] = set()
     for index, session in enumerate(sessions):
         if not isinstance(session, Mapping) or not required.issubset(session):
             raise ValueError(f"invalid session history row at index {index}")
-        if int(session["session_index"]) != index:
+        session_id = str(session["session_id"])
+        if not re.fullmatch(r"[0-9a-f]{32}", session_id):
+            raise ValueError(f"invalid session ID at row {index}")
+        if session_id in session_ids:
+            raise ValueError(f"duplicate session ID at row {index}")
+        session_ids.add(session_id)
+        if require_contiguous_indices and int(session["session_index"]) != index:
             raise ValueError(f"session history index mismatch at row {index}")
+        if int(session["session_index"]) < 0:
+            raise ValueError(f"negative session history index at row {index}")
         memory = session["max_memory"]
         if not isinstance(memory, Mapping) or not {
             "allocated_bytes",
             "reserved_bytes",
         }.issubset(memory):
             raise ValueError(f"invalid session memory record at index {index}")
+
+
+def _same_session(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    left_core = {key: value for key, value in left.items() if key != "recovered_after_crash"}
+    right_core = {key: value for key, value in right.items() if key != "recovered_after_crash"}
+    return _json_safe(left_core) == _json_safe(right_core)
 
 
 def aggregate_session_memory(sessions) -> dict[str, int]:

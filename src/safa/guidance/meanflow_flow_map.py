@@ -360,8 +360,8 @@ def optimize_initial_noise(
             "final_norm_squared_per_dimension": final_norm.square() / dimension,
             "initial_final_cosine": F.cosine_similarity(initial.flatten(1), final_noise.flatten(1), dim=1),
             "update_norm": (final_noise - initial).flatten(1).norm(dim=1),
-            "channel_mean": final_noise.mean(dim=(0, 2, 3)),
-            "channel_std": final_noise.std(dim=(0, 2, 3), unbiased=False),
+            "channel_mean": final_noise.mean(dim=(2, 3)),
+            "channel_std": final_noise.std(dim=(2, 3), unbiased=False),
             "loss_history": loss_history,
         },
     )
