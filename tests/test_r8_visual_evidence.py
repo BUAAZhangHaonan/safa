@@ -8,6 +8,7 @@ import pytest
 from safa.evaluation.r8_visual_evidence import (
     build_visual_evidence_contract,
     validate_visual_review_arm,
+    write_contact_sheets,
 )
 
 
@@ -91,3 +92,29 @@ def test_visual_review_rejects_any_unbound_or_replaced_evidence(
 
     with pytest.raises(ValueError):
         validate_visual_review_arm(review, evidence)
+
+
+def test_contact_sheets_reject_symlink_output_escape(tmp_path: Path) -> None:
+    from PIL import Image
+
+    assets = []
+    for name in ("source", "native", "candidate"):
+        path = tmp_path / f"{name}.png"
+        Image.new("RGB", (4, 4), color="white").save(path)
+        assets.append(path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    output = tmp_path / "contact"
+    output.symlink_to(outside, target_is_directory=True)
+    rows = [
+        {
+            "sample_id": "sample",
+            "source": str(assets[0]),
+            "native": str(assets[1]),
+            "candidate": str(assets[2]),
+        }
+    ]
+
+    with pytest.raises(ValueError, match="symlink"):
+        write_contact_sheets(output, rows, columns=("source", "native", "candidate"))
+    assert not list(outside.iterdir())

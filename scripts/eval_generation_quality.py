@@ -5,9 +5,11 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import sys
+import tempfile
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping, Sequence
 
 
 DEFAULT_IQA_METHOD = "niqe"
@@ -15,6 +17,103 @@ DEFAULT_METRICS = ("fid", "kid", "niqe")
 SUPPORTED_METRICS = frozenset((*DEFAULT_METRICS, "sharpness"))
 REAL_IMAGE_METRICS = frozenset(("fid", "kid"))
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def asset_manifest_digest(paths: Sequence[Path], labels: Sequence[str]) -> str:
+    if len(paths) != len(labels):
+        raise ValueError("asset digest labels and paths disagree")
+    return hashlib.sha256(
+        "".join(
+            f"{label}\t{sha256_file(path)}\n"
+            for label, path in zip(labels, paths, strict=True)
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = (json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def reusable_quality_payload(
+    output: Path,
+    *,
+    contract: Mapping[str, Any],
+    metric_names: Sequence[str],
+    num_generated: int,
+    num_real: int | None,
+) -> dict[str, Any] | None:
+    if not output.is_file():
+        return None
+    try:
+        payload = json.loads(output.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("quality_contract") != dict(contract):
+        return None
+    if payload.get("metrics") != list(metric_names) or payload.get("num_generated") != num_generated:
+        return None
+    if num_real is not None and payload.get("num_real") != num_real:
+        return None
+    scalar_fields = {
+        "fid": ("fid",),
+        "kid": ("kid_mean", "kid_std"),
+    }
+    for metric_name, fields in scalar_fields.items():
+        if metric_name in metric_names and any(
+            not isinstance(payload.get(field), (int, float))
+            or not math.isfinite(float(payload[field]))
+            for field in fields
+        ):
+            return None
+    if "niqe" in metric_names:
+        iqa = payload.get("iqa")
+        if not isinstance(iqa, Mapping) or any(
+            not isinstance(iqa.get(field), (int, float))
+            or not math.isfinite(float(iqa[field]))
+            for field in ("mean", "std")
+        ):
+            return None
+    if "sharpness" in metric_names:
+        sharpness = payload.get("sharpness")
+        if not isinstance(sharpness, Mapping) or any(
+            not isinstance(sharpness.get(field), (int, float))
+            or not math.isfinite(float(sharpness[field]))
+            for field in ("mean", "median", "std", "p05", "p10", "p90", "p95")
+        ):
+            return None
+    return payload
 
 
 def read_jsonl_objects(path: Path) -> list[dict[str, Any]]:
@@ -369,6 +468,8 @@ def evaluate_generation_quality(
     device: str = "auto",
     sample_id_manifest: Path | None = None,
     per_sample_jsonl: Path | None = None,
+    generation_result: Path | None = None,
+    reuse_valid_output: bool = False,
 ) -> dict[str, Any]:
     metric_names = normalize_metrics(metrics)
     needs_real_images = any(name in REAL_IMAGE_METRICS for name in metric_names)
@@ -387,6 +488,7 @@ def evaluate_generation_quality(
             sample_id_manifest=sample_id_manifest,
             per_sample_jsonl=per_sample_jsonl,
         )
+        contract_real_paths = joined_real_paths
         real_paths = joined_real_paths if needs_real_images else []
     else:
         generated_paths = limited_paths(
@@ -398,6 +500,55 @@ def evaluate_generation_quality(
             real_paths = limited_paths(real_image_paths(real_index), max_count=max_real, seed=subset_seed)
         else:
             real_paths = []
+        contract_real_paths = real_paths
+
+    labels = manifest_ids if manifest_mode else [path.name for path in generated_paths]
+    real_labels = manifest_ids if manifest_mode else [path.name for path in contract_real_paths]
+    quality_contract: dict[str, Any] = {
+        "schema_version": 1,
+        "metrics": list(metric_names),
+        "sample_id_manifest_sha256": (
+            sha256_file(sample_id_manifest) if sample_id_manifest is not None else None
+        ),
+        "per_sample_jsonl_sha256": (
+            sha256_file(per_sample_jsonl) if per_sample_jsonl is not None else None
+        ),
+        "real_asset_manifest_sha256": asset_manifest_digest(contract_real_paths, real_labels),
+        "generated_asset_manifest_sha256": asset_manifest_digest(generated_paths, labels),
+    }
+    if generation_result is not None:
+        try:
+            generation_payload = json.loads(generation_result.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid generation result JSON: {generation_result}") from exc
+        if not isinstance(generation_payload, Mapping) or generation_payload.get("status") != "complete":
+            raise ValueError("generation result must be a complete object")
+        arm_digest = generation_payload.get("arm_config_sha256")
+        if (
+            not isinstance(arm_digest, str)
+            or len(arm_digest) != 64
+            or any(character not in "0123456789abcdef" for character in arm_digest)
+        ):
+            raise ValueError("generation result requires a 64-character arm config digest")
+        quality_contract.update(
+            {
+                "generation_result_sha256": sha256_file(generation_result),
+                "arm_config_sha256": arm_digest,
+            }
+        )
+    cached = (
+        reusable_quality_payload(
+            output,
+            contract=quality_contract,
+            metric_names=metric_names,
+            num_generated=len(generated_paths),
+            num_real=len(real_paths) if needs_real_images else None,
+        )
+        if reuse_valid_output
+        else None
+    )
+    if cached is not None:
+        return cached
 
     selected_device = quality_eval_device(device)
     fid = create_fid_metric() if "fid" in metric_names else None
@@ -443,6 +594,7 @@ def evaluate_generation_quality(
         payload = {
             "metrics": list(metric_names),
             "num_generated": len(generated_paths),
+            "quality_contract": quality_contract,
         }
         if needs_real_images:
             payload["num_real"] = len(real_paths)
@@ -467,8 +619,7 @@ def evaluate_generation_quality(
         if "sharpness" in metric_names:
             payload["sharpness"] = sharpness_summary(sharpness_values)
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    atomic_write_json(output, payload)
     return payload
 
 
@@ -481,6 +632,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--sample-id-manifest", type=Path)
     parser.add_argument("--per-sample-jsonl", type=Path)
+    parser.add_argument("--generation-result", type=Path)
+    parser.add_argument("--reuse-valid-output", action="store_true")
     parser.add_argument("--max-generated", type=int, default=None)
     parser.add_argument("--max-real", type=int, default=None)
     parser.add_argument("--subset-seed", type=int, default=1337)
@@ -516,6 +669,8 @@ def main(argv: list[str] | None = None) -> int:
             device=args.device,
             sample_id_manifest=args.sample_id_manifest,
             per_sample_jsonl=args.per_sample_jsonl,
+            generation_result=args.generation_result,
+            reuse_valid_output=args.reuse_valid_output,
         )
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)

@@ -464,6 +464,89 @@ def test_quality_eval_manifest_digest_is_path_independent(tmp_path: Path, monkey
     assert digests[0] == digests[1]
 
 
+def test_quality_eval_reuses_only_matching_atomic_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_script("eval_generation_quality")
+    real_index, generated_dir, manifest, per_sample = _write_manifest_quality_case(
+        tmp_path, manifest_ids=["sample"]
+    )
+    generation_result = tmp_path / "generation_result.json"
+    generation_result.write_text(
+        json.dumps({"status": "complete", "arm_config_sha256": "a" * 64}),
+        encoding="utf-8",
+    )
+    output = tmp_path / "quality.json"
+    calls = 0
+
+    def fake_sharpness(path: Path) -> float:
+        nonlocal calls
+        del path
+        calls += 1
+        return 123.0
+
+    monkeypatch.setattr(module, "laplacian_variance", fake_sharpness)
+    first = module.evaluate_generation_quality(
+        real_index=real_index,
+        generated_dir=generated_dir,
+        output=output,
+        metrics=["sharpness"],
+        sample_id_manifest=manifest,
+        per_sample_jsonl=per_sample,
+        generation_result=generation_result,
+        reuse_valid_output=True,
+        device="cpu",
+    )
+    assert calls == 1
+    assert first["quality_contract"]["arm_config_sha256"] == "a" * 64
+
+    second = module.evaluate_generation_quality(
+        real_index=real_index,
+        generated_dir=generated_dir,
+        output=output,
+        metrics=["sharpness"],
+        sample_id_manifest=manifest,
+        per_sample_jsonl=per_sample,
+        generation_result=generation_result,
+        reuse_valid_output=True,
+        device="cpu",
+    )
+    assert second == first
+    assert calls == 1
+
+    generated = next(generated_dir.iterdir())
+    generated.write_bytes(generated.read_bytes() + b"stale")
+    third = module.evaluate_generation_quality(
+        real_index=real_index,
+        generated_dir=generated_dir,
+        output=output,
+        metrics=["sharpness"],
+        sample_id_manifest=manifest,
+        per_sample_jsonl=per_sample,
+        generation_result=generation_result,
+        reuse_valid_output=True,
+        device="cpu",
+    )
+    assert calls == 2
+    assert third["quality_contract"] != first["quality_contract"]
+
+    output.write_text("{\"truncated\":", encoding="utf-8")
+    monkeypatch.setattr(module.os, "replace", lambda source, target: (_ for _ in ()).throw(OSError("fault")))
+    with pytest.raises(OSError, match="fault"):
+        module.evaluate_generation_quality(
+            real_index=real_index,
+            generated_dir=generated_dir,
+            output=output,
+            metrics=["sharpness"],
+            sample_id_manifest=manifest,
+            per_sample_jsonl=per_sample,
+            generation_result=generation_result,
+            reuse_valid_output=True,
+            device="cpu",
+        )
+    assert output.read_text(encoding="utf-8") == "{\"truncated\":"
+
+
 def test_quality_eval_limits_real_and_generated_sets_deterministically(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

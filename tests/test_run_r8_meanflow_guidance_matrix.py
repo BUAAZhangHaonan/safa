@@ -303,7 +303,7 @@ def test_matrix_semigroup_waits_for_direct_visual_review_before_gate(
     assert not (tmp_path / module.SCHEDULE_MANIFEST).exists()
 
 
-def test_matrix_calibration_launches_four_processes_concurrently(
+def test_matrix_calibration_uses_one_owned_output_per_arm_and_four_gpu_queues(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     module = _load_script()
@@ -316,22 +316,32 @@ def test_matrix_calibration_launches_four_processes_concurrently(
     )
     plan = replace(plan, status_dir=tmp_path / "status")
     processes = []
+    active_gpus: set[str] = set()
+    max_active = 0
 
     class FakeProcess:
         def __init__(self, command, *, cwd, env, start_new_session):
-            del command, cwd, env, start_new_session
+            nonlocal max_active
+            del command, cwd, start_new_session
             self.pid = 1000 + len(processes)
             self.returncode = 0
+            self.gpu = env["CUDA_VISIBLE_DEVICES"]
+            assert self.gpu not in active_gpus
+            active_gpus.add(self.gpu)
+            max_active = max(max_active, len(active_gpus))
             processes.append(self)
 
         def wait(self):
-            assert len(processes) == 4
+            active_gpus.remove(self.gpu)
             return self.returncode
 
     monkeypatch.setattr(module.subprocess, "Popen", FakeProcess)
 
     assert module.launch_matrix(plan) == 0
-    assert len(processes) == 4
+    assert len(processes) == 20
+    assert max_active == 4
+    assert all(run.output_dir == module.ROOT / "calibration" / run.arm_ids[0] for run in plan.runs)
+    assert all(len(run.arm_ids) == 1 for run in plan.runs)
 
 
 def test_matrix_failed_semigroup_replaces_all_four_arms_with_noise_configs() -> None:
@@ -418,7 +428,7 @@ def test_matrix_quality_commands_never_use_max_count_flags() -> None:
         assert "--max-generated" not in text
 
 
-def test_matrix_calibration_never_overwrites_completed_quality() -> None:
+def test_matrix_calibration_quality_reuse_is_contract_validated() -> None:
     module = _load_script()
     plan = module.build_matrix_plan(
         _args(module, "--phase", "calibrate"), semigroup_gate=_passing_gate(module)
@@ -426,7 +436,48 @@ def test_matrix_calibration_never_overwrites_completed_quality() -> None:
 
     for run in plan.runs:
         command = " ".join(run.command)
-        assert "/quality.json; then :; else" in command
+        assert "--reuse-valid-output" in command
+        assert "--generation-result" in command
+        assert "/quality.json; then :; else" not in command
+
+
+def test_matrix_calibration_resume_contract_is_uniform_across_all_families(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_script()
+    plan = module.build_matrix_plan(
+        _args(module, "--phase", "calibrate"), semigroup_gate=_passing_gate(module)
+    )
+    selected = []
+    for family in (
+        "official_flow_map1",
+        "official_flow_map2",
+        "paper_algorithm_split",
+        "initial_noise_oracle",
+    ):
+        run = next(candidate for candidate in plan.runs if candidate.family == family)
+        output = tmp_path / run.output_dir
+        output.mkdir(parents=True)
+        (output / "resume_contract.json").write_text("{}", encoding="utf-8")
+        selected.append(run)
+    resumed_plan = replace(plan, repo_root=tmp_path, runs=tuple(selected))
+
+    module.validate_artifact_paths(resumed_plan)
+
+    gpu3 = next(run for run in selected if run.physical_gpu == 3)
+    command = " ".join(gpu3.command)
+    assert f"{gpu3.output_dir}/completion.json" in command
+    assert "--reuse-valid-output" in command
+    assert gpu3.output_dir == module.ROOT / "calibration" / gpu3.arm_ids[0]
+    finalized_arms: list[str] = []
+
+    def fake_evidence(value):
+        finalized_arms.extend(arm_id for run in value.runs for arm_id in run.arm_ids)
+        return {"arms": {}}
+
+    monkeypatch.setattr(module, "_build_calibration_visual_evidence", fake_evidence)
+    assert module.finalize_phase(resumed_plan) == 2
+    assert gpu3.arm_ids[0] in finalized_arms
 
 
 def test_matrix_records_exit_codes_peak_memory_and_external_processes(
@@ -747,6 +798,71 @@ def test_terminate_process_group_reaps_shell_and_child(tmp_path: Path) -> None:
     assert not Path(f"/proc/{child_pid}").exists()
 
 
+def test_execute_plan_keyboard_interrupt_reaps_session_before_unlock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    module = _load_script()
+    child_pid_path = tmp_path / "child.pid"
+    run = replace(
+        module.build_matrix_plan(_args(module, "--phase", "semigroup")).runs[0],
+        command=(
+            "/bin/bash",
+            "-lc",
+            f"sleep 60 & echo $! > {child_pid_path}; wait",
+        ),
+        output_dir=Path("owned"),
+        log_path=Path("logs/run.log"),
+    )
+    plan = replace(
+        module.build_matrix_plan(_args(module, "--phase", "semigroup", "--execute")),
+        repo_root=tmp_path,
+        runs=(run,),
+        status_dir=Path("status"),
+        lock_path=Path("matrix.lock"),
+    )
+    real_popen = subprocess.Popen
+
+    class InterruptingProcess:
+        def __init__(self, command, *, cwd, env, start_new_session):
+            self._process = real_popen(
+                command, cwd=cwd, env=env, start_new_session=start_new_session
+            )
+            self.pid = self._process.pid
+            self.interrupted = False
+
+        def wait(self, *args, **kwargs):
+            if not self.interrupted and not args and not kwargs:
+                self.interrupted = True
+                deadline = time.monotonic() + 5.0
+                while not child_pid_path.is_file() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert (tmp_path / "matrix.lock").is_file()
+                raise KeyboardInterrupt
+            return self._process.wait(*args, **kwargs)
+
+        def terminate(self):
+            self._process.terminate()
+
+        def kill(self):
+            self._process.kill()
+
+    monkeypatch.setattr(module.subprocess, "Popen", InterruptingProcess)
+    monkeypatch.setattr(module, "validate_artifact_paths", lambda value: None)
+    monkeypatch.setattr(module, "validate_preflight", lambda value: value)
+    monkeypatch.setattr(module, "materialize_locked_manifests", lambda value: None)
+    monkeypatch.setattr(module, "materialize_full_runtime_configs", lambda value: None)
+
+    with pytest.raises(KeyboardInterrupt):
+        module.execute_plan(plan)
+
+    child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 2.0
+    while Path(f"/proc/{child_pid}").exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not Path(f"/proc/{child_pid}").exists()
+    assert not (tmp_path / "matrix.lock").exists()
+
+
 def test_execute_plan_marks_finalize_failure_not_passed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -853,12 +969,61 @@ def test_full_merge_is_idempotent_and_recovers_partial_owned_output(tmp_path: Pa
 
     (combined / "completion.json").unlink()
     victim = next((combined / "generated_images").iterdir())
-    victim.unlink()
+    expected = victim.read_bytes()
+    victim.write_bytes(expected[: max(1, len(expected) // 2)])
     resumed = module._merge_full_arm(
         tmp_path, "native", combined, expected_arm_config_sha256=native_digest
     )
     assert resumed["status"] == "complete"
-    assert victim.is_file()
+    assert victim.read_bytes() == expected
+
+
+def test_full_merge_rejects_symlink_escape_and_unknown_output(tmp_path: Path) -> None:
+    module = _load_script()
+    native_config = {"mode": "native", "sampling_seed": 1337}
+    digest = canonical_arm_config_digest(native_config)
+    manifest = tmp_path / module.FULL_MANIFEST
+    manifest.parent.mkdir(parents=True)
+    ids = [f"sample-{index}" for index in range(4)]
+    manifest.write_text(
+        "".join(json.dumps({"sample_id": value}) + "\n" for value in ids),
+        encoding="utf-8",
+    )
+    for gpu, sample_id in enumerate(ids):
+        shard = tmp_path / module.ROOT / f"full/shards/shard_{gpu}/native"
+        shard.mkdir(parents=True)
+        image = shard / f"{gpu}.png"
+        image.write_bytes(b"image")
+        (shard / "per_sample.jsonl").write_text(
+            json.dumps({"sample_id": sample_id, "generated": str(image), "candidate_cosine": 0.5, "native_cosine": 0.5}) + "\n",
+            encoding="utf-8",
+        )
+        (shard / "completion.json").write_text(
+            json.dumps({"status": "complete", "sample_count": 1, "arm_config_sha256": digest}),
+            encoding="utf-8",
+        )
+        (shard / "generation_result.json").write_text(
+            json.dumps({
+                "status": "complete", "mode": "native", "checkpoint": {"sha256": module.CHECKPOINT_SHA256},
+                "sample_count": 1, "sample_id_sha256": module._sample_id_digest([sample_id]),
+                "arm_config_sha256": digest, "schedule": None, "config": native_config,
+            }),
+            encoding="utf-8",
+        )
+    combined = tmp_path / module.ROOT / "full/merged/native"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    combined.mkdir(parents=True)
+    (combined / "generated_images").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        module._merge_full_arm(tmp_path, "native", combined, expected_arm_config_sha256=digest)
+    assert not list(outside.iterdir())
+
+    (combined / "generated_images").unlink()
+    (combined / "unknown.txt").write_text("unknown", encoding="utf-8")
+    with pytest.raises((ValueError, FileExistsError), match="unowned"):
+        module._merge_full_arm(tmp_path, "native", combined, expected_arm_config_sha256=digest)
 
 
 @pytest.mark.parametrize(

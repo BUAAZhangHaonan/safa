@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import tempfile
 from typing import Any, Mapping, Sequence
 
 
@@ -39,7 +40,21 @@ def write_contact_sheets(
         raise ValueError("R8 visual evidence requires exactly three image columns")
     if rows_per_page <= 0 or tile_size <= 0:
         raise ValueError("contact sheet dimensions must be positive")
+    if output_dir.is_symlink():
+        raise ValueError(f"contact sheet output must not be a symlink: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
+    output_root = output_dir.resolve()
+    page_count = (len(rows) + rows_per_page - 1) // rows_per_page
+    expected_names = {f"page_{index:03d}.png" for index in range(page_count)}
+    for existing in output_dir.iterdir():
+        if existing.is_symlink():
+            raise ValueError(f"contact sheet output contains a symlink: {existing}")
+        if any(existing.name.startswith(f".{name}.") for name in expected_names) and existing.name.endswith(
+            ".tmp"
+        ):
+            if not existing.is_file():
+                raise ValueError(f"contact sheet temporary output has an invalid type: {existing}")
+            existing.unlink()
     pages = []
     for page_index, start in enumerate(range(0, len(rows), rows_per_page)):
         page_rows = rows[start : start + rows_per_page]
@@ -58,6 +73,8 @@ def write_contact_sheets(
         sheet.save(buffer, format="PNG")
         content = buffer.getvalue()
         path = output_dir / f"page_{page_index:03d}.png"
+        if path.resolve(strict=False).parent != output_root:
+            raise ValueError(f"contact sheet output escapes its directory: {path}")
         _write_or_validate_bytes(path, content)
         pages.append(
             {
@@ -66,7 +83,6 @@ def write_contact_sheets(
                 "sample_ids": [str(row["sample_id"]) for row in page_rows],
             }
         )
-    expected_names = {f"page_{index:03d}.png" for index in range(len(pages))}
     extras = sorted(path.name for path in output_dir.iterdir() if path.name not in expected_names)
     if extras:
         raise ValueError(f"contact sheet directory contains unowned entries: {extras!r}")
@@ -229,10 +245,28 @@ def _canonical_contract_sha256(payload: Mapping[str, Any]) -> str:
 
 
 def _write_or_validate_bytes(path: Path, content: bytes) -> None:
+    if path.is_symlink():
+        raise ValueError(f"contact sheet output must not be a symlink: {path}")
     if path.exists():
         if not path.is_file() or path.read_bytes() != content:
             raise ValueError(f"existing contact sheet disagrees with regenerated content: {path}")
         return
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_bytes(content)
-    os.replace(temporary, path)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)

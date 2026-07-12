@@ -279,15 +279,11 @@ def _guided_calibration_runs(
                 )
                 for noise_config in NOISE_CONFIGS
             ]
-        commands = []
-        arm_ids = []
-        source_configs = [config]
         for arm_id, overrides in candidates:
             candidate_config = config
             if overrides[:1] == ["--config-override"]:
                 candidate_config = Path(overrides[1])
                 overrides = []
-                source_configs.append(candidate_config)
             output = ROOT / "calibration" / arm_id
             generation = _generation_command(
                 python=python,
@@ -301,38 +297,33 @@ def _guided_calibration_runs(
             quality = build_quality_command(
                 python=python, output_dir=output, manifest=CALIBRATION_MANIFEST
             )
-            commands.extend(
-                (
-                    _skip_completed_generation(output, generation),
-                    _skip_completed_quality(output, quality),
+            shell = " && ".join(
+                (_skip_completed_generation(output, generation), _skip_completed_quality(output, quality))
+            )
+            log = ROOT / f"calibrate/logs/gpu{gpu}_{arm_id}.log"
+            runs.append(
+                RunContract(
+                    physical_gpu=gpu,
+                    gpu_uuid="",
+                    config=candidate_config,
+                    source_configs=(candidate_config,),
+                    family=family,
+                    arm_ids=(arm_id,),
+                    shard_index=0,
+                    num_shards=1,
+                    sample_count=64,
+                    sample_manifest=CALIBRATION_MANIFEST,
+                    sample_manifest_sha256=CALIBRATION_MANIFEST_SHA256,
+                    output_dir=output,
+                    log_path=log,
+                    env=_base_env(repo_root),
+                    command=(
+                        "/bin/bash",
+                        "-lc",
+                        f"{{ {shell}; }} > {shlex.quote(str(log))} 2>&1",
+                    ),
                 )
             )
-            arm_ids.append(arm_id)
-        shell = " && ".join(commands)
-        log = ROOT / f"calibrate/logs/gpu{gpu}.log"
-        runs.append(
-            RunContract(
-                physical_gpu=gpu,
-                gpu_uuid="",
-                config=config,
-                source_configs=tuple(dict.fromkeys(source_configs)),
-                family=family,
-                arm_ids=tuple(arm_ids),
-                shard_index=0,
-                num_shards=1,
-                sample_count=64,
-                sample_manifest=CALIBRATION_MANIFEST,
-                sample_manifest_sha256=CALIBRATION_MANIFEST_SHA256,
-                output_dir=ROOT / "calibration",
-                log_path=log,
-                env=_base_env(repo_root),
-                command=(
-                    "/bin/bash",
-                    "-lc",
-                    f"{{ {shell}; }} > {shlex.quote(str(log))} 2>&1",
-                ),
-            )
-        )
     return tuple(runs)
 
 
@@ -470,11 +461,8 @@ def _skip_completed_generation(output: Path, command: Sequence[str]) -> str:
 
 
 def _skip_completed_quality(output: Path, command: Sequence[str]) -> str:
-    quality = output / "quality.json"
-    return (
-        f"if test -f {shlex.quote(str(quality))}; then :; else "
-        f"{shlex.join(command)}; fi"
-    )
+    del output
+    return shlex.join(command)
 
 
 def build_quality_command(
@@ -493,6 +481,9 @@ def build_quality_command(
         str(manifest),
         "--output",
         str(output_dir / "quality.json"),
+        "--generation-result",
+        str(output_dir / "generation_result.json"),
+        "--reuse-valid-output",
         "--seed",
         "1337",
         "--device",
@@ -537,7 +528,11 @@ def validate_preflight(
     for script in (GUIDANCE_SCRIPT, QUALITY_SCRIPT):
         if not (plan.repo_root / script).is_file():
             raise FileNotFoundError(f"required R8 script does not exist: {script}")
-    if [run.physical_gpu for run in plan.runs] != [0, 1, 2, 3]:
+    physical_gpus = [run.physical_gpu for run in plan.runs]
+    if plan.phase == "calibrate":
+        if set(physical_gpus) != {0, 1, 2, 3}:
+            raise ValueError("R8 calibration must use physical GPUs 0,1,2,3")
+    elif physical_gpus != [0, 1, 2, 3]:
         raise ValueError("R8 matrix must pin physical GPUs 0,1,2,3 exactly once")
     checked: set[Path] = set()
     for run in plan.runs:
@@ -562,9 +557,6 @@ def validate_artifact_paths(plan: MatrixPlan) -> None:
             continue
         if (output / "resume_contract.json").is_file() or (output / "completion.json").is_file():
             continue
-        if run.family in {"official_flow_map1", "official_flow_map2", "paper_algorithm_split"}:
-            if output == _resolve(plan.repo_root, ROOT / "calibration"):
-                continue
         raise FileExistsError(f"refusing to overwrite existing R8 output directory: {output}")
 
 
@@ -723,87 +715,97 @@ def launch_matrix(plan: MatrixPlan) -> int:
     for run in plan.runs:
         _resolve(plan.repo_root, run.log_path).parent.mkdir(parents=True, exist_ok=True)
     started_at = _timestamp()
-    processes: list[tuple[RunContract, Any, str]] = []
-    try:
-        for run in plan.runs:
-            env = dict(os.environ)
-            env.update(run.env)
-            run_started = _timestamp()
-            process = subprocess.Popen(
-                run.command,
-                cwd=plan.repo_root,
-                env=env,
-                start_new_session=True,
-            )
-            processes.append((run, process, run_started))
-    except Exception as exc:
-        failed_index = len(processes)
-        rows = []
-        for run, process, run_started in processes:
+    queues: dict[int, list[tuple[int, RunContract]]] = {gpu: [] for gpu in range(4)}
+    for index, run in enumerate(plan.runs):
+        queues[run.physical_gpu].append((index, run))
+    active: dict[int, tuple[int, RunContract, Any, str]] = {}
+    rows_by_index: dict[int, dict[str, Any]] = {}
+
+    def start_next(gpu: int) -> None:
+        if not queues[gpu]:
+            return
+        index, run = queues[gpu].pop(0)
+        env = dict(os.environ)
+        env.update(run.env)
+        run_started = _timestamp()
+        process = subprocess.Popen(
+            run.command,
+            cwd=plan.repo_root,
+            env=env,
+            start_new_session=True,
+        )
+        active[gpu] = (index, run, process, run_started)
+
+    def terminate_active(status: str) -> None:
+        terminated = []
+        for gpu, (index, run, process, run_started) in list(active.items()):
             exit_code = _terminate_process_group(process)
-            rows.append(
-                _status_row(
-                    run,
-                    pid=getattr(process, "pid", None),
-                    started_at=run_started,
-                    exit_code=exit_code,
-                    status="terminated_after_launch_error",
-                )
+            terminated.append((index, run, process, run_started, exit_code))
+            del active[gpu]
+        for index, run, process, run_started, exit_code in terminated:
+            rows_by_index[index] = _status_row(
+                run,
+                pid=getattr(process, "pid", None),
+                started_at=run_started,
+                exit_code=exit_code,
+                status=status,
             )
-        failed_run = plan.runs[failed_index]
-        rows.append(
-            _status_row(
-                failed_run,
-                pid=None,
-                started_at=_timestamp(),
-                exit_code=None,
-                status="launch_failed",
-            )
-        )
-        for run in plan.runs[failed_index + 1 :]:
-            rows.append(
-                _status_row(
-                    run,
-                    pid=None,
-                    started_at=None,
-                    exit_code=None,
-                    status="not_started",
-                )
-            )
-        _write_matrix_status(
-            status_dir,
-            plan,
-            rows,
-            started_at=started_at,
-            overall_status="failed",
-            launch_error=f"{type(exc).__name__}: {exc}",
-        )
-        return 1
-    rows = []
-    for index, (run, process, run_started) in enumerate(processes):
-        exit_code = int(process.wait())
-        rows.append(
-            _status_row(
+
+    try:
+        for gpu in range(4):
+            start_next(gpu)
+        peer_failed = False
+        while active:
+            gpu = min(active)
+            index, run, process, run_started = active[gpu]
+            exit_code = int(process.wait())
+            rows_by_index[index] = _status_row(
                 run,
                 pid=getattr(process, "pid", None),
                 started_at=run_started,
                 exit_code=exit_code,
                 status="passed" if exit_code == 0 else "failed",
             )
+            del active[gpu]
+            if exit_code != 0:
+                peer_failed = True
+                terminate_active("terminated_after_peer_failure")
+                break
+            start_next(gpu)
+    except BaseException as exc:
+        terminate_active("terminated_after_launch_error")
+        represented = set(rows_by_index)
+        for index, run in enumerate(plan.runs):
+            if index in represented:
+                continue
+            rows_by_index[index] = _status_row(
+                run,
+                pid=None,
+                started_at=None,
+                exit_code=None,
+                status="not_started",
+            )
+        _write_matrix_status(
+            status_dir,
+            plan,
+            [rows_by_index[index] for index in sorted(rows_by_index)],
+            started_at=started_at,
+            overall_status="failed",
+            launch_error=f"{type(exc).__name__}: {exc}",
         )
-        if exit_code != 0:
-            for peer_run, peer_process, peer_started in processes[index + 1 :]:
-                peer_exit_code = _terminate_process_group(peer_process)
-                rows.append(
-                    _status_row(
-                        peer_run,
-                        pid=getattr(peer_process, "pid", None),
-                        started_at=peer_started,
-                        exit_code=peer_exit_code,
-                        status="terminated_after_peer_failure",
-                    )
-                )
-            break
+        if not isinstance(exc, Exception):
+            raise
+        return 1
+    for index, run in enumerate(plan.runs):
+        if index not in rows_by_index:
+            rows_by_index[index] = _status_row(
+                run,
+                pid=None,
+                started_at=None,
+                exit_code=None,
+                status="not_started",
+            )
+    rows = [rows_by_index[index] for index in sorted(rows_by_index)]
     failed = any(row["exit_code"] != 0 for row in rows)
     _write_matrix_status(
         status_dir,
@@ -812,7 +814,7 @@ def launch_matrix(plan: MatrixPlan) -> int:
         started_at=started_at,
         overall_status="failed" if failed else "children_passed_pending_finalize",
     )
-    return 1 if failed else 0
+    return 1 if failed or peer_failed else 0
 
 
 def _terminate_process_group(process: Any, *, terminate_timeout: float = 5.0) -> int:
@@ -1449,18 +1451,17 @@ def finalize_full_outputs(plan: MatrixPlan) -> int:
             expected_arm_config_sha256=_full_arm_config_digest(plan, arm_id),
         )
         quality_path = combined / "quality.json"
-        if not quality_path.is_file():
-            command = build_quality_command(
-                python=plan.python,
-                output_dir=ROOT / f"full/merged/{arm_id}",
-                manifest=FULL_MANIFEST,
-            )
-            subprocess.run(
-                command,
-                cwd=plan.repo_root,
-                check=True,
-                env={**os.environ, "PYTHONPATH": "src"},
-            )
+        command = build_quality_command(
+            python=plan.python,
+            output_dir=ROOT / f"full/merged/{arm_id}",
+            manifest=FULL_MANIFEST,
+        )
+        subprocess.run(
+            command,
+            cwd=plan.repo_root,
+            check=True,
+            env={**os.environ, "PYTHONPATH": "src"},
+        )
         _read_json(quality_path, f"full {arm_id} quality result")
     evidence = _build_full_visual_evidence(plan)
     visual_path = plan.repo_root / FULL_VISUAL_REVIEW
@@ -1520,7 +1521,10 @@ def _build_full_visual_evidence(plan: MatrixPlan) -> dict[str, Any]:
                 "candidate": winner.get("generated"),
             }
         )
-    page_dir = plan.repo_root / ROOT / "full/visual_evidence/contact_sheets"
+    visual_root = plan.repo_root / ROOT / "full/visual_evidence"
+    _reject_symlink_components(plan.repo_root, visual_root, "full visual evidence output")
+    _reject_symlink_tree(visual_root, "full visual evidence output")
+    page_dir = visual_root / "contact_sheets"
     pages = write_contact_sheets(
         page_dir,
         visual_rows,
@@ -1543,8 +1547,103 @@ def _build_full_visual_evidence(plan: MatrixPlan) -> dict[str, Any]:
         "full_sample_id_manifest_sha256": _sha256_file(plan.repo_root / FULL_MANIFEST),
         "arms": {winner_id: arm},
     }
-    _write_or_validate_json(plan.repo_root / FULL_VISUAL_EVIDENCE, payload)
+    evidence_path = plan.repo_root / FULL_VISUAL_EVIDENCE
+    _reject_symlink_components(plan.repo_root, evidence_path, "full visual evidence contract")
+    if evidence_path.is_symlink():
+        raise ValueError(f"full visual evidence contract must not be a symlink: {evidence_path}")
+    _write_or_validate_json(evidence_path, payload)
     return payload
+
+
+def _reject_symlink_components(root: Path, path: Path, label: str) -> None:
+    root_absolute = root.absolute()
+    path_absolute = path.absolute()
+    try:
+        relative = path_absolute.relative_to(root_absolute)
+    except ValueError as exc:
+        raise ValueError(f"{label} escapes the repository: {path}") from exc
+    current = root_absolute
+    if current.is_symlink():
+        raise ValueError(f"{label} has a symlink path component: {current}")
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            raise ValueError(f"{label} has a symlink path component: {current}")
+
+
+def _reject_symlink_tree(root: Path, label: str) -> None:
+    if root.is_symlink():
+        raise ValueError(f"{label} must not be a symlink: {root}")
+    if not root.exists():
+        return
+    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        base = Path(directory)
+        for name in (*dirnames, *filenames):
+            path = base / name
+            if path.is_symlink():
+                raise ValueError(f"{label} contains a symlink: {path}")
+
+
+def _require_contained(root: Path, path: Path, label: str) -> None:
+    try:
+        path.resolve(strict=False).relative_to(root.resolve(strict=False))
+    except ValueError as exc:
+        raise ValueError(f"{label} escapes its owned directory: {path}") from exc
+
+
+def _atomic_copy_file(source: Path, target: Path) -> None:
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    try:
+        with source.open("rb") as source_handle, temporary.open("xb") as target_handle:
+            shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
+            target_handle.flush()
+            os.fsync(target_handle.fileno())
+        os.replace(temporary, target)
+        directory_fd = os.open(target.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _remove_owned_temporaries(directory: Path, target_names: Sequence[str]) -> None:
+    if not directory.is_dir():
+        return
+    prefixes = tuple(f".{name}." for name in target_names)
+    for path in directory.iterdir():
+        if path.name.startswith(prefixes) and path.name.endswith(".tmp"):
+            if path.is_symlink() or not path.is_file():
+                raise ValueError(f"owned temporary output has an invalid type: {path}")
+            path.unlink()
+
+
+def _write_recoverable_json(
+    path: Path, payload: Mapping[str, Any], *, completed: bool
+) -> None:
+    expected = json.loads(json.dumps(payload, allow_nan=False))
+    try:
+        matches = path.is_file() and _read_json(path, path.name) == expected
+    except (ValueError, json.JSONDecodeError):
+        matches = False
+    if matches:
+        return
+    if completed:
+        raise ValueError(f"existing owned artifact disagrees with its contract: {path}")
+    _atomic_write_json(path, payload)
+
+
+def _write_recoverable_text(path: Path, content: str, *, completed: bool) -> None:
+    try:
+        matches = path.is_file() and path.read_text(encoding="utf-8") == content
+    except UnicodeError:
+        matches = False
+    if matches:
+        return
+    if completed:
+        raise ValueError(f"existing owned artifact disagrees with its contract: {path}")
+    _atomic_write_bytes(path, content.encode("utf-8"))
 
 
 def _merge_full_arm(
@@ -1558,11 +1657,20 @@ def _merge_full_arm(
         expected_arm_config_sha256, f"full {arm_id} arm config SHA256"
     )
     expected_ids = _read_manifest_ids(repo_root / FULL_MANIFEST)
+    shards_root = repo_root / ROOT / "full/shards"
+    _reject_symlink_components(repo_root, shards_root, f"full {arm_id} shard tree")
+    _reject_symlink_tree(shards_root, f"full {arm_id} shard tree")
+    merge_root = repo_root / ROOT / "full/merged"
+    _reject_symlink_components(repo_root, merge_root, f"full {arm_id} merge tree")
+    _reject_symlink_tree(merge_root, f"full {arm_id} merge tree")
+    _require_contained(merge_root, combined, f"full {arm_id} merged output")
     rows_by_id: dict[str, dict[str, Any]] = {}
+    shard_root_by_id: dict[str, Path] = {}
     shard_contracts = []
     generation_contracts = []
     for gpu in range(4):
         shard_root = repo_root / ROOT / f"full/shards/shard_{gpu}/{arm_id}"
+        _reject_symlink_tree(shard_root, f"full {arm_id} shard {gpu}")
         completion_path = shard_root / "completion.json"
         completion = _read_json(completion_path, f"full {arm_id} shard completion")
         if completion.get("status") != "complete":
@@ -1614,6 +1722,7 @@ def _merge_full_arm(
             if not isinstance(sample_id, str) or sample_id in rows_by_id:
                 raise ValueError(f"duplicate or invalid full {arm_id} sample ID: {sample_id!r}")
             rows_by_id[sample_id] = row
+            shard_root_by_id[sample_id] = shard_root
     if set(rows_by_id) != set(expected_ids):
         raise ValueError(f"full {arm_id} shards do not cover exactly the locked manifest IDs")
     first_generation = generation_contracts[0]
@@ -1629,6 +1738,9 @@ def _merge_full_arm(
         source = Path(str(source_value))
         if not source.is_absolute():
             source = repo_root / source
+        _require_contained(shard_root_by_id[sample_id], source, f"full {arm_id} source image")
+        if source.is_symlink():
+            raise ValueError(f"full {arm_id} source image must not be a symlink: {source}")
         if not source.is_file():
             raise FileNotFoundError(f"full {arm_id} generated image does not exist: {source}")
         source_rows.append((sample_id, source, _sha256_file(source)))
@@ -1651,30 +1763,76 @@ def _merge_full_arm(
     merge_contract["merge_contract_sha256"] = _canonical_contract_digest(
         merge_contract, "merge_contract_sha256"
     )
-    if combined.exists() and not (combined / "merge_contract.json").is_file():
-        if not combined.is_dir() or any(combined.iterdir()):
-            raise FileExistsError(f"merged full arm lacks its ownership contract: {combined}")
+    _reject_symlink_tree(combined, f"full {arm_id} merged output")
+    if combined.exists() and not combined.is_dir():
+        raise FileExistsError(f"merged full arm output is not a directory: {combined}")
+    allowed_top_level = {
+        "merge_contract.json",
+        "generated_images",
+        "per_sample.jsonl",
+        "generation_result.json",
+        "completion.json",
+        "quality.json",
+    }
+    if combined.is_dir():
+        _remove_owned_temporaries(combined, tuple(allowed_top_level))
+        extras = sorted(path.name for path in combined.iterdir() if path.name not in allowed_top_level)
+        if extras:
+            raise FileExistsError(f"merged full arm contains unowned entries: {extras!r}")
+    completion_path = combined / "completion.json"
+    completed = False
+    if completion_path.is_file():
+        try:
+            existing_completion = _read_json(completion_path, f"full {arm_id} merge completion")
+        except ValueError:
+            existing_completion = None
+        if existing_completion is not None:
+            if (
+                existing_completion.get("status") != "complete"
+                or existing_completion.get("arm_id") != arm_id
+                or existing_completion.get("arm_config_sha256") != expected_arm_config_sha256
+                or existing_completion.get("merge_contract_sha256")
+                != merge_contract["merge_contract_sha256"]
+            ):
+                raise ValueError(f"existing full {arm_id} completion contract disagrees")
+            completed = True
     combined.mkdir(parents=True, exist_ok=True)
-    _write_or_validate_json(combined / "merge_contract.json", merge_contract)
+    _write_recoverable_json(combined / "merge_contract.json", merge_contract, completed=completed)
     generated = combined / "generated_images"
+    _require_contained(combined, generated, f"full {arm_id} generated output")
     generated.mkdir(parents=True, exist_ok=True)
+    expected_image_names = {
+        f"{ordinal:06d}{source.suffix.lower() or '.png'}"
+        for ordinal, (_, source, _) in enumerate(source_rows)
+    }
+    _remove_owned_temporaries(generated, tuple(expected_image_names))
+    generated_extras = sorted(
+        path.name for path in generated.iterdir() if path.name not in expected_image_names
+    )
+    if generated_extras:
+        raise FileExistsError(f"merged full arm generated images contain unowned entries: {generated_extras!r}")
     output_rows = []
     image_manifest_lines = []
     for ordinal, (sample_id, source, source_sha256) in enumerate(source_rows):
         row = rows_by_id[sample_id]
         suffix = source.suffix.lower() or ".png"
         target = generated / f"{ordinal:06d}{suffix}"
+        _require_contained(generated, target, f"full {arm_id} merged image")
+        if target.is_symlink():
+            raise ValueError(f"merged full arm image must not be a symlink: {target}")
         if target.exists():
             if not target.is_file() or _sha256_file(target) != source_sha256:
-                raise ValueError(f"existing merged image disagrees with its source: {target}")
+                if completed:
+                    raise ValueError(f"existing merged image disagrees with its source: {target}")
+                _atomic_copy_file(source, target)
         else:
-            shutil.copy2(source, target)
+            _atomic_copy_file(source, target)
         output_rows.append({**row, "generated": str(target)})
         image_manifest_lines.append(f"{sample_id}\t{target.name}\t{source_sha256}\n")
     per_sample_content = "".join(
         json.dumps(row, sort_keys=True) + "\n" for row in output_rows
     )
-    _write_or_validate_text(combined / "per_sample.jsonl", per_sample_content)
+    _write_recoverable_text(combined / "per_sample.jsonl", per_sample_content, completed=completed)
     candidate_values = [
         _finite_metric(row.get("candidate_cosine"), "candidate cosine") for row in output_rows
     ]
@@ -1700,7 +1858,9 @@ def _merge_full_arm(
         },
         "shards": shard_contracts,
     }
-    _write_or_validate_json(combined / "generation_result.json", merged_generation)
+    _write_recoverable_json(
+        combined / "generation_result.json", merged_generation, completed=completed
+    )
     completion = {
         "schema_version": 1,
         "status": "complete",
@@ -1714,7 +1874,7 @@ def _merge_full_arm(
             "".join(image_manifest_lines).encode("utf-8")
         ).hexdigest(),
     }
-    _write_or_validate_json(combined / "completion.json", completion)
+    _write_recoverable_json(completion_path, completion, completed=completed)
     return completion
 
 
@@ -1902,13 +2062,30 @@ def _write_locked_text(path: Path, content: str, expected_sha256: str | None) ->
 def _atomic_write_json(path: Path, payload: Mapping[str, Any], *, exclusive: bool = False) -> None:
     if exclusive and path.exists():
         raise FileExistsError(f"refusing to overwrite existing R8 artifact: {path}")
+    _atomic_write_bytes(
+        path,
+        (json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n").encode(
+            "utf-8"
+        ),
+    )
+
+
+def _atomic_write_bytes(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(
-        json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _write_or_validate_json(path: Path, payload: Mapping[str, Any]) -> None:
