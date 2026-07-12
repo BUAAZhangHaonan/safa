@@ -30,6 +30,10 @@ from safa.utils.sampling import make_x_init_for_sample_ids
 EXPECTED_CHECKPOINT_PATH = (
     "artifacts/checkpoints/e15_meanflow_sit_b_face_mixed_h100_resume_2400ep/last_nopretrained.pt"
 )
+EXPECTED_E0_CHECKPOINT_PATH = "artifacts/checkpoints/e0_medium_v1/best.pt"
+EXPECTED_EDEV_CHECKPOINT_PATH = "artifacts/checkpoints/e0_resnet18/best.pt"
+EXPECTED_VAE_PATH = "artifacts/checkpoints/external/sd-vae-ft-ema"
+EXPECTED_VAE_SCALING_FACTOR = 0.18215
 EXPECTED_STAGE = "stage2"
 EXPECTED_STAGE_EPOCH = 1652
 EXPECTED_MODEL_CONFIG: dict[str, Any] = {
@@ -72,6 +76,15 @@ class GuidanceRuntime:
     vae_scaling_factor: float = 0.0
     real_index_path: Path | None = None
     real_index_sha256: str = ""
+    target_features_path: Path | None = None
+    target_features_digest: str = ""
+    feature_source: str = ""
+    input_sample_manifest_path: Path | None = None
+    input_sample_manifest_sha256: str = ""
+    input_sample_manifest_id_sha256: str = ""
+    input_sample_manifest_count: int = 0
+    heldout_e1: dict[str, str] | None = None
+    heldout_e2: dict[str, str] | None = None
 
 
 def validate_checkpoint_contract(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -143,13 +156,20 @@ def validate_guidance_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(config, Mapping):
         raise ValueError("guidance config must be a mapping")
     resolved = dict(config)
+    allowed_heldout_fields = {
+        "heldout_e1_checkpoint",
+        "heldout_e1_sha256",
+        "heldout_e2_checkpoint",
+        "heldout_e2_sha256",
+    }
     present_forbidden = sorted(
         str(field)
         for field in resolved
         if re.search(r"(^|_)e[12]($|_)", str(field).lower())
+        and str(field) not in allowed_heldout_fields
     )
     if present_forbidden:
-        raise ValueError(f"guidance runner must not accept or load E1/E2 fields: {present_forbidden!r}")
+        raise ValueError(f"guidance runner accepts only locked heldout E1/E2 assets: {present_forbidden!r}")
     checkpoint = str(resolved.get("checkpoint", ""))
     if checkpoint != EXPECTED_CHECKPOINT_PATH:
         raise ValueError(
@@ -159,6 +179,39 @@ def validate_guidance_config(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("guidance checkpoint_model must be 'ema'")
     if resolved.get("transport_condition") != "learned_null_condition":
         raise ValueError("guidance transport_condition must be learned_null_condition")
+    for field, expected in (
+        ("e0_checkpoint", EXPECTED_E0_CHECKPOINT_PATH),
+        ("edev_checkpoint", EXPECTED_EDEV_CHECKPOINT_PATH),
+        ("vae_path", EXPECTED_VAE_PATH),
+        ("vae_scaling_factor", EXPECTED_VAE_SCALING_FACTOR),
+    ):
+        if resolved.get(field) != expected:
+            raise ValueError(f"guidance config {field} must be {expected!r}, got {resolved.get(field)!r}")
+    required_digests = (
+        "checkpoint_sha256",
+        "e0_sha256",
+        "edev_sha256",
+        "vae_digest",
+        "index_sha256",
+        "features_digest",
+        "sample_id_manifest_sha256",
+        "heldout_e1_sha256",
+        "heldout_e2_sha256",
+    )
+    for field in required_digests:
+        _require_sha256(resolved.get(field), field)
+    required_paths = (
+        "index",
+        "features",
+        "sample_id_manifest",
+        "heldout_e1_checkpoint",
+        "heldout_e2_checkpoint",
+    )
+    missing_paths = [field for field in required_paths if not resolved.get(field)]
+    if missing_paths:
+        raise ValueError(f"guidance config missing locked asset paths: {missing_paths!r}")
+    if resolved.get("feature_source") != "cached_features":
+        raise ValueError("guidance config feature_source must be 'cached_features'")
     mode = str(resolved.get("mode", resolved.get("route", "")))
     mode = _MODE_ALIASES.get(mode, mode)
     if mode not in SUPPORTED_MODES:
@@ -181,11 +234,25 @@ def validate_guidance_config(config: Mapping[str, Any]) -> dict[str, Any]:
 
 def asset_contract_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
     required = (
+        "checkpoint",
+        "checkpoint_sha256",
         "e0_checkpoint",
+        "e0_sha256",
         "edev_checkpoint",
+        "edev_sha256",
         "vae_path",
+        "vae_digest",
         "vae_scaling_factor",
         "index",
+        "index_sha256",
+        "features",
+        "features_digest",
+        "sample_id_manifest",
+        "sample_id_manifest_sha256",
+        "heldout_e1_checkpoint",
+        "heldout_e1_sha256",
+        "heldout_e2_checkpoint",
+        "heldout_e2_sha256",
     )
     missing = [field for field in required if not config.get(field)]
     if missing:
@@ -193,27 +260,69 @@ def asset_contract_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
     mode = _MODE_ALIASES.get(str(config.get("mode", "")), str(config.get("mode", "")))
     if mode not in SUPPORTED_MODES:
         raise ValueError(f"guidance asset contract has unsupported mode {mode!r}")
+    for field, expected in (
+        ("checkpoint", EXPECTED_CHECKPOINT_PATH),
+        ("e0_checkpoint", EXPECTED_E0_CHECKPOINT_PATH),
+        ("edev_checkpoint", EXPECTED_EDEV_CHECKPOINT_PATH),
+        ("vae_path", EXPECTED_VAE_PATH),
+        ("vae_scaling_factor", EXPECTED_VAE_SCALING_FACTOR),
+    ):
+        if config.get(field) != expected:
+            raise ValueError(f"guidance asset {field} must be {expected!r}")
+    checkpoint_path = Path(str(config["checkpoint"]))
     e0_path = Path(str(config["e0_checkpoint"]))
     edev_path = Path(str(config["edev_checkpoint"]))
     vae_path = Path(str(config["vae_path"]))
     index_path = Path(str(config["index"]))
+    features_path = Path(str(config["features"]))
+    sample_manifest_path = Path(str(config["sample_id_manifest"]))
+    heldout_e1_path = Path(str(config["heldout_e1_checkpoint"]))
+    heldout_e2_path = Path(str(config["heldout_e2_checkpoint"]))
+    checkpoint_digest = _digest_path(checkpoint_path)
     e0_digest = _digest_path(e0_path)
     edev_digest = _digest_path(edev_path)
     vae_digest = _digest_path(vae_path)
     index_digest = _digest_path(index_path)
-    _validate_expected_digest(config, ("e0_sha256", "e0_checkpoint_sha256"), e0_digest, "E0")
-    _validate_expected_digest(config, ("edev_sha256", "edev_checkpoint_sha256"), edev_digest, "Edev")
-    _validate_expected_digest(config, ("vae_digest", "vae_sha256"), vae_digest, "VAE")
-    _validate_expected_digest(config, ("index_sha256", "real_index_sha256"), index_digest, "real index")
+    features_digest = _digest_path(features_path)
+    sample_manifest_digest = _digest_path(sample_manifest_path)
+    ordered_manifest_rows = read_ordered_sample_manifest(sample_manifest_path)
+    ordered_manifest_ids = [str(row["sample_id"]) for row in ordered_manifest_rows]
+    heldout_e1_digest = _digest_path(heldout_e1_path)
+    heldout_e2_digest = _digest_path(heldout_e2_path)
+    _validate_expected_digest(config, ("checkpoint_sha256",), checkpoint_digest, "checkpoint")
+    _validate_expected_digest(config, ("e0_sha256",), e0_digest, "E0")
+    _validate_expected_digest(config, ("edev_sha256",), edev_digest, "Edev")
+    _validate_expected_digest(config, ("vae_digest",), vae_digest, "VAE")
+    _validate_expected_digest(config, ("index_sha256",), index_digest, "real index")
+    _validate_expected_digest(config, ("features_digest",), features_digest, "target features")
+    _validate_expected_digest(
+        config, ("sample_id_manifest_sha256",), sample_manifest_digest, "sample manifest"
+    )
+    _validate_expected_digest(config, ("heldout_e1_sha256",), heldout_e1_digest, "heldout E1")
+    _validate_expected_digest(config, ("heldout_e2_sha256",), heldout_e2_digest, "heldout E2")
     scale = float(config["vae_scaling_factor"])
     if not math.isfinite(scale) or scale <= 0.0:
         raise ValueError(f"vae_scaling_factor must be positive and finite, got {scale!r}")
     seed = int(config.get("sampling_seed", config.get("seed")))
     return {
+        "checkpoint": {"path": str(checkpoint_path), "sha256": checkpoint_digest},
         "e0": {"path": str(e0_path), "sha256": e0_digest},
         "edev": {"path": str(edev_path), "sha256": edev_digest},
         "vae": {"path": str(vae_path), "digest": vae_digest, "scaling_factor": scale},
         "real_index": {"path": str(index_path), "sha256": index_digest},
+        "target_features": {
+            "path": str(features_path),
+            "digest": features_digest,
+            "feature_source": str(config.get("feature_source")),
+        },
+        "sample_manifest": {
+            "path": str(sample_manifest_path),
+            "sha256": sample_manifest_digest,
+            "sample_count": len(ordered_manifest_ids),
+            "ordered_sample_id_sha256": _sample_id_digest(ordered_manifest_ids),
+        },
+        "heldout_e1": {"path": str(heldout_e1_path), "sha256": heldout_e1_digest},
+        "heldout_e2": {"path": str(heldout_e2_path), "sha256": heldout_e2_digest},
         "seed": seed,
         "schedule": _json_safe(config.get("locked_schedule")),
         "mode": mode,
@@ -279,6 +388,17 @@ def build_frozen_runtime(
         vae_scaling_factor=float(asset_contract["vae"]["scaling_factor"]),
         real_index_path=Path(str(asset_contract["real_index"]["path"])),
         real_index_sha256=str(asset_contract["real_index"]["sha256"]),
+        target_features_path=Path(str(asset_contract["target_features"]["path"])),
+        target_features_digest=str(asset_contract["target_features"]["digest"]),
+        feature_source=str(asset_contract["target_features"]["feature_source"]),
+        input_sample_manifest_path=Path(str(asset_contract["sample_manifest"]["path"])),
+        input_sample_manifest_sha256=str(asset_contract["sample_manifest"]["sha256"]),
+        input_sample_manifest_id_sha256=str(
+            asset_contract["sample_manifest"]["ordered_sample_id_sha256"]
+        ),
+        input_sample_manifest_count=int(asset_contract["sample_manifest"]["sample_count"]),
+        heldout_e1=dict(asset_contract["heldout_e1"]),
+        heldout_e2=dict(asset_contract["heldout_e2"]),
     )
 
 
@@ -552,12 +672,34 @@ def run_guidance_records(
             "path": "" if runtime.real_index_path is None else str(runtime.real_index_path),
             "sha256": runtime.real_index_sha256,
         },
+        "target_features": {
+            "path": ""
+            if runtime.target_features_path is None
+            else str(runtime.target_features_path),
+            "digest": runtime.target_features_digest,
+            "feature_source": runtime.feature_source,
+        },
+        "input_sample_manifest": {
+            "path": ""
+            if runtime.input_sample_manifest_path is None
+            else str(runtime.input_sample_manifest_path),
+            "sha256": runtime.input_sample_manifest_sha256,
+            "sample_count": runtime.input_sample_manifest_count,
+            "ordered_sample_id_sha256": runtime.input_sample_manifest_id_sha256,
+        },
+        "heldout_e1": runtime.heldout_e1,
+        "heldout_e2": runtime.heldout_e2,
         "seed": int(resolved_config.get("sampling_seed", resolved_config.get("seed", 0))),
         "schedule": resolved_config.get("locked_schedule"),
         "mode": mode,
         "config": resolved_config,
         "sample_id_sha256": _sample_id_digest(expected_ids),
-        "shard": {"index": int(shard_index), "count": int(num_shards)},
+        "shard": {
+            "index": int(shard_index),
+            "count": int(num_shards),
+            "sample_count": len(expected_ids),
+            "ordered_sample_id_sha256": _sample_id_digest(expected_ids),
+        },
     }
     if resume_contract_path.exists():
         existing_contract = _read_json_mapping(resume_contract_path, "resume contract")
@@ -891,7 +1033,6 @@ def run_guidance_from_config(
     from safa.data.feature_dataset import FeatureAlignedAffectNet
     from safa.training.transforms import generator_image_transform
     from safa.utils.device import require_cuda_device
-    from safa.utils.hashing import sha256_file
 
     required = (
         "device",
@@ -906,7 +1047,8 @@ def run_guidance_from_config(
     if missing:
         raise ValueError(f"guidance config missing required fields: {missing!r}")
     checkpoint = Path(str(resolved["checkpoint"]))
-    checkpoint_sha256 = sha256_file(checkpoint)
+    assets = asset_contract_from_config(resolved)
+    checkpoint_sha256 = str(assets["checkpoint"]["sha256"])
     mode = resolved["mode"]
     if mode in FMRG_MODES:
         schedule = resolve_locked_schedule(
@@ -921,7 +1063,6 @@ def run_guidance_from_config(
     if output_manifest.exists() or output_result.exists():
         raise FileExistsError(f"refusing to replace completed output: {output_manifest}")
 
-    assets = asset_contract_from_config(resolved)
     dataset = FeatureAlignedAffectNet(
         resolved["index"],
         resolved["features"],
@@ -1003,12 +1144,23 @@ def _preflight_existing_resume_contract(
         "edev": asset_contract["edev"],
         "vae": asset_contract["vae"],
         "real_index": asset_contract["real_index"],
+        "target_features": asset_contract["target_features"],
+        "input_sample_manifest": asset_contract["sample_manifest"],
+        "heldout_e1": asset_contract["heldout_e1"],
+        "heldout_e2": asset_contract["heldout_e2"],
         "seed": int(config["sampling_seed"]),
         "schedule": config.get("locked_schedule"),
         "mode": config["mode"],
         "config": dict(config),
         "sample_id_sha256": _sample_id_digest(str(row["sample_id"]) for row in selected),
-        "shard": {"index": int(shard_index), "count": int(num_shards)},
+        "shard": {
+            "index": int(shard_index),
+            "count": int(num_shards),
+            "sample_count": len(selected),
+            "ordered_sample_id_sha256": _sample_id_digest(
+                str(row["sample_id"]) for row in selected
+            ),
+        },
     }
     actual = {
         "checkpoint_path": existing.get("checkpoint", {}).get("path"),
@@ -1017,6 +1169,10 @@ def _preflight_existing_resume_contract(
         "edev": existing.get("edev"),
         "vae": existing.get("vae"),
         "real_index": existing.get("real_index"),
+        "target_features": existing.get("target_features"),
+        "input_sample_manifest": existing.get("input_sample_manifest"),
+        "heldout_e1": existing.get("heldout_e1"),
+        "heldout_e2": existing.get("heldout_e2"),
         "seed": existing.get("seed"),
         "schedule": existing.get("schedule"),
         "mode": existing.get("mode"),
@@ -1492,6 +1648,13 @@ def _validate_expected_digest(
         raise ValueError(f"{label} asset digest mismatch: expected={values[0]} actual={actual}")
 
 
+def _require_sha256(value: Any, field: str) -> str:
+    text = str(value or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", text):
+        raise ValueError(f"guidance config {field} must be a lowercase SHA256 digest")
+    return text
+
+
 def _result_with_trace(result: GuidanceResult, trace, mode: str) -> GuidanceResult:
     if len(trace) != int(result.nfe):
         raise RuntimeError(f"{mode} flow-map trace length does not match NFE")
@@ -1604,6 +1767,8 @@ def _finite_summary(values: Sequence[float]) -> dict[str, float]:
         "median": float(torch.quantile(tensor, 0.5)),
         "std": float(tensor.std(unbiased=False)),
         "p05": float(torch.quantile(tensor, 0.05)),
+        "p10": float(torch.quantile(tensor, 0.10)),
+        "p90": float(torch.quantile(tensor, 0.90)),
         "p95": float(torch.quantile(tensor, 0.95)),
     }
 

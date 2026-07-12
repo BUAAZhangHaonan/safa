@@ -14,6 +14,10 @@ from torch import nn  # noqa: E402
 
 from safa.evaluation.meanflow_guidance_runner import (  # noqa: E402
     EXPECTED_CHECKPOINT_PATH,
+    EXPECTED_E0_CHECKPOINT_PATH,
+    EXPECTED_EDEV_CHECKPOINT_PATH,
+    EXPECTED_VAE_PATH,
+    EXPECTED_VAE_SCALING_FACTOR,
     GuidanceRuntime,
     aggregate_session_memory,
     asset_contract_from_config,
@@ -129,14 +133,37 @@ def test_load_ema_generator_strictly_loads_only_ema_before_device_move(monkeypat
     assert metadata["weight_source"] == "ema_model_state_dict"
 
 
-def test_guidance_config_requires_exact_checkpoint_ema_and_learned_null() -> None:
-    valid = {
+def _r8_guidance_config() -> dict:
+    return {
         "checkpoint": EXPECTED_CHECKPOINT_PATH,
+        "checkpoint_sha256": "a" * 64,
         "checkpoint_model": "ema",
         "transport_condition": "learned_null_condition",
         "mode": "native",
         "sampling_seed": 1337,
+        "e0_checkpoint": EXPECTED_E0_CHECKPOINT_PATH,
+        "e0_sha256": "b" * 64,
+        "edev_checkpoint": EXPECTED_EDEV_CHECKPOINT_PATH,
+        "edev_sha256": "c" * 64,
+        "vae_path": EXPECTED_VAE_PATH,
+        "vae_digest": "d" * 64,
+        "vae_scaling_factor": EXPECTED_VAE_SCALING_FACTOR,
+        "index": "data/index/val.jsonl",
+        "index_sha256": "e" * 64,
+        "feature_source": "cached_features",
+        "features": "artifacts/e0_features/val",
+        "features_digest": "f" * 64,
+        "sample_id_manifest": "artifacts/r8/sample_ids.jsonl",
+        "sample_id_manifest_sha256": "1" * 64,
+        "heldout_e1_checkpoint": "artifacts/checkpoints/e1.pt",
+        "heldout_e1_sha256": "2" * 64,
+        "heldout_e2_checkpoint": "artifacts/checkpoints/e2.pt",
+        "heldout_e2_sha256": "3" * 64,
     }
+
+
+def test_guidance_config_requires_exact_checkpoint_ema_and_learned_null() -> None:
+    valid = _r8_guidance_config()
     assert validate_guidance_config(valid)["mode"] == "native"
     assert validate_guidance_config({**valid, "mode": "noise_oracle"})["mode"] == "initial_noise"
 
@@ -151,21 +178,33 @@ def test_guidance_config_requires_exact_checkpoint_ema_and_learned_null() -> Non
             validate_guidance_config(invalid)
 
 
-@pytest.mark.parametrize(
-    "forbidden",
-    ["e1_checkpoint", "e2_checkpoint", "heldout_e1_checkpoint", "heldout_e2_checkpoint"],
-)
-def test_guidance_config_rejects_heldout_encoder_fields(forbidden: str) -> None:
-    config = {
-        "checkpoint": EXPECTED_CHECKPOINT_PATH,
-        "checkpoint_model": "ema",
-        "transport_condition": "learned_null_condition",
-        "mode": "native",
-        "sampling_seed": 1337,
-        forbidden: "/forbidden/checkpoint.pt",
-    }
+def test_guidance_config_carries_heldout_encoder_assets_without_rejecting_them() -> None:
+    resolved = validate_guidance_config(_r8_guidance_config())
 
-    with pytest.raises(ValueError, match="E1/E2"):
+    assert resolved["heldout_e1_checkpoint"] == "artifacts/checkpoints/e1.pt"
+    assert resolved["heldout_e2_sha256"] == "3" * 64
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("checkpoint", "other.pt"),
+        ("e0_checkpoint", "other-e0.pt"),
+        ("edev_checkpoint", "other-edev.pt"),
+        ("vae_path", "other-vae"),
+        ("vae_scaling_factor", 1.0),
+    ],
+)
+def test_guidance_config_rejects_any_fixed_r8_asset_substitution(field: str, value) -> None:
+    with pytest.raises(ValueError, match=field):
+        validate_guidance_config({**_r8_guidance_config(), field: value})
+
+
+def test_guidance_config_requires_every_expected_digest() -> None:
+    config = _r8_guidance_config()
+    config.pop("features_digest")
+
+    with pytest.raises(ValueError, match="features_digest"):
         validate_guidance_config(config)
 
 
@@ -204,53 +243,49 @@ def test_locked_schedule_is_uniform_and_rejects_t_cut_or_hash_disagreement(tmp_p
             )
 
 
-def test_asset_contract_locks_every_path_digest_scale_seed_schedule_and_mode(tmp_path: Path) -> None:
-    paths = {}
-    for name in ("e0", "edev", "index"):
-        path = tmp_path / name
-        path.write_bytes(name.encode("ascii"))
-        paths[name] = path
-    vae = tmp_path / "vae"
-    vae.mkdir()
-    (vae / "config.json").write_bytes(b"config")
-    (vae / "model.safetensors").write_bytes(b"weights")
-    paths["vae"] = vae
-    import hashlib
-
-    digests = {
-        name: hashlib.sha256(name.encode("ascii")).hexdigest()
-        for name in ("e0", "edev", "index")
+def test_asset_contract_locks_all_r8_assets_features_and_input_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _r8_guidance_config()
+    config["mode"] = "initial_noise"
+    expected_by_path = {
+        Path(config["checkpoint"]): config["checkpoint_sha256"],
+        Path(config["e0_checkpoint"]): config["e0_sha256"],
+        Path(config["edev_checkpoint"]): config["edev_sha256"],
+        Path(config["vae_path"]): config["vae_digest"],
+        Path(config["index"]): config["index_sha256"],
+        Path(config["features"]): config["features_digest"],
+        Path(config["sample_id_manifest"]): config["sample_id_manifest_sha256"],
+        Path(config["heldout_e1_checkpoint"]): config["heldout_e1_sha256"],
+        Path(config["heldout_e2_checkpoint"]): config["heldout_e2_sha256"],
     }
-    vae_hasher = hashlib.sha256()
-    for relative, content in (("config.json", b"config"), ("model.safetensors", b"weights")):
-        vae_hasher.update(relative.encode("ascii") + b"\0" + content + b"\0")
-    digests["vae"] = vae_hasher.hexdigest()
-    config = {
-        "e0_checkpoint": str(paths["e0"]),
-        "e0_sha256": digests["e0"],
-        "edev_checkpoint": str(paths["edev"]),
-        "edev_sha256": digests["edev"],
-        "vae_path": str(paths["vae"]),
-        "vae_digest": digests["vae"],
-        "vae_scaling_factor": 0.18215,
-        "index": str(paths["index"]),
-        "index_sha256": digests["index"],
-        "sampling_seed": 1337,
-        "mode": "initial_noise",
-        "locked_schedule": None,
-    }
+    monkeypatch.setattr(runner_module, "_digest_path", lambda path: expected_by_path[Path(path)])
+    monkeypatch.setattr(
+        runner_module,
+        "read_ordered_sample_manifest",
+        lambda path: [{"sample_id": "a"}, {"sample_id": "b"}],
+    )
 
     contract = asset_contract_from_config(config)
 
-    assert contract["e0"] == {"path": str(paths["e0"]), "sha256": digests["e0"]}
-    assert contract["edev"] == {"path": str(paths["edev"]), "sha256": digests["edev"]}
-    assert contract["vae"]["digest"] == digests["vae"]
-    assert contract["real_index"]["sha256"] == digests["index"]
+    assert contract["e0"] == {
+        "path": EXPECTED_E0_CHECKPOINT_PATH,
+        "sha256": config["e0_sha256"],
+    }
+    assert contract["edev"]["path"] == EXPECTED_EDEV_CHECKPOINT_PATH
+    assert contract["vae"]["digest"] == config["vae_digest"]
+    assert contract["target_features"] == {
+        "path": config["features"],
+        "digest": config["features_digest"],
+        "feature_source": "cached_features",
+    }
+    assert contract["sample_manifest"]["sha256"] == config["sample_id_manifest_sha256"]
+    assert contract["heldout_e1"]["sha256"] == config["heldout_e1_sha256"]
     assert contract["seed"] == 1337
     assert contract["mode"] == "initial_noise"
 
     with pytest.raises(ValueError, match="E0.*digest"):
-        asset_contract_from_config({**config, "e0_sha256": "f" * 64})
+        asset_contract_from_config({**config, "e0_sha256": "9" * 64})
 
 
 class _DifferentiableVAE(nn.Module):
@@ -294,6 +329,8 @@ def test_build_frozen_runtime_uses_real_e0_loader_and_preserves_input_gradient(
         "checkpoint": EXPECTED_CHECKPOINT_PATH,
         "e0_checkpoint": str(e0_path),
         "edev_checkpoint": str(edev_path),
+        "heldout_e1_checkpoint": "/models/e1.pt",
+        "heldout_e2_checkpoint": "/models/e2.pt",
         "phase": "calibration",
     }
     monkeypatch.setattr(torch, "load", fake_torch_load)
@@ -303,6 +340,19 @@ def test_build_frozen_runtime_uses_real_e0_loader_and_preserves_input_gradient(
         "edev": {"path": str(edev_path), "sha256": "1" * 64},
         "vae": {"path": "/models/vae", "digest": "2" * 64, "scaling_factor": 1.0},
         "real_index": {"path": "/dataset/index.jsonl", "sha256": "3" * 64},
+        "target_features": {
+            "path": "/features",
+            "digest": "4" * 64,
+            "feature_source": "cached_features",
+        },
+        "sample_manifest": {
+            "path": "/samples.jsonl",
+            "sha256": "5" * 64,
+            "sample_count": 2,
+            "ordered_sample_id_sha256": "8" * 64,
+        },
+        "heldout_e1": {"path": "/models/e1.pt", "sha256": "6" * 64},
+        "heldout_e2": {"path": "/models/e2.pt", "sha256": "7" * 64},
     }
 
     runtime = build_frozen_runtime(
@@ -355,6 +405,15 @@ def test_session_memory_uses_maximum_across_resumed_sessions() -> None:
         "allocated_bytes": 900,
         "reserved_bytes": 1200,
     }
+
+
+def test_finite_summary_reports_p05_p10_p90_and_p95() -> None:
+    summary = runner_module._finite_summary([0.0, 10.0])
+
+    assert summary["p05"] == pytest.approx(0.5)
+    assert summary["p10"] == pytest.approx(1.0)
+    assert summary["p90"] == pytest.approx(9.0)
+    assert summary["p95"] == pytest.approx(9.5)
 
 
 class _FakeGenerator(nn.Module):
@@ -480,6 +539,15 @@ def _guidance_runtime(*, edev=None, checkpoint_sha256: str = "c" * 64) -> Guidan
         vae_scaling_factor=0.18215,
         real_index_path=Path("/dataset/index.jsonl"),
         real_index_sha256="3" * 64,
+        target_features_path=Path("/features"),
+        target_features_digest="4" * 64,
+        feature_source="cached_features",
+        input_sample_manifest_path=Path("/samples.jsonl"),
+        input_sample_manifest_sha256="5" * 64,
+        input_sample_manifest_id_sha256="8" * 64,
+        input_sample_manifest_count=3,
+        heldout_e1={"path": "/models/e1.pt", "sha256": "6" * 64},
+        heldout_e2={"path": "/models/e2.pt", "sha256": "7" * 64},
     )
 
 
@@ -544,6 +612,9 @@ def test_runner_writes_bound_rows_generation_result_and_prevents_overwrite(tmp_p
     assert manifest["checkpoint"]["sha256"] == "c" * 64
     assert manifest["checkpoint"]["weight_source"] == "ema_model_state_dict"
     assert manifest["nfe"] == {"candidate": 1, "matched_native": 1}
+    assert manifest["resume_contract"]["target_features"]["digest"] == "4" * 64
+    assert manifest["resume_contract"]["input_sample_manifest"]["sha256"] == "5" * 64
+    assert len(manifest["resume_contract"]["shard"]["ordered_sample_id_sha256"]) == 64
     assert manifest["sample_count"] == 3
     assert manifest["timing"]["generation_seconds"] > 0.0
     assert manifest["timing"]["io_seconds"] >= 0.0
@@ -631,6 +702,7 @@ def test_candidate_writes_matched_native_edev_traces_and_pil_contact_sheets(tmp_
     ]
     assert result["nfe"] == {"candidate": 3, "matched_native": 1}
     assert set(result["cosine"]) == {"candidate_e0_target", "native_e0_target", "candidate_edev_source"}
+    assert all({"p05", "p10", "p90", "p95"}.issubset(summary) for summary in result["cosine"].values())
     contact_manifest = json.loads((output_dir / "contact_sheet_columns.json").read_text())
     assert contact_manifest["columns"] == ["source", "native", "candidate"]
     assert len(contact_manifest["pages"]) == 2
