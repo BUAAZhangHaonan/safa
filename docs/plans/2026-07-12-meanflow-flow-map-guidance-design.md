@@ -2,7 +2,7 @@
 
 **Status:** Approved for implementation and short feasibility experiments.
 
-**Decision:** Use the frozen Stage 2 EMA MeanFlow SiT-B/4 checkpoint. Run a semigroup preflight first, use direct-autograd FMRG-J as the main baseline when that preflight passes, and use constrained initial-noise optimization as a separate feasibility oracle. Do not rename diffusion-only methods as MeanFlow implementations.
+**Decision:** Use the frozen Stage 2 EMA MeanFlow SiT-B/4 checkpoint. Run a four-GPU semigroup preflight first. Compare the current official FMRG-J implementation as the main baseline against the paper's split-state algorithm, and keep constrained initial-noise optimization as a separate feasibility oracle. Do not rename diffusion-only methods as MeanFlow implementations.
 
 ## 1. Exact Starting Point
 
@@ -31,15 +31,37 @@ model_config.sample_steps: 1
 model_config.sit_data_space: latent
 ```
 
-The frozen supporting models are:
+The frozen optimization stack is:
 
 ```text
 E0: artifacts/checkpoints/e0_medium_v1/best.pt
+E0 SHA256: d7d2c57a552155776b8c15a4e52e43ec5082fc046aa0aabb4e9709685f7e3d1a
 VAE: artifacts/checkpoints/external/sd-vae-ft-ema
 VAE scaling factor: 0.18215
 validation index: data/index/val_face_mixed_e14.jsonl
 validation features: artifacts/e0_features/val_face_mixed_e14_e0_medium_v1
 ```
+
+Encoder evaluation is deliberately layered:
+
+```text
+optimization encoder E0:
+  artifacts/checkpoints/e0_medium_v1/best.pt
+
+calibration-only development encoder Edev (allowed before winner lock):
+  artifacts/checkpoints/e0_resnet18/best.pt
+  SHA256 373b331c917834467e854ddf3fe20f39000532f189ec73f76a1abc55d82e560e
+
+prospective held-out E1 (forbidden before winner lock):
+  artifacts/checkpoints/e0_dinov2_large_v2/best.pt
+  SHA256 cce0de2f1eab097cb6091886f587a9f334dd84ced1ca4dd5e08c3a765718a14c
+
+prospective held-out E2 (forbidden before winner lock):
+  artifacts/checkpoints/e0_convnext_tiny/best.pt
+  SHA256 09c88bd416057222abefeba52ebe88d710715ede791ec34198a23ae5e6e850a8
+```
+
+E1 and E2 must not be loaded, scored, or inspected during semigroup testing, calibration, candidate selection, or winner revision. Evaluate them once on the locked winner and matched native arm at 2048 samples. Each encoder uses its own coordinate system: compare `cos(Ek(generated), Ek(source))`. Never compute a cross-coordinate quantity such as `cos(E1(generated), Z0_E0)`.
 
 The checkpoint says that Stage 2 was trained with `flow_condition: learned_null_condition`. Therefore all prior-transport calls in the new baselines use the learned null condition. The full dense target `Z0` enters the representation objective, not the transport condition. A direct target-conditioned sample may be recorded as a diagnostic, but it is not the quality baseline because that condition is out of the Stage 2 training contract.
 
@@ -65,23 +87,27 @@ This difference is large enough that code and equations cannot be copied unchang
 
 ## 3. Transfer Boundary From the Reviewed Baselines
 
-The following names must not be used for the MeanFlow implementation:
+The audit root is `/home/hdd3/zhanghaonan/projects/safa-paper-code`. The study is pinned to these snapshots rather than to moving default branches:
 
-- MPGD-LDM uses a diffusion latent manifold projection inside a DDIM-like denoising recurrence.
-- LGD and LGD-MC use noisy conditional expectations and, for the MC form, stochastic samples around a diffusion state.
-- DPS uses a score/Tweedie posterior estimate tied to a diffusion noise schedule.
-- FreeDoM and Universal Guidance apply gradients across a multi-step diffusion scheduler.
+| Method | Local directory | Commit | Top-level license state | Audited core entry |
+| --- | --- | --- | --- | --- |
+| MPGD | `mpgd_pytorch` | `9f94b386` | MIT | `nonlinear/Face-GD/functions/faceid_denoising.py:152`; `linear_inv/guided_diffusion/condition_methods.py:138` |
+| DPS | `diffusion-posterior-sampling` | `effbde73` | no top-level license found | `guided_diffusion/posterior_mean_variance.py:120`; `guided_diffusion/condition_methods.py:28`; `guided_diffusion/gaussian_diffusion.py:170` |
+| FreeDoM | `FreeDoM` | `1394b1dc` | no top-level license found | `Face-GD/functions/denoising.py:20,261`; `SD_style/ldm/models/diffusion/ddim.py:202` |
+| Universal Guidance | `Universal-Guided-Diffusion` | `ff82f880` | no top-level license found | forward: `stable-diffusion-guided/ldm/models/diffusion/ddim_with_grad.py:129,216`; backward: `Guided_Diffusion_Imagenet/guided_diffusion/gaussian_diffusion.py:726` |
+| Z+ inversion | `hypershpere-gan-inversion` | `abedeb1b` | AGPL/MIT split across components | `BDInvert_Release/BDInvert/invert_zp.py:211`; `BDInvert_Release/BDInvert/models/stylegan2_generator.py:246` |
+| II2S | `II2S` | `6ce02da8` | no top-level license found | `models/Net.py:38,89`; related P-space audit: `hypershpere-gan-inversion/BDInvert_Release/BDInvert/pca_p_space.py:22` |
+| StyleCLIP | `StyleCLIP` | `f87a47f7` | MIT | `optimization/run_optimization.py:38`; `mapper/training/coach.py:70,223` |
+| FMRG | `fmrg` | `be485ba` | bundled license text is incomplete for all dependencies/components | `fluxfm_sampler_reward.py:388-461,1039-1115,1140-1167` |
+| LGD | no author-official repository located | paper only | not applicable | no official code entry to port |
 
-The current 1-NFE MeanFlow model has no alpha schedule, score output, Tweedie identity, or DDIM recurrence. Replacing those primitives with arbitrary flow-map calls would be a new method, not a faithful reproduction of any of these baselines.
+The license column is an audit fact, not permission to copy code. The implementation should reproduce equations through clean SAFA code and preserve the snapshot table for review.
 
-FMRG is the closest reviewed implementation because it is written for a two-time flow map. The reviewed source is pinned at:
+The diffusion methods cannot be ported by name. MPGD uses diffusion latent projection inside a denoising recurrence. DPS requires score/Tweedie posterior estimates. FreeDoM and Universal Guidance require diffusion next-step equations, scheduler coefficients, and in some branches re-noising. LGD/LGD-MC require noisy conditional expectations and stochastic samples around a diffusion state. The current MeanFlow checkpoint has none of the alpha/sigma schedule, score, Tweedie identity, or DDIM recurrence required by those algorithms.
 
-```text
-/home/hdd3/zhanghaonan/projects/safa-paper-code/fmrg
-commit be485ba40f1d1c163b95ad61112aca6baa13ed22
-```
+Z+, II2S, and StyleCLIP contribute the valid high-level idea of freezing the generator and constraining the optimized input or adapter. Their StyleGAN Z/W/W+/P interfaces do not exist in SiT-B/4, so their architecture-specific updates are not copied.
 
-The useful branch is FMRG-J: differentiate a reward through a flow-map lookahead with respect to the current flow state. The SAFA port must use direct `torch.autograd.grad`. It must not copy the optional Adam branch from the reference code.
+FMRG is the closest executable baseline because it targets a two-time flow map. However, the paper's Algorithms 5/6 and official HEAD `be485ba` do not apply the Jacobian guidance at the same state. The experiment must preserve and name both variants instead of merging them into one ambiguous `FMRG-J` label.
 
 ## 4. Existing MeanFlow Primitive
 
@@ -117,7 +143,7 @@ e_semigroup(s) = 2 * ||x_direct - x_split||_2
                  / (||x_direct||_2 + ||x_split||_2 + 1e-8)
 ```
 
-Test `s in {0.75, 0.50, 0.25}` on 64 fixed validation sample IDs. Report median and p90 latent residual, decoded pixel L1, PSNR, and cosine between `E0(x_direct)` and `E0(x_split)`. Save direct side-by-side images for every split.
+Test `s in {0.75, 0.50, 0.25}` on one deterministic set of 64 validation sample IDs. Partition the ordered IDs into four disjoint 16-sample shards and run them concurrently on physical GPUs 0-3. Aggregate by sample ID, reject missing or duplicate rows, and apply the gate only to the merged 64 rows. Report median and p90 latent residual, decoded pixel L1, PSNR, and cosine between `E0(x_direct)` and `E0(x_split)`. Save direct side-by-side images for every split.
 
 ### Operational Gate
 
@@ -132,61 +158,87 @@ If no split passes, do not run a full FMRG-J matrix. Keep the report, run Route 
 
 The passing split closest to `s=0.25` becomes `t_cut`, because a longer final unguided jump gives the frozen prior more opportunity to restore image quality. If only another split passes, use that split and record the reason.
 
-## 6. Route B: Frozen-EMA FMRG-J
+## 6. Route B: Two Frozen-EMA FMRG-J Baselines
 
-### Recommendation
+Both variants use a decreasing schedule `1=t_0 > t_1 > ... > t_N=0`, optimize only a temporary latent state, and leave the generator, VAE, and encoders frozen. Their state ordering is different and must remain visible in every config, artifact, and table.
 
-This is the main baseline if Route A passes. It is the closest faithful match to the current model and to the reviewed FMRG code. It changes no model weight.
+### B1 Main Baseline: `official_head_current_xt`
 
-Use a decreasing guided schedule:
+This variant follows official HEAD `be485ba` in `fluxfm_sampler_reward.py:388-461,1039-1115,1140-1167`. At current state `x_t`, it differentiates the endpoint lookahead `Phi_{t->0}(x_t)` with respect to `x_t`, then adds that correction to the velocity used for the `t->s` advance.
 
-```text
-1 = t_0 > t_1 > ... > t_K = t_cut > 0
-```
-
-For each guided interval `t -> s`:
+For one guided interval `t->s`:
 
 ```text
-1. With no gradient:
-   x_bar = Phi_{t->s}(x, c_null)
+u_endpoint = u_theta(x_t, 0, t, c_null)
+x0_hat = x_t - t * u_endpoint
+L_repr = mean(1 - cos(E0(VAE.decode(x0_hat)), Z0_E0))
 
-2. Re-enable only the input gradient:
-   x_bar.requires_grad_(True)
-   x0_hat = Phi_{s->0}(x_bar, c_null)
+current-x_t correction:
+  direct/paper-normalized mode:
+    g = d L_repr / d x_t
+    g <- per-sample normalize(g) * ||u_step|| when normalization is enabled
+    delta_xt <- eta * g
 
-3. Decode and use the full dense representation target:
-   L_repr = mean(1 - cos(E0(VAE.decode(x0_hat)), Z0))
-   g = d L_repr / d x_bar
+  official-Adam mode:
+    run the official inner Adam update on x_t
+    delta_xt <- -(x_t_after - x_t_before)
 
-4. Normalize each sample and match the flow-step velocity scale:
-   u_step = (x_before - x_bar) / (t - s)
-   g_scaled_i = g_i / (||g_i||_2 + 1e-8) * ||u_step_i||_2
-
-5. Update the state at time s:
-   x = stop_gradient(x_bar - (t - s) * eta * g_scaled)
+advance:
+  x_s = x_t - (t-s) * (stop_gradient(u_step) + delta_xt)
 ```
 
-After the last guided interval, make one explicit unguided jump:
+Support both official transport modes:
 
 ```text
-x0 = Phi_{t_cut->0}(x, c_null)
+flow_map1:
+  u_step = u_endpoint
+  one vector-field call can serve endpoint lookahead and interval advance
+
+flow_map2:
+  u_endpoint = u_theta(x_t, 0, t, c_null)
+  u_step = u_theta(x_t, s, t, c_null)
+  endpoint and interval advance use separate vector-field calls
 ```
 
-There is no optimizer state, momentum, Adam, generator update, VAE update, or E0 update. The only optimized object is the temporary flow state.
-
-### Cost
-
-Each guided interval uses one no-grad transition and one differentiable lookahead. The tail uses one final transition:
+Support two optimization modes because both are part of the reviewed baseline surface:
 
 ```text
-NFE = 2K + 1
+official_adam
+paper_normalized_direct_autograd
 ```
 
-Start with `K=1` and `K=2`. Do not describe them as 1-step inference. Report NFE, wall time, images per second, peak allocated VRAM, and peak reserved VRAM beside every quality result.
+Do not silently replace Adam with direct gradient descent. Report the mode, step size, number of inner optimization steps, and whether per-sample velocity-norm scaling is active.
 
-### Why It May Protect Quality
+The reference low-NFE contract must be reproduced in unit tests and smoke metadata. For nominal schedule `N=16`, guided prefix `L=4`, unguided tail `U=2`, and `nopt=1`:
 
-The representation gradient is applied to an intermediate state reached by the frozen prior. The last jump is always an unguided frozen-prior map. This is a stronger link to the learned image distribution than updating all network weights with a proxy quality loss. It is still not a proof of manifold membership, so FID, KID, Sharpness, and images remain decisive.
+```text
+official_head_current_xt + flow_map1: NFE = 5
+official_head_current_xt + flow_map2: NFE = 8
+```
+
+These counts include the official early-stop/tail ordering. They replace the incorrect blanket `2K+1` claim.
+
+### B2 Paper Ablation: `paper_algorithm_split`
+
+Algorithms 5/6 in the paper first transport from `x_t` to `x_s`, then differentiate an `s->0` lookahead with respect to `x_s`:
+
+```text
+x_bar = stop_gradient(Phi_{t->s}(x_t, c_null))
+x_bar.requires_grad_(True)
+x0_hat = Phi_{s->0}(x_bar, c_null)
+L_repr = mean(1 - cos(E0(VAE.decode(x0_hat)), Z0_E0))
+g_s = d L_repr / d x_bar
+g_s <- per-sample normalize(g_s) * ||u_step||
+x_s = stop_gradient(x_bar - (t-s) * eta * g_s)
+```
+
+Finish with an explicit unguided map to zero. This was the route previously called simply `FMRG-J`; it is not the current official HEAD ordering. Keep it as a paper-faithful comparison, not the main baseline.
+
+Count B2 NFE from actual `CountedFlowMap` calls. Do not infer it from a generic formula, because schedule splitting, inner optimization count, and tail configuration change the total.
+
+### Why These Routes May Protect Quality
+
+Both routes optimize states produced or consumed by the frozen flow map and retain an unguided frozen-prior tail. This ties the representation update more closely to the learned image path than a full-model proxy quality loss. B1 tests the maintained official implementation; B2 isolates the paper's split-state claim. Neither guarantees distribution preservation, so FID, KID, Sharpness, held-out encoders, and images remain decisive.
 
 ## 7. Route C: Gaussian-Constrained Initial-Noise Oracle
 
@@ -229,7 +281,7 @@ All arms use the same ordered sample IDs, `sampling_seed=1337`, exact initial no
 
 ### Semigroup Phase
 
-Run Route A first on GPU 0. This is small and sequential because its result gates Route B.
+Run Route A first on all four GPUs. GPU `k` receives deterministic ordered positions `k, k+4, ..., k+60`. Aggregate the four 16-sample shards before applying the gate.
 
 ### Calibration Phase
 
@@ -238,24 +290,26 @@ Run four independent processes at the same time:
 | Physical GPU | Arm | Calibration search |
 | --- | --- | --- |
 | 0 | native EMA control | null-conditioned native sample plus direct-target-condition diagnostic |
-| 1 | FMRG-J K=1 | fixed passing `t_cut`, `eta in {0.01, 0.03, 0.10}` |
-| 2 | FMRG-J K=2 | equal intervals from 1 to `t_cut`, `eta in {0.01, 0.03, 0.10}` |
-| 3 | initial-noise oracle | fixed-radius PGD with `T in {4, 8, 16}` and fixed tested step-size list |
+| 1 | B1 official HEAD `flow_map1` | `official_adam` and `paper_normalized_direct_autograd`, closed step-size search |
+| 2 | B1 official HEAD `flow_map2` | the same two optimization modes and closed search |
+| 3 | B2 paper split plus Route C | paper-split candidate sequence, then fixed-radius and typical-shell oracle candidates |
 
-Use 128 samples for numerical and visual calibration. Save every image. Generate 64 paired comparison images in pages with columns `source`, `native`, and `candidate`. An agent must directly open every page before selecting the full-run candidate.
+Every calibration candidate uses the same 64 samples. Save every image and make paired pages with columns `source`, `native`, and `candidate`. An agent must directly open every page before selecting the winner. Calibration FID is diagnostic only: 64 samples are too few for it to choose or reject a winner by itself. Selection uses E0, the allowed ResNet18 development encoder, Sharpness/KID/NIQE, exact costs, and direct images under a fixed rule.
+
+If the semigroup gate fails, do not leave GPUs idle and do not run either FMRG family. Replace the calibration matrix with four explicit Route C configurations spanning fixed-radius versus typical-shell constraints and the pre-registered step sizes. Keep one matched native generation inside each shard for comparison.
 
 ### Full Phase
 
-After calibration, run four independent 2048-sample processes at the same time:
+Lock one winner before loading E1 or E2. Then partition the same ordered 2048 sample IDs into four disjoint 512-sample shards and generate both native and winner on physical GPUs 0-3. Aggregate the shards by sample ID before computing metrics:
 
 | Physical GPU | Arm |
 | --- | --- |
-| 0 | matched native EMA baseline |
-| 1 | selected FMRG-J K=1 candidate |
-| 2 | selected FMRG-J K=2 candidate |
-| 3 | selected initial-noise oracle candidate |
+| 0 | native plus locked winner, sample positions `0 mod 4` |
+| 1 | native plus locked winner, sample positions `1 mod 4` |
+| 2 | native plus locked winner, sample positions `2 mod 4` |
+| 3 | native plus locked winner, sample positions `3 mod 4` |
 
-No arm may silently reduce its sample count. A failed arm must be marked failed rather than compared with fewer samples.
+No shard may silently reduce its sample count. A failed shard fails the 2048 result rather than producing a smaller comparison. Only after the 2048 images and winner identity are immutable, evaluate E1 and E2 once on the matched native/winner images.
 
 ## 9. Evaluation Contract
 
@@ -265,10 +319,15 @@ No arm may silently reduce its sample count. A failed arm must be marked failed 
 - KID mean and standard deviation on the same sets.
 - NIQE as a secondary no-reference metric.
 - Sharpness using the established grayscale Laplacian-variance definition. Report mean, standard deviation, median, p10, and p90.
-- Per-sample `cos(E0(generated), Z0)`. Report mean, standard deviation, median, p10, and p90.
+- Optimization metric: per-sample `cos(E0(generated), Z0_E0)`. Report mean, standard deviation, median, p10, and p90.
+- Calibration development metric: `cos(Edev(generated), Edev(source))` from the existing ResNet18. It may help select the winner but is not a prospective held-out result.
+- Final prospective metrics, evaluated once after winner lock: `cos(E1(generated), E1(source))` and `cos(E2(generated), E2(source))` for native and winner.
+- For E0, Edev, E1, and E2, report pairwise cosine-distance Spearman between generated and source embedding geometry and 8-class affect accuracy against the validation labels when that encoder is used in the corresponding phase.
 - NFE, wall time, images per second, peak allocated VRAM, and peak reserved VRAM.
 
 Face detection may be recorded as extra information, but it must not decide whether an image collapsed.
+
+The final E1/E2 protocol is prospective. Their files and hashes may be validated before a run, but their model outputs must not be computed until the winner config, checkpoint hash, sample-ID digest, noise seed, and 2048 generated files are locked. Do not use E1/E2 to revise the winner afterward.
 
 ### Required Visual Review
 
@@ -297,11 +356,13 @@ Sharpness mean >= 300
 Sharpness mean >= 0.95 * B_native.Sharpness mean
 KID mean <= B_native.KID mean + 0.005
 E0 cosine mean >= 0.516
+E1 winner mean cos(E1(generated), E1(source)) > matched native E1 mean cosine
+E2 winner mean cos(E2(generated), E2(source)) > matched native E2 mean cosine
 severe visual failures <= 5% of the 64 reviewed samples
 all tensors and reported metrics finite
 ```
 
-`directional evidence` means the method improves cosine by at least 0.05 over the matched native arm and passes the visual/numerical safety checks, but misses one of the solved thresholds.
+`directional evidence` means the method improves E0 cosine by at least 0.05 over the matched native arm and passes the visual/numerical safety checks, but misses one of the solved thresholds. A winner that improves E0 but falls or stays flat on E1 or E2 is encoder-specific evidence, not a solved representation result.
 
 Anything else is not evidence that the quality-representation problem is solved.
 
@@ -310,22 +371,25 @@ Anything else is not evidence that the quality-representation problem is solved.
 Stop or skip work under these conditions:
 
 1. Abort all arms if the checkpoint, EMA, epoch, B/4, E0, VAE, index, or feature-cache contract does not match exactly.
-2. If Route A fails, skip the full FMRG-J arms. Run Route C and the native arm only. Do not hide the failed premise by changing the threshold after seeing results.
+2. If Route A fails, skip both FMRG variants. Use GPUs 0-3 for four pre-registered Route C constraint/step configurations. Do not hide the failed premise by changing the threshold after seeing results.
 3. Stop a calibration candidate on the first non-finite loss, gradient, latent, decoded image, or metric.
 4. Reject a calibration candidate if direct inspection finds severe failures in more than 10% of the 64 pages, Sharpness falls below 80% of native, or cosine improves by less than 0.02 at its strongest tested setting.
 5. Do not extend an oracle beyond 16 updates in this first study. If it only improves after leaving the fixed-radius or typical-shell constraint, mark the reachable-set test failed.
 6. Do not train model weights in this study. A positive frozen-generator result is required before adapter or full-model training resumes.
+7. Do not load E1/E2 outputs before winner lock, and do not reopen candidate selection after seeing E1/E2. If a held-out encoder falls, report that prospective failure.
 
 ## 11. Interpretation
 
-- FMRG-J success means the earlier collapse was mainly an optimization/path problem. The frozen generator can retain quality while the endpoint representation changes.
-- Initial-noise-oracle success with FMRG-J failure means the target is reachable, but the current intermediate flow map or guidance schedule is inadequate.
+- B1 official-HEAD success means the maintained current-state Jacobian path can improve the frozen generator without weight updates.
+- B2-only success means the paper's split-state ordering matters and the current official implementation is not the best match for this checkpoint.
+- Initial-noise-oracle success with both FMRG variants failing means the target is reachable, but the current intermediate flow map or guidance schedules are inadequate.
 - Failure of both routes is strong evidence that the target is difficult to reach inside this checkpoint's useful support. It is not a mathematical proof that low FID and high cosine are incompatible for SAFA or for other generator families.
 - A result from MeanFlow does not replace later diffusion or StyleGAN comparisons. It answers the immediate question with the only mature checkpoint currently online.
 
 ## 12. Main Risks
 
 1. Approximate semigroup consistency may be too weak at epoch 1652. This invalidates FMRG-J for this checkpoint even if the general method is sound.
-2. E0 guidance may exploit encoder-specific directions. Direct visual review and distribution metrics reduce this risk but do not replace a held-out encoder test.
+2. E0 guidance may exploit encoder-specific directions. The locked-winner E1/E2 prospective test detects this risk without leaking held-out outputs into tuning.
 3. Radial noise projection is not a full Gaussian-distribution constraint. Route C is only a reachability oracle.
-4. FMRG-J and the oracle increase NFE and memory. Any quality gain must be reported with that cost rather than compared as if all arms were 1-NFE.
+4. Both FMRG variants and the oracle increase NFE and memory. The counter, not a generic formula, is authoritative for every reported arm.
+5. Several audited repositories have absent, incomplete, or component-specific license text. Their code is research reference material, not source to copy into SAFA.
