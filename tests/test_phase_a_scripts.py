@@ -226,6 +226,231 @@ def test_quality_eval_niqe_only_does_not_create_fid_or_kid(tmp_path: Path, monke
     assert payload["iqa"] == {"method": "niqe", "mean": 3.5, "std": 0.0}
 
 
+def test_quality_eval_reports_generated_laplacian_sharpness_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_script("eval_generation_quality")
+    generated_dir = tmp_path / "generated"
+    generated_dir.mkdir()
+    _write_png(generated_dir / "flat.png", (127, 127, 127))
+    checkerboard = Image.new("L", (8, 8))
+    checkerboard.putdata([255 if (row + column) % 2 else 0 for row in range(8) for column in range(8)])
+    checkerboard.convert("RGB").save(generated_dir / "checkerboard.png")
+
+    monkeypatch.setattr(module, "create_fid_metric", lambda: pytest.fail("FID metric should not be created"))
+    monkeypatch.setattr(module, "create_kid_metric", lambda: pytest.fail("KID metric should not be created"))
+    monkeypatch.setattr(module, "create_iqa_metric", lambda method: pytest.fail("IQA metric should not be created"))
+
+    payload = module.evaluate_generation_quality(
+        real_index=None,
+        generated_dir=generated_dir,
+        output=tmp_path / "quality.json",
+        metrics=["sharpness"],
+        device="cpu",
+    )
+
+    assert module.laplacian_variance(generated_dir / "flat.png") == 0.0
+    assert module.laplacian_variance(generated_dir / "checkerboard.png") > 0.0
+    assert payload["sharpness"]["definition"] == "grayscale_laplacian_variance"
+    assert set(payload["sharpness"]) == {"definition", "mean", "median", "std", "p05", "p95"}
+    assert payload["sharpness"]["mean"] > 0.0
+    assert payload["sharpness"]["median"] == pytest.approx(payload["sharpness"]["mean"])
+    assert module.DEFAULT_METRICS == ("fid", "kid", "niqe")
+
+
+def _write_manifest_quality_case(
+    root: Path,
+    *,
+    manifest_ids: list[str],
+    real_ids: list[str] | None = None,
+    per_sample_ids: list[str] | None = None,
+    generated_file_ids: list[str] | None = None,
+) -> tuple[Path, Path, Path, Path]:
+    generated_dir = root / "generated"
+    real_dir = root / "real"
+    generated_dir.mkdir(parents=True)
+    real_dir.mkdir()
+    real_ids = list(manifest_ids if real_ids is None else real_ids)
+    per_sample_ids = list(manifest_ids if per_sample_ids is None else per_sample_ids)
+    generated_file_ids = list(per_sample_ids if generated_file_ids is None else generated_file_ids)
+
+    real_rows = []
+    for index, sample_id in enumerate(real_ids):
+        path = real_dir / f"real_{index}.png"
+        _write_png(path, (index + 1, 0, 0))
+        real_rows.append({"sample_id": sample_id, "image_path": str(path)})
+    real_index = root / "real.jsonl"
+    _write_jsonl(real_index, real_rows)
+
+    generated_paths: dict[str, Path] = {}
+    for index, sample_id in enumerate(generated_file_ids):
+        path = generated_dir / f"generated_{index}.png"
+        _write_png(path, (0, index + 1, 0))
+        generated_paths[sample_id] = path
+    per_sample = root / "per_sample.jsonl"
+    _write_jsonl(
+        per_sample,
+        [
+            {
+                "sample_id": sample_id,
+                "generated": str(generated_paths.get(sample_id, generated_dir / f"missing_{sample_id}.png")),
+            }
+            for sample_id in per_sample_ids
+        ],
+    )
+    manifest = root / "manifest.jsonl"
+    _write_jsonl(manifest, [{"sample_id": sample_id} for sample_id in manifest_ids])
+    return real_index, generated_dir, manifest, per_sample
+
+
+def test_quality_eval_manifest_joins_real_superset_in_manifest_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_script("eval_generation_quality")
+    real_index, generated_dir, manifest, per_sample = _write_manifest_quality_case(
+        tmp_path,
+        manifest_ids=["b", "a"],
+        real_ids=["extra", "a", "b"],
+    )
+    seen: list[str] = []
+
+    def fake_load(path: Path):
+        import torch
+
+        seen.append(path.name)
+        return torch.zeros(1, 3, 8, 8, dtype=torch.uint8)
+
+    class FakeFid:
+        def update(self, images, real: bool) -> None:
+            del images, real
+
+        def compute(self):
+            import torch
+
+            return torch.tensor(1.0)
+
+    monkeypatch.setattr(module, "load_image_uint8", fake_load)
+    monkeypatch.setattr(module, "create_fid_metric", FakeFid)
+    payload = module.evaluate_generation_quality(
+        real_index=real_index,
+        generated_dir=generated_dir,
+        output=tmp_path / "quality.json",
+        metrics=["fid"],
+        sample_id_manifest=manifest,
+        per_sample_jsonl=per_sample,
+        device="cpu",
+    )
+
+    assert seen == ["real_2.png", "real_1.png", "generated_0.png", "generated_1.png"]
+    assert payload["sample_id_count"] == 2
+    assert payload["sample_id_manifest"] == str(manifest)
+    assert len(payload["sample_id_sha256"]) == 64
+
+
+@pytest.mark.parametrize(
+    ("manifest_ids", "real_ids", "per_sample_ids", "generated_file_ids", "message"),
+    [
+        (["a", "b"], ["a"], None, None, "real index.*missing"),
+        (["a"], ["a", "a"], None, None, "duplicate.*real index"),
+        (["a", "b"], None, ["a"], ["a"], "per-sample.*missing"),
+        (["a"], None, ["a", "extra"], ["a", "extra"], "per-sample.*extra"),
+        (["a"], None, ["a", "a"], ["a"], "duplicate.*per-sample"),
+        (["a"], None, ["a"], ["a", "extra"], "generated-dir.*extra"),
+    ],
+)
+def test_quality_eval_manifest_rejects_id_contract_violations_before_metrics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    manifest_ids: list[str],
+    real_ids: list[str] | None,
+    per_sample_ids: list[str] | None,
+    generated_file_ids: list[str] | None,
+    message: str,
+) -> None:
+    module = _load_script("eval_generation_quality")
+    real_index, generated_dir, manifest, per_sample = _write_manifest_quality_case(
+        tmp_path,
+        manifest_ids=manifest_ids,
+        real_ids=real_ids,
+        per_sample_ids=per_sample_ids,
+        generated_file_ids=generated_file_ids,
+    )
+    monkeypatch.setattr(module, "create_fid_metric", lambda: pytest.fail("metric creation must follow validation"))
+
+    with pytest.raises((ValueError, FileNotFoundError), match=message):
+        module.evaluate_generation_quality(
+            real_index=real_index,
+            generated_dir=generated_dir,
+            output=tmp_path / "quality.json",
+            metrics=["fid"],
+            sample_id_manifest=manifest,
+            per_sample_jsonl=per_sample,
+            device="cpu",
+        )
+
+
+@pytest.mark.parametrize(("max_real", "max_generated"), [(1, None), (None, 1)])
+def test_quality_eval_manifest_rejects_legacy_limits(
+    tmp_path: Path,
+    max_real: int | None,
+    max_generated: int | None,
+) -> None:
+    module = _load_script("eval_generation_quality")
+    real_index, generated_dir, manifest, per_sample = _write_manifest_quality_case(
+        tmp_path,
+        manifest_ids=["a"],
+    )
+
+    with pytest.raises(ValueError, match="manifest mode.*max-real.*max-generated"):
+        module.evaluate_generation_quality(
+            real_index=real_index,
+            generated_dir=generated_dir,
+            output=tmp_path / "quality.json",
+            metrics=["fid"],
+            max_real=max_real,
+            max_generated=max_generated,
+            sample_id_manifest=manifest,
+            per_sample_jsonl=per_sample,
+            device="cpu",
+        )
+
+
+def test_quality_eval_manifest_digest_is_path_independent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_script("eval_generation_quality")
+    digests: list[str] = []
+
+    class FakeFid:
+        def update(self, images, real: bool) -> None:
+            del images, real
+
+        def compute(self):
+            import torch
+
+            return torch.tensor(1.0)
+
+    monkeypatch.setattr(module, "create_fid_metric", FakeFid)
+    for directory_name in ("first-output", "second-output"):
+        root = tmp_path / directory_name
+        real_index, generated_dir, manifest, per_sample = _write_manifest_quality_case(
+            root,
+            manifest_ids=["sample-2", "sample-1"],
+        )
+        payload = module.evaluate_generation_quality(
+            real_index=real_index,
+            generated_dir=generated_dir,
+            output=root / "quality.json",
+            metrics=["fid"],
+            sample_id_manifest=manifest,
+            per_sample_jsonl=per_sample,
+            device="cpu",
+        )
+        digests.append(payload["sample_id_sha256"])
+
+    assert digests[0] == digests[1]
+
+
 def test_quality_eval_limits_real_and_generated_sets_deterministically(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

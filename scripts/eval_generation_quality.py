@@ -12,12 +12,12 @@ from typing import Any, Iterable
 
 DEFAULT_IQA_METHOD = "niqe"
 DEFAULT_METRICS = ("fid", "kid", "niqe")
-SUPPORTED_METRICS = frozenset(DEFAULT_METRICS)
+SUPPORTED_METRICS = frozenset((*DEFAULT_METRICS, "sharpness"))
 REAL_IMAGE_METRICS = frozenset(("fid", "kid"))
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
 
-def read_jsonl_index(path: Path) -> list[dict[str, Any]]:
+def read_jsonl_objects(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as handle:
         for line_no, line in enumerate(handle, start=1):
@@ -30,11 +30,17 @@ def read_jsonl_index(path: Path) -> list[dict[str, Any]]:
                 raise ValueError(f"{path}:{line_no}: invalid JSON: {exc.msg}") from exc
             if not isinstance(row, dict):
                 raise ValueError(f"{path}:{line_no}: expected JSON object")
-            if "image_path" not in row:
-                raise ValueError(f"{path}:{line_no}: missing required field 'image_path'")
             rows.append(row)
     if not rows:
-        raise ValueError(f"{path}: real index contains no rows")
+        raise ValueError(f"{path}: JSONL contains no rows")
+    return rows
+
+
+def read_jsonl_index(path: Path) -> list[dict[str, Any]]:
+    rows = read_jsonl_objects(path)
+    for line_no, row in enumerate(rows, start=1):
+        if "image_path" not in row:
+            raise ValueError(f"{path}:{line_no}: missing required field 'image_path'")
     return rows
 
 
@@ -76,6 +82,125 @@ def generated_image_paths(generated_dir: Path) -> list[Path]:
     if not paths:
         raise ValueError("generated-dir contains no supported images")
     return paths
+
+
+def _unique_sample_rows(path: Path, *, label: str) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    ordered_ids: list[str] = []
+    rows_by_id: dict[str, dict[str, Any]] = {}
+    for line_no, row in enumerate(read_jsonl_objects(path), start=1):
+        sample_id = row.get("sample_id")
+        if not isinstance(sample_id, str) or not sample_id:
+            raise ValueError(f"{path}:{line_no}: {label} requires a non-empty string sample_id")
+        if sample_id in rows_by_id:
+            raise ValueError(f"duplicate sample_id in {label}: {sample_id!r}")
+        ordered_ids.append(sample_id)
+        rows_by_id[sample_id] = row
+    return ordered_ids, rows_by_id
+
+
+def _id_set_difference_message(label: str, *, expected: set[str], actual: set[str]) -> str:
+    missing = sorted(expected - actual)
+    extra = sorted(actual - expected)
+    details = []
+    if missing:
+        details.append(f"missing IDs {missing!r}")
+    if extra:
+        details.append(f"extra IDs {extra!r}")
+    return f"{label} sample IDs do not match manifest: " + "; ".join(details)
+
+
+def manifest_image_paths(
+    *,
+    real_index: Path,
+    generated_dir: Path,
+    sample_id_manifest: Path,
+    per_sample_jsonl: Path,
+) -> tuple[list[str], list[Path], list[Path]]:
+    manifest_ids, _ = _unique_sample_rows(sample_id_manifest, label="sample-ID manifest")
+    manifest_set = set(manifest_ids)
+    _, real_rows = _unique_sample_rows(real_index, label="real index")
+    missing_real = manifest_set - set(real_rows)
+    if missing_real:
+        raise ValueError(f"real index is missing manifest IDs {sorted(missing_real)!r}")
+
+    _, generated_rows = _unique_sample_rows(per_sample_jsonl, label="per-sample JSONL")
+    if set(generated_rows) != manifest_set:
+        raise ValueError(
+            _id_set_difference_message("per-sample JSONL", expected=manifest_set, actual=set(generated_rows))
+        )
+
+    real_paths: list[Path] = []
+    generated_paths: list[Path] = []
+    for sample_id in manifest_ids:
+        real_value = real_rows[sample_id].get("image_path")
+        if not isinstance(real_value, str) or not real_value:
+            raise ValueError(f"real index sample {sample_id!r} is missing image_path")
+        real_path = Path(real_value)
+        if not real_path.is_file():
+            raise FileNotFoundError(f"real image does not exist: {real_path}")
+        real_paths.append(real_path)
+
+        generated_row = generated_rows[sample_id]
+        generated_value = generated_row.get("generated", generated_row.get("generated_image_path"))
+        if not isinstance(generated_value, str) or not generated_value:
+            raise ValueError(f"per-sample JSONL sample {sample_id!r} is missing generated path")
+        generated_path = Path(generated_value)
+        if not generated_path.is_file():
+            raise FileNotFoundError(f"generated image does not exist: {generated_path}")
+        generated_paths.append(generated_path)
+
+    resolved_selected = [path.resolve() for path in generated_paths]
+    if len(set(resolved_selected)) != len(resolved_selected):
+        raise ValueError("per-sample JSONL maps multiple sample IDs to the same generated image")
+    resolved_directory = {path.resolve() for path in generated_image_paths(generated_dir)}
+    resolved_expected = set(resolved_selected)
+    if resolved_directory != resolved_expected:
+        missing_files = sorted(str(path) for path in resolved_expected - resolved_directory)
+        extra_files = sorted(str(path) for path in resolved_directory - resolved_expected)
+        details = []
+        if missing_files:
+            details.append(f"missing files {missing_files!r}")
+        if extra_files:
+            details.append(f"extra files {extra_files!r}")
+        raise ValueError("generated-dir files do not match per-sample JSONL: " + "; ".join(details))
+    return manifest_ids, real_paths, generated_paths
+
+
+def sample_id_digest(sample_ids: Iterable[str]) -> str:
+    canonical = "".join(f"{sample_id}\n" for sample_id in sample_ids).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def laplacian_variance(path: Path) -> float:
+    try:
+        import cv2
+    except ImportError as exc:
+        raise RuntimeError("opencv-python is required for Sharpness evaluation") from exc
+    gray = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if gray is None:
+        raise ValueError(f"failed to read generated image for Sharpness: {path}")
+    value = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    if not math.isfinite(value):
+        raise ValueError(f"Sharpness returned a non-finite value for {path}")
+    return value
+
+
+def sharpness_summary(values: list[float]) -> dict[str, float | str]:
+    if not values:
+        raise ValueError("cannot summarize empty Sharpness values")
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError("numpy is required for Sharpness evaluation") from exc
+    array = np.asarray(values, dtype=np.float64)
+    return {
+        "definition": "grayscale_laplacian_variance",
+        "mean": float(array.mean()),
+        "median": float(np.median(array)),
+        "std": float(array.std()),
+        "p05": float(np.percentile(array, 5)),
+        "p95": float(np.percentile(array, 95)),
+    }
 
 
 def quality_eval_device(device: str):
@@ -240,16 +365,37 @@ def evaluate_generation_quality(
     max_real: int | None = None,
     subset_seed: int | None = 1337,
     device: str = "auto",
+    sample_id_manifest: Path | None = None,
+    per_sample_jsonl: Path | None = None,
 ) -> dict[str, Any]:
     metric_names = normalize_metrics(metrics)
-    generated_paths = limited_paths(generated_image_paths(generated_dir), max_count=max_generated, seed=subset_seed)
     needs_real_images = any(name in REAL_IMAGE_METRICS for name in metric_names)
-    if needs_real_images:
+    manifest_mode = sample_id_manifest is not None or per_sample_jsonl is not None
+    manifest_ids: list[str] = []
+    if manifest_mode:
+        if sample_id_manifest is None or per_sample_jsonl is None:
+            raise ValueError("manifest mode requires both --sample-id-manifest and --per-sample-jsonl")
+        if max_real is not None or max_generated is not None:
+            raise ValueError("manifest mode rejects both --max-real and --max-generated")
         if real_index is None:
-            raise ValueError("real-index is required when FID or KID metrics are enabled")
-        real_paths = limited_paths(real_image_paths(real_index), max_count=max_real, seed=subset_seed)
+            raise ValueError("manifest mode requires --real-index")
+        manifest_ids, joined_real_paths, generated_paths = manifest_image_paths(
+            real_index=real_index,
+            generated_dir=generated_dir,
+            sample_id_manifest=sample_id_manifest,
+            per_sample_jsonl=per_sample_jsonl,
+        )
+        real_paths = joined_real_paths if needs_real_images else []
     else:
-        real_paths = []
+        generated_paths = limited_paths(
+            generated_image_paths(generated_dir), max_count=max_generated, seed=subset_seed
+        )
+        if needs_real_images:
+            if real_index is None:
+                raise ValueError("real-index is required when FID or KID metrics are enabled")
+            real_paths = limited_paths(real_image_paths(real_index), max_count=max_real, seed=subset_seed)
+        else:
+            real_paths = []
 
     selected_device = quality_eval_device(device)
     fid = create_fid_metric() if "fid" in metric_names else None
@@ -266,6 +412,7 @@ def evaluate_generation_quality(
         iqa.eval()
 
     iqa_values: list[float] = []
+    sharpness_values: list[float] = []
     try:
         import torch
     except ImportError as exc:
@@ -288,6 +435,8 @@ def evaluate_generation_quality(
             if iqa is not None:
                 iqa_image = image_to_device(image, iqa_device)
                 iqa_values.extend(metric_values(iqa(iqa_image.float().div(255.0))))
+            if "sharpness" in metric_names:
+                sharpness_values.append(laplacian_variance(path))
 
         payload = {
             "metrics": list(metric_names),
@@ -295,6 +444,10 @@ def evaluate_generation_quality(
         }
         if needs_real_images:
             payload["num_real"] = len(real_paths)
+        if manifest_mode:
+            payload["sample_id_manifest"] = str(sample_id_manifest)
+            payload["sample_id_count"] = len(manifest_ids)
+            payload["sample_id_sha256"] = sample_id_digest(manifest_ids)
         if fid is not None:
             payload["fid"] = metric_scalar(fid.compute())
         if kid is not None:
@@ -309,6 +462,8 @@ def evaluate_generation_quality(
                 "mean": iqa_summary["mean"],
                 "std": iqa_summary["std"],
             }
+        if "sharpness" in metric_names:
+            payload["sharpness"] = sharpness_summary(sharpness_values)
 
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -322,6 +477,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--real-index", type=Path)
     parser.add_argument("--generated-dir", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--sample-id-manifest", type=Path)
+    parser.add_argument("--per-sample-jsonl", type=Path)
     parser.add_argument("--max-generated", type=int, default=None)
     parser.add_argument("--max-real", type=int, default=None)
     parser.add_argument("--subset-seed", type=int, default=1337)
@@ -355,6 +512,8 @@ def main(argv: list[str] | None = None) -> int:
             max_real=args.max_real,
             subset_seed=args.subset_seed,
             device=args.device,
+            sample_id_manifest=args.sample_id_manifest,
+            per_sample_jsonl=args.per_sample_jsonl,
         )
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
