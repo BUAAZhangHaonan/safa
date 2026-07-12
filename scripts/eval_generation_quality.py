@@ -199,6 +199,8 @@ def sharpness_summary(values: list[float]) -> dict[str, float | str]:
         "median": float(np.median(array)),
         "std": float(array.std()),
         "p05": float(np.percentile(array, 5)),
+        "p10": float(np.percentile(array, 10)),
+        "p90": float(np.percentile(array, 90)),
         "p95": float(np.percentile(array, 95)),
     }
 

@@ -16,7 +16,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--num-shards", type=int, default=1)
-    parser.add_argument("--allow-overwrite", action="store_true")
     parser.add_argument("--mode", choices=sorted(SUPPORTED_MODES))
     parser.add_argument("--max-samples", type=int)
     parser.add_argument("--eta", type=float)
@@ -72,7 +71,6 @@ def main(argv: list[str] | None = None) -> int:
             output_dir=args.output_dir,
             shard_index=args.shard_index,
             num_shards=args.num_shards,
-            allow_overwrite=args.allow_overwrite,
             explicit_t_cut=args.t_cut,
         )
     except Exception as exc:

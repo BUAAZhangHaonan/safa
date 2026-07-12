@@ -20,12 +20,15 @@ class GuidanceResult:
 class CountedFlowMap:
     """Count vector-field evaluations made through a generator flow map."""
 
-    def __init__(self, generator):
+    def __init__(self, generator, *, kind: str = "flow_map"):
         self.generator = generator
         self.nfe = 0
+        self.kind = str(kind)
+        self.trace: list[dict[str, float | str | list[float]]] = []
 
     def __call__(self, x, z, *, t, r):
         self.nfe += 1
+        self.trace.append({"t": _trace_time(t), "r": _trace_time(r), "kind": self.kind})
         return self.generator.flow_map(x, z, t=t, r=r)
 
 
@@ -474,3 +477,9 @@ def _threshold_passes(value, requirement) -> bool:
             raise ValueError(f"unsupported threshold keys: {sorted(set(requirement) - {'min', 'max'})}")
         return True
     return value == requirement
+
+
+def _trace_time(value) -> float | list[float]:
+    tensor = torch.as_tensor(value).detach().cpu().reshape(-1)
+    values = [float(item) for item in tensor.tolist()]
+    return values[0] if len(values) == 1 else values

@@ -253,9 +253,22 @@ def test_quality_eval_reports_generated_laplacian_sharpness_summary(
     assert module.laplacian_variance(generated_dir / "flat.png") == 0.0
     assert module.laplacian_variance(generated_dir / "checkerboard.png") > 0.0
     assert payload["sharpness"]["definition"] == "grayscale_laplacian_variance"
-    assert set(payload["sharpness"]) == {"definition", "mean", "median", "std", "p05", "p95"}
+    assert set(payload["sharpness"]) == {
+        "definition",
+        "mean",
+        "median",
+        "std",
+        "p05",
+        "p10",
+        "p90",
+        "p95",
+    }
     assert payload["sharpness"]["mean"] > 0.0
     assert payload["sharpness"]["median"] == pytest.approx(payload["sharpness"]["mean"])
+    assert payload["sharpness"]["p05"] == pytest.approx(payload["sharpness"]["mean"] * 0.1)
+    assert payload["sharpness"]["p10"] == pytest.approx(payload["sharpness"]["mean"] * 0.2)
+    assert payload["sharpness"]["p90"] == pytest.approx(payload["sharpness"]["mean"] * 1.8)
+    assert payload["sharpness"]["p95"] == pytest.approx(payload["sharpness"]["mean"] * 1.9)
     assert module.DEFAULT_METRICS == ("fid", "kid", "niqe")
 
 

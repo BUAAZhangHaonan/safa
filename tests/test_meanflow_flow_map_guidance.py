@@ -288,6 +288,20 @@ def test_counted_flow_map_counts_one_nfe_per_call() -> None:
     assert counted.nfe == 2
 
 
+def test_counted_flow_map_records_t_r_and_kind_for_every_call() -> None:
+    counted = CountedFlowMap(_ExponentialFlowGenerator(), kind="matched_native")
+    x = torch.ones(2, 1, 2, 2)
+    z = torch.zeros(2, 2)
+
+    counted(x, z, t=1.0, r=0.5)
+    counted(x, z, t=torch.tensor([0.5, 0.25]), r=torch.tensor([0.0, 0.0]))
+
+    assert counted.trace == [
+        {"t": 1.0, "r": 0.5, "kind": "matched_native"},
+        {"t": [0.5, 0.25], "r": [0.0, 0.0], "kind": "matched_native"},
+    ]
+
+
 def test_semigroup_probe_returns_zero_for_exact_semigroup() -> None:
     counted = CountedFlowMap(_ExponentialFlowGenerator().eval().requires_grad_(False))
     report = semigroup_probe(counted, torch.randn(3, 1, 2, 2), torch.zeros(3, 2), [0.25, 0.5, 0.75])
