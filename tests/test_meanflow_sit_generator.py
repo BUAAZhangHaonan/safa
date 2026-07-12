@@ -96,9 +96,11 @@ def test_meanflow_flow_map_1_to_0_matches_native_sample() -> None:
     t = torch.ones(2)
 
     expected = x_init - generator.vector_field(x_init, r, t, z)
-    actual = generator.flow_map(x_init, z, t=1.0, r=0.0)
+    flow_mapped = generator.flow_map(x_init, z, t=1.0, r=0.0)
+    sampled = generator.sample(z, x_init=x_init, clamp_output=False)
 
-    assert torch.equal(actual, expected)
+    assert torch.equal(flow_mapped, expected)
+    assert torch.equal(sampled, expected)
 
 
 def test_meanflow_pixel_flow_map_matches_sample_after_data_space_conversion() -> None:
@@ -130,16 +132,26 @@ def test_meanflow_flow_map_accepts_per_sample_times_and_input_gradient() -> None
     config["sit_data_space"] = "latent"
     generator = build_generator(config)
     z = torch.randn(2, 16)
-    x = torch.randn(2, 3, 16, 16, requires_grad=True)
+    with torch.no_grad():
+        generator.vector_field.final_layer.linear.weight.normal_()
+        generator.vector_field.final_layer.linear.bias.normal_()
+    x_values = torch.randn(2, 3, 16, 16)
+    x = x_values.clone().requires_grad_(True)
+    reference_x = x_values.clone().requires_grad_(True)
     t = torch.tensor([1.0, 0.75])
     r = torch.tensor([0.5, 0.25])
 
     output = generator.flow_map(x, z, t=t, r=r)
-    output.square().mean().backward()
+    gradient = torch.autograd.grad(output.sum(), x)[0]
+    horizon = (t - r).view(-1, 1, 1, 1)
+    reference = reference_x - horizon * generator.vector_field(reference_x, r, t, z)
+    reference_gradient = torch.autograd.grad(reference.sum(), reference_x)[0]
 
     assert tuple(output.shape) == tuple(x.shape)
-    assert x.grad is not None
-    assert torch.isfinite(x.grad).all()
+    assert torch.equal(output, reference)
+    assert torch.allclose(gradient, reference_gradient, atol=1.0e-6, rtol=1.0e-5)
+    assert not torch.allclose(gradient, torch.ones_like(gradient), atol=1.0e-4, rtol=1.0e-4)
+    assert torch.isfinite(gradient).all()
 
 
 @pytest.mark.parametrize(
