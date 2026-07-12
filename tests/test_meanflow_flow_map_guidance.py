@@ -15,6 +15,9 @@ from safa.guidance.meanflow_flow_map import (  # noqa: E402
     freeze_guidance_stack,
     sample_official_head_current_xt,
     sample_paper_algorithm_split,
+    optimize_initial_noise,
+    project_fixed_radius,
+    project_gaussian_typical_shell,
     select_t_cut,
     semigroup_probe,
     symmetric_relative_l2,
@@ -491,3 +494,108 @@ def test_fmrg_variants_reject_non_positive_step_size(variant, step_size) -> None
             _run_official(step_size=step_size)
         else:
             _run_paper(step_size=step_size)
+
+
+def test_project_fixed_radius_restores_each_initial_norm() -> None:
+    initial = torch.randn(3, 4, 2, 2)
+    candidate = torch.randn_like(initial) * torch.tensor([0.5, 2.0, 4.0]).view(3, 1, 1, 1)
+
+    projected = project_fixed_radius(candidate, initial)
+
+    assert torch.allclose(projected.flatten(1).norm(dim=1), initial.flatten(1).norm(dim=1), atol=1.0e-6)
+
+
+def test_project_fixed_radius_rejects_zero_candidate() -> None:
+    with pytest.raises(ValueError, match="zero-norm candidate"):
+        project_fixed_radius(torch.zeros(2, 4, 2, 2), torch.randn(2, 4, 2, 2))
+
+
+def test_project_typical_shell_clamps_only_outside_radii() -> None:
+    dimension = 4 * 2 * 2
+    delta = 0.25
+    minimum = math.sqrt(dimension * (1.0 - delta))
+    maximum = math.sqrt(dimension * (1.0 + delta))
+    directions = torch.randn(3, 4, 2, 2)
+    directions = directions / directions.flatten(1).norm(dim=1).view(3, 1, 1, 1)
+    requested_norms = torch.tensor([minimum / 2.0, math.sqrt(dimension), maximum * 2.0])
+    candidate = directions * requested_norms.view(3, 1, 1, 1)
+
+    projected = project_gaussian_typical_shell(candidate, delta=delta)
+    projected_norms = projected.flatten(1).norm(dim=1)
+
+    assert torch.allclose(projected_norms, torch.tensor([minimum, math.sqrt(dimension), maximum]), atol=1.0e-6)
+    assert torch.equal(projected[1], candidate[1])
+
+
+@pytest.mark.parametrize("delta", [0.0, 1.0, -0.1, 1.1, float("nan")])
+def test_project_typical_shell_rejects_invalid_delta(delta) -> None:
+    with pytest.raises(ValueError, match=r"0 < delta < 1"):
+        project_gaussian_typical_shell(torch.randn(2, 4, 2, 2), delta=delta)
+
+
+def _run_noise_oracle(*, num_updates=8, eta=0.25, projection="fixed_radius", x_init=None):
+    generator, codec, e0 = _frozen_guidance_stack()
+    default_x, condition, target = _guidance_inputs()
+    if x_init is None:
+        x_init = default_x
+    counted = CountedFlowMap(generator)
+    result = optimize_initial_noise(
+        flow_map=counted,
+        codec=codec,
+        e0=e0,
+        x_init=x_init,
+        transport_condition=condition,
+        target_z0=target,
+        num_updates=num_updates,
+        eta=eta,
+        projection=projection,
+    )
+    return result, generator, codec, e0, target
+
+
+def test_noise_oracle_reduces_tiny_representation_loss() -> None:
+    result, generator, codec, e0, target = _run_noise_oracle()
+    initial, _, _ = _guidance_inputs()
+    from safa.training.losses import normalize_for_e0
+
+    initial_endpoint = initial - generator.velocity.detach()
+    initial_embedding = e0(normalize_for_e0(codec.decode(initial_endpoint)))["embedding"]
+    final_embedding = e0(normalize_for_e0(codec.decode(result.latent)))["embedding"]
+    initial_loss = 1.0 - torch.cosine_similarity(initial_embedding, target, dim=1).mean()
+    final_loss = 1.0 - torch.cosine_similarity(final_embedding, target, dim=1).mean()
+
+    assert final_loss < initial_loss
+
+
+def test_noise_oracle_re_evaluates_projected_final_point() -> None:
+    result, generator, _, _, _ = _run_noise_oracle(num_updates=2)
+
+    assert len(generator.calls) == 3
+    assert torch.equal(generator.calls[-1][2], result.diagnostics["final_noise"])
+    assert len(result.diagnostics["loss_history"]) == 3
+
+
+def test_noise_oracle_reports_updates_plus_one_nfe() -> None:
+    result, generator, _, _, _ = _run_noise_oracle(num_updates=8)
+
+    assert result.nfe == 9
+    assert result.nfe == len(generator.calls)
+
+
+def test_noise_oracle_does_not_change_frozen_weights() -> None:
+    result, generator, codec, e0, _ = _run_noise_oracle()
+
+    assert torch.equal(generator.velocity, torch.tensor(0.5))
+    assert all(parameter.grad is None for parameter in generator.parameters())
+    assert all(parameter.grad is None for parameter in codec.vae.parameters())
+    assert all(parameter.grad is None for parameter in e0.parameters())
+    assert_guidance_stack_frozen(generator, codec, e0)
+    assert torch.isfinite(result.latent).all()
+
+
+def test_noise_oracle_rejects_non_finite_state() -> None:
+    x_init, _, _ = _guidance_inputs()
+    x_init[0, 0, 0, 0] = float("nan")
+
+    with pytest.raises(FloatingPointError, match="non-finite x_init"):
+        _run_noise_oracle(x_init=x_init)

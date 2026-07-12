@@ -243,6 +243,115 @@ def normalize_per_sample_to_velocity_norm(gradient, velocity, eps: float = 1.0e-
     return _finite_tensor("normalized representation gradient", normalized)
 
 
+def project_fixed_radius(candidate, initial, eps: float = 1.0e-8):
+    _validate_noise_pair(candidate, initial)
+    candidate_norm = candidate.flatten(1).norm(dim=1)
+    if torch.any(candidate_norm <= eps).item():
+        raise ValueError("fixed-radius projection received a zero-norm candidate")
+    initial_norm = initial.flatten(1).norm(dim=1)
+    scale = initial_norm / candidate_norm
+    projected = candidate * scale.view(candidate.shape[0], 1, 1, 1)
+    return _finite_tensor("fixed-radius projection", projected)
+
+
+def project_gaussian_typical_shell(candidate, *, delta, eps: float = 1.0e-8):
+    delta_value = float(delta)
+    if not math.isfinite(delta_value) or not 0.0 < delta_value < 1.0:
+        raise ValueError(f"typical-shell projection requires 0 < delta < 1, got {delta!r}")
+    _validate_noise_tensor("candidate", candidate)
+    candidate_norm = candidate.flatten(1).norm(dim=1)
+    if torch.any(candidate_norm <= eps).item():
+        raise ValueError("typical-shell projection received a zero-norm candidate")
+    dimension = math.prod(candidate.shape[1:])
+    minimum = math.sqrt(dimension * (1.0 - delta_value))
+    maximum = math.sqrt(dimension * (1.0 + delta_value))
+    scale = torch.ones_like(candidate_norm)
+    scale = torch.where(candidate_norm < minimum, minimum / candidate_norm, scale)
+    scale = torch.where(candidate_norm > maximum, maximum / candidate_norm, scale)
+    projected = candidate * scale.view(candidate.shape[0], 1, 1, 1)
+    return _finite_tensor("typical-shell projection", projected)
+
+
+def optimize_initial_noise(
+    *,
+    flow_map: CountedFlowMap,
+    codec,
+    e0,
+    x_init: torch.Tensor,
+    transport_condition: torch.Tensor,
+    target_z0: torch.Tensor,
+    num_updates: int,
+    eta: float,
+    projection: Literal["fixed_radius", "typical_shell"],
+    typical_delta: float = 0.05,
+) -> GuidanceResult:
+    assert_guidance_stack_frozen(flow_map.generator, codec, e0)
+    _validate_noise_tensor("x_init", x_init)
+    if isinstance(num_updates, bool) or int(num_updates) != num_updates or num_updates < 0:
+        raise ValueError(f"num_updates must be a non-negative integer, got {num_updates!r}")
+    eta_value = float(eta)
+    if eta_value not in {0.25, 0.5, 1.0, 2.0}:
+        raise ValueError(f"eta must be one of {{0.25, 0.5, 1.0, 2.0}}, got {eta!r}")
+    if projection not in {"fixed_radius", "typical_shell"}:
+        raise ValueError(f"unsupported noise projection {projection!r}")
+    if projection == "typical_shell":
+        delta_value = float(typical_delta)
+        if not math.isfinite(delta_value) or not 0.0 < delta_value < 1.0:
+            raise ValueError(f"typical-shell projection requires 0 < delta < 1, got {typical_delta!r}")
+
+    initial_nfe = flow_map.nfe
+    initial = x_init.detach().clone()
+    noise = initial.clone()
+    loss_history: list[float] = []
+
+    for _ in range(num_updates):
+        active_noise = noise.detach().requires_grad_(True)
+        endpoint = flow_map(active_noise, transport_condition, t=1.0, r=0.0)
+        loss = _representation_loss(endpoint, codec, e0, target_z0)
+        loss_history.append(float(loss.detach()))
+        gradient = torch.autograd.grad(loss, active_noise, only_inputs=True)[0]
+        gradient = _finite_tensor("representation gradient", gradient)
+        gradient_norm = gradient.flatten(1).norm(dim=1)
+        view_shape = (gradient.shape[0],) + (1,) * (gradient.ndim - 1)
+        normalized = gradient / (gradient_norm + 1.0e-8).view(view_shape)
+        candidate = active_noise.detach() - eta_value * normalized
+        if projection == "fixed_radius":
+            noise = project_fixed_radius(candidate, initial)
+        else:
+            noise = project_gaussian_typical_shell(candidate, delta=typical_delta)
+        noise = _finite_tensor("projected noise", noise.detach())
+
+    final_noise = noise.detach()
+    final_endpoint = flow_map(final_noise, transport_condition, t=1.0, r=0.0)
+    final_loss = _representation_loss(final_endpoint, codec, e0, target_z0)
+    loss_history.append(float(final_loss.detach()))
+    dimension = math.prod(initial.shape[1:])
+    initial_norm = initial.flatten(1).norm(dim=1)
+    final_norm = final_noise.flatten(1).norm(dim=1)
+    assert_guidance_stack_frozen(flow_map.generator, codec, e0)
+    return GuidanceResult(
+        latent=final_endpoint.detach(),
+        nfe=flow_map.nfe - initial_nfe,
+        diagnostics={
+            "projection": projection,
+            "eta": eta_value,
+            "num_updates": int(num_updates),
+            "typical_delta": float(typical_delta),
+            "initial_noise": initial,
+            "final_noise": final_noise,
+            "initial_norm": initial_norm,
+            "final_norm": final_norm,
+            "initial_norm_squared_per_dimension": initial_norm.square() / dimension,
+            "final_norm_squared_per_dimension": final_norm.square() / dimension,
+            "initial_final_cosine": F.cosine_similarity(initial.flatten(1), final_noise.flatten(1), dim=1),
+            "update_norm": (final_noise - initial).flatten(1).norm(dim=1),
+            "channel_mean": final_noise.mean(dim=(0, 2, 3)),
+            "channel_std": final_noise.std(dim=(0, 2, 3), unbiased=False),
+            "loss_history": loss_history,
+        },
+    )
+
+
 def select_t_cut(candidate_reports, registered_thresholds) -> float | None:
     ordered = sorted(candidate_reports, key=lambda report: float(report["t_cut"]))
     for report in ordered:
@@ -298,6 +407,22 @@ def _finite_tensor(name, tensor):
     if tensor is None or not torch.isfinite(tensor).all().item():
         raise FloatingPointError(f"non-finite {name}")
     return tensor
+
+
+def _validate_noise_pair(candidate, initial):
+    _validate_noise_tensor("candidate", candidate)
+    _validate_noise_tensor("initial", initial)
+    if candidate.shape != initial.shape:
+        raise ValueError(
+            f"candidate and initial noise must have the same shape, got {tuple(candidate.shape)} and {tuple(initial.shape)}"
+        )
+
+
+def _validate_noise_tensor(name, tensor):
+    if not isinstance(tensor, torch.Tensor) or tensor.ndim != 4 or not torch.is_floating_point(tensor):
+        shape = tuple(tensor.shape) if isinstance(tensor, torch.Tensor) else type(tensor).__name__
+        raise ValueError(f"{name} must be a floating tensor with shape [B,C,H,W], got {shape}")
+    _finite_tensor(name, tensor)
 
 
 def _freeze_module(module) -> None:
