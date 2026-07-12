@@ -200,6 +200,9 @@ test_semigroup_probe_returns_zero_for_exact_semigroup
 test_semigroup_probe_reports_each_requested_split
 test_semigroup_probe_rejects_unsorted_or_boundary_split
 test_semigroup_relative_residual_is_finite_for_zero_endpoints
+test_t_cut_selection_sorts_candidates_and_chooses_smallest_full_pass
+test_t_cut_selection_returns_gate_failure_when_none_pass
+test_t_cut_selection_has_no_manual_tie_break_input
 test_latent_codec_wrapper_freezes_vae_but_keeps_decode_input_gradient
 test_assert_guidance_stack_checks_codec_vae_not_codec_parameters
 ```
@@ -246,9 +249,12 @@ def assert_guidance_stack_frozen(generator, codec, e0) -> None:
     ...
 def symmetric_relative_l2(left, right, eps=1.0e-8) -> torch.Tensor: ...
 def semigroup_probe(flow_map, x_init, condition, split_times) -> dict: ...
+def select_t_cut(candidate_reports, registered_thresholds) -> float | None: ...
 ```
 
 `CountedFlowMap` increments once for each vector-field evaluation, not once per image. `semigroup_probe` must return the direct endpoint, each composed endpoint, per-sample residuals, and total NFE. It must not decode or compute FID.
+
+`select_t_cut` sorts by numeric `t_cut` and returns the first candidate passing every registered numerical and visual field. It returns `None` when no candidate passes. It accepts no manual preference or tie-break argument.
 
 Never wrap `codec.decode(...)` or the following E0 forward in `torch.no_grad()` inside guidance. Parameter freezing prevents weight updates while autograd must still connect the decoded image and loss to the latent input.
 
@@ -297,8 +303,9 @@ Add:
 
 ```text
 test_paper_split_transports_to_xs_before_endpoint_gradient
-test_paper_split_finishes_with_explicit_unguided_map
+test_paper_split_iterates_both_shared_unguided_tail_segments
 test_paper_split_nfe_matches_counted_calls
+test_b1_and_b2_receive_identical_guided_and_unguided_times
 test_paper_split_normalizes_gradient_per_sample
 test_paper_split_reduces_tiny_representation_loss
 test_fmrg_variants_reject_non_decreasing_schedule
@@ -378,12 +385,13 @@ def sample_paper_algorithm_split(
     transport_condition: torch.Tensor,
     target_z0: torch.Tensor,
     guided_times: Sequence[float],
+    unguided_times: Sequence[float],
     step_size: float,
 ) -> GuidanceResult:
     ...
 ```
 
-This function first computes `x_bar=Phi_{t->s}(x_t)`, then differentiates `Phi_{s->0}(x_bar)` with respect to `x_bar`, applies the per-sample normalized correction at time `s`, and finishes with an unguided map. It must not call the official-current-x_t function internally. `CountedFlowMap` is the only source of its NFE result.
+This function first computes `x_bar=Phi_{t->s}(x_t)`, then differentiates `Phi_{s->0}(x_bar)` with respect to `x_bar`, and applies the per-sample normalized correction at time `s`. It then loops over both adjacent pairs in the supplied `unguided_times` array. It must not call the official-current-x_t function internally. B1 and B2 receive the exact same schedule arrays, and `CountedFlowMap` is the only source of B2 NFE.
 
 ### Step 6: Run focused and model tests
 
@@ -497,10 +505,12 @@ Add tests that:
 4. The JSON contains mean, std, median, p10, and p90.
 5. Existing default metrics remain exactly `fid`, `kid`, and `niqe` for backward compatibility.
 6. `--sample-id-manifest` joins the real index and `--per-sample-jsonl` by exact sample ID.
-7. Missing, duplicate, or extra IDs in any input fail before metric creation.
-8. Manifest mode rejects `--max-real` and `--max-generated` and never calls path-hash subset selection.
-9. Two generated output directories with different filenames and path order still select the same ordered IDs when their per-sample JSONL files map the same manifest.
-10. Native and candidate payloads record the same ordered sample-ID digest.
+7. A unique real index that is a strict superset of the manifest succeeds.
+8. A real index with a duplicate ID or a missing manifest ID fails before metric creation.
+9. `per_sample.jsonl` and the generated-image ID set each fail on any missing, duplicate, or extra manifest ID.
+10. Manifest mode rejects `--max-real` and `--max-generated` and never calls path-hash subset selection.
+11. Two generated output directories with different filenames and path order still select the same ordered IDs when their per-sample JSONL files map the same manifest.
+12. Native and candidate payloads record the same ordered sample-ID digest.
 
 Use the installed OpenCV definition:
 
@@ -543,7 +553,7 @@ Add CLI arguments:
 --per-sample-jsonl PATH
 ```
 
-The manifest is ordered JSONL with one unique `sample_id` per row. Build exact maps from `real_index.sample_id -> image_path` and `per_sample.sample_id -> generated_image_path`, then materialize both path lists in manifest order. Reject any missing, duplicate, or extra sample ID. Record `sample_id_manifest`, count, and SHA256 digest in `quality.json`.
+The manifest is ordered JSONL with one unique `sample_id` per row. Build exact maps from `real_index.sample_id -> image_path` and `per_sample.sample_id -> generated_image_path`, then materialize both path lists in manifest order. The real index must have globally unique IDs and cover the manifest, but unrelated extra real IDs are allowed. In contrast, the per-sample ID set must equal the manifest exactly, and the set of image files in `generated_dir` must equal the generated paths named by those rows. Reject any generated-side missing, duplicate, or extra ID/file. Record `sample_id_manifest`, count, and SHA256 digest in `quality.json`.
 
 R8 must use manifest mode. In this mode reject `--max-real`, `--max-generated`, path-hash selection, directory-order truncation, and any generated file not selected through `per_sample.jsonl`. Legacy non-R8 callers may retain the old flags for backward compatibility, but the R8 matrix and result validator must reject an R8 payload that used them.
 
@@ -985,7 +995,7 @@ PYTHONPATH=src /home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python \
 
 ### Step 3: Validate artifacts and inspect images
 
-Verify four 16-sample shard manifests merge to the exact deterministic 64 IDs with no missing or duplicate row. Check the merged report against the fixed numerical gate. Open every direct/composed comparison page. Record the selected `t_cut`, or record that no split passed. On pass, write `locked_schedule_manifest.json` with checkpoint hash, gate-report hash, `t_cut`, `guided_steps=3`, the four guided time points, the three unguided time points, sample-ID digest, and selection rule. The launcher must pass both `--schedule-manifest` and the same explicit `--t-cut`.
+Verify four 16-sample shard manifests merge to the exact deterministic 64 IDs with no missing or duplicate row. Check the merged report against the fixed numerical and visual thresholds. Sort candidate values numerically and lock the smallest `t_cut` that passes every threshold. No manual tie-break is allowed. If none passes, record gate failure. On pass, write `locked_schedule_manifest.json` with checkpoint hash, gate-report hash, `t_cut`, `guided_steps=3`, the four guided time points, the three unguided time points, sample-ID digest, and deterministic selection rule. The launcher must pass both `--schedule-manifest` and the same explicit `--t-cut`.
 
 If the gate fails, skip both FMRG variants and run the four registered noise-oracle constraint/step configurations on GPUs 0-3. Do not leave a GPU idle and do not wait for new input.
 

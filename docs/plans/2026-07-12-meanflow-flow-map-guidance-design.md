@@ -158,7 +158,7 @@ This gate is an engineering validity test, not a theorem about MeanFlow:
 
 If no split passes, do not run a full FMRG-J matrix. Keep the report, run Route C, and state that the current checkpoint does not support the required intermediate-map assumption. Do not repair the failure with extra smoothing or post-processing.
 
-Every passing split is a candidate `t_cut`. Select it with the pre-registered semigroup residual, endpoint-consistency, and visual gate; do not prefer `0.25` merely because it makes a longer tail. Write the selected scalar into `locked_schedule_manifest.json`, the resolved experiment config, every CLI record, and every result artifact. FMRG launch must fail if those copies disagree.
+Sort candidate `t_cut` values in ascending numeric order. Select the smallest candidate that passes every pre-registered semigroup-residual, endpoint-consistency, and visual threshold; this gives the longest valid guided window. If none passes, the gate fails and execution moves to the noise-oracle matrix. There is no manual tie-break or post-hoc preference. Write the selected scalar into `locked_schedule_manifest.json`, the resolved experiment config, every CLI record, and every result artifact. FMRG launch must fail if those copies disagree.
 
 ## 6. Route B: Two Frozen-EMA FMRG-J Baselines
 
@@ -256,9 +256,9 @@ g_s <- per-sample normalize(g_s) * ||u_step||
 x_s = stop_gradient(x_bar - (t-s) * eta * g_s)
 ```
 
-Finish with an explicit unguided map to zero. This was the route previously called simply `FMRG-J`; it is not the current official HEAD ordering. Keep it as a paper-faithful comparison, not the main baseline.
+After the guided intervals, iterate both adjacent pairs in the shared `unguided_times` array, including `t_cut->mid` and `mid->0`. This was the route previously called simply `FMRG-J`; it is not the current official HEAD ordering. Keep it as a paper-faithful comparison, not the main baseline.
 
-Count B2 NFE from actual `CountedFlowMap` calls. Do not infer it from a generic formula, because schedule splitting, inner optimization count, and tail configuration change the total.
+Count B2 NFE from actual `CountedFlowMap` calls. Do not infer it from a generic formula. B1 and B2 must receive byte-identical locked `guided_times` and `unguided_times`; only their guided update ordering differs.
 
 B2 uses the same locked SAFA time arrays and a closed normalized `eta in {0.25, 0.5, 1.0, 2.0}` search.
 
@@ -355,7 +355,7 @@ No shard may silently reduce its sample count. A failed shard fails the 2048 res
 
 Face detection may be recorded as extra information, but it must not decide whether an image collapsed.
 
-Every quality run is keyed by an ordered sample-ID manifest. Join that manifest to the real index and each arm's `per_sample.jsonl` by exact `sample_id`; do not select images by path hash, directory order, `max_real`, or `max_generated`. Native, winner, and real inputs must have the same 2048 IDs and manifest digest. Missing, duplicate, or extra IDs fail the result. Different output directories are comparable only when their joined ID sequence and digest are identical.
+Every quality run is keyed by an ordered sample-ID manifest. Join that manifest to the real index and each arm's `per_sample.jsonl` by exact `sample_id`; do not select images by path hash, directory order, `max_real`, or `max_generated`. The complete real index may be a superset, but every real-index `sample_id` must be unique and it must cover every manifest ID. Each arm's `per_sample.jsonl` IDs and generated-image IDs must equal the manifest exactly: no missing, duplicate, or extra generated ID. Native, winner, and real metric inputs therefore share the same ordered 2048 IDs and manifest digest. Different output directories are comparable only when their joined ID sequence and digest are identical.
 
 The final E1/E2 protocol is prospective. Their files and hashes may be validated before a run, but their model outputs must not be computed until the winner config, checkpoint hash, sample-ID digest, noise seed, and 2048 generated files are locked. Do not use E1/E2 to revise the winner afterward.
 
