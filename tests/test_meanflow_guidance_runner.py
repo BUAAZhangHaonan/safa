@@ -826,13 +826,18 @@ def test_candidate_writes_matched_native_edev_traces_and_pil_contact_sheets(tmp_
     assert all(row["mode"] == "initial_noise" for row in rows)
     assert all(Path(row["generated"]).is_file() and Path(row["native"]).is_file() for row in rows)
     assert all(row["candidate_nfe"] == 3 and row["native_nfe"] == 1 for row in rows)
-    assert all("edev_cosine" in row for row in rows)
+    assert all("edev_cosine" in row and "native_edev_cosine" in row for row in rows)
     assert all(item["kind"] == "initial_noise" for item in rows[0]["candidate_trace"])
     assert rows[0]["native_trace"] == [
         {"kind": "matched_native", "r": 0.0, "t": 1.0}
     ]
     assert result["nfe"] == {"candidate": 3, "matched_native": 1}
-    assert set(result["cosine"]) == {"candidate_e0_target", "native_e0_target", "candidate_edev_source"}
+    assert set(result["cosine"]) == {
+        "candidate_e0_target",
+        "native_e0_target",
+        "candidate_edev_source",
+        "native_edev_source",
+    }
     assert all({"p05", "p10", "p90", "p95"}.issubset(summary) for summary in result["cosine"].values())
     contact_manifest = json.loads((output_dir / "contact_sheet_columns.json").read_text())
     assert contact_manifest["columns"] == ["source", "native", "candidate"]

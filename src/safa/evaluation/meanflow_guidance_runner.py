@@ -1021,15 +1021,20 @@ def run_guidance_records(
             candidate_cosine = F.cosine_similarity(candidate_embedding, target_z0, dim=1)
             native_cosine = F.cosine_similarity(native_embedding, target_z0, dim=1)
             edev_cosine = None
+            native_edev_cosine = None
             if runtime.edev is not None:
                 if source_images is None:
                     raise RuntimeError("calibration source images were not loaded")
                 edev_generated = runtime.edev(normalize_for_e0(generated))["embedding"]
+                edev_native = runtime.edev(normalize_for_e0(native_images))["embedding"]
                 edev_source = runtime.edev(normalize_for_e0(source_images))["embedding"]
                 edev_cosine = F.cosine_similarity(edev_generated, edev_source, dim=1)
+                native_edev_cosine = F.cosine_similarity(edev_native, edev_source, dim=1)
         tensors_to_check = [generated, native_images, candidate_cosine, native_cosine]
         if edev_cosine is not None:
             tensors_to_check.append(edev_cosine)
+        if native_edev_cosine is not None:
+            tensors_to_check.append(native_edev_cosine)
         if any(not torch.isfinite(tensor).all() for tensor in tensors_to_check):
             raise FloatingPointError("guidance runner produced non-finite images or cosine values")
         batch_semigroup = {}
@@ -1074,6 +1079,10 @@ def run_guidance_records(
             }
             if edev_cosine is not None:
                 row["edev_cosine"] = float(edev_cosine[local_index].detach().cpu())
+            if native_edev_cosine is not None:
+                row["native_edev_cosine"] = float(
+                    native_edev_cosine[local_index].detach().cpu()
+                )
             if mode == "semigroup":
                 row["semigroup"] = batch_semigroup[sample_id]
             source_io_per_sample = source_io_seconds / len(sample_ids)
@@ -1176,6 +1185,10 @@ def run_guidance_records(
     if all("edev_cosine" in row for row in final_rows):
         cosine["candidate_edev_source"] = _finite_summary(
             [float(row["edev_cosine"]) for row in final_rows]
+        )
+    if all("native_edev_cosine" in row for row in final_rows):
+        cosine["native_edev_source"] = _finite_summary(
+            [float(row["native_edev_cosine"]) for row in final_rows]
         )
 
     manifest = {
