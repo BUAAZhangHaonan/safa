@@ -127,6 +127,8 @@ Phi_{1->0}(x_init, c)
 
 The implementation should expose the general map without changing the native one-step result. This is a small model API addition, not a new model or training objective.
 
+`LatentCodec` is a wrapper, not an `nn.Module`. Freeze `codec.vae` explicitly with `eval()` and `requires_grad_(False)`, but call `codec.decode(latent)` outside `torch.no_grad()` so the representation loss retains its gradient to the latent state. Frozen parameters and differentiable inputs are separate requirements.
+
 ## 5. Route A: Semigroup Preflight
 
 ### Purpose
@@ -156,11 +158,21 @@ This gate is an engineering validity test, not a theorem about MeanFlow:
 
 If no split passes, do not run a full FMRG-J matrix. Keep the report, run Route C, and state that the current checkpoint does not support the required intermediate-map assumption. Do not repair the failure with extra smoothing or post-processing.
 
-The passing split closest to `s=0.25` becomes `t_cut`, because a longer final unguided jump gives the frozen prior more opportunity to restore image quality. If only another split passes, use that split and record the reason.
+Every passing split is a candidate `t_cut`. Select it with the pre-registered semigroup residual, endpoint-consistency, and visual gate; do not prefer `0.25` merely because it makes a longer tail. Write the selected scalar into `locked_schedule_manifest.json`, the resolved experiment config, every CLI record, and every result artifact. FMRG launch must fail if those copies disagree.
 
 ## 6. Route B: Two Frozen-EMA FMRG-J Baselines
 
 Both variants use a decreasing schedule `1=t_0 > t_1 > ... > t_N=0`, optimize only a temporary latent state, and leave the generator, VAE, and encoders frozen. Their state ordering is different and must remain visible in every config, artifact, and table.
+
+SAFA uses one explicit uniform schedule after the gate locks `t_cut`:
+
+```text
+guided_steps = 3
+guided_times = linspace(1.0, t_cut, 4)       # three guided intervals
+unguided_times = linspace(t_cut, 0.0, 3)    # two unguided intervals
+```
+
+This is a SAFA MeanFlow schedule. It does not reproduce FLUX's dynamic timestep shift, nominal `N=16` grid, or scheduler-specific sigma construction. All variants must consume the same locked `t_cut` and resolved time arrays.
 
 ### B1 Main Baseline: `official_head_current_xt`
 
@@ -180,6 +192,7 @@ current-x_t correction:
     delta_xt <- eta * g
 
   official-Adam mode:
+    lr_i = step_size * (1 - i/4) for guided interval i in {0,1,2}
     run the official inner Adam update on x_t
     delta_xt <- -(x_t_after - x_t_before)
 
@@ -209,14 +222,25 @@ paper_normalized_direct_autograd
 
 Do not silently replace Adam with direct gradient descent. Report the mode, step size, number of inner optimization steps, and whether per-sample velocity-norm scaling is active.
 
-The reference low-NFE contract must be reproduced in unit tests and smoke metadata. For nominal schedule `N=16`, guided prefix `L=4`, unguided tail `U=2`, and `nopt=1`:
+The behaviors are intentionally different. `official_adam` uses Adam state and the interval-decayed learning rate. `paper_normalized_direct_autograd` uses a direct per-sample normalized gradient scaled by the step velocity and has no optimizer state. For Adam with `nopt>1`, recompute `Phi_{t->0}(x_t)` and its representation loss after every inner update at the updated `x_t`; reusing the first endpoint would not implement the official loop. The first study fixes `nopt=1` but tests the refresh contract before accepting the implementation.
+
+The closed B1 search is:
+
+```text
+sample_mode in {flow_map1, flow_map2}
+official_adam step_size in {1.0, 3.0}
+paper_normalized_direct_autograd eta in {0.25, 0.5, 1.0, 2.0}
+nopt = 1
+```
+
+For the resolved SAFA schedule with three guided intervals, two unguided intervals, and `nopt=1`:
 
 ```text
 official_head_current_xt + flow_map1: NFE = 5
 official_head_current_xt + flow_map2: NFE = 8
 ```
 
-These counts include the official early-stop/tail ordering. They replace the incorrect blanket `2K+1` claim.
+`flow_map1` uses one endpoint/step call per guided interval plus two tail calls. `flow_map2` uses separate endpoint and step calls per guided interval plus two tail calls. These counts replace both the incorrect blanket `2K+1` claim and the earlier FLUX `N/L/U` description.
 
 ### B2 Paper Ablation: `paper_algorithm_split`
 
@@ -235,6 +259,8 @@ x_s = stop_gradient(x_bar - (t-s) * eta * g_s)
 Finish with an explicit unguided map to zero. This was the route previously called simply `FMRG-J`; it is not the current official HEAD ordering. Keep it as a paper-faithful comparison, not the main baseline.
 
 Count B2 NFE from actual `CountedFlowMap` calls. Do not infer it from a generic formula, because schedule splitting, inner optimization count, and tail configuration change the total.
+
+B2 uses the same locked SAFA time arrays and a closed normalized `eta in {0.25, 0.5, 1.0, 2.0}` search.
 
 ### Why These Routes May Protect Quality
 
@@ -273,6 +299,8 @@ Gaussian radial typical shell:
 
 The fixed-radius form is the primary oracle because it preserves the exact initial per-sample norm. The shell is an ablation. Neither constraint preserves the full Gaussian distribution after target-dependent angular optimization. Therefore success proves reachability under a radial constraint, not distributional equivalence to random sampling.
 
+Use the same closed normalized update scale `eta in {0.25, 0.5, 1.0, 2.0}`. Do not add a second unregistered step-size grid.
+
 Report initial and final norm, squared norm per dimension, cosine to the initial noise, update norm, and aggregate channel mean/std. Use the final re-evaluated projected point. With `T` updates, report `T+1` NFE.
 
 ## 8. Four-GPU Experiment
@@ -289,12 +317,12 @@ Run four independent processes at the same time:
 
 | Physical GPU | Arm | Calibration search |
 | --- | --- | --- |
-| 0 | native EMA control | null-conditioned native sample plus direct-target-condition diagnostic |
-| 1 | B1 official HEAD `flow_map1` | `official_adam` and `paper_normalized_direct_autograd`, closed step-size search |
-| 2 | B1 official HEAD `flow_map2` | the same two optimization modes and closed search |
-| 3 | B2 paper split plus Route C | paper-split candidate sequence, then fixed-radius and typical-shell oracle candidates |
+| 0 | B1 official HEAD `flow_map1` | Adam `{1.0,3.0}` then normalized `{0.25,0.5,1.0,2.0}` serially |
+| 1 | B1 official HEAD `flow_map2` | Adam `{1.0,3.0}` then normalized `{0.25,0.5,1.0,2.0}` serially |
+| 2 | B2 paper split | normalized `eta={0.25,0.5,1.0,2.0}` serially |
+| 3 | Route C initial-noise oracle | normalized `eta={0.25,0.5,1.0,2.0}` over the registered constraint configs serially |
 
-Every calibration candidate uses the same 64 samples. Save every image and make paired pages with columns `source`, `native`, and `candidate`. An agent must directly open every page before selecting the winner. Calibration FID is diagnostic only: 64 samples are too few for it to choose or reject a winner by itself. Selection uses E0, the allowed ResNet18 development encoder, Sharpness/KID/NIQE, exact costs, and direct images under a fixed rule.
+Start all four GPU processes before waiting; each process executes only its closed candidate list serially. Every process generates or reuses the same matched native control. Every calibration candidate uses the same 64 sample-ID manifest. Save every image and make paired pages with columns `source`, `native`, and `candidate`. An agent must directly open every page before selecting the winner. Calibration FID is diagnostic only: 64 samples are too few for it to choose or reject a winner by itself. Selection uses E0, the allowed ResNet18 development encoder, Sharpness/KID/NIQE, exact costs, and direct images under a fixed rule.
 
 If the semigroup gate fails, do not leave GPUs idle and do not run either FMRG family. Replace the calibration matrix with four explicit Route C configurations spanning fixed-radius versus typical-shell constraints and the pre-registered step sizes. Keep one matched native generation inside each shard for comparison.
 
@@ -326,6 +354,8 @@ No shard may silently reduce its sample count. A failed shard fails the 2048 res
 - NFE, wall time, images per second, peak allocated VRAM, and peak reserved VRAM.
 
 Face detection may be recorded as extra information, but it must not decide whether an image collapsed.
+
+Every quality run is keyed by an ordered sample-ID manifest. Join that manifest to the real index and each arm's `per_sample.jsonl` by exact `sample_id`; do not select images by path hash, directory order, `max_real`, or `max_generated`. Native, winner, and real inputs must have the same 2048 IDs and manifest digest. Missing, duplicate, or extra IDs fail the result. Different output directories are comparable only when their joined ID sequence and digest are identical.
 
 The final E1/E2 protocol is prospective. Their files and hashes may be validated before a run, but their model outputs must not be computed until the winner config, checkpoint hash, sample-ID digest, noise seed, and 2048 generated files are locked. Do not use E1/E2 to revise the winner afterward.
 

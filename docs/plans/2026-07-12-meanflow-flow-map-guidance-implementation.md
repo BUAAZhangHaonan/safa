@@ -200,9 +200,13 @@ test_semigroup_probe_returns_zero_for_exact_semigroup
 test_semigroup_probe_reports_each_requested_split
 test_semigroup_probe_rejects_unsorted_or_boundary_split
 test_semigroup_relative_residual_is_finite_for_zero_endpoints
+test_latent_codec_wrapper_freezes_vae_but_keeps_decode_input_gradient
+test_assert_guidance_stack_checks_codec_vae_not_codec_parameters
 ```
 
 The exact-semigroup fake should implement `Phi_{t->r}(x) = exp(-(t-r)) * x`, so direct and composed endpoints are equal within floating-point tolerance.
+
+Do not rely only on the identity codec fake. Construct the real `safa.training.latent_codec.LatentCodec` around a small differentiable fake VAE that exposes the actual `.decode(...).sample` interface. Assert that `codec` is not treated as an `nn.Module`, `codec.vae.training` is false, every VAE parameter has `requires_grad=False`, `decoded.sum().backward()` populates the latent input gradient, and no VAE parameter gradient appears.
 
 ### Step 2: Run and verify failure
 
@@ -230,13 +234,23 @@ class CountedFlowMap:
     def __call__(self, x, z, *, t, r): ...
 
 
-def freeze_guidance_stack(generator, codec, e0) -> None: ...
-def assert_guidance_stack_frozen(generator, codec, e0) -> None: ...
+def freeze_guidance_stack(generator, codec, e0) -> None:
+    generator.eval().requires_grad_(False)
+    codec.vae.eval()
+    codec.vae.requires_grad_(False)
+    e0.eval().requires_grad_(False)
+
+
+def assert_guidance_stack_frozen(generator, codec, e0) -> None:
+    # Inspect generator.parameters(), codec.vae.parameters(), and e0.parameters().
+    ...
 def symmetric_relative_l2(left, right, eps=1.0e-8) -> torch.Tensor: ...
 def semigroup_probe(flow_map, x_init, condition, split_times) -> dict: ...
 ```
 
 `CountedFlowMap` increments once for each vector-field evaluation, not once per image. `semigroup_probe` must return the direct endpoint, each composed endpoint, per-sample residuals, and total NFE. It must not decode or compute FID.
+
+Never wrap `codec.decode(...)` or the following E0 forward in `torch.no_grad()` inside guidance. Parameter freezing prevents weight updates while autograd must still connect the decoded image and loss to the latent input.
 
 ### Step 4: Run focused tests
 
@@ -265,14 +279,17 @@ test_official_current_xt_takes_endpoint_gradient_at_xt_before_advance
 test_official_current_xt_flow_map1_reuses_endpoint_velocity
 test_official_current_xt_flow_map2_uses_distinct_endpoint_and_step_maps
 test_official_current_xt_supports_adam_and_normalized_direct_modes
-test_official_reference_flow_map1_n16_l4_u2_nopt1_is_five_nfe
-test_official_reference_flow_map2_n16_l4_u2_nopt1_is_eight_nfe
+test_safa_uniform_schedule_flow_map1_nopt1_is_five_nfe
+test_safa_uniform_schedule_flow_map2_nopt1_is_eight_nfe
+test_official_adam_uses_interval_decay_one_minus_i_over_four
+test_official_adam_nopt_gt_one_refreshes_endpoint_at_updated_xt
+test_normalized_mode_has_no_adam_state_or_lr_decay
 test_official_current_xt_finishes_with_official_unguided_tail_order
 test_official_current_xt_leaves_generator_codec_and_e0_unchanged
 test_official_current_xt_fails_on_non_finite_gradient
 ```
 
-Record every fake vector-field `(t,r)` call. Use the audited reference contract `N=16`, `L=4`, `U=2`, and `nopt=1`; assert five NFE for `flow_map1` and eight for `flow_map2`. These assertions must fail if endpoint and interval maps are accidentally double-counted or merged in the wrong mode.
+Record every fake vector-field `(t,r)` call. With `guided_times=linspace(1,t_cut,4)`, `unguided_times=linspace(t_cut,0,3)`, and `nopt=1`, assert five NFE for `flow_map1` and eight for `flow_map2`. Assert Adam learning rates are exactly `step_size*(1-i/4)` for guided interval indices `i=0,1,2`. With `nopt=2`, record two distinct endpoint calls and prove the second consumes the updated `x_t`, not the interval's initial tensor.
 
 ### Step 2: Write failing paper-split tests
 
@@ -307,9 +324,8 @@ def sample_official_head_current_xt(
     x_init: torch.Tensor,
     transport_condition: torch.Tensor,
     target_z0: torch.Tensor,
-    num_steps: int,
-    early_stop: int,
-    unguided_steps: int,
+    guided_times: Sequence[float],
+    unguided_times: Sequence[float],
     sample_mode: Literal["flow_map1", "flow_map2"],
     optimization_mode: Literal["official_adam", "paper_normalized_direct_autograd"],
     num_optim_iters: int,
@@ -318,7 +334,7 @@ def sample_official_head_current_xt(
     ...
 ```
 
-Follow official `fmrg/fluxfm_sampler_reward.py:388-461,1039-1115,1140-1167`, including its early-stop and unguided-tail ordering. At current `x_t`, build the endpoint lookahead before advancing:
+Follow the current-x_t update behavior in official `fmrg/fluxfm_sampler_reward.py:388-461,1039-1115,1140-1167`, but use SAFA's explicit uniform time arrays rather than FLUX dynamic-shift timesteps. At current `x_t`, build the endpoint lookahead before advancing:
 
 ```python
 x_t = x_t.detach().requires_grad_(True)
@@ -333,8 +349,10 @@ For `flow_map1`, reuse `u_endpoint` as `u_step`. For `flow_map2`, make a separat
 
 ```python
 if optimization_mode == "official_adam":
+    lr_i = step_size * (1.0 - interval_index / 4.0)
     # Match the official inner x_t Adam update and derive
     # delta_xt = -(x_t_after - x_t_before).
+    # For every inner iteration, recompute x0_hat from the updated x_t.
     ...
 else:
     gradient = torch.autograd.grad(loss, x_t, only_inputs=True)[0]
@@ -437,7 +455,7 @@ def optimize_initial_noise(
     transport_condition: torch.Tensor,
     target_z0: torch.Tensor,
     num_updates: int,
-    step_fraction: float,
+    eta: float,
     projection: Literal["fixed_radius", "typical_shell"],
     typical_delta: float = 0.05,
 ) -> GuidanceResult:
@@ -447,12 +465,11 @@ def optimize_initial_noise(
 At each update, evaluate `Phi_{1->0}`, decode, calculate full-Z0 cosine loss, take `grad = autograd.grad(loss, noise)`, normalize each sample, and update by:
 
 ```text
-step_norm = step_fraction * sqrt(d)
-noise <- noise - step_norm * grad / (||grad||_2 + 1e-8)
+noise <- noise - eta * grad / (||grad||_2 + 1e-8)
 noise <- project(noise)
 ```
 
-Detach and re-enable only the input gradient between updates. Re-evaluate the projected final point after the last update. Record the initial/final norm, norm squared per dimension, initial-final cosine, update norm, channel mean/std, loss history, and NFE.
+Use only `eta in {0.25,0.5,1.0,2.0}`. Detach and re-enable only the input gradient between updates. Re-evaluate the projected final point after the last update. Record the initial/final norm, norm squared per dimension, initial-final cosine, update norm, channel mean/std, loss history, and NFE.
 
 ### Step 5: Run tests and commit
 
@@ -464,7 +481,7 @@ git commit -m "feat(guidance): add constrained noise oracle"
 git push origin master
 ```
 
-## Task 5: Add Sharpness to the Shared Quality Evaluator
+## Task 5: Add Sharpness and Exact Sample-ID Quality Joining
 
 **Files:**
 - Modify: `tests/test_phase_a_scripts.py`
@@ -479,6 +496,11 @@ Add tests that:
 3. `metrics=["sharpness"]` does not require a real index or create FID/KID/NIQE models.
 4. The JSON contains mean, std, median, p10, and p90.
 5. Existing default metrics remain exactly `fid`, `kid`, and `niqe` for backward compatibility.
+6. `--sample-id-manifest` joins the real index and `--per-sample-jsonl` by exact sample ID.
+7. Missing, duplicate, or extra IDs in any input fail before metric creation.
+8. Manifest mode rejects `--max-real` and `--max-generated` and never calls path-hash subset selection.
+9. Two generated output directories with different filenames and path order still select the same ordered IDs when their per-sample JSONL files map the same manifest.
+10. Native and candidate payloads record the same ordered sample-ID digest.
 
 Use the installed OpenCV definition:
 
@@ -495,7 +517,7 @@ PYTHONPATH=src /home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python -m pytest \
 
 Expected: `sharpness` is rejected as unsupported.
 
-### Step 3: Implement without changing defaults
+### Step 3: Implement manifest joining without changing legacy defaults
 
 Add `sharpness` to `SUPPORTED_METRICS`, not to `DEFAULT_METRICS`. Compute it for the selected generated paths only. Write:
 
@@ -513,6 +535,17 @@ Add `sharpness` to `SUPPORTED_METRICS`, not to `DEFAULT_METRICS`. Compute it for
 ```
 
 Do not mix source/real image Sharpness into the generated summary.
+
+Add CLI arguments:
+
+```text
+--sample-id-manifest PATH
+--per-sample-jsonl PATH
+```
+
+The manifest is ordered JSONL with one unique `sample_id` per row. Build exact maps from `real_index.sample_id -> image_path` and `per_sample.sample_id -> generated_image_path`, then materialize both path lists in manifest order. Reject any missing, duplicate, or extra sample ID. Record `sample_id_manifest`, count, and SHA256 digest in `quality.json`.
+
+R8 must use manifest mode. In this mode reject `--max-real`, `--max-generated`, path-hash selection, directory-order truncation, and any generated file not selected through `per_sample.jsonl`. Legacy non-R8 callers may retain the old flags for backward compatibility, but the R8 matrix and result validator must reject an R8 payload that used them.
 
 ### Step 4: Run tests and commit
 
@@ -543,6 +576,8 @@ test_checkpoint_contract_requires_learned_null_condition
 test_checkpoint_contract_accepts_exact_target_metadata
 test_guidance_config_rejects_target_condition_as_transport
 test_guidance_config_requires_unique_output_directory
+test_guidance_config_locks_uniform_times_from_manifest_t_cut
+test_guidance_config_rejects_t_cut_mismatch_across_manifest_cli_and_yaml
 test_result_metadata_records_checkpoint_hash_seed_nfe_and_weight_source
 test_calibration_loads_e0_and_edev_but_not_e1_or_e2
 test_final_heldout_eval_requires_locked_winner_manifest
@@ -571,6 +606,7 @@ The runner module must:
 5. Load/freeze E0 and VAE. Load/freeze Edev only for calibration. Do not load E1/E2 in this runner before winner lock.
 6. Use `FeatureAlignedAffectNet` and `make_x_init_for_sample_ids` so sample IDs and noise match existing evaluation.
 7. Construct transport condition only with `generator.make_null_condition(...)`.
+8. Resolve `guided_times=linspace(1,t_cut,4)` and `unguided_times=linspace(t_cut,0,3)` from the locked schedule manifest; reject any CLI/config disagreement.
 
 Reject mismatches; do not fall back to raw weights, another epoch, B/2, random initialization, a downloaded model, or target-conditioned transport.
 
@@ -589,10 +625,11 @@ initial_noise
 For each generation arm:
 
 - Save one PNG per sample with a stable ordinal and sanitized sample ID.
-- Save `per_sample.jsonl` with target cosine and route diagnostics.
+- Save `per_sample.jsonl` with unique `sample_id`, exact `generated_image_path`, target cosine, and route diagnostics so quality evaluation can join by ID.
 - Save `generation_result.json` with E0 and phase-allowed Edev statistics, NFE, exact flow-map call trace, wall time, images/sec, peak allocated VRAM, peak reserved VRAM, checkpoint SHA256, exact config, and sample count.
 - Save 64 deterministic visual pages. Each row contains source, matched native, and candidate. Label columns in a separate JSON manifest, not by drawing text over images.
 - Save all raw candidate images. Do not save only face-detected images or a selected subset.
+- Copy the locked ordered sample-ID manifest and its digest into every arm result. Record the resolved `t_cut`, guided time array, and unguided time array for every FMRG candidate.
 
 Measure CUDA cost as follows:
 
@@ -619,16 +656,16 @@ NFE is the counted vector-field calls in the candidate algorithm. Native compari
 --output-dir PATH
 --eta FLOAT
 --num-updates N
---step-fraction FLOAT
 --projection fixed_radius|typical_shell
 --semigroup-report PATH
+--schedule-manifest PATH --t-cut FLOAT
 --fmrg-variant official_head_current_xt|paper_algorithm_split
 --sample-mode flow_map1|flow_map2
 --optimization-mode official_adam|paper_normalized_direct_autograd
---num-steps N --early-stop N --unguided-steps N --num-optim-iters N
+--num-optim-iters N
 ```
 
-Config values are the default; explicit CLI values are recorded overrides. `--semigroup-report` is mandatory for either FMRG variant and must name a passing merged 64-sample report with the same checkpoint SHA256.
+Config values are the default; explicit CLI values are recorded overrides. `--semigroup-report` and `--schedule-manifest` are mandatory for either FMRG variant. The report, manifest, resolved config, and explicit `--t-cut` must agree on the passing split and checkpoint SHA256 or the run aborts.
 
 ### Step 6: Test, compile, commit, and push
 
@@ -649,14 +686,14 @@ git push origin master
 
 **Files:**
 - Create: `configs/medium_v2/experiments/r8_meanflow_semigroup_preflight.yaml`
-- Create: `configs/medium_v2/experiments/r8_meanflow_native_ema_gpu0.yaml`
-- Create: `configs/medium_v2/experiments/r8_meanflow_official_xt_flow_map1_gpu1.yaml`
-- Create: `configs/medium_v2/experiments/r8_meanflow_official_xt_flow_map2_gpu2.yaml`
-- Create: `configs/medium_v2/experiments/r8_meanflow_paper_split_gpu3.yaml`
-- Create: `configs/medium_v2/experiments/r8_meanflow_noise_fixed_001.yaml`
-- Create: `configs/medium_v2/experiments/r8_meanflow_noise_fixed_003.yaml`
-- Create: `configs/medium_v2/experiments/r8_meanflow_noise_shell_003.yaml`
-- Create: `configs/medium_v2/experiments/r8_meanflow_noise_shell_010.yaml`
+- Create: `configs/medium_v2/experiments/r8_meanflow_native_ema.yaml`
+- Create: `configs/medium_v2/experiments/r8_meanflow_official_xt_flow_map1_gpu0.yaml`
+- Create: `configs/medium_v2/experiments/r8_meanflow_official_xt_flow_map2_gpu1.yaml`
+- Create: `configs/medium_v2/experiments/r8_meanflow_paper_split_gpu2.yaml`
+- Create: `configs/medium_v2/experiments/r8_meanflow_noise_fixed_eta025.yaml`
+- Create: `configs/medium_v2/experiments/r8_meanflow_noise_fixed_eta05.yaml`
+- Create: `configs/medium_v2/experiments/r8_meanflow_noise_shell_eta1.yaml`
+- Create: `configs/medium_v2/experiments/r8_meanflow_noise_shell_eta2.yaml`
 - Create: `tests/test_r8_meanflow_guidance_configs.py`
 
 ### Step 1: Write config-contract tests first
@@ -670,9 +707,10 @@ The tests must load all nine YAML files and assert:
 - `sampling_seed: 1337`.
 - Unique experiment and output names.
 - Semigroup split times exactly `[0.75, 0.5, 0.25]`.
-- Official variants use `N=16`, `L=4`, `U=2`, `nopt=1`, one config each for `flow_map1` and `flow_map2`, and list both `official_adam` and `paper_normalized_direct_autograd` calibration modes.
+- Every guided config points to one locked schedule manifest. It resolves `guided_steps=3`, `guided_times=linspace(1,t_cut,4)`, and `unguided_times=linspace(t_cut,0,3)` and rejects a CLI/config `t_cut` mismatch.
+- Official variants use `nopt=1`, one config each for `flow_map1` and `flow_map2`, Adam step sizes `[1.0,3.0]`, and normalized eta `[0.25,0.5,1.0,2.0]`.
 - The paper variant is named `paper_algorithm_split` and never aliases the official implementation.
-- Noise oracle projection defaults to `fixed_radius`, `num_updates: 8`, and `step_fraction: 0.003`.
+- Paper split and noise oracle use the same closed normalized eta `[0.25,0.5,1.0,2.0]`; the four fallback noise configs bind those four eta values to their registered fixed-radius/shell constraints.
 - Required metrics are `fid`, `kid`, `niqe`, and `sharpness`.
 - Calibration and visual review counts are 64. Full native/winner count is 2048.
 - E1/E2 evaluation has `prospective_after_winner_lock: true` and cannot appear in a calibration metric list.
@@ -701,6 +739,7 @@ expected_stage_epoch_1based: 1652
 expected_model_type: meanflow_sit
 expected_sit_patch_size: 4
 transport_condition: learned_null_condition
+schedule_manifest: artifacts/r8_meanflow_flow_map_guidance/semigroup/locked_schedule_manifest.json
 e0_checkpoint: artifacts/checkpoints/e0_medium_v1/best.pt
 edev_checkpoint: artifacts/checkpoints/e0_resnet18/best.pt
 heldout_e1_checkpoint: artifacts/checkpoints/e0_dinov2_large_v2/best.pt
@@ -722,12 +761,12 @@ quality_metrics: [fid, kid, niqe, sharpness]
 Add the route-specific values asserted above. Keep calibration candidates in config:
 
 ```text
-official optimization modes: official_adam, paper_normalized_direct_autograd
+official Adam step_size candidates: 1.0, 3.0
+official normalized eta candidates: 0.25, 0.5, 1.0, 2.0
 official sample modes: flow_map1 or flow_map2 as named by the config
-official reference schedule: N=16, L=4, U=2, nopt=1
-paper-split step-size candidates: 0.01, 0.03, 0.10
-noise update candidates: 4, 8, 16
-noise step-fraction candidates: 0.001, 0.003, 0.010
+SAFA schedule: guided_steps=3, two unguided tail intervals, nopt=1
+paper-split eta candidates: 0.25, 0.5, 1.0, 2.0
+noise-oracle eta candidates: 0.25, 0.5, 1.0, 2.0
 ```
 
 These are a closed first search. Do not add candidates after looking at results without a new config and commit.
@@ -767,6 +806,8 @@ test_matrix_calibration_launches_four_processes_concurrently
 test_matrix_failed_semigroup_replaces_all_four_arms_with_noise_configs
 test_matrix_full_requires_2048_samples_and_visual_review
 test_matrix_full_shards_locked_native_and_winner_across_four_gpus
+test_matrix_quality_commands_require_manifest_and_per_sample_join
+test_matrix_quality_commands_never_use_max_count_flags
 test_matrix_records_exit_codes_peak_memory_and_external_processes
 test_matrix_terminates_started_children_after_partial_launch_failure
 ```
@@ -803,10 +844,10 @@ semigroup:
   merge all 64 rows by sample ID, then write one gate report
 
 calibrate:
-  GPU0 native control
-  GPU1 official_head_current_xt flow_map1 candidates
-  GPU2 official_head_current_xt flow_map2 candidates
-  GPU3 paper_algorithm_split then noise-oracle candidates
+  GPU0 official_head_current_xt flow_map1 closed candidates
+  GPU1 official_head_current_xt flow_map2 closed candidates
+  GPU2 paper_algorithm_split closed candidates
+  GPU3 initial-noise oracle closed candidates
   all four physical GPU processes start before waiting for any one of them
   if semigroup failed, replace GPUs 0-3 with the four registered noise configs
 
@@ -823,15 +864,15 @@ For each generated candidate, chain the quality command only after generation su
   scripts/eval_generation_quality.py \
   --real-index data/index/val_face_mixed_e14.jsonl \
   --generated-dir ARM_OUTPUT/generated_images \
+  --per-sample-jsonl ARM_OUTPUT/per_sample.jsonl \
+  --sample-id-manifest LOCKED_SAMPLE_ID_MANIFEST.jsonl \
   --output ARM_OUTPUT/quality.json \
-  --max-generated 2048 \
-  --max-real 2048 \
   --seed 1337 \
   --device cuda:0 \
   --metrics fid kid niqe sharpness
 ```
 
-The calibration form changes both limits to 64. Its FID is diagnostic and is never the sole selection/ranking key. Write a lock and `matrix_status.json` with exact commands, GPU UUIDs, external process records, start/end times, exit codes, and output paths. Refuse to overwrite any output.
+The calibration command uses a locked 64-ID manifest; the full command uses the locked 2048-ID manifest. Neither passes max-count flags. Calibration FID is diagnostic and is never the sole selection/ranking key. Write a lock and `matrix_status.json` with exact commands, GPU UUIDs, external process records, start/end times, exit codes, schedule manifest, sample-ID manifest digest, and output paths. Refuse to overwrite any output.
 
 ### Step 4: Test, dry-run, commit, and push
 
@@ -944,7 +985,7 @@ PYTHONPATH=src /home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python \
 
 ### Step 3: Validate artifacts and inspect images
 
-Verify four 16-sample shard manifests merge to the exact deterministic 64 IDs with no missing or duplicate row. Check the merged report against the fixed numerical gate. Open every direct/composed comparison page. Record the selected `t_cut`, or record that no split passed.
+Verify four 16-sample shard manifests merge to the exact deterministic 64 IDs with no missing or duplicate row. Check the merged report against the fixed numerical gate. Open every direct/composed comparison page. Record the selected `t_cut`, or record that no split passed. On pass, write `locked_schedule_manifest.json` with checkpoint hash, gate-report hash, `t_cut`, `guided_steps=3`, the four guided time points, the three unguided time points, sample-ID digest, and selection rule. The launcher must pass both `--schedule-manifest` and the same explicit `--t-cut`.
 
 If the gate fails, skip both FMRG variants and run the four registered noise-oracle constraint/step configurations on GPUs 0-3. Do not leave a GPU idle and do not wait for new input.
 
@@ -1022,6 +1063,8 @@ per-sample JSONL rows: 2048
 visual-review manifest sample IDs: 64
 all required metric fields finite
 checkpoint hashes and sample-ID digests identical across arms
+real/native/winner IDs exactly equal the locked 2048 manifest in order
+quality payload confirms manifest join and contains no max-count selection
 ```
 
 Open all full visual pages and update `visual_review.json` with the full-arm IDs.
@@ -1084,6 +1127,8 @@ Expected: all tests pass, Ruff passes, compileall passes, and `git diff --check`
 The report must contain:
 
 - Exact checkpoint contract and SHA256.
+- Locked `t_cut`, explicit SAFA guided/unguided time arrays, and schedule-manifest hash.
+- Locked 2048 sample-ID manifest digest proving identical real/native/winner membership.
 - Semigroup residual table and pass/fail decision.
 - Full metric table with FID, KID, NIQE, Sharpness, cosine, NFE, speed, and VRAM.
 - Separate E0, Edev, E1, and E2 columns; E1/E2 include within-encoder cosine, pairwise-distance Spearman, and 8-class accuracy.
