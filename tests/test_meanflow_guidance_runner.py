@@ -275,6 +275,7 @@ def _write_locked_schedule_fixture(tmp_path: Path) -> tuple[Path, dict]:
     report = {
         "gate_passed": True,
         "checkpoint_sha256": "a" * 64,
+        "sample_id_manifest_sha256": _file_sha256(sample_manifest),
         "selected_t_cut": 0.25,
     }
     _write_json(report_path, report)
@@ -353,6 +354,60 @@ def test_locked_schedule_rejects_report_manifest_or_self_digest_tampering(tmp_pa
     _write_json(schedule_path, payload)
     with pytest.raises(ValueError, match="schedule contract SHA256"):
         resolve_locked_schedule(config, checkpoint_sha256="a" * 64)
+
+
+@pytest.mark.parametrize(
+    "report_manifest_binding",
+    ("different_manifest", "missing"),
+)
+def test_semigroup_gate_binds_report_to_locked_sample_manifest_before_runtime_loading(
+    report_manifest_binding: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schedule_path, schedule_config = _write_locked_schedule_fixture(tmp_path)
+    report_path = Path(schedule_config["semigroup_report"])
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+
+    if report_manifest_binding == "different_manifest":
+        other_manifest = tmp_path / "other_semigroup_sample_ids.jsonl"
+        _write_jsonl(other_manifest, [{"sample_id": "sample-B"}])
+        report["sample_id_manifest_sha256"] = _file_sha256(other_manifest)
+    else:
+        report.pop("sample_id_manifest_sha256")
+    _write_json(report_path, report)
+    schedule = json.loads(schedule_path.read_text(encoding="utf-8"))
+    schedule["semigroup_report_sha256"] = _file_sha256(report_path)
+    schedule["schedule_contract_sha256"] = _schedule_contract_sha256(schedule)
+    _write_json(schedule_path, schedule)
+
+    from safa.data import feature_dataset as dataset_module
+    from safa.utils import device as device_module
+
+    def forbidden_runtime_loading(*args, **kwargs):
+        pytest.fail("semigroup gate must fail before dataset, CUDA, or model loading")
+
+    monkeypatch.setattr(
+        runner_module,
+        "asset_contract_from_config",
+        lambda config: {"checkpoint": {"sha256": "a" * 64}},
+    )
+    monkeypatch.setattr(runner_module, "_bind_arm_config_digest", lambda config: dict(config))
+    monkeypatch.setattr(dataset_module, "FeatureAlignedAffectNet", forbidden_runtime_loading)
+    monkeypatch.setattr(device_module, "require_cuda_device", forbidden_runtime_loading)
+    monkeypatch.setattr(runner_module, "build_frozen_runtime", forbidden_runtime_loading)
+    run_config = {
+        **_r8_guidance_config(),
+        **schedule_config,
+        "mode": "paper_algorithm_split",
+        "device": "cuda:0",
+    }
+
+    with pytest.raises(ValueError, match="sample_id_manifest_sha256"):
+        run_guidance_from_config(
+            run_config,
+            output_dir=tmp_path / f"run-{report_manifest_binding}",
+        )
 
 
 def test_asset_contract_locks_all_r8_assets_features_and_input_manifest(

@@ -1410,7 +1410,12 @@ def run_guidance_from_config(
             checkpoint_sha256=checkpoint_sha256,
             explicit_t_cut=explicit_t_cut,
         )
-        _validate_semigroup_gate(resolved, checkpoint_sha256, schedule["t_cut"])
+        _validate_semigroup_gate(
+            resolved,
+            checkpoint_sha256,
+            schedule["t_cut"],
+            schedule["semigroup_sample_id_manifest_sha256"],
+        )
         resolved["locked_schedule"] = schedule
     resolved = _bind_arm_config_digest(resolved)
     dataset = FeatureAlignedAffectNet(
@@ -1536,7 +1541,12 @@ def _preflight_existing_resume_contract(
         raise ValueError("existing resume contract disagrees before CUDA/model loading")
 
 
-def _validate_semigroup_gate(config: Mapping[str, Any], checkpoint_hash: str, t_cut: float) -> None:
+def _validate_semigroup_gate(
+    config: Mapping[str, Any],
+    checkpoint_hash: str,
+    t_cut: float,
+    locked_sample_id_manifest_sha256: str,
+) -> None:
     report_value = config.get("semigroup_report")
     if not report_value:
         raise ValueError("FMRG guidance requires semigroup_report")
@@ -1545,6 +1555,26 @@ def _validate_semigroup_gate(config: Mapping[str, Any], checkpoint_hash: str, t_
         raise ValueError("semigroup report must record gate_passed=true")
     if report.get("checkpoint_sha256") != checkpoint_hash:
         raise ValueError("semigroup report checkpoint SHA256 disagrees with the loaded checkpoint")
+    locked_sample_manifest_sha256 = _require_sha256(
+        locked_sample_id_manifest_sha256,
+        "locked schedule semigroup_sample_id_manifest_sha256",
+    )
+    config_sample_manifest_sha256 = _require_sha256(
+        config.get("semigroup_sample_id_manifest_sha256"),
+        "config semigroup_sample_id_manifest_sha256",
+    )
+    if config_sample_manifest_sha256 != locked_sample_manifest_sha256:
+        raise ValueError(
+            "config semigroup sample manifest SHA256 disagrees with locked schedule"
+        )
+    report_sample_manifest_sha256 = _require_sha256(
+        report.get("sample_id_manifest_sha256"),
+        "semigroup report sample_id_manifest_sha256",
+    )
+    if report_sample_manifest_sha256 != locked_sample_manifest_sha256:
+        raise ValueError(
+            "semigroup report sample_id_manifest_sha256 disagrees with locked schedule"
+        )
     selected = _finite_open_unit(
         report.get("selected_t_cut", report.get("t_cut")), "semigroup report selected t_cut"
     )
