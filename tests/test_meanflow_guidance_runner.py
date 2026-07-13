@@ -691,6 +691,33 @@ def test_manifest_sharding_and_resume_are_deterministic_and_strict(tmp_path: Pat
         read_ordered_sample_manifest(manifest)
 
 
+def test_feature_dataset_records_reject_duplicate_ids_before_selection_or_manifest_join(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ForbiddenFeatureSelection:
+        def __getitem__(self, index):
+            pytest.fail("duplicate IDs must be rejected before feature selection")
+
+    dataset = SimpleNamespace(
+        records=[
+            SimpleNamespace(sample_id="duplicate-feature-id", image_path=Path("a.png")),
+            SimpleNamespace(sample_id="duplicate-feature-id", image_path=Path("b.png")),
+        ],
+        features=ForbiddenFeatureSelection(),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "read_ordered_sample_manifest",
+        lambda path: pytest.fail("duplicate IDs must be rejected before manifest join"),
+    )
+
+    with pytest.raises(ValueError, match="duplicate-feature-id"):
+        runner_module._records_from_feature_dataset(
+            dataset,
+            {"sample_id_manifest": "samples.jsonl"},
+        )
+
+
 def test_session_memory_uses_maximum_across_resumed_sessions() -> None:
     sessions = [
         {"max_memory": {"allocated_bytes": 900, "reserved_bytes": 1200}},

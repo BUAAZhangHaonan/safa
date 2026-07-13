@@ -1453,6 +1453,18 @@ def run_guidance_from_config(
 
 
 def _records_from_feature_dataset(dataset, config: Mapping[str, Any]) -> list[dict[str, Any]]:
+    seen_sample_ids = set()
+    duplicate_sample_ids = set()
+    for record in dataset.records:
+        sample_id = record.sample_id
+        if sample_id in seen_sample_ids:
+            duplicate_sample_ids.add(sample_id)
+        seen_sample_ids.add(sample_id)
+    if duplicate_sample_ids:
+        raise ValueError(
+            "feature dataset contains duplicate sample_id values: "
+            f"{sorted(duplicate_sample_ids)!r}"
+        )
     all_records = [
         {
             "sample_id": record.sample_id,
