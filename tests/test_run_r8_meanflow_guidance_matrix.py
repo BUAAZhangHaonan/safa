@@ -179,7 +179,7 @@ def test_calibration_campaign_paths_are_isolated_and_shared_inputs_stay_locked()
     assert plan.campaign_root == campaign_root
     assert plan.status_dir == campaign_root / "status"
     assert plan.lock_path == campaign_root / ".calibrate.lock"
-    assert len(plan.runs) == 20
+    assert len(plan.runs) == 21
     assert all(
         run.output_dir == campaign_root / "calibration" / run.arm_ids[0]
         for run in plan.runs
@@ -215,6 +215,7 @@ def test_two_calibration_campaigns_have_disjoint_writable_paths() -> None:
             plan.campaign_root / "calibration/visual_evidence.json",
             *(run.output_dir for run in plan.runs),
             *(run.log_path for run in plan.runs),
+            *(run.runtime_config for run in plan.runs if run.runtime_config is not None),
         }
 
     assert writable_paths(plans[0]).isdisjoint(writable_paths(plans[1]))
@@ -256,6 +257,86 @@ def test_campaign_contract_is_atomic_immutable_and_allows_exact_resume(tmp_path:
     ) == expected["campaign_contract_sha256"]
     assert not list(contract_path.parent.glob(".*.tmp"))
     assert module.ensure_campaign_contract(plan) == expected
+
+
+def test_native_unguided_calibration_baseline_has_complete_locked_contract(
+    tmp_path: Path,
+) -> None:
+    module = _load_script()
+    plan = module.build_matrix_plan(
+        _calibration_args(module, "native-baseline"),
+        semigroup_gate=_passing_gate(module),
+    )
+
+    assert len(plan.runs) == 21
+    run = next(candidate for candidate in plan.runs if candidate.arm_ids == ("native_unguided_64",))
+    assert run.physical_gpu == 3
+    assert run.family == "native_unguided"
+    assert run.config == module.NATIVE_CONFIG
+    assert run.source_configs == (module.NATIVE_CONFIG,)
+    assert run.shard_index == 0
+    assert run.num_shards == 1
+    assert run.sample_count == 64
+    assert run.sample_manifest == module.CALIBRATION_MANIFEST
+    assert run.sample_manifest_sha256 == module.CALIBRATION_MANIFEST_SHA256
+    assert run.output_dir == plan.campaign_root / "calibration/native_unguided_64"
+    assert run.log_path == plan.campaign_root / "logs/gpu3_native_unguided_64.log"
+    assert run.runtime_config == plan.campaign_root / "runtime_configs/native_unguided_64.yaml"
+
+    command = " ".join(run.command)
+    assert f"--config {run.runtime_config}" in command
+    assert "--mode native" in command
+    assert "--semigroup-report" not in command
+    assert "--schedule-manifest" not in command
+    assert "--t-cut" not in command
+    assert str(run.output_dir / "completion.json") in command
+    assert "--reuse-valid-output" in command
+    assert "--generation-result" in command
+    assert "--seed 1337" in command
+
+    tmp_plan = _campaign_plan_in_tmp(module, tmp_path)
+    tmp_run = next(candidate for candidate in tmp_plan.runs if candidate.family == "native_unguided")
+    runtime = module._native_unguided_runtime_config(tmp_plan, tmp_run)
+    assert runtime["mode"] == "native"
+    assert runtime["phase"] == "calibration"
+    assert runtime["max_samples"] == 64
+    assert runtime["sample_id_manifest"] == str(module.CALIBRATION_MANIFEST)
+    assert runtime["sample_id_manifest_sha256"] == module.CALIBRATION_MANIFEST_SHA256
+    assert runtime["sampling_seed"] == 1337
+    assert runtime["contact_sheets"] is True
+    assert "schedule_manifest" not in runtime
+    assert runtime["asset_digest_cache"] == str(module.ROOT / "shared/asset_digests.json")
+
+    contract = module.build_campaign_contract(tmp_plan)
+    native = next(row for row in contract["runs"] if row["arm_ids"] == ["native_unguided_64"])
+    assert native["sampling_seed"] == 1337
+    assert native["runtime_config"]["path"] == str(tmp_run.runtime_config)
+    assert len(native["runtime_config"]["sha256"]) == 64
+
+    module.materialize_calibration_runtime_configs(tmp_plan)
+    runtime_path = tmp_path / tmp_run.runtime_config
+    assert yaml.safe_load(runtime_path.read_text(encoding="utf-8")) == runtime
+    module.materialize_calibration_runtime_configs(tmp_plan)
+
+
+def test_native_unguided_calibration_requires_registered_seed_1337(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_script()
+    real_load_yaml = module._load_yaml
+
+    def tampered_seed(path: Path):
+        payload = real_load_yaml(path)
+        if Path(path).resolve() == (REPO_ROOT / module.NATIVE_CONFIG).resolve():
+            payload["sampling_seed"] = 1338
+        return payload
+
+    monkeypatch.setattr(module, "_load_yaml", tampered_seed)
+    with pytest.raises(ValueError, match="sampling_seed.*1337"):
+        module.build_matrix_plan(
+            _calibration_args(module, "wrong-seed"),
+            semigroup_gate=_passing_gate(module),
+        )
 
 
 def test_campaign_contract_rejects_new_nonempty_root_without_contract(tmp_path: Path) -> None:
@@ -603,7 +684,7 @@ def test_matrix_calibration_uses_one_owned_output_per_arm_and_four_gpu_queues(
     monkeypatch.setattr(module.subprocess, "Popen", FakeProcess)
 
     assert module.launch_matrix(plan) == 0
-    assert len(processes) == 20
+    assert len(processes) == 21
     assert max_active == 4
     assert all(
         run.output_dir == plan.campaign_root / "calibration" / run.arm_ids[0]

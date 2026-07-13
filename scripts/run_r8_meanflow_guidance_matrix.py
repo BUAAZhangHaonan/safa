@@ -92,6 +92,7 @@ class RunContract:
     log_path: Path
     env: Mapping[str, str]
     command: tuple[str, ...]
+    runtime_config: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -352,7 +353,55 @@ def _guided_calibration_runs(
                     ),
                 )
             )
+    runs.append(_native_unguided_calibration_run(repo_root, python, campaign_root))
     return tuple(runs)
+
+
+def _native_unguided_calibration_run(
+    repo_root: Path, python: str, campaign_root: Path
+) -> RunContract:
+    config = _load_yaml(repo_root / NATIVE_CONFIG)
+    _require_sampling_seed_1337(config, "native unguided calibration config")
+    arm_id = "native_unguided_64"
+    output = campaign_root / "calibration" / arm_id
+    runtime_config = campaign_root / "runtime_configs/native_unguided_64.yaml"
+    generation = _generation_command(
+        python=python,
+        config=runtime_config,
+        output_dir=output,
+        shard_index=0,
+        num_shards=1,
+        overrides=("--mode", "native"),
+    )
+    quality = build_quality_command(
+        python=python, output_dir=output, manifest=CALIBRATION_MANIFEST
+    )
+    shell = " && ".join(
+        (_skip_completed_generation(output, generation), _skip_completed_quality(output, quality))
+    )
+    log = campaign_root / "logs/gpu3_native_unguided_64.log"
+    return RunContract(
+        physical_gpu=3,
+        gpu_uuid="",
+        config=NATIVE_CONFIG,
+        source_configs=(NATIVE_CONFIG,),
+        family="native_unguided",
+        arm_ids=(arm_id,),
+        shard_index=0,
+        num_shards=1,
+        sample_count=64,
+        sample_manifest=CALIBRATION_MANIFEST,
+        sample_manifest_sha256=CALIBRATION_MANIFEST_SHA256,
+        output_dir=output,
+        log_path=log,
+        env=_base_env(repo_root),
+        command=(
+            "/bin/bash",
+            "-lc",
+            f"{{ {shell}; }} > {shlex.quote(str(log))} 2>&1",
+        ),
+        runtime_config=runtime_config,
+    )
 
 
 def _fallback_calibration_runs(
@@ -1370,6 +1419,41 @@ def materialize_full_runtime_configs(plan: MatrixPlan) -> None:
         )
 
 
+def _native_unguided_runtime_config(plan: MatrixPlan, run: RunContract) -> dict[str, Any]:
+    if run.family != "native_unguided" or run.runtime_config is None:
+        raise ValueError("native unguided runtime config requires its registered run")
+    resolved = _load_yaml(_resolve(plan.repo_root, run.config))
+    _require_sampling_seed_1337(resolved, "native unguided calibration config")
+    resolved.pop("schedule_manifest", None)
+    resolved.update(
+        {
+            "out_dir": str(run.output_dir),
+            "mode": "native",
+            "phase": "calibration",
+            "sample_id_manifest": str(CALIBRATION_MANIFEST),
+            "sample_id_manifest_sha256": CALIBRATION_MANIFEST_SHA256,
+            "max_samples": 64,
+            "contact_sheets": True,
+        }
+    )
+    validate_guidance_config(resolved)
+    return resolved
+
+
+def materialize_calibration_runtime_configs(plan: MatrixPlan) -> None:
+    if plan.phase != "calibrate":
+        return
+    for run in plan.runs:
+        if run.runtime_config is None:
+            continue
+        resolved = _native_unguided_runtime_config(plan, run)
+        _write_locked_text(
+            _resolve(plan.repo_root, run.runtime_config),
+            yaml.safe_dump(resolved, sort_keys=False),
+            None,
+        )
+
+
 def build_campaign_contract(plan: MatrixPlan) -> dict[str, Any]:
     if plan.phase != "calibrate" or plan.campaign_id is None or plan.campaign_root is None:
         raise ValueError("campaign contracts are only defined for calibration plans")
@@ -1378,6 +1462,16 @@ def build_campaign_contract(plan: MatrixPlan) -> dict[str, Any]:
     for run in plan.runs:
         config_path = _resolve(plan.repo_root, run.config)
         config = _load_yaml(config_path)
+        sampling_seed = _require_sampling_seed_1337(config, f"{run.arm_ids[0]} config")
+        runtime_config = None
+        if run.runtime_config is not None:
+            resolved_runtime = _native_unguided_runtime_config(plan, run)
+            runtime_content = yaml.safe_dump(resolved_runtime, sort_keys=False)
+            runtime_config = {
+                "path": str(run.runtime_config),
+                "sha256": hashlib.sha256(runtime_content.encode("utf-8")).hexdigest(),
+                "arm_config_sha256": canonical_arm_config_digest(resolved_runtime),
+            }
         sources = []
         for source in run.source_configs:
             source_path = _resolve(plan.repo_root, source)
@@ -1395,6 +1489,8 @@ def build_campaign_contract(plan: MatrixPlan) -> dict[str, Any]:
                 "config": str(run.config),
                 "config_sha256": _sha256_file(config_path),
                 "arm_config_sha256": canonical_arm_config_digest(config),
+                "sampling_seed": sampling_seed,
+                "runtime_config": runtime_config,
                 "source_configs": sources,
                 "shard_index": run.shard_index,
                 "num_shards": run.num_shards,
@@ -1472,6 +1568,7 @@ def execute_plan(plan: MatrixPlan) -> int:
             validate_artifact_paths(plan)
             bound = validate_preflight(plan)
             materialize_locked_manifests(plan.repo_root)
+        materialize_calibration_runtime_configs(bound)
         materialize_full_runtime_configs(plan)
         result = launch_matrix(bound)
         if result != 0:
@@ -2320,6 +2417,13 @@ def _require_sha256(value: Any, label: str) -> str:
     if len(text) != 64 or any(character not in "0123456789abcdef" for character in text):
         raise ValueError(f"{label} must be a lowercase SHA256 digest")
     return text
+
+
+def _require_sampling_seed_1337(config: Mapping[str, Any], label: str) -> int:
+    value = config.get("sampling_seed")
+    if isinstance(value, bool) or not isinstance(value, int) or value != 1337:
+        raise ValueError(f"{label} sampling_seed must be the registered integer 1337")
+    return value
 
 
 def _percentile(values: Sequence[float], fraction: float) -> float:
