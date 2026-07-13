@@ -1453,3 +1453,41 @@ def test_guidance_cli_accepts_required_config_output_and_shard_controls() -> Non
         module.parse_args(
             ["--config", "config.yaml", "--output-dir", "output", "--allow-overwrite"]
         )
+
+
+def test_guidance_effective_config_resolvers_bind_semantics_and_schedule() -> None:
+    path = REPO_ROOT / "scripts" / "run_meanflow_flow_map_guidance.py"
+    spec = importlib.util.spec_from_file_location("run_meanflow_flow_map_guidance", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    base = {
+        "mode": "official_head_current_xt",
+        "optimization_mode": "official_adam",
+        "step_size": 1.0,
+    }
+    schedule = {"schedule_contract_sha256": "a" * 64, "t_cut": 0.25}
+
+    semantics = module.resolve_guidance_semantics(
+        base,
+        {
+            "optimization_mode": "paper_normalized_direct_autograd",
+            "step_size": 0.5,
+            "t_cut": 0.25,
+        },
+    )
+    effective = module.finalize_effective_guidance_config(
+        semantics,
+        locked_schedule=schedule,
+    )
+
+    assert base == {
+        "mode": "official_head_current_xt",
+        "optimization_mode": "official_adam",
+        "step_size": 1.0,
+    }
+    assert effective["optimization_mode"] == "paper_normalized_direct_autograd"
+    assert effective["step_size"] == 0.5
+    assert effective["t_cut"] == 0.25
+    assert effective["locked_schedule"] == schedule
+    assert len(effective["arm_config_sha256"]) == 64

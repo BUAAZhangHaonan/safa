@@ -5,9 +5,44 @@ import argparse
 import json
 from pathlib import Path
 import sys
+from typing import Any, Mapping
 
-from safa.evaluation.meanflow_guidance_runner import SUPPORTED_MODES, run_guidance_from_config
+from safa.evaluation.meanflow_guidance_runner import (
+    FMRG_MODES,
+    SUPPORTED_MODES,
+    _validate_semigroup_gate,
+    resolve_locked_schedule,
+    run_guidance_from_config,
+    validate_guidance_config,
+)
+from safa.evaluation.r8_arm_contracts import (
+    canonical_arm_config_digest,
+    require_arm_config_digest,
+)
 from safa.utils.config import load_yaml
+
+
+SEMANTIC_OVERRIDE_FIELDS = frozenset(
+    {
+        "mode",
+        "max_samples",
+        "eta",
+        "step_size",
+        "num_updates",
+        "projection",
+        "semigroup_report",
+        "schedule_manifest",
+        "t_cut",
+        "sample_mode",
+        "optimization_mode",
+        "num_optim_iters",
+        "out_dir",
+        "phase",
+        "sample_id_manifest",
+        "sample_id_manifest_sha256",
+        "contact_sheets",
+    }
+)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -38,8 +73,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def resolved_config(args: argparse.Namespace) -> dict:
-    config = load_yaml(args.config)
+def semantic_overrides_from_args(args: argparse.Namespace) -> dict[str, Any]:
     if args.mode is not None and args.fmrg_variant is not None and args.mode != args.fmrg_variant:
         raise ValueError("--mode and --fmrg-variant disagree")
     overrides = {
@@ -56,10 +90,72 @@ def resolved_config(args: argparse.Namespace) -> dict:
         "optimization_mode": args.optimization_mode,
         "num_optim_iters": args.num_optim_iters,
     }
-    for field, value in overrides.items():
-        if value is not None:
-            config[field] = str(value) if isinstance(value, Path) else value
-    return config
+    return {field: value for field, value in overrides.items() if value is not None}
+
+
+def resolve_guidance_semantics(
+    base_config: Mapping[str, Any], semantic_overrides: Mapping[str, Any]
+) -> dict[str, Any]:
+    unknown = sorted(set(semantic_overrides) - SEMANTIC_OVERRIDE_FIELDS)
+    if unknown:
+        raise ValueError(f"unsupported semantic guidance overrides: {unknown!r}")
+    resolved = dict(base_config)
+    for field, value in semantic_overrides.items():
+        if value is None:
+            resolved.pop(field, None)
+        else:
+            resolved[field] = str(value) if isinstance(value, Path) else value
+    return resolved
+
+
+def finalize_effective_guidance_config(
+    validated_config: Mapping[str, Any], *, locked_schedule: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    effective = dict(validated_config)
+    mode = str(effective["mode"])
+    if mode in FMRG_MODES:
+        if locked_schedule is None:
+            raise ValueError("FMRG effective config requires a locked schedule")
+        effective["locked_schedule"] = dict(locked_schedule)
+    elif locked_schedule is not None or "locked_schedule" in effective:
+        raise ValueError("non-FMRG effective config must not contain a locked schedule")
+    computed = canonical_arm_config_digest(effective)
+    declared = effective.get("arm_config_sha256")
+    if declared is not None and require_arm_config_digest(declared) != computed:
+        raise ValueError(
+            "declared arm config SHA256 disagrees with the effective guidance config"
+        )
+    effective["arm_config_sha256"] = computed
+    return effective
+
+
+def resolve_effective_guidance_config(
+    base_config: Mapping[str, Any], semantic_overrides: Mapping[str, Any]
+) -> dict[str, Any]:
+    semantic_config = resolve_guidance_semantics(base_config, semantic_overrides)
+    validated = validate_guidance_config(semantic_config)
+    schedule = None
+    if validated["mode"] in FMRG_MODES:
+        checkpoint_sha256 = str(validated["checkpoint_sha256"])
+        schedule = resolve_locked_schedule(
+            validated,
+            checkpoint_sha256=checkpoint_sha256,
+            explicit_t_cut=None,
+        )
+        _validate_semigroup_gate(
+            validated,
+            checkpoint_sha256,
+            float(schedule["t_cut"]),
+            str(schedule["semigroup_sample_id_manifest_sha256"]),
+        )
+    return finalize_effective_guidance_config(validated, locked_schedule=schedule)
+
+
+def resolved_config(args: argparse.Namespace) -> dict[str, Any]:
+    return resolve_effective_guidance_config(
+        load_yaml(args.config),
+        semantic_overrides_from_args(args),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -71,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
             output_dir=args.output_dir,
             shard_index=args.shard_index,
             num_shards=args.num_shards,
-            explicit_t_cut=args.t_cut,
+            explicit_t_cut=None,
         )
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)

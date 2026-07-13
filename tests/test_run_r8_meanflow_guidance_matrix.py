@@ -27,9 +27,11 @@ def _load_script():
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
+    sys.path.insert(0, str(path.parent))
     try:
         spec.loader.exec_module(module)
     finally:
+        sys.path.remove(str(path.parent))
         sys.modules.pop(spec.name, None)
     return module
 
@@ -403,6 +405,7 @@ def _kernel_lock_execute_worker(
     module.materialize_locked_manifests = lambda value: None
     module.ensure_campaign_contract = lambda value: {}
     module.materialize_calibration_runtime_configs = lambda value: None
+    module.validate_calibration_runtime_configs = lambda value: None
     module.materialize_full_runtime_configs = lambda value: None
 
     def preflight(value):
@@ -510,7 +513,8 @@ def test_native_unguided_calibration_baseline_has_complete_locked_contract(
 
     command = " ".join(run.command)
     assert f"--config {run.runtime_config}" in command
-    assert "--mode native" in command
+    assert "--mode native" not in command
+    assert dict(run.semantic_overrides)["mode"] == "native"
     assert "--semigroup-report" not in command
     assert "--schedule-manifest" not in command
     assert "--t-cut" not in command
@@ -537,11 +541,81 @@ def test_native_unguided_calibration_baseline_has_complete_locked_contract(
     assert native["sampling_seed"] == 1337
     assert native["runtime_config"]["path"] == str(tmp_run.runtime_config)
     assert len(native["runtime_config"]["sha256"]) == 64
+    assert native["runtime_config"]["arm_config_sha256"] == native["arm_config_sha256"]
 
     module.materialize_calibration_runtime_configs(tmp_plan)
     runtime_path = tmp_path / tmp_run.runtime_config
     assert yaml.safe_load(runtime_path.read_text(encoding="utf-8")) == runtime
     module.materialize_calibration_runtime_configs(tmp_plan)
+
+
+def test_calibration_contract_digests_match_effective_configs_for_all_arms() -> None:
+    module = _load_script()
+    plan = module.build_matrix_plan(
+        _calibration_args(module, "effective-contract"),
+        semigroup_gate=_passing_gate(module),
+    )
+    contract = module.build_campaign_contract(plan)
+    registered = {row["arm_ids"][0]: row for row in contract["runs"]}
+
+    assert len(registered) == 21
+    for run in plan.runs:
+        arm_id = run.arm_ids[0]
+        effective = module.resolve_calibration_effective_config(plan, run)
+        digest = canonical_arm_config_digest(effective)
+        assert effective["arm_config_sha256"] == digest
+        assert registered[arm_id]["arm_config_sha256"] == digest
+        assert registered[arm_id]["runtime_config"]["arm_config_sha256"] == digest
+        assert registered[arm_id]["config"] == str(run.runtime_config)
+        assert (
+            registered[arm_id]["config_sha256"]
+            == registered[arm_id]["runtime_config"]["sha256"]
+        )
+
+
+def test_calibration_generation_commands_use_only_campaign_runtime_configs() -> None:
+    module = _load_script()
+    plan = module.build_matrix_plan(
+        _calibration_args(module, "runtime-only"),
+        semigroup_gate=_passing_gate(module),
+    )
+    semantic_flags = (
+        "--mode",
+        "--fmrg-variant",
+        "--max-samples",
+        "--eta",
+        "--step-size",
+        "--num-updates",
+        "--projection",
+        "--semigroup-report",
+        "--schedule-manifest",
+        "--t-cut",
+        "--sample-mode",
+        "--optimization-mode",
+        "--num-optim-iters",
+    )
+
+    assert len({run.runtime_config for run in plan.runs}) == 21
+    for run in plan.runs:
+        assert run.runtime_config is not None
+        assert run.runtime_config.is_relative_to(plan.campaign_root / "runtime_configs")
+        command = " ".join(run.command)
+        assert f"--config {run.runtime_config}" in command
+        assert all(flag not in command for flag in semantic_flags)
+
+
+def test_calibration_runtime_config_tampering_is_rejected(tmp_path: Path) -> None:
+    module = _load_script()
+    plan = _campaign_plan_in_tmp(module, tmp_path)
+    module.materialize_calibration_runtime_configs(plan)
+    run = plan.runs[0]
+    runtime_path = tmp_path / run.runtime_config
+    payload = yaml.safe_load(runtime_path.read_text(encoding="utf-8"))
+    payload["step_size"] = float(payload["step_size"]) + 1.0
+    runtime_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="runtime config.*contract"):
+        module.validate_calibration_runtime_configs(plan)
 
 
 def test_native_unguided_calibration_requires_registered_seed_1337(
@@ -630,14 +704,11 @@ def test_campaign_contract_rejects_any_semantic_change(tmp_path: Path) -> None:
     module.ensure_campaign_contract(plan)
     first = plan.runs[0]
 
-    changed_command = list(first.command)
-    changed_command[-1] = changed_command[-1].replace(
-        "--optimization-mode official_adam",
-        "--optimization-mode paper_normalized_direct_autograd",
-    )
+    changed_semantics = dict(first.semantic_overrides)
+    changed_semantics["optimization_mode"] = "paper_normalized_direct_autograd"
     changed_seed = list(first.command)
     changed_seed[-1] = changed_seed[-1].replace("--seed 1337", "--seed 1338")
-    assert changed_command != list(first.command)
+    assert changed_semantics != dict(first.semantic_overrides)
     assert changed_seed != list(first.command)
 
     mutations = {
@@ -648,7 +719,10 @@ def test_campaign_contract_rejects_any_semantic_change(tmp_path: Path) -> None:
         ),
         "mode": replace(
             plan,
-            runs=(replace(first, command=tuple(changed_command)), *plan.runs[1:]),
+            runs=(
+                replace(first, semantic_overrides=tuple(changed_semantics.items())),
+                *plan.runs[1:],
+            ),
         ),
         "manifest": replace(plan, sample_manifest=REPO_ROOT / module.FULL_MANIFEST),
         "hash": replace(plan, sample_manifest_sha256="0" * 64),

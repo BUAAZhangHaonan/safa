@@ -24,6 +24,7 @@ from typing import Any, Iterator, Mapping, Sequence
 
 import yaml
 
+from run_meanflow_flow_map_guidance import resolve_effective_guidance_config
 from safa.evaluation.meanflow_guidance_runner import validate_guidance_config
 from safa.evaluation.r8_arm_contracts import (
     canonical_arm_config_digest,
@@ -98,6 +99,7 @@ class RunContract:
     env: Mapping[str, str]
     command: tuple[str, ...]
     runtime_config: Path | None = None
+    semantic_overrides: tuple[tuple[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -278,6 +280,32 @@ def _semigroup_run(repo_root: Path, python: str, gpu: int) -> RunContract:
     )
 
 
+def _calibration_semantic_overrides(
+    output_dir: Path,
+    arm_overrides: Mapping[str, Any],
+    *,
+    t_cut: float | None,
+) -> tuple[tuple[str, Any], ...]:
+    resolved: dict[str, Any] = {
+        "out_dir": str(output_dir),
+        "phase": "calibration",
+        "sample_id_manifest": str(CALIBRATION_MANIFEST),
+        "sample_id_manifest_sha256": CALIBRATION_MANIFEST_SHA256,
+        "max_samples": 64,
+        "contact_sheets": True,
+        **arm_overrides,
+    }
+    if t_cut is not None:
+        resolved.update(
+            {
+                "semigroup_report": str(SEMIGROUP_GATE),
+                "schedule_manifest": str(SCHEDULE_MANIFEST),
+                "t_cut": t_cut,
+            }
+        )
+    return tuple(resolved.items())
+
+
 def _guided_calibration_runs(
     repo_root: Path, python: str, gate: Mapping[str, Any], campaign_root: Path
 ) -> tuple[RunContract, ...]:
@@ -292,48 +320,55 @@ def _guided_calibration_runs(
     for gpu, config, family in specs:
         if gpu in (0, 1):
             candidates = [
-                (f"{family}_adam_step{value:g}", ["--optimization-mode", "official_adam", "--step-size", str(value)])
+                (
+                    f"{family}_adam_step{value:g}",
+                    {"optimization_mode": "official_adam", "step_size": value},
+                )
                 for value in (1.0, 3.0)
             ]
             candidates.extend(
                 (
                     f"{family}_normalized_eta{value:g}",
-                    [
-                        "--optimization-mode",
-                        "paper_normalized_direct_autograd",
-                        "--step-size",
-                        str(value),
-                    ],
+                    {
+                        "optimization_mode": "paper_normalized_direct_autograd",
+                        "step_size": value,
+                    },
                 )
                 for value in (0.25, 0.5, 1.0, 2.0)
             )
         elif gpu == 2:
             candidates = [
-                (f"paper_split_eta{value:g}", ["--step-size", str(value)])
+                (f"paper_split_eta{value:g}", {"step_size": value})
                 for value in (0.25, 0.5, 1.0, 2.0)
             ]
         else:
             candidates = [
                 (
                     f"noise_{_config_stem(noise_config)}",
-                    ["--config-override", str(noise_config)],
+                    noise_config,
+                    {},
                 )
                 for noise_config in NOISE_CONFIGS
             ]
-        for arm_id, overrides in candidates:
-            candidate_config = config
-            if overrides[:1] == ["--config-override"]:
-                candidate_config = Path(overrides[1])
-                overrides = []
+        normalized_candidates = (
+            candidates
+            if gpu == 3
+            else [(arm_id, config, overrides) for arm_id, overrides in candidates]
+        )
+        for arm_id, candidate_config, arm_overrides in normalized_candidates:
             output = campaign_root / "calibration" / arm_id
+            runtime_config = campaign_root / f"runtime_configs/{arm_id}.yaml"
+            semantic_overrides = _calibration_semantic_overrides(
+                output,
+                arm_overrides,
+                t_cut=t_cut if gpu < 3 else None,
+            )
             generation = _generation_command(
                 python=python,
-                config=candidate_config,
+                config=runtime_config,
                 output_dir=output,
                 shard_index=0,
                 num_shards=1,
-                overrides=overrides,
-                t_cut=t_cut if gpu < 3 else None,
             )
             quality = build_quality_command(
                 python=python, output_dir=output, manifest=CALIBRATION_MANIFEST
@@ -363,6 +398,8 @@ def _guided_calibration_runs(
                         "-lc",
                         f"{{ {shell}; }} > {shlex.quote(str(log))} 2>&1",
                     ),
+                    runtime_config=runtime_config,
+                    semantic_overrides=semantic_overrides,
                 )
             )
     runs.append(_native_unguided_calibration_run(repo_root, python, campaign_root))
@@ -383,7 +420,6 @@ def _native_unguided_calibration_run(
         output_dir=output,
         shard_index=0,
         num_shards=1,
-        overrides=("--mode", "native"),
     )
     quality = build_quality_command(
         python=python, output_dir=output, manifest=CALIBRATION_MANIFEST
@@ -413,6 +449,11 @@ def _native_unguided_calibration_run(
             f"{{ {shell}; }} > {shlex.quote(str(log))} 2>&1",
         ),
         runtime_config=runtime_config,
+        semantic_overrides=_calibration_semantic_overrides(
+            output,
+            {"mode": "native", "schedule_manifest": None},
+            t_cut=None,
+        ),
     )
 
 
@@ -423,9 +464,10 @@ def _fallback_calibration_runs(
     for gpu, config in enumerate(NOISE_CONFIGS):
         arm_id = f"fallback_{_config_stem(config)}"
         output = campaign_root / "calibration" / arm_id
+        runtime_config = campaign_root / f"runtime_configs/{arm_id}.yaml"
         generation = _generation_command(
             python=python,
-            config=config,
+            config=runtime_config,
             output_dir=output,
             shard_index=0,
             num_shards=1,
@@ -457,6 +499,10 @@ def _fallback_calibration_runs(
                     "/bin/bash",
                     "-lc",
                     f"{{ {shell}; }} > {shlex.quote(str(log))} 2>&1",
+                ),
+                runtime_config=runtime_config,
+                semantic_overrides=_calibration_semantic_overrides(
+                    output, {}, t_cut=None
                 ),
             )
         )
@@ -1571,25 +1617,32 @@ def materialize_full_runtime_configs(plan: MatrixPlan) -> None:
         )
 
 
-def _native_unguided_runtime_config(plan: MatrixPlan, run: RunContract) -> dict[str, Any]:
-    if run.family != "native_unguided" or run.runtime_config is None:
-        raise ValueError("native unguided runtime config requires its registered run")
-    resolved = _load_yaml(_resolve(plan.repo_root, run.config))
-    _require_sampling_seed_1337(resolved, "native unguided calibration config")
-    resolved.pop("schedule_manifest", None)
-    resolved.update(
-        {
-            "out_dir": str(run.output_dir),
-            "mode": "native",
-            "phase": "calibration",
-            "sample_id_manifest": str(CALIBRATION_MANIFEST),
-            "sample_id_manifest_sha256": CALIBRATION_MANIFEST_SHA256,
-            "max_samples": 64,
-            "contact_sheets": True,
-        }
+def resolve_calibration_effective_config(
+    plan: MatrixPlan, run: RunContract
+) -> dict[str, Any]:
+    if plan.phase != "calibrate" or run.runtime_config is None:
+        raise ValueError("calibration effective config requires a registered runtime config")
+    base_config = _load_yaml(_resolve(plan.repo_root, run.config))
+    resolved = resolve_effective_guidance_config(
+        base_config,
+        dict(run.semantic_overrides),
     )
-    validate_guidance_config(resolved)
+    _require_sampling_seed_1337(resolved, f"{run.arm_ids[0]} effective config")
     return resolved
+
+
+def _native_unguided_runtime_config(plan: MatrixPlan, run: RunContract) -> dict[str, Any]:
+    if run.family != "native_unguided":
+        raise ValueError("native unguided runtime config requires its registered run")
+    return resolve_calibration_effective_config(plan, run)
+
+
+def _calibration_runtime_content(plan: MatrixPlan, run: RunContract) -> tuple[str, str]:
+    content = yaml.safe_dump(
+        resolve_calibration_effective_config(plan, run),
+        sort_keys=False,
+    )
+    return content, hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def materialize_calibration_runtime_configs(plan: MatrixPlan) -> None:
@@ -1598,13 +1651,30 @@ def materialize_calibration_runtime_configs(plan: MatrixPlan) -> None:
     validate_campaign_path_safety(plan)
     for run in plan.runs:
         if run.runtime_config is None:
-            continue
-        resolved = _native_unguided_runtime_config(plan, run)
+            raise ValueError("calibration run is missing its runtime config path")
+        content, expected_sha256 = _calibration_runtime_content(plan, run)
         _write_locked_text(
             _resolve(plan.repo_root, run.runtime_config),
-            yaml.safe_dump(resolved, sort_keys=False),
-            None,
+            content,
+            expected_sha256,
         )
+
+
+def validate_calibration_runtime_configs(plan: MatrixPlan) -> None:
+    if plan.phase != "calibrate":
+        return
+    validate_campaign_path_safety(plan)
+    for run in plan.runs:
+        if run.runtime_config is None:
+            raise ValueError("calibration run is missing its runtime config path")
+        path = _resolve(plan.repo_root, run.runtime_config)
+        expected_content, expected_sha256 = _calibration_runtime_content(plan, run)
+        if not path.is_file():
+            raise ValueError(f"runtime config is missing from its campaign contract: {path}")
+        actual_content = path.read_text(encoding="utf-8")
+        actual_sha256 = hashlib.sha256(actual_content.encode("utf-8")).hexdigest()
+        if actual_content != expected_content or actual_sha256 != expected_sha256:
+            raise ValueError(f"runtime config disagrees with its campaign contract: {path}")
 
 
 def build_campaign_contract(plan: MatrixPlan) -> dict[str, Any]:
@@ -1613,18 +1683,22 @@ def build_campaign_contract(plan: MatrixPlan) -> dict[str, Any]:
     manifest_path = _resolve(plan.repo_root, plan.sample_manifest)
     runs = []
     for run in plan.runs:
-        config_path = _resolve(plan.repo_root, run.config)
-        config = _load_yaml(config_path)
-        sampling_seed = _require_sampling_seed_1337(config, f"{run.arm_ids[0]} config")
-        runtime_config = None
-        if run.runtime_config is not None:
-            resolved_runtime = _native_unguided_runtime_config(plan, run)
-            runtime_content = yaml.safe_dump(resolved_runtime, sort_keys=False)
-            runtime_config = {
-                "path": str(run.runtime_config),
-                "sha256": hashlib.sha256(runtime_content.encode("utf-8")).hexdigest(),
-                "arm_config_sha256": canonical_arm_config_digest(resolved_runtime),
-            }
+        if run.runtime_config is None:
+            raise ValueError("calibration run is missing its runtime config path")
+        effective_config = resolve_calibration_effective_config(plan, run)
+        sampling_seed = _require_sampling_seed_1337(
+            effective_config, f"{run.arm_ids[0]} effective config"
+        )
+        runtime_content, runtime_sha256 = _calibration_runtime_content(plan, run)
+        arm_config_sha256 = require_arm_config_digest(
+            effective_config["arm_config_sha256"],
+            f"{run.arm_ids[0]} effective arm config SHA256",
+        )
+        runtime_config = {
+            "path": str(run.runtime_config),
+            "sha256": runtime_sha256,
+            "arm_config_sha256": arm_config_sha256,
+        }
         sources = []
         for source in run.source_configs:
             source_path = _resolve(plan.repo_root, source)
@@ -1639,11 +1713,12 @@ def build_campaign_contract(plan: MatrixPlan) -> dict[str, Any]:
                 "physical_gpu": run.physical_gpu,
                 "family": run.family,
                 "arm_ids": list(run.arm_ids),
-                "config": str(run.config),
-                "config_sha256": _sha256_file(config_path),
-                "arm_config_sha256": canonical_arm_config_digest(config),
+                "config": str(run.runtime_config),
+                "config_sha256": runtime_sha256,
+                "arm_config_sha256": arm_config_sha256,
                 "sampling_seed": sampling_seed,
                 "runtime_config": runtime_config,
+                "semantic_overrides": dict(run.semantic_overrides),
                 "source_configs": sources,
                 "shard_index": run.shard_index,
                 "num_shards": run.num_shards,
@@ -1779,6 +1854,7 @@ def execute_plan(plan: MatrixPlan) -> int:
             bound = validate_preflight(plan)
             materialize_locked_manifests(plan.repo_root)
         materialize_calibration_runtime_configs(bound)
+        validate_calibration_runtime_configs(bound)
         materialize_full_runtime_configs(plan)
         validate_campaign_path_safety(bound)
         result = launch_matrix(bound)
