@@ -351,6 +351,54 @@ def test_campaign_contract_rejects_new_nonempty_root_without_contract(tmp_path: 
     assert not (campaign_root / "campaign_contract.json").exists()
 
 
+@pytest.mark.parametrize("symlink_level", ["campaigns", "campaign"])
+def test_campaign_contract_rejects_symlinked_path_components_before_outside_write(
+    tmp_path: Path, symlink_level: str
+) -> None:
+    module = _load_script()
+    repo_root = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    plan = _campaign_plan_in_tmp(module, repo_root)
+    campaigns_root = repo_root / module.ROOT / "campaigns"
+    if symlink_level == "campaigns":
+        campaigns_root.parent.mkdir(parents=True)
+        campaigns_root.symlink_to(outside, target_is_directory=True)
+    else:
+        campaigns_root.mkdir(parents=True)
+        (repo_root / plan.campaign_root).symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink path component"):
+        module.ensure_campaign_contract(plan)
+
+    assert list(outside.iterdir()) == []
+
+
+def test_execute_rejects_symlinked_campaigns_before_any_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_script()
+    repo_root = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    plan = replace(_campaign_plan_in_tmp(module, repo_root), execute=True)
+    campaigns_root = repo_root / module.ROOT / "campaigns"
+    campaigns_root.parent.mkdir(parents=True)
+    campaigns_root.symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(module, "validate_artifact_paths", lambda value: None)
+    monkeypatch.setattr(module, "validate_preflight", lambda value: value)
+    monkeypatch.setattr(
+        module,
+        "materialize_locked_manifests",
+        lambda value: pytest.fail("execute wrote manifests before campaign path validation"),
+    )
+
+    with pytest.raises(ValueError, match="symlink path component"):
+        module.execute_plan(plan)
+
+    assert list(outside.iterdir()) == []
+
+
 def test_campaign_contract_rejects_any_semantic_change(tmp_path: Path) -> None:
     module = _load_script()
     plan = _campaign_plan_in_tmp(module, tmp_path)

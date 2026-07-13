@@ -13,6 +13,7 @@ import re
 import signal
 import shlex
 import shutil
+import stat
 import statistics
 import subprocess
 import time
@@ -1443,6 +1444,7 @@ def _native_unguided_runtime_config(plan: MatrixPlan, run: RunContract) -> dict[
 def materialize_calibration_runtime_configs(plan: MatrixPlan) -> None:
     if plan.phase != "calibrate":
         return
+    validate_campaign_path_safety(plan)
     for run in plan.runs:
         if run.runtime_config is None:
             continue
@@ -1528,6 +1530,7 @@ def build_campaign_contract(plan: MatrixPlan) -> dict[str, Any]:
 def ensure_campaign_contract(plan: MatrixPlan) -> dict[str, Any]:
     if plan.phase != "calibrate" or plan.campaign_root is None:
         raise ValueError("campaign contract requires a calibration campaign root")
+    validate_campaign_path_safety(plan)
     campaigns_root = plan.repo_root / ROOT / "campaigns"
     campaign_root = _resolve(plan.repo_root, plan.campaign_root)
     _require_contained(campaigns_root, campaign_root, "calibration campaign")
@@ -1550,6 +1553,7 @@ def ensure_campaign_contract(plan: MatrixPlan) -> dict[str, Any]:
 
 def execute_plan(plan: MatrixPlan) -> int:
     if plan.phase == "calibrate":
+        validate_campaign_path_safety(plan)
         validate_artifact_paths(plan)
         bound = validate_preflight(plan)
         materialize_locked_manifests(plan.repo_root)
@@ -1570,6 +1574,7 @@ def execute_plan(plan: MatrixPlan) -> int:
             materialize_locked_manifests(plan.repo_root)
         materialize_calibration_runtime_configs(bound)
         materialize_full_runtime_configs(plan)
+        validate_campaign_path_safety(bound)
         result = launch_matrix(bound)
         if result != 0:
             return result
@@ -1790,6 +1795,37 @@ def _build_full_visual_evidence(plan: MatrixPlan) -> dict[str, Any]:
     return payload
 
 
+def validate_campaign_path_safety(plan: MatrixPlan) -> None:
+    if plan.phase != "calibrate":
+        return
+    if plan.campaign_root is None:
+        raise ValueError("calibration campaign path safety requires a campaign root")
+    campaigns_root = plan.repo_root / ROOT / "campaigns"
+    campaign_root = _resolve(plan.repo_root, plan.campaign_root)
+    _reject_symlink_components(plan.repo_root, campaigns_root, "calibration campaigns root")
+    _reject_symlink_components(plan.repo_root, campaign_root, "calibration campaign")
+    _require_contained(campaigns_root, campaign_root, "calibration campaign")
+    owned_paths = [
+        _resolve(plan.repo_root, plan.status_dir),
+        _resolve(plan.repo_root, plan.lock_path),
+        campaign_root / "campaign_contract.json",
+        campaign_root / "visual_review.json",
+        campaign_root / "calibration/visual_evidence.json",
+    ]
+    for run in plan.runs:
+        owned_paths.extend(
+            (
+                _resolve(plan.repo_root, run.output_dir),
+                _resolve(plan.repo_root, run.log_path),
+            )
+        )
+        if run.runtime_config is not None:
+            owned_paths.append(_resolve(plan.repo_root, run.runtime_config))
+    for path in owned_paths:
+        _reject_symlink_components(plan.repo_root, path, "calibration campaign artifact")
+        _require_contained(campaign_root, path, "calibration campaign artifact")
+
+
 def _reject_symlink_components(root: Path, path: Path, label: str) -> None:
     root_absolute = root.absolute()
     path_absolute = path.absolute()
@@ -1798,12 +1834,19 @@ def _reject_symlink_components(root: Path, path: Path, label: str) -> None:
     except ValueError as exc:
         raise ValueError(f"{label} escapes the repository: {path}") from exc
     current = root_absolute
-    if current.is_symlink():
-        raise ValueError(f"{label} has a symlink path component: {current}")
+    _reject_lstat_symlink(current, label)
     for part in relative.parts:
         current /= part
-        if current.is_symlink():
-            raise ValueError(f"{label} has a symlink path component: {current}")
+        _reject_lstat_symlink(current, label)
+
+
+def _reject_lstat_symlink(path: Path, label: str) -> None:
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(mode):
+        raise ValueError(f"{label} has a symlink path component: {path}")
 
 
 def _reject_symlink_tree(root: Path, label: str) -> None:
