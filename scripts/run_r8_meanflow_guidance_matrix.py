@@ -9,6 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import signal
 import shlex
 import shutil
@@ -98,6 +99,8 @@ class MatrixPlan:
     repo_root: Path
     python: str
     phase: str
+    campaign_id: str | None
+    campaign_root: Path | None
     execute: bool
     allow_busy_gpus: bool
     status_dir: Path
@@ -108,6 +111,7 @@ class MatrixPlan:
     sample_manifest_sha256: str
     external_compute_processes: Mapping[int, tuple[str, ...]]
     full_contract: Mapping[str, Any] | None = None
+    calibration_gate: Mapping[str, Any] | None = None
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -120,11 +124,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--phase", choices=("semigroup", "calibrate", "full", "all"), default="all"
     )
+    parser.add_argument("--campaign-id")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--execute", action="store_true")
     parser.add_argument("--allow-busy-gpus", action="store_true")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.phase in {"calibrate", "all"}:
+        if args.campaign_id is None:
+            parser.error("--campaign-id is required for calibration")
+        if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", args.campaign_id) is None:
+            parser.error("--campaign-id must be a lowercase slug")
+    elif args.campaign_id is not None:
+        parser.error("--campaign-id is only valid for calibration")
+    return args
 
 
 def build_matrix_plan(
@@ -141,6 +154,8 @@ def build_matrix_plan(
         "repo_root": repo_root,
         "python": str(args.python),
         "phase": phase,
+        "campaign_id": None,
+        "campaign_root": None,
         "execute": bool(args.execute),
         "allow_busy_gpus": bool(args.allow_busy_gpus),
         "status_dir": ROOT / phase,
@@ -157,15 +172,25 @@ def build_matrix_plan(
             sample_manifest_sha256=CALIBRATION_MANIFEST_SHA256,
         )
     if phase == "calibrate":
+        campaign_id = str(args.campaign_id)
+        if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", campaign_id) is None:
+            raise ValueError("calibration requires a valid campaign_id")
+        campaign_root = ROOT / "campaigns" / campaign_id
+        common.update(
+            campaign_id=campaign_id,
+            campaign_root=campaign_root,
+            status_dir=campaign_root / "status",
+            lock_path=campaign_root / ".calibrate.lock",
+        )
         gate = dict(semigroup_gate) if semigroup_gate is not None else _load_required_json(
             repo_root / SEMIGROUP_GATE, "semigroup gate"
         )
         _validate_gate_identity(gate)
         if gate.get("gate_passed") is True:
-            runs = _guided_calibration_runs(repo_root, str(args.python), gate)
+            runs = _guided_calibration_runs(repo_root, str(args.python), gate, campaign_root)
             schedule = SCHEDULE_MANIFEST
         else:
-            runs = _fallback_calibration_runs(repo_root, str(args.python))
+            runs = _fallback_calibration_runs(repo_root, str(args.python), campaign_root)
             schedule = None
         return MatrixPlan(
             **common,
@@ -173,6 +198,7 @@ def build_matrix_plan(
             schedule_manifest=schedule,
             sample_manifest=CALIBRATION_MANIFEST,
             sample_manifest_sha256=CALIBRATION_MANIFEST_SHA256,
+            calibration_gate=gate,
         )
     contract = dict(full_contract) if full_contract is not None else load_full_contract(
         repo_root / SELECTION, repo_root / VISUAL_REVIEW
@@ -240,7 +266,7 @@ def _semigroup_run(repo_root: Path, python: str, gpu: int) -> RunContract:
 
 
 def _guided_calibration_runs(
-    repo_root: Path, python: str, gate: Mapping[str, Any]
+    repo_root: Path, python: str, gate: Mapping[str, Any], campaign_root: Path
 ) -> tuple[RunContract, ...]:
     t_cut = float(gate.get("selected_t_cut", gate.get("t_cut")))
     specs = (
@@ -286,7 +312,7 @@ def _guided_calibration_runs(
             if overrides[:1] == ["--config-override"]:
                 candidate_config = Path(overrides[1])
                 overrides = []
-            output = ROOT / "calibration" / arm_id
+            output = campaign_root / "calibration" / arm_id
             generation = _generation_command(
                 python=python,
                 config=candidate_config,
@@ -302,7 +328,7 @@ def _guided_calibration_runs(
             shell = " && ".join(
                 (_skip_completed_generation(output, generation), _skip_completed_quality(output, quality))
             )
-            log = ROOT / f"calibrate/logs/gpu{gpu}_{arm_id}.log"
+            log = campaign_root / f"logs/gpu{gpu}_{arm_id}.log"
             runs.append(
                 RunContract(
                     physical_gpu=gpu,
@@ -329,11 +355,13 @@ def _guided_calibration_runs(
     return tuple(runs)
 
 
-def _fallback_calibration_runs(repo_root: Path, python: str) -> tuple[RunContract, ...]:
+def _fallback_calibration_runs(
+    repo_root: Path, python: str, campaign_root: Path
+) -> tuple[RunContract, ...]:
     runs = []
     for gpu, config in enumerate(NOISE_CONFIGS):
         arm_id = f"fallback_{_config_stem(config)}"
-        output = ROOT / "calibration" / arm_id
+        output = campaign_root / "calibration" / arm_id
         generation = _generation_command(
             python=python,
             config=config,
@@ -344,7 +372,7 @@ def _fallback_calibration_runs(repo_root: Path, python: str) -> tuple[RunContrac
         quality = build_quality_command(
             python=python, output_dir=output, manifest=CALIBRATION_MANIFEST
         )
-        log = ROOT / f"calibrate/logs/gpu{gpu}.log"
+        log = campaign_root / f"logs/gpu{gpu}.log"
         shell = " && ".join(
             (_skip_completed_generation(output, generation), _skip_completed_quality(output, quality))
         )
@@ -1085,11 +1113,13 @@ def load_full_contract(selection_path: Path, visual_review_path: Path) -> dict[s
 
 
 def _build_calibration_visual_evidence(plan: MatrixPlan) -> dict[str, Any]:
+    if plan.campaign_root is None:
+        raise ValueError("calibration visual evidence requires a campaign root")
     manifest_path = plan.repo_root / CALIBRATION_MANIFEST
     arm_ids = sorted({arm_id for run in plan.runs for arm_id in run.arm_ids})
     arms = {}
     for arm_id in arm_ids:
-        arm_root = plan.repo_root / ROOT / "calibration" / arm_id
+        arm_root = plan.repo_root / plan.campaign_root / "calibration" / arm_id
         rows = _read_jsonl(arm_root / "per_sample.jsonl")
         visual_rows = [
             {
@@ -1119,7 +1149,9 @@ def _build_calibration_visual_evidence(plan: MatrixPlan) -> dict[str, Any]:
         "sample_id_manifest_sha256": _sha256_file(manifest_path),
         "arms": arms,
     }
-    _write_or_validate_json(plan.repo_root / CALIBRATION_VISUAL_EVIDENCE, payload)
+    _write_or_validate_json(
+        plan.repo_root / plan.campaign_root / "calibration/visual_evidence.json", payload
+    )
     return payload
 
 
@@ -1338,7 +1370,96 @@ def materialize_full_runtime_configs(plan: MatrixPlan) -> None:
         )
 
 
+def build_campaign_contract(plan: MatrixPlan) -> dict[str, Any]:
+    if plan.phase != "calibrate" or plan.campaign_id is None or plan.campaign_root is None:
+        raise ValueError("campaign contracts are only defined for calibration plans")
+    manifest_path = _resolve(plan.repo_root, plan.sample_manifest)
+    runs = []
+    for run in plan.runs:
+        config_path = _resolve(plan.repo_root, run.config)
+        config = _load_yaml(config_path)
+        sources = []
+        for source in run.source_configs:
+            source_path = _resolve(plan.repo_root, source)
+            sources.append(
+                {
+                    "path": str(source),
+                    "sha256": _sha256_file(source_path),
+                }
+            )
+        runs.append(
+            {
+                "physical_gpu": run.physical_gpu,
+                "family": run.family,
+                "arm_ids": list(run.arm_ids),
+                "config": str(run.config),
+                "config_sha256": _sha256_file(config_path),
+                "arm_config_sha256": canonical_arm_config_digest(config),
+                "source_configs": sources,
+                "shard_index": run.shard_index,
+                "num_shards": run.num_shards,
+                "sample_count": run.sample_count,
+                "sample_id_manifest": str(run.sample_manifest),
+                "sample_id_manifest_sha256": run.sample_manifest_sha256,
+                "output_dir": str(run.output_dir),
+                "command": list(run.command),
+            }
+        )
+    schedule = None
+    if plan.schedule_manifest is not None:
+        schedule_path = _resolve(plan.repo_root, plan.schedule_manifest)
+        schedule = {
+            "path": str(plan.schedule_manifest),
+            "sha256": _sha256_file(schedule_path),
+        }
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "campaign_id": plan.campaign_id,
+        "phase": plan.phase,
+        "sample_id_manifest": str(plan.sample_manifest),
+        "sample_id_manifest_sha256": plan.sample_manifest_sha256,
+        "sample_id_manifest_file_sha256": _sha256_file(manifest_path),
+        "schedule_manifest": schedule,
+        "semigroup_gate": plan.calibration_gate,
+        "runs": runs,
+    }
+    payload["campaign_contract_sha256"] = _canonical_contract_digest(
+        payload, "campaign_contract_sha256"
+    )
+    return payload
+
+
+def ensure_campaign_contract(plan: MatrixPlan) -> dict[str, Any]:
+    if plan.phase != "calibrate" or plan.campaign_root is None:
+        raise ValueError("campaign contract requires a calibration campaign root")
+    campaigns_root = plan.repo_root / ROOT / "campaigns"
+    campaign_root = _resolve(plan.repo_root, plan.campaign_root)
+    _require_contained(campaigns_root, campaign_root, "calibration campaign")
+    contract_path = campaign_root / "campaign_contract.json"
+    if campaign_root.exists() and not campaign_root.is_dir():
+        raise FileExistsError(f"calibration campaign root is not a directory: {campaign_root}")
+    if contract_path.is_symlink():
+        raise ValueError(f"campaign contract must not be a symlink: {contract_path}")
+    if not contract_path.exists() and campaign_root.exists():
+        unexpected = sorted(path.name for path in campaign_root.iterdir())
+        if unexpected:
+            raise FileExistsError(
+                "refusing calibration campaign root with entries but no contract: "
+                f"{unexpected!r}"
+            )
+    payload = build_campaign_contract(plan)
+    _write_immutable_json(contract_path, payload)
+    return payload
+
+
 def execute_plan(plan: MatrixPlan) -> int:
+    if plan.phase == "calibrate":
+        validate_artifact_paths(plan)
+        bound = validate_preflight(plan)
+        materialize_locked_manifests(plan.repo_root)
+        ensure_campaign_contract(bound)
+    else:
+        bound = plan
     lock = _resolve(plan.repo_root, plan.lock_path)
     lock.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -1347,9 +1468,10 @@ def execute_plan(plan: MatrixPlan) -> int:
         raise FileExistsError(f"R8 matrix lock already exists: {lock}") from exc
     try:
         os.write(fd, f"pid={os.getpid()} phase={plan.phase}\n".encode())
-        validate_artifact_paths(plan)
-        bound = validate_preflight(plan)
-        materialize_locked_manifests(plan.repo_root)
+        if plan.phase != "calibrate":
+            validate_artifact_paths(plan)
+            bound = validate_preflight(plan)
+            materialize_locked_manifests(plan.repo_root)
         materialize_full_runtime_configs(plan)
         result = launch_matrix(bound)
         if result != 0:
@@ -1442,8 +1564,10 @@ def finalize_phase(plan: MatrixPlan) -> int:
             )
         return 0
     if plan.phase == "calibrate":
+        if plan.campaign_root is None:
+            raise ValueError("calibration finalization requires a campaign root")
         evidence = _build_calibration_visual_evidence(plan)
-        visual_path = plan.repo_root / VISUAL_REVIEW
+        visual_path = plan.repo_root / plan.campaign_root / "visual_review.json"
         if not visual_path.is_file():
             return 2
         visual = _read_json(visual_path, "calibration visual review")
@@ -2109,6 +2233,36 @@ def _write_or_validate_json(path: Path, payload: Mapping[str, Any]) -> None:
             raise ValueError(f"existing owned artifact disagrees with its contract: {path}")
         return
     _atomic_write_json(path, payload, exclusive=True)
+
+
+def _write_immutable_json(path: Path, payload: Mapping[str, Any]) -> None:
+    expected = json.loads(json.dumps(payload, allow_nan=False))
+    if path.exists():
+        if not path.is_file() or _read_json(path, path.name) != expected:
+            raise ValueError(f"existing owned artifact disagrees with its contract: {path}")
+        return
+    content = (json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n").encode(
+        "utf-8"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            if not path.is_file() or _read_json(path, path.name) != expected:
+                raise ValueError(f"existing owned artifact disagrees with its contract: {path}")
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _write_or_validate_text(path: Path, content: str) -> None:

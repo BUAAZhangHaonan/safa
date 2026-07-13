@@ -33,9 +33,24 @@ def _load_script():
 
 
 def _args(module, *extra: str):
+    values = list(extra)
+    phase = values[values.index("--phase") + 1] if "--phase" in values else "all"
+    if phase in {"calibrate", "all"} and "--campaign-id" not in values:
+        values.extend(("--campaign-id", "test-campaign"))
     return module.parse_args(
-        ["--repo-root", str(REPO_ROOT), "--python", sys.executable, *extra]
+        ["--repo-root", str(REPO_ROOT), "--python", sys.executable, *values]
     )
+def _calibration_args(module, campaign_id: str):
+    return module.argparse.Namespace(
+        repo_root=REPO_ROOT,
+        python=sys.executable,
+        phase="calibrate",
+        dry_run=False,
+        execute=False,
+        allow_busy_gpus=False,
+        campaign_id=campaign_id,
+    )
+
 
 
 def _idle_gpu_states(module):
@@ -94,7 +109,18 @@ def test_matrix_dry_run_is_default_and_has_no_writes(
     monkeypatch.setattr(module, "launch_matrix", lambda plan: pytest.fail("dry-run launched"))
     before = set((REPO_ROOT / "artifacts").iterdir())
 
-    assert module.main(["--repo-root", str(REPO_ROOT), "--python", sys.executable, "--phase", "all"]) == 0
+    assert module.main(
+        [
+            "--repo-root",
+            str(REPO_ROOT),
+            "--python",
+            sys.executable,
+            "--phase",
+            "all",
+            "--campaign-id",
+            "test-campaign",
+        ]
+    ) == 0
 
     assert set((REPO_ROOT / "artifacts").iterdir()) == before
     output = capsys.readouterr().out
@@ -109,6 +135,242 @@ def test_matrix_requires_explicit_execute() -> None:
     assert _args(module).execute is False
     assert _args(module, "--dry-run").execute is False
     assert _args(module, "--execute").execute is True
+
+def test_campaign_id_is_required_strict_and_calibration_only() -> None:
+    module = _load_script()
+    base = ["--repo-root", str(REPO_ROOT), "--python", sys.executable]
+
+    with pytest.raises(SystemExit):
+        module.parse_args([*base, "--phase", "calibrate"])
+    valid = module.parse_args(
+        [*base, "--phase", "calibrate", "--campaign-id", "campaign-2026-07-13"]
+    )
+    assert valid.campaign_id == "campaign-2026-07-13"
+
+    for invalid in (
+        "../escape",
+        "nested/path",
+        ".hidden",
+        "Uppercase",
+        "under_score",
+        "double--dash",
+        "trailing-",
+    ):
+        with pytest.raises(SystemExit):
+            module.parse_args(
+                [*base, "--phase", "calibrate", "--campaign-id", invalid]
+            )
+    for phase in ("semigroup", "full"):
+        with pytest.raises(SystemExit):
+            module.parse_args(
+                [*base, "--phase", phase, "--campaign-id", "campaign-a"]
+            )
+
+
+def test_calibration_campaign_paths_are_isolated_and_shared_inputs_stay_locked() -> None:
+    module = _load_script()
+    plan = module.build_matrix_plan(
+        _calibration_args(module, "campaign-a"),
+        semigroup_gate=_passing_gate(module),
+    )
+    campaign_root = module.ROOT / "campaigns" / "campaign-a"
+
+    assert plan.campaign_id == "campaign-a"
+    assert plan.campaign_root == campaign_root
+    assert plan.status_dir == campaign_root / "status"
+    assert plan.lock_path == campaign_root / ".calibrate.lock"
+    assert len(plan.runs) == 20
+    assert all(
+        run.output_dir == campaign_root / "calibration" / run.arm_ids[0]
+        for run in plan.runs
+    )
+    assert all(run.log_path.is_relative_to(campaign_root / "logs") for run in plan.runs)
+    assert plan.sample_manifest == module.CALIBRATION_MANIFEST
+    assert plan.sample_manifest_sha256 == module.CALIBRATION_MANIFEST_SHA256
+    assert plan.schedule_manifest == module.SCHEDULE_MANIFEST
+
+    for run in plan.runs:
+        command = " ".join(run.command)
+        old_completion = module.ROOT / "calibration" / run.arm_ids[0] / "completion.json"
+        assert str(run.output_dir / "completion.json") in command
+        assert str(old_completion) not in command
+
+
+def test_two_calibration_campaigns_have_disjoint_writable_paths() -> None:
+    module = _load_script()
+    plans = [
+        module.build_matrix_plan(
+            _calibration_args(module, campaign_id),
+            semigroup_gate=_passing_gate(module),
+        )
+        for campaign_id in ("campaign-a", "campaign-b")
+    ]
+
+    def writable_paths(plan):
+        return {
+            plan.status_dir,
+            plan.lock_path,
+            plan.campaign_root / "campaign_contract.json",
+            plan.campaign_root / "visual_review.json",
+            plan.campaign_root / "calibration/visual_evidence.json",
+            *(run.output_dir for run in plan.runs),
+            *(run.log_path for run in plan.runs),
+        }
+
+    assert writable_paths(plans[0]).isdisjoint(writable_paths(plans[1]))
+
+
+def _campaign_plan_in_tmp(module, tmp_path: Path):
+    plan = module.build_matrix_plan(
+        _calibration_args(module, "contract-test"),
+        semigroup_gate=_passing_gate(module),
+    )
+    runs = tuple(
+        replace(
+            run,
+            config=REPO_ROOT / run.config,
+            source_configs=tuple(REPO_ROOT / path for path in run.source_configs),
+            sample_manifest=REPO_ROOT / run.sample_manifest,
+        )
+        for run in plan.runs
+    )
+    return replace(
+        plan,
+        repo_root=tmp_path,
+        runs=runs,
+        sample_manifest=REPO_ROOT / plan.sample_manifest,
+        schedule_manifest=REPO_ROOT / plan.schedule_manifest,
+    )
+
+
+def test_campaign_contract_is_atomic_immutable_and_allows_exact_resume(tmp_path: Path) -> None:
+    module = _load_script()
+    plan = _campaign_plan_in_tmp(module, tmp_path)
+
+    expected = module.ensure_campaign_contract(plan)
+    contract_path = tmp_path / plan.campaign_root / "campaign_contract.json"
+
+    assert json.loads(contract_path.read_text(encoding="utf-8")) == expected
+    assert module._canonical_contract_digest(
+        expected, "campaign_contract_sha256"
+    ) == expected["campaign_contract_sha256"]
+    assert not list(contract_path.parent.glob(".*.tmp"))
+    assert module.ensure_campaign_contract(plan) == expected
+
+
+def test_campaign_contract_rejects_new_nonempty_root_without_contract(tmp_path: Path) -> None:
+    module = _load_script()
+    plan = _campaign_plan_in_tmp(module, tmp_path)
+    campaign_root = tmp_path / plan.campaign_root
+    campaign_root.mkdir(parents=True)
+    (campaign_root / "unowned.txt").write_text("junk", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="entries but no contract"):
+        module.ensure_campaign_contract(plan)
+    assert not (campaign_root / "campaign_contract.json").exists()
+
+
+def test_campaign_contract_rejects_any_semantic_change(tmp_path: Path) -> None:
+    module = _load_script()
+    plan = _campaign_plan_in_tmp(module, tmp_path)
+    module.ensure_campaign_contract(plan)
+    first = plan.runs[0]
+
+    changed_command = list(first.command)
+    changed_command[-1] = changed_command[-1].replace(
+        "--optimization-mode official_adam",
+        "--optimization-mode paper_normalized_direct_autograd",
+    )
+    changed_seed = list(first.command)
+    changed_seed[-1] = changed_seed[-1].replace("--seed 1337", "--seed 1338")
+    assert changed_command != list(first.command)
+    assert changed_seed != list(first.command)
+
+    mutations = {
+        "arm": replace(plan, runs=(replace(first, arm_ids=("changed-arm",)), *plan.runs[1:])),
+        "config": replace(
+            plan,
+            runs=(replace(first, config=REPO_ROOT / module.FLOW_MAP2_CONFIG), *plan.runs[1:]),
+        ),
+        "mode": replace(
+            plan,
+            runs=(replace(first, command=tuple(changed_command)), *plan.runs[1:]),
+        ),
+        "manifest": replace(plan, sample_manifest=REPO_ROOT / module.FULL_MANIFEST),
+        "hash": replace(plan, sample_manifest_sha256="0" * 64),
+        "seed": replace(
+            plan,
+            runs=(replace(first, command=tuple(changed_seed)), *plan.runs[1:]),
+        ),
+    }
+    for label, changed in mutations.items():
+        with pytest.raises(ValueError, match="disagrees"):
+            module.ensure_campaign_contract(changed)
+
+
+def test_calibration_visual_evidence_is_written_only_inside_campaign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_script()
+    plan = replace(
+        module.build_matrix_plan(
+            _calibration_args(module, "evidence-test"),
+            semigroup_gate=_passing_gate(module),
+        ),
+        repo_root=tmp_path,
+    )
+    read_paths = []
+    monkeypatch.setattr(
+        module,
+        "_read_jsonl",
+        lambda path: read_paths.append(path) or [{"sample_id": "sample-a"}],
+    )
+    monkeypatch.setattr(
+        module,
+        "_read_json",
+        lambda path, label: {"columns": ["source", "native", "candidate"], "pages": []},
+    )
+    monkeypatch.setattr(module, "build_visual_evidence_contract", lambda **kwargs: {})
+    monkeypatch.setattr(module, "_sha256_file", lambda path: module.CALIBRATION_MANIFEST_SHA256)
+
+    module._build_calibration_visual_evidence(plan)
+
+    campaign_root = tmp_path / plan.campaign_root
+    assert (campaign_root / "calibration/visual_evidence.json").is_file()
+    assert not (tmp_path / module.CALIBRATION_VISUAL_EVIDENCE).exists()
+    assert all(path.is_relative_to(campaign_root / "calibration") for path in read_paths)
+
+
+def test_calibration_finalize_reads_only_campaign_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_script()
+    plan = replace(
+        module.build_matrix_plan(
+            _calibration_args(module, "review-test"),
+            semigroup_gate=_passing_gate(module),
+        ),
+        repo_root=tmp_path,
+    )
+    global_review = tmp_path / module.VISUAL_REVIEW
+    global_review.parent.mkdir(parents=True)
+    global_review.write_text(json.dumps({"source": "global"}), encoding="utf-8")
+    monkeypatch.setattr(module, "_build_calibration_visual_evidence", lambda value: {"arms": {}})
+
+    assert module.finalize_phase(plan) == 2
+
+    campaign_review = tmp_path / plan.campaign_root / "visual_review.json"
+    campaign_review.parent.mkdir(parents=True)
+    campaign_review.write_text(json.dumps({"source": "campaign"}), encoding="utf-8")
+    reviewed = []
+    monkeypatch.setattr(
+        module,
+        "_validate_multi_arm_review",
+        lambda review, evidence, require_passed: reviewed.append(review) or review,
+    )
+
+    assert module.finalize_phase(plan) == 0
+    assert reviewed == [{"source": "campaign"}]
 
 
 @pytest.mark.parametrize(
@@ -343,7 +605,10 @@ def test_matrix_calibration_uses_one_owned_output_per_arm_and_four_gpu_queues(
     assert module.launch_matrix(plan) == 0
     assert len(processes) == 20
     assert max_active == 4
-    assert all(run.output_dir == module.ROOT / "calibration" / run.arm_ids[0] for run in plan.runs)
+    assert all(
+        run.output_dir == plan.campaign_root / "calibration" / run.arm_ids[0]
+        for run in plan.runs
+    )
     assert all(len(run.arm_ids) == 1 for run in plan.runs)
 
 
@@ -565,7 +830,7 @@ def test_matrix_calibration_resume_contract_is_uniform_across_all_families(
     command = " ".join(gpu3.command)
     assert f"{gpu3.output_dir}/completion.json" in command
     assert "--reuse-valid-output" in command
-    assert gpu3.output_dir == module.ROOT / "calibration" / gpu3.arm_ids[0]
+    assert gpu3.output_dir == plan.campaign_root / "calibration" / gpu3.arm_ids[0]
     finalized_arms: list[str] = []
 
     def fake_evidence(value):
