@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 import importlib.util
 import json
+import multiprocessing
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -242,6 +244,95 @@ def _campaign_plan_in_tmp(module, tmp_path: Path):
         sample_manifest=REPO_ROOT / plan.sample_manifest,
         schedule_manifest=REPO_ROOT / plan.schedule_manifest,
     )
+
+
+def _kernel_lock_execute_worker(
+    repo_root: str,
+    host_lock_dir: str,
+    campaign_id: str,
+    barrier,
+    release,
+    events,
+    mode: str,
+) -> None:
+    module = _load_script()
+    module.HOST_GPU_LOCK_DIR = Path(host_lock_dir)
+    plan = replace(
+        module.build_matrix_plan(
+            _calibration_args(module, campaign_id),
+            semigroup_gate=_passing_gate(module),
+        ),
+        repo_root=Path(repo_root),
+        execute=True,
+    )
+    module.validate_artifact_paths = lambda value: None
+    module.materialize_locked_manifests = lambda value: None
+    module.ensure_campaign_contract = lambda value: {}
+    module.materialize_calibration_runtime_configs = lambda value: None
+    module.materialize_full_runtime_configs = lambda value: None
+
+    def preflight(value):
+        events.put((campaign_id, os.getpid(), "query"))
+        if mode == "hold_preflight" and not release.wait(10.0):
+            raise TimeoutError("test release barrier timed out")
+        return value
+
+    def launch(value):
+        events.put((campaign_id, os.getpid(), "launch"))
+        if mode == "crash_launch":
+            os._exit(17)
+        return 1
+
+    module.validate_preflight = preflight
+    module.launch_matrix = launch
+    try:
+        barrier.wait(timeout=10.0)
+        module.execute_plan(plan)
+        events.put((campaign_id, os.getpid(), "done"))
+    except Exception as exc:
+        events.put((campaign_id, os.getpid(), "rejected", type(exc).__name__, str(exc)))
+
+
+def _collect_process_events(events, count: int) -> list[tuple]:
+    return [events.get(timeout=10.0) for _ in range(count)]
+
+
+def _kernel_lock_hold_gpu_worker(
+    host_lock_dir: str, physical_gpu: int, ready, release, events
+) -> None:
+    module = _load_script()
+    module.HOST_GPU_LOCK_DIR = Path(host_lock_dir)
+    path = module.HOST_GPU_LOCK_DIR / f"gpu{physical_gpu}.lock"
+    fd = module._acquire_kernel_lease(
+        path,
+        module.HOST_GPU_LOCK_DIR.parent,
+        f"test physical GPU {physical_gpu} lease",
+    )
+    try:
+        events.put(("held", physical_gpu))
+        ready.set()
+        if not release.wait(10.0):
+            raise TimeoutError("test GPU lock release timed out")
+    finally:
+        os.close(fd)
+
+
+def _kernel_lock_probe_worker(
+    repo_root: str, host_lock_dir: str, campaign_id: str, events
+) -> None:
+    module = _load_script()
+    module.HOST_GPU_LOCK_DIR = Path(host_lock_dir)
+    plan = module.build_matrix_plan(
+        _calibration_args(module, campaign_id),
+        semigroup_gate=_passing_gate(module),
+    )
+    gpu0_run = next(run for run in plan.runs if run.physical_gpu == 0)
+    plan = replace(plan, repo_root=Path(repo_root), runs=(gpu0_run,))
+    try:
+        with module.execution_leases(plan):
+            events.put(("acquired", os.getpid()))
+    except Exception as exc:
+        events.put(("rejected", type(exc).__name__, str(exc)))
 
 
 def test_campaign_contract_is_atomic_immutable_and_allows_exact_resume(tmp_path: Path) -> None:
@@ -1267,6 +1358,184 @@ def test_peak_memory_recurses_over_every_owned_arm(tmp_path: Path) -> None:
     assert module.run_peak_memory(run) == {"allocated": 30, "reserved": 25}
 
 
+@pytest.mark.parametrize(
+    "campaign_ids",
+    [("campaign-a", "campaign-b"), ("same-campaign", "same-campaign")],
+    ids=("different-campaigns", "same-campaign"),
+)
+def test_kernel_gpu_leases_admit_only_one_process_before_query(
+    tmp_path: Path, campaign_ids: tuple[str, str]
+) -> None:
+    context = multiprocessing.get_context("fork")
+    barrier = context.Barrier(2)
+    release = context.Event()
+    events = context.Queue()
+    repo_root = tmp_path / "repo"
+    host_lock_dir = tmp_path / "host-locks"
+    processes = [
+        context.Process(
+            target=_kernel_lock_execute_worker,
+            args=(
+                str(repo_root),
+                str(host_lock_dir),
+                campaign_id,
+                barrier,
+                release,
+                events,
+                "hold_preflight",
+            ),
+        )
+        for campaign_id in campaign_ids
+    ]
+    for process in processes:
+        process.start()
+    try:
+        before_release = _collect_process_events(events, 2)
+        assert [event[2] for event in before_release].count("query") == 1
+        assert [event[2] for event in before_release].count("rejected") == 1
+    finally:
+        release.set()
+        for process in processes:
+            process.join(timeout=10.0)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=5.0)
+    assert [process.exitcode for process in processes] == [0, 0]
+    after_release = _collect_process_events(events, 2)
+    assert [event[2] for event in after_release] == ["launch", "done"]
+
+
+def test_kernel_leases_recover_after_holder_process_abrupt_exit(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("fork")
+    repo_root = tmp_path / "repo"
+    host_lock_dir = tmp_path / "host-locks"
+    release = context.Event()
+    release.set()
+    crash_events = context.Queue()
+    crashed = context.Process(
+        target=_kernel_lock_execute_worker,
+        args=(
+            str(repo_root),
+            str(host_lock_dir),
+            "recover-campaign",
+            context.Barrier(1),
+            release,
+            crash_events,
+            "crash_launch",
+        ),
+    )
+    crashed.start()
+    crashed.join(timeout=10.0)
+    if crashed.is_alive():
+        crashed.kill()
+        crashed.join(timeout=5.0)
+    assert crashed.exitcode == 17
+
+    recovered_events = context.Queue()
+    recovered = context.Process(
+        target=_kernel_lock_execute_worker,
+        args=(
+            str(repo_root),
+            str(host_lock_dir),
+            "recover-campaign",
+            context.Barrier(1),
+            release,
+            recovered_events,
+            "normal",
+        ),
+    )
+    recovered.start()
+    recovered.join(timeout=10.0)
+    if recovered.is_alive():
+        recovered.kill()
+        recovered.join(timeout=5.0)
+    assert recovered.exitcode == 0
+    stages = [event[2] for event in _collect_process_events(recovered_events, 3)]
+    assert stages == ["query", "launch", "done"]
+
+
+def test_kernel_lease_partial_acquisition_failure_releases_earlier_leases(
+    tmp_path: Path,
+) -> None:
+    context = multiprocessing.get_context("fork")
+    host_lock_dir = tmp_path / "host-locks"
+    ready = context.Event()
+    release = context.Event()
+    holder_events = context.Queue()
+    holder = context.Process(
+        target=_kernel_lock_hold_gpu_worker,
+        args=(str(host_lock_dir), 1, ready, release, holder_events),
+    )
+    holder.start()
+    try:
+        assert ready.wait(10.0)
+        assert holder_events.get(timeout=10.0) == ("held", 1)
+        module = _load_script()
+        module.HOST_GPU_LOCK_DIR = host_lock_dir
+        plan = _campaign_plan_in_tmp(module, tmp_path / "repo")
+        gpu_runs = tuple(
+            next(run for run in plan.runs if run.physical_gpu == gpu)
+            for gpu in (0, 1)
+        )
+        plan = replace(plan, runs=gpu_runs)
+        with pytest.raises(RuntimeError, match="physical GPU 1 lease"):
+            with module.execution_leases(plan):
+                pytest.fail("held GPU lease was acquired")
+
+        probe_events = context.Queue()
+        probe = context.Process(
+            target=_kernel_lock_probe_worker,
+            args=(
+                str(tmp_path / "repo"),
+                str(host_lock_dir),
+                str(plan.campaign_id),
+                probe_events,
+            ),
+        )
+        probe.start()
+        probe.join(timeout=10.0)
+        if probe.is_alive():
+            probe.kill()
+            probe.join(timeout=5.0)
+        assert probe.exitcode == 0
+        assert probe_events.get(timeout=10.0)[0] == "acquired"
+    finally:
+        release.set()
+        holder.join(timeout=10.0)
+        if holder.is_alive():
+            holder.kill()
+            holder.join(timeout=5.0)
+    assert holder.exitcode == 0
+
+
+@pytest.mark.parametrize("lock_kind", ["campaign-leaf", "gpu-directory", "gpu-leaf"])
+def test_kernel_lease_paths_reject_symlinks(tmp_path: Path, lock_kind: str) -> None:
+    module = _load_script()
+    module.HOST_GPU_LOCK_DIR = tmp_path / "host-locks"
+    repo_root = tmp_path / "repo"
+    plan = replace(_campaign_plan_in_tmp(module, repo_root), execute=True)
+    outside_file = tmp_path / "outside.lock"
+    outside_file.write_text("unchanged", encoding="utf-8")
+    outside_dir = tmp_path / "outside-dir"
+    outside_dir.mkdir()
+    if lock_kind == "campaign-leaf":
+        lock_path = repo_root / plan.lock_path
+        lock_path.parent.mkdir(parents=True)
+        lock_path.symlink_to(outside_file)
+    elif lock_kind == "gpu-directory":
+        module.HOST_GPU_LOCK_DIR.symlink_to(outside_dir, target_is_directory=True)
+    else:
+        module.HOST_GPU_LOCK_DIR.mkdir()
+        (module.HOST_GPU_LOCK_DIR / "gpu0.lock").symlink_to(outside_file)
+
+    with pytest.raises(ValueError, match="symlink"):
+        with module.execution_leases(plan):
+            pytest.fail("symlinked lock path was acquired")
+
+    assert outside_file.read_text(encoding="utf-8") == "unchanged"
+    assert list(outside_dir.iterdir()) == []
+
+
 def test_terminate_process_group_reaps_shell_and_child(tmp_path: Path) -> None:
     module = _load_script()
     child_pid_path = tmp_path / "child.pid"
@@ -1296,6 +1565,7 @@ def test_execute_plan_keyboard_interrupt_reaps_session_before_unlock(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     module = _load_script()
+    module.HOST_GPU_LOCK_DIR = tmp_path / "host-locks"
     child_pid_path = tmp_path / "child.pid"
     run = replace(
         module.build_matrix_plan(_args(module, "--phase", "semigroup")).runs[0],
@@ -1357,13 +1627,16 @@ def test_execute_plan_keyboard_interrupt_reaps_session_before_unlock(
     while Path(f"/proc/{child_pid}").exists() and time.monotonic() < deadline:
         time.sleep(0.01)
     assert not Path(f"/proc/{child_pid}").exists()
-    assert not (tmp_path / "matrix.lock").exists()
+    assert (tmp_path / "matrix.lock").is_file()
+    with module.execution_leases(plan):
+        pass
 
 
 def test_execute_plan_marks_finalize_failure_not_passed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     module = _load_script()
+    module.HOST_GPU_LOCK_DIR = tmp_path / "host-locks"
     plan = replace(
         module.build_matrix_plan(_args(module, "--phase", "semigroup", "--execute")),
         repo_root=tmp_path,

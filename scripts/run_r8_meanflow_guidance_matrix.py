@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+import errno
+import fcntl
 import hashlib
 import json
 import math
@@ -17,7 +20,7 @@ import stat
 import statistics
 import subprocess
 import time
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 import yaml
 
@@ -66,6 +69,7 @@ QUALITY_SCRIPT = Path("scripts/eval_generation_quality.py")
 GUIDANCE_SCRIPT = Path("scripts/run_meanflow_flow_map_guidance.py")
 MIN_FREE_MEMORY_MIB = 12000
 PROCESS_POLL_INTERVAL_SECONDS = 0.05
+HOST_GPU_LOCK_DIR = Path("/tmp") / f"safa-r8-meanflow-guidance-{os.getuid()}"
 
 
 @dataclass(frozen=True)
@@ -1540,7 +1544,11 @@ def ensure_campaign_contract(plan: MatrixPlan) -> dict[str, Any]:
     if contract_path.is_symlink():
         raise ValueError(f"campaign contract must not be a symlink: {contract_path}")
     if not contract_path.exists() and campaign_root.exists():
-        unexpected = sorted(path.name for path in campaign_root.iterdir())
+        unexpected = sorted(
+            path.name
+            for path in campaign_root.iterdir()
+            if path != _resolve(plan.repo_root, plan.lock_path)
+        )
         if unexpected:
             raise FileExistsError(
                 "refusing calibration campaign root with entries but no contract: "
@@ -1551,24 +1559,75 @@ def ensure_campaign_contract(plan: MatrixPlan) -> dict[str, Any]:
     return payload
 
 
+def _acquire_kernel_lease(path: Path, root: Path, label: str) -> int:
+    _reject_symlink_components(root, path.parent, label)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _reject_symlink_components(root, path.parent, label)
+    _reject_lstat_symlink(path, label)
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ValueError(f"{label} must not be a symlink: {path}") from exc
+        raise
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f"{label} must be a regular file: {path}")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                raise RuntimeError(f"{label} is held by another process: {path}") from exc
+            raise
+        metadata = f"pid={os.getpid()} label={label}\n".encode()
+        os.ftruncate(fd, 0)
+        os.write(fd, metadata)
+        os.fsync(fd)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+@contextmanager
+def execution_leases(plan: MatrixPlan) -> Iterator[None]:
+    campaign_lock = _resolve(plan.repo_root, plan.lock_path)
+    lease_specs = [
+        (campaign_lock, plan.repo_root, f"R8 {plan.phase} campaign lease"),
+        *[
+            (
+                HOST_GPU_LOCK_DIR / f"gpu{gpu}.lock",
+                HOST_GPU_LOCK_DIR.parent,
+                f"R8 physical GPU {gpu} lease",
+            )
+            for gpu in sorted({run.physical_gpu for run in plan.runs})
+        ],
+    ]
+    leases: list[int] = []
+    try:
+        for path, root, label in lease_specs:
+            leases.append(_acquire_kernel_lease(path, root, label))
+        yield
+    finally:
+        for fd in reversed(leases):
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
 def execute_plan(plan: MatrixPlan) -> int:
     if plan.phase == "calibrate":
         validate_campaign_path_safety(plan)
-        validate_artifact_paths(plan)
-        bound = validate_preflight(plan)
-        materialize_locked_manifests(plan.repo_root)
-        ensure_campaign_contract(bound)
-    else:
-        bound = plan
-    lock = _resolve(plan.repo_root, plan.lock_path)
-    lock.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    except FileExistsError as exc:
-        raise FileExistsError(f"R8 matrix lock already exists: {lock}") from exc
-    try:
-        os.write(fd, f"pid={os.getpid()} phase={plan.phase}\n".encode())
-        if plan.phase != "calibrate":
+    with execution_leases(plan):
+        if plan.phase == "calibrate":
+            validate_campaign_path_safety(plan)
+            validate_artifact_paths(plan)
+            bound = validate_preflight(plan)
+            materialize_locked_manifests(plan.repo_root)
+            ensure_campaign_contract(bound)
+        else:
             validate_artifact_paths(plan)
             bound = validate_preflight(plan)
             materialize_locked_manifests(plan.repo_root)
@@ -1598,9 +1657,6 @@ def execute_plan(plan: MatrixPlan) -> int:
                 finalize_error=f"finalize_phase returned {finalize_result}",
             )
         return finalize_result
-    finally:
-        os.close(fd)
-        lock.unlink(missing_ok=True)
 
 
 def _update_matrix_status(
