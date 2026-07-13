@@ -136,13 +136,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     mode.add_argument("--execute", action="store_true")
     parser.add_argument("--allow-busy-gpus", action="store_true")
     args = parser.parse_args(argv)
-    if args.phase in {"calibrate", "all"}:
+    if args.phase in {"calibrate", "full", "all"}:
         if args.campaign_id is None:
-            parser.error("--campaign-id is required for calibration")
+            parser.error("--campaign-id is required for calibration and full evaluation")
         if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", args.campaign_id) is None:
             parser.error("--campaign-id must be a lowercase slug")
     elif args.campaign_id is not None:
-        parser.error("--campaign-id is only valid for calibration")
+        parser.error("--campaign-id is not valid for semigroup")
     return args
 
 
@@ -206,10 +206,17 @@ def build_matrix_plan(
             sample_manifest_sha256=CALIBRATION_MANIFEST_SHA256,
             calibration_gate=gate,
         )
-    contract = dict(full_contract) if full_contract is not None else load_full_contract(
-        repo_root / SELECTION, repo_root / VISUAL_REVIEW
+    campaign_id = str(args.campaign_id)
+    if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", campaign_id) is None:
+        raise ValueError("full evaluation requires a valid campaign_id")
+    campaign_root = ROOT / "campaigns" / campaign_id
+    common.update(campaign_id=campaign_id, campaign_root=campaign_root)
+    contract = (
+        dict(full_contract)
+        if full_contract is not None
+        else load_full_contract(repo_root, campaign_id)
     )
-    _validate_full_contract(contract)
+    _validate_full_contract(contract, expected_campaign_id=campaign_id)
     runs = tuple(_full_run(repo_root, str(args.python), gpu, contract) for gpu in range(4))
     return MatrixPlan(
         **common,
@@ -1141,29 +1148,145 @@ def merge_semigroup_shards(
     }
 
 
-def load_full_contract(selection_path: Path, visual_review_path: Path) -> dict[str, Any]:
-    selection = _load_required_json(selection_path, "locked winner selection")
-    visual = _load_required_json(visual_review_path, "visual_review")
-    if int(visual.get("reviewed_sample_count", -1)) != 64:
-        raise ValueError("visual_review must contain exactly 64 reviewed samples")
-    if visual.get("passed") is not True:
-        raise ValueError("visual_review must pass before the full run")
-    evidence_path = selection_path.parent / "calibration/visual_evidence.json"
+def load_full_contract(repo_root: Path, campaign_id: str) -> dict[str, Any]:
+    if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", campaign_id) is None:
+        raise ValueError("full evaluation requires a valid campaign_id")
+    campaign_root = ROOT / "campaigns" / campaign_id
+    campaign_root_path = repo_root / campaign_root
+    campaigns_root = repo_root / ROOT / "campaigns"
+    _require_contained(campaigns_root, campaign_root_path, "full evaluation campaign")
+    _reject_symlink_components(repo_root / ROOT, campaign_root_path, "full evaluation campaign")
+
+    contract_path = campaign_root_path / "campaign_contract.json"
+    evidence_path = campaign_root_path / "calibration/visual_evidence.json"
+    review_path = campaign_root_path / "visual_review.json"
+    selection_path = campaign_root_path / "selection.json"
+    for path, label in (
+        (contract_path, "campaign contract"),
+        (evidence_path, "calibration visual evidence"),
+        (review_path, "visual review"),
+        (selection_path, "locked winner selection"),
+    ):
+        _reject_lstat_symlink(path, label)
+
+    campaign_contract = _load_required_json(contract_path, "campaign contract")
     evidence = _load_required_json(evidence_path, "calibration visual evidence")
-    _validate_multi_arm_review(visual, evidence, require_passed=True)
+    visual = _load_required_json(review_path, "visual_review")
+    selection = _load_required_json(selection_path, "locked winner selection")
+
+    if campaign_contract.get("campaign_id") != campaign_id:
+        raise ValueError("campaign contract campaign_id disagrees with the requested campaign")
+    registered_contract_sha = _require_sha256(
+        campaign_contract.get("campaign_contract_sha256"), "campaign contract SHA256"
+    )
+    if (
+        _canonical_contract_digest(campaign_contract, "campaign_contract_sha256")
+        != registered_contract_sha
+    ):
+        raise ValueError("campaign contract self SHA256 disagrees")
+    if selection.get("campaign_id") != campaign_id:
+        raise ValueError("selection campaign_id disagrees with the requested campaign")
+    selection_sha = _require_sha256(
+        selection.get("selection_contract_sha256"), "selection contract SHA256"
+    )
+    if _canonical_contract_digest(selection, "selection_contract_sha256") != selection_sha:
+        raise ValueError("selection contract self SHA256 disagrees")
+    if selection.get("campaign_contract_sha256") != registered_contract_sha:
+        raise ValueError("selection campaign contract SHA256 disagrees")
+    if selection.get("visual_evidence_sha256") != _sha256_file(evidence_path):
+        raise ValueError("selection visual evidence SHA256 disagrees")
+    if selection.get("visual_review_sha256") != _sha256_file(review_path):
+        raise ValueError("selection visual review SHA256 disagrees")
+
     winner = selection.get("winner")
-    if not isinstance(winner, Mapping) or not winner.get("config"):
-        raise ValueError("selection must contain a locked winner config")
-    _require_sha256(winner.get("config_sha256"), "winner config SHA256")
-    require_arm_config_digest(winner.get("arm_config_sha256"), "winner arm config SHA256")
-    manifest_count = int(selection.get("full_sample_count", 2048))
-    manifest_sha = str(selection.get("full_sample_id_manifest_sha256", FULL_MANIFEST_SHA256))
-    return {
+    if not isinstance(winner, Mapping):
+        raise ValueError("selection must contain a locked winner")
+    arm_id = winner.get("arm_id")
+    if not isinstance(arm_id, str) or not arm_id:
+        raise ValueError("selection winner must contain an arm_id")
+    runs = campaign_contract.get("runs")
+    if not isinstance(runs, list):
+        raise ValueError("campaign contract must contain registered runs")
+    registered_runs = [
+        run
+        for run in runs
+        if isinstance(run, Mapping)
+        and isinstance(run.get("arm_ids"), list)
+        and arm_id in run["arm_ids"]
+    ]
+    if len(registered_runs) != 1:
+        raise ValueError("selection winner arm_id is not one registered campaign arm")
+    registered_run = registered_runs[0]
+    expected_output = campaign_root / "calibration" / arm_id
+    if Path(str(registered_run.get("output_dir"))) != expected_output:
+        raise ValueError("registered winner output directory disagrees with its campaign arm")
+
+    expected_config = Path(str(registered_run.get("config")))
+    if Path(str(winner.get("config"))) != expected_config:
+        raise ValueError("winner config path disagrees with the registered campaign arm")
+    expected_config_sha = _require_sha256(
+        registered_run.get("config_sha256"), "registered winner config SHA256"
+    )
+    if winner.get("config_sha256") != expected_config_sha:
+        raise ValueError("winner config SHA256 disagrees with the registered campaign arm")
+    config_path = _resolve(repo_root, expected_config)
+    if _sha256_file(config_path) != expected_config_sha:
+        raise ValueError("registered winner config file SHA256 changed")
+    expected_arm_sha = require_arm_config_digest(
+        registered_run.get("arm_config_sha256"), "registered winner arm config SHA256"
+    )
+    if winner.get("arm_config_sha256") != expected_arm_sha:
+        raise ValueError("winner arm config SHA256 disagrees with the registered campaign arm")
+    if canonical_arm_config_digest(_load_yaml(config_path)) != expected_arm_sha:
+        raise ValueError("registered winner canonical arm config SHA256 changed")
+
+    expected_metrics = expected_output / "quality.json"
+    if Path(str(winner.get("metrics_path"))) != expected_metrics:
+        raise ValueError("winner metrics path must be the registered campaign arm quality.json")
+    metrics_sha = _require_sha256(winner.get("metrics_sha256"), "winner metrics SHA256")
+    if _sha256_file(repo_root / expected_metrics) != metrics_sha:
+        raise ValueError("winner metrics SHA256 disagrees")
+
+    evidence_arms = evidence.get("arms")
+    if not isinstance(evidence_arms, Mapping) or arm_id not in evidence_arms:
+        raise ValueError("selection winner arm_id is missing from campaign visual evidence")
+    normalized_visual = _validate_multi_arm_review(visual, evidence, require_passed=False)
+    normalized_arms = normalized_visual.get("arms")
+    selected_review = normalized_arms.get(arm_id) if isinstance(normalized_arms, Mapping) else None
+    if not isinstance(selected_review, Mapping) or selected_review.get("passed") is not True:
+        raise ValueError("selection winner arm must pass visual review")
+
+    if int(selection.get("full_sample_count", -1)) != 2048:
+        raise ValueError("selection must lock exactly 2048 full samples")
+    if Path(str(selection.get("full_sample_id_manifest"))) != FULL_MANIFEST:
+        raise ValueError("selection full sample manifest path is not the registered manifest")
+    manifest_sha = _require_sha256(
+        selection.get("full_sample_id_manifest_sha256"), "full sample manifest SHA256"
+    )
+    if manifest_sha != FULL_MANIFEST_SHA256:
+        raise ValueError("selection full sample manifest SHA256 is not registered")
+
+    contract = {
+        "campaign_id": campaign_id,
+        "campaign_contract_sha256": registered_contract_sha,
+        "visual_evidence_sha256": selection["visual_evidence_sha256"],
+        "visual_review_sha256": selection["visual_review_sha256"],
+        "selection_contract_sha256": selection_sha,
+        "campaign_arm_ids": sorted(
+            {
+                str(run_arm)
+                for run in runs
+                if isinstance(run, Mapping) and isinstance(run.get("arm_ids"), list)
+                for run_arm in run["arm_ids"]
+            }
+        ),
         "winner": dict(winner),
-        "visual_review": visual,
-        "manifest_count": manifest_count,
+        "visual_review": normalized_visual,
+        "manifest_count": 2048,
         "manifest_sha256": manifest_sha,
     }
+    _validate_full_contract(contract, expected_campaign_id=campaign_id)
+    return contract
 
 
 def _build_calibration_visual_evidence(plan: MatrixPlan) -> dict[str, Any]:
@@ -1297,16 +1420,40 @@ def _validate_multi_arm_review(
     }
 
 
-def _validate_full_contract(contract: Mapping[str, Any]) -> None:
+def _validate_full_contract(
+    contract: Mapping[str, Any], *, expected_campaign_id: str
+) -> None:
+    if contract.get("campaign_id") != expected_campaign_id:
+        raise ValueError("full contract campaign_id disagrees with the requested campaign")
+    for field, label in (
+        ("campaign_contract_sha256", "campaign contract SHA256"),
+        ("visual_evidence_sha256", "visual evidence SHA256"),
+        ("visual_review_sha256", "visual review SHA256"),
+        ("selection_contract_sha256", "selection contract SHA256"),
+    ):
+        _require_sha256(contract.get(field), label)
     winner = contract.get("winner")
     if not isinstance(winner, Mapping) or not winner.get("config"):
         raise ValueError("full phase requires a locked winner config")
+    arm_id = winner.get("arm_id")
+    if not isinstance(arm_id, str) or not arm_id:
+        raise ValueError("full phase requires a locked winner arm_id")
+    campaign_arm_ids = contract.get("campaign_arm_ids")
+    if not isinstance(campaign_arm_ids, list) or arm_id not in campaign_arm_ids:
+        raise ValueError("full winner is not a registered campaign arm")
+    _require_sha256(winner.get("config_sha256"), "winner config SHA256")
     require_arm_config_digest(winner.get("arm_config_sha256"), "winner arm config SHA256")
+    expected_metrics = ROOT / "campaigns" / expected_campaign_id / "calibration" / arm_id / "quality.json"
+    if Path(str(winner.get("metrics_path"))) != expected_metrics:
+        raise ValueError("full winner metrics path is not bound to its campaign arm")
+    _require_sha256(winner.get("metrics_sha256"), "winner metrics SHA256")
     visual = contract.get("visual_review")
     if not isinstance(visual, Mapping) or int(visual.get("reviewed_sample_count", -1)) != 64:
         raise ValueError("full phase requires a 64-sample visual review")
-    if visual.get("passed") is not True:
-        raise ValueError("full phase requires visual review pass")
+    visual_arms = visual.get("arms")
+    selected_visual = visual_arms.get(arm_id) if isinstance(visual_arms, Mapping) else None
+    if not isinstance(selected_visual, Mapping) or selected_visual.get("passed") is not True:
+        raise ValueError("full winner arm requires visual review pass")
     if int(contract.get("manifest_count", -1)) != 2048:
         raise ValueError("full phase requires exactly 2048 samples")
     if contract.get("manifest_sha256") != FULL_MANIFEST_SHA256:
@@ -2223,7 +2370,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             if phase == "calibrate":
                 plan = build_matrix_plan(phase_args, semigroup_gate=_dry_run_gate())
             elif phase == "full":
-                plan = build_matrix_plan(phase_args, full_contract=_dry_run_full_contract())
+                plan = build_matrix_plan(
+                    phase_args,
+                    full_contract=_dry_run_full_contract(str(args.campaign_id)),
+                )
             else:
                 plan = build_matrix_plan(phase_args)
             plan = validate_preflight(plan, gpu_states=states)
@@ -2248,15 +2398,38 @@ def _dry_run_gate() -> dict[str, Any]:
     }
 
 
-def _dry_run_full_contract() -> dict[str, Any]:
+def _dry_run_full_contract(campaign_id: str) -> dict[str, Any]:
     config = _load_yaml(Path(__file__).resolve().parents[1] / NOISE_CONFIGS[0])
+    arm_id = "dry-run-winner"
     return {
+        "campaign_id": campaign_id,
+        "campaign_contract_sha256": "0" * 64,
+        "visual_evidence_sha256": "1" * 64,
+        "visual_review_sha256": "2" * 64,
+        "selection_contract_sha256": "3" * 64,
+        "campaign_arm_ids": [arm_id],
         "winner": {
-            "arm_id": "dry_run_winner",
+            "arm_id": arm_id,
             "config": str(NOISE_CONFIGS[0]),
+            "config_sha256": _sha256_file(
+                Path(__file__).resolve().parents[1] / NOISE_CONFIGS[0]
+            ),
             "arm_config_sha256": canonical_arm_config_digest(config),
+            "metrics_path": str(
+                ROOT
+                / "campaigns"
+                / campaign_id
+                / "calibration"
+                / arm_id
+                / "quality.json"
+            ),
+            "metrics_sha256": "4" * 64,
         },
-        "visual_review": {"reviewed_sample_count": 64, "passed": True},
+        "visual_review": {
+            "reviewed_sample_count": 64,
+            "passed": True,
+            "arms": {arm_id: {"passed": True}},
+        },
         "manifest_count": 2048,
         "manifest_sha256": FULL_MANIFEST_SHA256,
     }

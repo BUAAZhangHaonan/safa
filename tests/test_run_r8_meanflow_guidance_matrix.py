@@ -37,7 +37,7 @@ def _load_script():
 def _args(module, *extra: str):
     values = list(extra)
     phase = values[values.index("--phase") + 1] if "--phase" in values else "all"
-    if phase in {"calibrate", "all"} and "--campaign-id" not in values:
+    if phase in {"calibrate", "full", "all"} and "--campaign-id" not in values:
         values.extend(("--campaign-id", "test-campaign"))
     return module.parse_args(
         ["--repo-root", str(REPO_ROOT), "--python", sys.executable, *values]
@@ -74,6 +74,134 @@ def _passing_gate(module) -> dict:
         "selected_t_cut": 0.25,
         "t_cut": 0.25,
         "sample_id_manifest_sha256": module.CALIBRATION_MANIFEST_SHA256,
+    }
+
+
+def _injected_full_contract(module, winner: dict, campaign_id: str = "test-campaign") -> dict:
+    arm_id = str(winner["arm_id"])
+    bound_winner = {
+        "metrics_path": str(
+            module.ROOT / "campaigns" / campaign_id / "calibration" / arm_id / "quality.json"
+        ),
+        "metrics_sha256": "4" * 64,
+        **winner,
+    }
+    return {
+        "campaign_id": campaign_id,
+        "campaign_contract_sha256": "0" * 64,
+        "visual_evidence_sha256": "1" * 64,
+        "visual_review_sha256": "2" * 64,
+        "selection_contract_sha256": "3" * 64,
+        "campaign_arm_ids": [arm_id],
+        "winner": bound_winner,
+        "visual_review": {
+            "reviewed_sample_count": 64,
+            "passed": True,
+            "arms": {arm_id: {"passed": True}},
+        },
+        "manifest_count": 2048,
+        "manifest_sha256": module.FULL_MANIFEST_SHA256,
+    }
+
+
+def _write_campaign_selection_fixture(
+    module,
+    repo_root: Path,
+    campaign_id: str,
+    *,
+    arm_id: str = "noise-fixed-eta025",
+    visual_passed: bool = True,
+) -> dict[str, Path | dict]:
+    campaign_root = repo_root / module.ROOT / "campaigns" / campaign_id
+    arm_root = campaign_root / "calibration" / arm_id
+    arm_root.mkdir(parents=True)
+    config_path = REPO_ROOT / module.NOISE_CONFIGS[0]
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    metrics_path = arm_root / "quality.json"
+    metrics_path.write_text(json.dumps({"campaign_id": campaign_id}), encoding="utf-8")
+    run = {
+        "arm_ids": [arm_id],
+        "config": str(config_path),
+        "config_sha256": module._sha256_file(config_path),
+        "arm_config_sha256": canonical_arm_config_digest(config),
+        "output_dir": str(module.ROOT / "campaigns" / campaign_id / "calibration" / arm_id),
+    }
+    campaign_contract = {
+        "schema_version": 1,
+        "campaign_id": campaign_id,
+        "phase": "calibrate",
+        "runs": [run],
+    }
+    campaign_contract["campaign_contract_sha256"] = module._canonical_contract_digest(
+        campaign_contract, "campaign_contract_sha256"
+    )
+    contract_path = campaign_root / "campaign_contract.json"
+    contract_path.write_text(json.dumps(campaign_contract), encoding="utf-8")
+    evidence = {
+        "schema_version": 1,
+        "campaign_id": campaign_id,
+        "sample_count": 64,
+        "arms": {arm_id: {}},
+    }
+    evidence_path = campaign_root / "calibration" / "visual_evidence.json"
+    evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+    review = {
+        "campaign_id": campaign_id,
+        "reviewed_sample_count": 64,
+        "passed": visual_passed,
+        "arms": {arm_id: {"passed": visual_passed}},
+    }
+    review_path = campaign_root / "visual_review.json"
+    review_path.write_text(json.dumps(review), encoding="utf-8")
+    selection = {
+        "schema_version": 1,
+        "campaign_id": campaign_id,
+        "campaign_contract_sha256": campaign_contract["campaign_contract_sha256"],
+        "visual_evidence_sha256": module._sha256_file(evidence_path),
+        "visual_review_sha256": module._sha256_file(review_path),
+        "winner": {
+            "arm_id": arm_id,
+            "config": run["config"],
+            "config_sha256": run["config_sha256"],
+            "arm_config_sha256": run["arm_config_sha256"],
+            "metrics_path": str(
+                module.ROOT
+                / "campaigns"
+                / campaign_id
+                / "calibration"
+                / arm_id
+                / "quality.json"
+            ),
+            "metrics_sha256": module._sha256_file(metrics_path),
+        },
+        "full_sample_count": 2048,
+        "full_sample_id_manifest": str(module.FULL_MANIFEST),
+        "full_sample_id_manifest_sha256": module.FULL_MANIFEST_SHA256,
+    }
+    selection["selection_contract_sha256"] = module._canonical_contract_digest(
+        selection, "selection_contract_sha256"
+    )
+    selection_path = campaign_root / "selection.json"
+    selection_path.write_text(json.dumps(selection), encoding="utf-8")
+    return {
+        "campaign_root": campaign_root,
+        "contract_path": contract_path,
+        "evidence_path": evidence_path,
+        "review_path": review_path,
+        "selection_path": selection_path,
+        "metrics_path": metrics_path,
+        "campaign_contract": campaign_contract,
+        "selection": selection,
+    }
+
+
+def _accept_fixture_visual_review(review, evidence, *, require_passed):
+    del require_passed
+    assert set(review["arms"]) == set(evidence["arms"])
+    return {
+        "reviewed_sample_count": int(evidence["sample_count"]),
+        "passed": bool(review["passed"]),
+        "arms": review["arms"],
     }
 
 
@@ -138,7 +266,7 @@ def test_matrix_requires_explicit_execute() -> None:
     assert _args(module, "--dry-run").execute is False
     assert _args(module, "--execute").execute is True
 
-def test_campaign_id_is_required_strict_and_calibration_only() -> None:
+def test_campaign_id_is_required_strict_for_calibration_and_full(tmp_path: Path) -> None:
     module = _load_script()
     base = ["--repo-root", str(REPO_ROOT), "--python", sys.executable]
 
@@ -162,11 +290,17 @@ def test_campaign_id_is_required_strict_and_calibration_only() -> None:
             module.parse_args(
                 [*base, "--phase", "calibrate", "--campaign-id", invalid]
             )
-    for phase in ("semigroup", "full"):
-        with pytest.raises(SystemExit):
-            module.parse_args(
-                [*base, "--phase", phase, "--campaign-id", "campaign-a"]
-            )
+    global_selection = tmp_path / module.SELECTION
+    global_selection.parent.mkdir(parents=True)
+    global_selection.write_text("{}", encoding="utf-8")
+    (tmp_path / module.VISUAL_REVIEW).write_text("{}", encoding="utf-8")
+    full_base = ["--repo-root", str(tmp_path), "--python", sys.executable]
+    with pytest.raises(SystemExit):
+        module.parse_args([*full_base, "--phase", "full"])
+    full = module.parse_args([*base, "--phase", "full", "--campaign-id", "campaign-a"])
+    assert full.campaign_id == "campaign-a"
+    with pytest.raises(SystemExit):
+        module.parse_args([*base, "--phase", "semigroup", "--campaign-id", "campaign-a"])
 
 
 def test_calibration_campaign_paths_are_isolated_and_shared_inputs_stay_locked() -> None:
@@ -578,6 +712,7 @@ def test_calibration_finalize_reads_only_campaign_review(
     monkeypatch.setattr(module, "_build_calibration_visual_evidence", lambda value: {"arms": {}})
 
     assert module.finalize_phase(plan) == 2
+    assert not (tmp_path / plan.campaign_root / "selection.json").exists()
 
     campaign_review = tmp_path / plan.campaign_root / "visual_review.json"
     campaign_review.parent.mkdir(parents=True)
@@ -591,6 +726,7 @@ def test_calibration_finalize_reads_only_campaign_review(
 
     assert module.finalize_phase(plan) == 0
     assert reviewed == [{"source": "campaign"}]
+    assert not (tmp_path / plan.campaign_root / "selection.json").exists()
 
 
 @pytest.mark.parametrize(
@@ -939,34 +1075,116 @@ def test_matrix_failed_semigroup_replaces_all_four_arms_with_noise_configs() -> 
     assert all("paper_split" not in " ".join(run.command) for run in plan.runs)
 
 
-def test_matrix_full_requires_2048_samples_and_visual_review(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "artifact_key",
+    ["contract_path", "evidence_path", "review_path", "selection_path", "metrics_path"],
+)
+def test_matrix_full_rejects_cross_campaign_artifact_or_sha(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, artifact_key: str
+) -> None:
     module = _load_script()
-    selection = tmp_path / "selection.json"
-    selection.write_text(json.dumps({"winner": {"config": str(module.NOISE_CONFIGS[0])}}), encoding="utf-8")
+    first = _write_campaign_selection_fixture(module, tmp_path, "campaign-a")
+    second = _write_campaign_selection_fixture(module, tmp_path, "campaign-b")
+    Path(first[artifact_key]).write_bytes(Path(second[artifact_key]).read_bytes())
+    monkeypatch.setattr(module, "_validate_multi_arm_review", _accept_fixture_visual_review)
 
-    with pytest.raises(FileNotFoundError, match="visual_review"):
-        module.load_full_contract(selection, tmp_path / "visual_review.json")
+    with pytest.raises(ValueError):
+        module.load_full_contract(tmp_path, "campaign-a")
 
-    review = tmp_path / "visual_review.json"
-    review.write_text(json.dumps({"reviewed_sample_count": 63, "passed": True}), encoding="utf-8")
-    with pytest.raises(ValueError, match="64"):
-        module.load_full_contract(selection, review)
+
+def test_matrix_full_reads_only_the_explicit_campaign_and_ignores_globals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_script()
+    first = _write_campaign_selection_fixture(module, tmp_path, "campaign-a")
+    _write_campaign_selection_fixture(module, tmp_path, "campaign-b", arm_id="noise-fixed-eta05")
+    global_selection = tmp_path / module.SELECTION
+    global_selection.parent.mkdir(parents=True, exist_ok=True)
+    global_selection.write_text("not json", encoding="utf-8")
+    (tmp_path / module.VISUAL_REVIEW).write_text("not json", encoding="utf-8")
+    monkeypatch.setattr(module, "_validate_multi_arm_review", _accept_fixture_visual_review)
+
+    contract = module.load_full_contract(tmp_path, "campaign-a")
+
+    assert contract["campaign_id"] == "campaign-a"
+    assert contract["selection_contract_sha256"] == first["selection"][
+        "selection_contract_sha256"
+    ]
+    assert "/campaign-a/" in contract["winner"]["metrics_path"]
+
+
+def test_matrix_full_rejects_selection_changed_after_self_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_script()
+    fixture = _write_campaign_selection_fixture(module, tmp_path, "campaign-a")
+    selection_path = Path(fixture["selection_path"])
+    selection = json.loads(selection_path.read_text(encoding="utf-8"))
+    selection["full_sample_count"] = 2047
+    selection_path.write_text(json.dumps(selection), encoding="utf-8")
+    monkeypatch.setattr(module, "_validate_multi_arm_review", _accept_fixture_visual_review)
+
+    with pytest.raises(ValueError, match="selection contract self SHA256"):
+        module.load_full_contract(tmp_path, "campaign-a")
+
+
+def test_injected_full_contract_must_match_expected_campaign() -> None:
+    module = _load_script()
+    winner = {
+        "arm_id": "winner",
+        "config": str(module.NOISE_CONFIGS[0]),
+        "config_sha256": module._sha256_file(REPO_ROOT / module.NOISE_CONFIGS[0]),
+        "arm_config_sha256": canonical_arm_config_digest(
+            yaml.safe_load((REPO_ROOT / module.NOISE_CONFIGS[0]).read_text())
+        ),
+    }
+    contract = _injected_full_contract(module, winner, campaign_id="campaign-b")
+
+    with pytest.raises(ValueError, match="campaign_id"):
+        module.build_matrix_plan(
+            _args(module, "--phase", "full", "--campaign-id", "campaign-a"),
+            full_contract=contract,
+        )
+
+
+@pytest.mark.parametrize("case", ["unknown", "unpassed"])
+def test_matrix_full_rejects_unknown_or_visually_unpassed_winner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    module = _load_script()
+    fixture = _write_campaign_selection_fixture(
+        module,
+        tmp_path,
+        "campaign-a",
+        visual_passed=case != "unpassed",
+    )
+    if case == "unknown":
+        selection_path = Path(fixture["selection_path"])
+        selection = json.loads(selection_path.read_text(encoding="utf-8"))
+        selection["winner"]["arm_id"] = "unknown-arm"
+        selection["selection_contract_sha256"] = module._canonical_contract_digest(
+            selection, "selection_contract_sha256"
+        )
+        selection_path.write_text(json.dumps(selection), encoding="utf-8")
+    monkeypatch.setattr(module, "_validate_multi_arm_review", _accept_fixture_visual_review)
+
+    with pytest.raises(ValueError, match="registered campaign arm|pass visual review"):
+        module.load_full_contract(tmp_path, "campaign-a")
 
 
 def test_matrix_full_shards_locked_native_and_winner_across_four_gpus() -> None:
     module = _load_script()
-    contract = {
-        "winner": {
+    contract = _injected_full_contract(
+        module,
+        {
             "arm_id": "winner",
             "config": str(module.NOISE_CONFIGS[0]),
+            "config_sha256": module._sha256_file(REPO_ROOT / module.NOISE_CONFIGS[0]),
             "arm_config_sha256": canonical_arm_config_digest(
                 yaml.safe_load((REPO_ROOT / module.NOISE_CONFIGS[0]).read_text())
             ),
         },
-        "visual_review": {"reviewed_sample_count": 64, "passed": True},
-        "manifest_count": 2048,
-        "manifest_sha256": module.FULL_MANIFEST_SHA256,
-    }
+    )
     plan = module.build_matrix_plan(
         _args(module, "--phase", "full"), full_contract=contract
     )
@@ -1144,10 +1362,12 @@ def test_matrix_terminates_started_children_after_partial_launch_failure(
 
 def test_fmrg_full_plan_requires_and_uses_locked_tcut_and_schedule_digest() -> None:
     module = _load_script()
-    contract = {
-        "winner": {
+    contract = _injected_full_contract(
+        module,
+        {
             "arm_id": "official",
             "config": str(module.FLOW_MAP1_CONFIG),
+            "config_sha256": module._sha256_file(REPO_ROOT / module.FLOW_MAP1_CONFIG),
             "mode": "official_head_current_xt",
             "t_cut": 0.25,
             "schedule_manifest": str(module.SCHEDULE_MANIFEST),
@@ -1155,10 +1375,7 @@ def test_fmrg_full_plan_requires_and_uses_locked_tcut_and_schedule_digest() -> N
             "schedule_contract_sha256": "e" * 64,
             "arm_config_sha256": "f" * 64,
         },
-        "visual_review": {"reviewed_sample_count": 64, "passed": True},
-        "manifest_count": 2048,
-        "manifest_sha256": module.FULL_MANIFEST_SHA256,
-    }
+    )
 
     plan = module.build_matrix_plan(
         _args(module, "--phase", "full"), full_contract=contract
@@ -1247,12 +1464,7 @@ def test_materialized_full_fmrg_keeps_semigroup_schedule_manifest_independent(
     args.repo_root = tmp_path
     plan = module.build_matrix_plan(
         args,
-        full_contract={
-            "winner": winner,
-            "visual_review": {"reviewed_sample_count": 64, "passed": True},
-            "manifest_count": 2048,
-            "manifest_sha256": module.FULL_MANIFEST_SHA256,
-        },
+        full_contract=_injected_full_contract(module, winner),
     )
     module.materialize_full_runtime_configs(plan)
     runtime = yaml.safe_load(
@@ -1809,16 +2021,15 @@ def test_full_preflight_rejects_old_winner_completion_with_different_algorithm_f
     locked_digest = canonical_arm_config_digest(locked_config)
     old_digest = canonical_arm_config_digest({**locked_config, field: old_value})
     assert old_digest != locked_digest
-    contract = {
-        "winner": {
+    contract = _injected_full_contract(
+        module,
+        {
             "arm_id": "noise-winner",
             "config": str(config_path),
+            "config_sha256": module._sha256_file(REPO_ROOT / config_path),
             "arm_config_sha256": locked_digest,
         },
-        "visual_review": {"reviewed_sample_count": 64, "passed": True},
-        "manifest_count": 2048,
-        "manifest_sha256": module.FULL_MANIFEST_SHA256,
-    }
+    )
     plan = module.build_matrix_plan(
         _args(module, "--phase", "full"), full_contract=contract
     )
