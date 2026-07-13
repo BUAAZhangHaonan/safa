@@ -182,6 +182,41 @@ def test_guidance_config_requires_exact_checkpoint_ema_and_learned_null() -> Non
             validate_guidance_config(invalid)
 
 
+@pytest.mark.parametrize(
+    "missing_field",
+    ("sample_mode", "optimization_mode", "num_optim_iters", "step_size"),
+)
+def test_official_guidance_requires_explicit_algorithm_settings_before_runtime_loading(
+    missing_field: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from safa.utils import device as device_module
+
+    def forbidden_runtime_access(*args, **kwargs):
+        pytest.fail("official algorithm settings must be validated before runtime access")
+
+    monkeypatch.setattr(runner_module, "asset_contract_from_config", forbidden_runtime_access)
+    monkeypatch.setattr(runner_module, "build_frozen_runtime", forbidden_runtime_access)
+    monkeypatch.setattr(device_module, "require_cuda_device", forbidden_runtime_access)
+    config = {
+        **_r8_guidance_config(),
+        "mode": "official_head_current_xt",
+        "device": "cuda:0",
+        "sample_mode": "flow_map1",
+        "optimization_mode": "paper_normalized_direct_autograd",
+        "num_optim_iters": 1,
+        "step_size": 0.25,
+    }
+    config.pop(missing_field)
+
+    with pytest.raises(ValueError, match=missing_field):
+        run_guidance_from_config(
+            config,
+            output_dir=tmp_path / f"missing-{missing_field}",
+        )
+
+
 def test_guidance_config_carries_heldout_encoder_assets_without_rejecting_them() -> None:
     resolved = validate_guidance_config(_r8_guidance_config())
 

@@ -225,6 +225,21 @@ def validate_guidance_config(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError(f"guidance mode must be one of {sorted(SUPPORTED_MODES)}, got {mode!r}")
     resolved["mode"] = mode
     resolved.pop("route", None)
+    if mode == "official_head_current_xt":
+        required_algorithm_settings = (
+            "sample_mode",
+            "optimization_mode",
+            "num_optim_iters",
+            "step_size",
+        )
+        missing_algorithm_settings = [
+            field for field in required_algorithm_settings if field not in resolved
+        ]
+        if missing_algorithm_settings:
+            raise ValueError(
+                "guidance mode 'official_head_current_xt' requires explicit algorithm settings: "
+                f"{missing_algorithm_settings!r}"
+            )
     if "sampling_seed" not in resolved and "seed" not in resolved:
         raise ValueError("guidance config requires sampling_seed or seed")
     resolved["sampling_seed"] = int(resolved.get("sampling_seed", resolved.get("seed")))
@@ -797,12 +812,10 @@ def execute_guidance_mode(
             target_z0=target_z0,
             guided_times=guided_times,
             unguided_times=unguided_times,
-            sample_mode=str(config.get("sample_mode", "flow_map1")),
-            optimization_mode=str(
-                config.get("optimization_mode", "paper_normalized_direct_autograd")
-            ),
-            num_optim_iters=int(config.get("num_optim_iters", 1)),
-            step_size=float(config.get("step_size", config.get("eta", 0.25))),
+            sample_mode=str(config["sample_mode"]),
+            optimization_mode=str(config["optimization_mode"]),
+            num_optim_iters=int(config["num_optim_iters"]),
+            step_size=float(config["step_size"]),
         )
         return _result_with_trace(result, counted.trace, mode)
     if mode == "paper_algorithm_split":
