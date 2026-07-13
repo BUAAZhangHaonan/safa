@@ -481,10 +481,12 @@ def test_safa_uniform_schedule_flow_map2_nopt1_is_eight_nfe() -> None:
     assert result.nfe == 8
 
 
-def test_official_adam_uses_interval_decay_one_minus_i_over_four() -> None:
+def test_official_adam_decay_uses_actual_guided_interval_count() -> None:
     result, _, _, _, _ = _run_official(optimization_mode="official_adam", step_size=4.0)
+    guided_interval_count = len(GUIDED_TIMES) - 1
 
-    assert result.diagnostics["adam_learning_rates"] == [4.0, 3.0, 2.0]
+    expected = [4.0 * (1.0 - index / guided_interval_count) for index in range(guided_interval_count)]
+    assert result.diagnostics["adam_learning_rates"] == pytest.approx(expected)
 
 
 def test_official_adam_nopt_gt_one_refreshes_endpoint_at_updated_xt() -> None:
@@ -543,9 +545,10 @@ def test_official_normalized_update_matches_analytic_nonlinear_state_and_sign() 
 def test_official_adam_update_matches_analytic_nonlinear_state_and_sign() -> None:
     result, x_init = _run_nonlinear_official("official_adam")
     expected = x_init
+    guided_interval_count = len(GUIDED_TIMES) - 1
     for interval_index, (t, s) in enumerate(zip(GUIDED_TIMES, GUIDED_TIMES[1:])):
         gradient = _analytic_endpoint_gradient(expected, t=t)
-        learning_rate = 0.1 * (1.0 - interval_index / 4.0)
+        learning_rate = 0.1 * (1.0 - interval_index / guided_interval_count)
         adam_delta = learning_rate * gradient / (gradient.abs() + 1.0e-8)
         expected = expected - (t - s) * (expected.square() + adam_delta)
     for t, r in zip(UNGUIDED_TIMES, UNGUIDED_TIMES[1:]):

@@ -130,11 +130,12 @@ def sample_official_head_current_xt(
     state = _finite_tensor("x_init", x_init.detach())
     loss_history: list[float] = []
     learning_rates: list[float] = []
+    guided_interval_count = len(guided) - 1
 
     for interval_index, (t, s) in enumerate(zip(guided, guided[1:])):
         before = state.detach()
         if optimization_mode == "official_adam":
-            lr = step_size * (1.0 - interval_index / 4.0)
+            lr = step_size * (1.0 - interval_index / guided_interval_count)
             learning_rates.append(lr)
             optimized = before.clone().requires_grad_(True)
             optimizer = torch.optim.Adam([optimized], lr=lr)
