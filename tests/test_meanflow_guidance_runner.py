@@ -37,6 +37,14 @@ from safa.evaluation.meanflow_guidance_runner import (  # noqa: E402
 )
 from safa.evaluation import meanflow_guidance_runner as runner_module  # noqa: E402
 from safa.evaluation.r8_arm_contracts import canonical_arm_config_digest  # noqa: E402
+from safa.evaluation.r9_determinism import (  # noqa: E402
+    R9_DETERMINISM_POLICY,
+    R9_DETERMINISM_POLICY_SHA256,
+    R9_EXPERIMENT_CONTRACT,
+)
+from safa.evaluation.r9_semigroup_contracts import (  # noqa: E402
+    canonical_r9_schedule_contract_sha256,
+)
 from safa.guidance.meanflow_flow_map import freeze_guidance_stack  # noqa: E402
 from safa.training.latent_codec import LatentCodec, LatentCodecConfig  # noqa: E402
 from safa.training.losses import normalize_for_e0  # noqa: E402
@@ -354,6 +362,61 @@ def test_locked_schedule_rejects_report_manifest_or_self_digest_tampering(tmp_pa
     _write_json(schedule_path, payload)
     with pytest.raises(ValueError, match="schedule contract SHA256"):
         resolve_locked_schedule(config, checkpoint_sha256="a" * 64)
+
+
+def test_r9_locked_schedule_uses_schema3_and_consumes_gate_bindings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, config = _write_locked_schedule_fixture(tmp_path)
+    schedule_path = Path(config["schedule_manifest"])
+    schedule = json.loads(schedule_path.read_text(encoding="utf-8"))
+    schedule["schema_version"] = 3
+    schedule.update(
+        {
+            "semigroup_preflight_contract": str(tmp_path / "preflight_contract.json"),
+            "semigroup_preflight_contract_sha256": "d" * 64,
+            "r9_semigroup_gate_contract": str(tmp_path / "gate_contract.json"),
+            "r9_semigroup_gate_contract_sha256": "e" * 64,
+        }
+    )
+    schedule["schedule_contract_sha256"] = canonical_r9_schedule_contract_sha256(
+        schedule
+    )
+    _write_json(schedule_path, schedule)
+    gate = {"gate_contract_sha256": "f" * 64}
+    calls: list[tuple[dict, dict]] = []
+
+    def validate_gate(actual_config, actual_schedule):
+        calls.append((dict(actual_config), dict(actual_schedule)))
+        return gate
+
+    monkeypatch.setattr(
+        runner_module, "validate_r9_locked_schedule_bindings", validate_gate
+    )
+    r9_config = {
+        **config,
+        "experiment_contract": R9_EXPERIMENT_CONTRACT,
+        "determinism_policy": dict(R9_DETERMINISM_POLICY),
+        "determinism_policy_sha256": R9_DETERMINISM_POLICY_SHA256,
+        "attention_backend": "native",
+        "semigroup_preflight_contract": schedule[
+            "semigroup_preflight_contract"
+        ],
+        "semigroup_preflight_contract_sha256": schedule[
+            "semigroup_preflight_contract_sha256"
+        ],
+        "r9_semigroup_gate_contract": schedule["r9_semigroup_gate_contract"],
+        "r9_semigroup_gate_contract_sha256": schedule[
+            "r9_semigroup_gate_contract_sha256"
+        ],
+    }
+
+    resolved = resolve_locked_schedule(r9_config, checkpoint_sha256="a" * 64)
+
+    assert len(calls) == 1
+    assert calls[0][1] == schedule
+    assert resolved["r9_gate_contract"] == gate
+    assert resolved["r9_semigroup_gate_contract_sha256"] == "e" * 64
 
 
 @pytest.mark.parametrize(

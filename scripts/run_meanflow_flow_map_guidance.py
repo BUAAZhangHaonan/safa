@@ -16,9 +16,9 @@ from safa.evaluation.meanflow_guidance_runner import (
     validate_guidance_config,
 )
 from safa.evaluation.r8_arm_contracts import (
-    canonical_arm_config_digest,
     require_arm_config_digest,
 )
+from safa.evaluation.r9_determinism import canonical_guidance_arm_config_digest
 from safa.utils.config import load_yaml
 
 
@@ -119,7 +119,7 @@ def finalize_effective_guidance_config(
         effective["locked_schedule"] = dict(locked_schedule)
     elif locked_schedule is not None or "locked_schedule" in effective:
         raise ValueError("non-FMRG effective config must not contain a locked schedule")
-    computed = canonical_arm_config_digest(effective)
+    computed = canonical_guidance_arm_config_digest(effective)
     declared = effective.get("arm_config_sha256")
     if declared is not None and require_arm_config_digest(declared) != computed:
         raise ValueError(

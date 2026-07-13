@@ -27,8 +27,20 @@ from safa.guidance.meanflow_flow_map import (
 )
 from safa.training.losses import normalize_for_e0
 from safa.evaluation.r8_arm_contracts import (
-    canonical_arm_config_digest,
     require_arm_config_digest,
+)
+from safa.evaluation.r9_determinism import (
+    R9_ATTENTION_BACKEND,
+    apply_r9_strict_cuda_determinism,
+    assert_r9_strict_cuda_determinism,
+    canonical_guidance_arm_config_digest,
+    is_r9_guidance_config,
+    validate_r9_execution_config,
+)
+from safa.evaluation.r9_semigroup_contracts import (
+    canonical_r9_schedule_contract_sha256,
+    validate_r9_locked_schedule_bindings,
+    validate_r9_semigroup_preflight_config,
 )
 from safa.utils.sampling import make_x_init_for_sample_ids
 
@@ -134,6 +146,7 @@ def load_ema_generator(
     checkpoint_path: str | Path,
     *,
     device: torch.device,
+    r9_attention_backend: str | None = None,
     generator_builder=None,
 ) -> tuple[Any, dict[str, Any]]:
     checkpoint = Path(checkpoint_path)
@@ -145,6 +158,10 @@ def load_ema_generator(
     # The target EMA is complete. Do not load an older pretrained SiT before replacing it.
     model_config["sit_pretrained_path"] = ""
     model_config["sit_pretrained_state_key"] = ""
+    if r9_attention_backend is not None:
+        if r9_attention_backend != R9_ATTENTION_BACKEND:
+            raise ValueError("R9 generator attention backend must be locked to 'native'")
+        model_config["attention_backend"] = str(r9_attention_backend)
     if generator_builder is None:
         from safa.models.generator import build_generator
 
@@ -156,6 +173,17 @@ def load_ema_generator(
     del payload
     generator = generator.to(device).eval()
     generator.requires_grad_(False)
+    if r9_attention_backend is not None:
+        requested = getattr(generator, "requested_attention_backend", None)
+        resolved = getattr(generator, "attention_backend", None)
+        if requested != r9_attention_backend or resolved != r9_attention_backend:
+            raise RuntimeError(
+                "MeanFlow generator did not honor the locked attention backend: "
+                f"requested={requested!r} resolved={resolved!r} "
+                f"expected={r9_attention_backend!r}"
+            )
+        metadata["attention_backend_requested"] = requested
+        metadata["attention_backend_resolved"] = resolved
     return generator, metadata
 
 
@@ -251,6 +279,11 @@ def validate_guidance_config(config: Mapping[str, Any]) -> dict[str, Any]:
     ):
         if field in resolved and resolved[field] != expected:
             raise ValueError(f"guidance config {field} must be {expected!r}, got {resolved[field]!r}")
+    if is_r9_guidance_config(resolved):
+        execution_contract = validate_r9_execution_config(resolved)
+        resolved.update(execution_contract)
+        if mode == "semigroup":
+            validate_r9_semigroup_preflight_config(resolved)
     return resolved
 
 
@@ -528,7 +561,14 @@ def build_frozen_runtime(
         from safa.training.latent_codec import build_latent_codec_from_train_config
 
         codec_builder = build_latent_codec_from_train_config
-    generator, checkpoint_state = generator_loader(config["checkpoint"], device=device)
+    generator_loader_kwargs: dict[str, Any] = {"device": device}
+    if is_r9_guidance_config(config):
+        generator_loader_kwargs["r9_attention_backend"] = str(
+            config["attention_backend"]
+        )
+    generator, checkpoint_state = generator_loader(
+        config["checkpoint"], **generator_loader_kwargs
+    )
     e0, _ = encoder_loader(config["e0_checkpoint"], device="cpu")
     e0 = e0.to(device)
     edev = None
@@ -592,14 +632,24 @@ def resolve_locked_schedule(
         raise ValueError("FMRG guidance requires a locked schedule_manifest")
     manifest_path = Path(str(manifest_value))
     manifest = _read_json_mapping(manifest_path, "locked schedule manifest")
-    if manifest.get("schema_version") != 2:
-        raise ValueError("locked schedule manifest must use schema_version=2")
+    r9_contract = is_r9_guidance_config(config)
+    expected_schema_version = 3 if r9_contract else 2
+    if manifest.get("schema_version") != expected_schema_version:
+        raise ValueError(
+            "locked schedule manifest must use "
+            f"schema_version={expected_schema_version}"
+        )
     if manifest.get("gate_passed") is not True:
         raise ValueError("locked schedule manifest must record gate_passed=true")
     schedule_contract_sha256 = _require_sha256(
         manifest.get("schedule_contract_sha256"), "schedule_contract_sha256"
     )
-    if _schedule_contract_sha256(manifest) != schedule_contract_sha256:
+    computed_schedule_sha256 = (
+        canonical_r9_schedule_contract_sha256(manifest)
+        if r9_contract
+        else _schedule_contract_sha256(manifest)
+    )
+    if computed_schedule_sha256 != schedule_contract_sha256:
         raise ValueError("locked schedule contract SHA256 does not match its canonical payload")
     manifest_hash = manifest.get("checkpoint_sha256")
     if manifest_hash != checkpoint_sha256:
@@ -650,7 +700,7 @@ def resolve_locked_schedule(
         raise ValueError("config semigroup sample manifest SHA256 disagrees with locked schedule")
     if _digest_path(sample_manifest_path) != sample_manifest_sha256:
         raise ValueError("locked semigroup sample manifest SHA256 does not match the manifest file")
-    return {
+    resolved_schedule = {
         "manifest": str(manifest_path),
         "manifest_sha256": _digest_path(manifest_path),
         "schedule_contract_sha256": schedule_contract_sha256,
@@ -664,11 +714,22 @@ def resolve_locked_schedule(
         "unguided_times": unguided,
         "gate_passed": True,
     }
+    if r9_contract:
+        gate_contract = validate_r9_locked_schedule_bindings(config, manifest)
+        for field in (
+            "semigroup_preflight_contract",
+            "semigroup_preflight_contract_sha256",
+            "r9_semigroup_gate_contract",
+            "r9_semigroup_gate_contract_sha256",
+        ):
+            resolved_schedule[field] = manifest[field]
+        resolved_schedule["r9_gate_contract"] = gate_contract
+    return resolved_schedule
 
 
 def _bind_arm_config_digest(config: Mapping[str, Any]) -> dict[str, Any]:
     resolved = dict(config)
-    computed = canonical_arm_config_digest(resolved)
+    computed = canonical_guidance_arm_config_digest(resolved)
     declared = resolved.get("arm_config_sha256")
     if declared is not None and require_arm_config_digest(declared) != computed:
         raise ValueError(
@@ -870,6 +931,14 @@ def run_guidance_records(
     resolved_config = dict(config)
     resolved_config["mode"] = mode
     resolved_config.pop("route", None)
+    r9_execution_contract = None
+    if is_r9_guidance_config(resolved_config):
+        r9_execution_contract = validate_r9_execution_config(resolved_config)
+        if resolved_config.get("r9_execution_contract") != r9_execution_contract:
+            raise ValueError(
+                "R9 run requires the applied strict execution contract from the runner preflight"
+            )
+        assert_r9_strict_cuda_determinism(torch_module=torch)
     resolved_config = _bind_arm_config_digest(resolved_config)
     generated_dir = output / "generated_images"
     native_dir = output / "native_images"
@@ -969,6 +1038,7 @@ def run_guidance_records(
         },
         "heldout_e1": runtime.heldout_e1,
         "heldout_e2": runtime.heldout_e2,
+        "r9_execution_contract": r9_execution_contract,
         "seed": int(resolved_config.get("sampling_seed", resolved_config.get("seed", 0))),
         "schedule": resolved_config.get("locked_schedule"),
         "mode": mode,
@@ -1332,6 +1402,7 @@ def run_guidance_records(
         "schedule": _json_safe(schedule),
         "config": _json_safe(resolved_config),
         "resume_contract": _json_safe(resume_contract),
+        "r9_execution_contract": _json_safe(r9_execution_contract),
         "artifacts": {
             "generated_dir": str(generated_dir),
             "native_dir": str(native_dir) if mode != "native" else None,
@@ -1384,6 +1455,10 @@ def run_guidance_from_config(
         shard_index=shard_index,
         num_shards=num_shards,
     )
+    if is_r9_guidance_config(resolved):
+        resolved["r9_execution_contract"] = apply_r9_strict_cuda_determinism(
+            resolved, torch_module=torch
+        )
     from safa.data.feature_dataset import FeatureAlignedAffectNet
     from safa.training.transforms import generator_image_transform
     from safa.utils.device import require_cuda_device
