@@ -1,0 +1,351 @@
+schema_version: 1
+contract_type: safa_r9_campaign_runtime_v1
+experiment_contract: safa_r9_meanflow_v1
+campaign_contract: safa_r9_campaign_v1
+campaign_root: artifacts/r9_meanflow_flow_map_guidance/campaigns
+python: /home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python
+generation_script: scripts/run_meanflow_flow_map_guidance.py
+quality_script: scripts/eval_generation_quality.py
+base_config: configs/medium_v2/experiments/r9_meanflow_semigroup_preflight.yaml
+base_config_sha256: 0a9536583af4d3b6234e425bca8ad01d6e52110b81827ad97b71dfa08a40b24d
+checkpoint:
+  path: artifacts/checkpoints/e15_meanflow_sit_b_face_mixed_h100_resume_2400ep/last_nopretrained.pt
+  sha256: 4690717781db58a6021d57d124300a9b212f0a5043cf3028fb5de4d9c835cc4d
+determinism_policy_sha256: ea6a4e81627a993066d9b1a3ca4ae791a0bcb3e21e399a5d2cb27811aa22147f
+attention_backend: native
+schedule_manifest: artifacts/r9_meanflow_flow_map_guidance/semigroup/locked_schedule_manifest.json
+schedule_manifest_sha256: 79ff589e692e3b96302842053f7a042081b18104658520a7ca028528dd9cadaa
+schedule_contract_sha256: f9cf525e5abb329bc93375e2ebc7baef6aca06e7a430b5ed693f476a40373f9d
+gate_contract: artifacts/r9_meanflow_flow_map_guidance/semigroup/gate_contract.json
+gate_contract_sha256: 1799f8c98e00243955f87347b14fdbdc7d9aadff7f5b36358bf53b039a5b2ca5
+gate_canonical_sha256: 2fdb235f2720ef101a487564043a958e1ad087c8e190d143fe0498cb328d42bd
+
+clean_source:
+  index: data/index/val_single_face_privacy_clean_arcface.jsonl
+  index_sha256: c425eedb7e2939bf89782d9a0ecbb9fa896208a55546f895e673354b16432354
+  ordered_sample_id_sha256: 686534e4284ccc985faa9aa316f7c0ffde9cae9716aed2b9a66d3903dc33718f
+  sample_count: 3968
+  arcface_exact_one: true
+
+manifest_construction:
+  r8_visual_review: artifacts/r8_meanflow_flow_map_guidance/campaigns/r8-calibration-v3/visual_review.json
+  r8_visual_review_sha256: a6dc4bd1a9d6c5b99e7fc65419948be92109859ecb1733619f6fbb12d67ffc14
+  r8_native_per_sample: artifacts/r8_meanflow_flow_map_guidance/campaigns/r8-calibration-v3/calibration/native_unguided_64/per_sample.jsonl
+  r8_native_per_sample_sha256: 9aaa7d7eb330c5090b0b797e2355c728fdc17a5eec4c6c1df0a6ec2b3fffcd8c
+  diagnose_source_arm: paper_split_eta0.25
+  diagnose_matching: scipy_linear_sum_assignment_absolute_native_e0_cosine
+  validate_rank_domain: safa-r9-validate-512-v1
+  full_rank_domain: safa-r9-full-2048-v1
+  full_visual_rank_domain: safa-r9-full-visual-64-v1
+  r8_calibration_64:
+    path: artifacts/r8_meanflow_flow_map_guidance/campaigns/r8-calibration-v3/calibration/native_unguided_64/sample_id_manifest.jsonl
+    sha256: b030b23ab5e688f709213f4671c1b12c2f53905a488909882234f0d5688b1a63
+    sample_count: 64
+    ordered_sample_id_sha256: 0e9dc5bd1da3c265efe4d66959cdc6649a6b60b82c29058adf0dab843b7c1df3
+  diagnose_18:
+    path: configs/medium_v2/experiments/r9_manifests/diagnose_18.jsonl
+    sha256: e41b68999939f3ca53a60cb4d7a2452f75c4cd103a8bd6ac7136a0a5f08a0aa3
+    sample_count: 18
+    ordered_sample_id_sha256: c2ba8aed127b392aadabdb65b19253fa7dd7413337304b33d30d9692c56842f8
+    difficult_count: 9
+    control_count: 9
+    matched_pair_sha256: 080f45a7d6f108afa903df4e03d8773a198b83d878e435b8cf128436bcbc5c24
+
+manifests:
+  diagnose_18:
+    path: configs/medium_v2/experiments/r9_manifests/diagnose_18.jsonl
+    sha256: e41b68999939f3ca53a60cb4d7a2452f75c4cd103a8bd6ac7136a0a5f08a0aa3
+    ordered_sample_id_sha256: c2ba8aed127b392aadabdb65b19253fa7dd7413337304b33d30d9692c56842f8
+    sample_count: 18
+    construction: r8_paper_eta0p25_nine_severe_plus_global_min_cost_native_e0_matching
+  calibration_64:
+    path: configs/medium_v2/experiments/r9_manifests/calibration_64.jsonl
+    sha256: ffc1f04f671533ee1498f4b03565826920afcc4e5c6ab244fc6f9b7aa680f964
+    ordered_sample_id_sha256: 0e9dc5bd1da3c265efe4d66959cdc6649a6b60b82c29058adf0dab843b7c1df3
+    sample_count: 64
+  validate_512:
+    path: configs/medium_v2/experiments/r9_manifests/validate_512.jsonl
+    sha256: b05bc43a5ad03b77567ef1e1053c4d97ae47b016e8ec149d8a5cd49040e0e391
+    ordered_sample_id_sha256: 46872147bedc0f796e8ae3ca1a59083d375fea6ada38f653b6eaab7d30156816
+    sample_count: 512
+    construction: sha256_rank_safa-r9-validate-512-v1_after_calibration_exclusion
+  full_2048:
+    path: configs/medium_v2/experiments/r9_manifests/full_2048.jsonl
+    sha256: ba760481941505b2d519951b8077026cdc0cdf97bcd44b5eac7e0e9329b36b68
+    ordered_sample_id_sha256: 6462edef5fa4b19f970c35038baf206a906c5ae9c3abc7c342354dcec614b1fc
+    sample_count: 2048
+    construction: sha256_rank_safa-r9-full-2048-v1_after_calibration_validate_exclusion
+  full_visual_64:
+    path: configs/medium_v2/experiments/r9_manifests/full_visual_64.jsonl
+    sha256: 16955700ab7630d5029dcbf815fe0e0ca77a03e591297fc54595c9031b23b9b5
+    ordered_sample_id_sha256: 527fd0695f7b9578f90c62eb42a0cb6dc23f14be2b886e08a61be61c9bbb63a0
+    sample_count: 64
+    construction: sha256_rank_safa-r9-full-visual-64-v1_within_full_2048
+
+resources:
+  physical_gpus: [0, 1, 2, 3]
+  global_slot_lock_root: /tmp/safa-r9-gpu-slots-v1
+  max_slots_per_gpu: 4
+  gpu_slot_claim_bytes: 4938792960
+  gpu_headroom_bytes: 2147483648
+  ram_smoke_margin_numerator: 110
+  ram_smoke_margin_denominator: 100
+  ram_admission_percent: 85
+  ram_hard_limit_percent: 90
+  require_tmux: true
+  retry_count: 0
+  resource_smoke:
+    required: true
+    run_id: native_smoke_calibration_64_v4
+    arm_id: native
+    manifest: calibration_64
+    output_path: artifacts/r9_meanflow_flow_map_guidance/shared/resource_smoke_v4.json
+    factor: 1.10
+
+bootstrap:
+  resamples: 10000
+  confidence: 0.95
+  seed: 91637
+  cluster: sample_id
+  identity_delta_direction: source_candidate_minus_source_native
+
+evaluation:
+  resource_smokes:
+    arcface:
+      mode: measured_single_worker
+      artifact_root: artifacts/r9_meanflow_flow_map_guidance/shared/evaluator_smoke/arcface-calibration64-v2
+    quality:
+      mode: measured_exclusive_bootstrap
+      artifact_root: artifacts/r9_meanflow_flow_map_guidance/shared/evaluator_smoke/quality-calibration64-v2
+    heldout:
+      mode: exclusive_single_official_run
+      smoke_execution: sealed_until_winner_lock
+      global_exclusive_slots: 16
+      ram_admission_percent: 85
+      ram_hard_limit_percent: 90
+  worker:
+    path: scripts/run_r9_phase_evaluator.py
+    sha256: 1e7be33cd517305d4e18a094ab643993fff79f95dbaf970e5c31f67c901cda42
+    implementation_path: src/safa/evaluation/r9_evaluator_worker.py
+    implementation_sha256: 603b2ff61c064b3fd1bbc90e659cabacf0ea1479e75e9538edfb4db638245cd4
+  quality:
+    script:
+      path: scripts/eval_generation_quality.py
+      sha256: f91f2f382ab30ad4b42fd999ccb9f87f6ebd9903ab55e9e59b31e1399c406369
+    real_index:
+      path: data/index/val_face_mixed_e14.jsonl
+      sha256: da14e23eacefecbc2948d1374fb93961a13d017a9183aa1fe2a2f62b33a4b4ea
+    metrics: [fid, kid, niqe, sharpness]
+    iqa_method: niqe
+    device: cuda:0
+  arcface:
+    model_name: buffalo_l
+    model_root: /home/hdd3/zhanghaonan/.insightface
+    det_size: [224, 224]
+    provider: CUDAExecutionProvider
+    insightface_version: 0.7.3
+    onnxruntime_version: 1.26.0
+    assets:
+      1k3d68.onnx: df5c06b8a0c12e422b2ed8947b8869faa4105387f199c477af038aa01f9a45cc
+      2d106det.onnx: f001b856447c413801ef5c42091ed0cd516fcd21f2d6b79635b1e733a7109dbf
+      det_10g.onnx: 5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91
+      genderage.onnx: 4fde69b1c810857b88c64a335084f1c3fe8f01246c9a191b48c7bb756d6652fb
+      w600k_r50.onnx: 4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43
+    execution_probe:
+      path: artifacts/r9_meanflow_flow_map_guidance/shared/arcface_execution_probe_v4.json
+      sha256: 1ad7c4c9928a982f25aa6c9f4d47184432585ff239b22fe1a9ac46e8962b29f4
+      bootstrap_claim_path: artifacts/r9_meanflow_flow_map_guidance/shared/bootstrap/arcface-profile-v4/claim.json
+      bootstrap_claim_file_sha256: 51d19b97ad5d80d2f8365e29a131f4cc53a997c6629451de503434131603ebcb
+      bootstrap_claim_sha256: 722d0965fd0fb8c2f33d97977e5724a4476f5570e6283b107aba27921f3a19fa
+      bootstrap_result_path: artifacts/r9_meanflow_flow_map_guidance/shared/bootstrap/arcface-profile-v4/result.json
+      bootstrap_result_file_sha256: 07283c42b849cdc91536e98e3252490a234c344fb0f64c0a92913bf270a4c178
+      bootstrap_result_sha256: f9540e2f865cc66def719d6fdb5e66184875bf4c4077d42c80cf49bab2a610ef
+  heldout:
+    batch_size: 16
+    representation_image_size: 224
+    facenet:
+      embedding_dim: 512
+      input_size: 160
+    adaface:
+      embedding_dim: 512
+      input_size: 112
+
+heldout_assets:
+  e1:
+    path: artifacts/checkpoints/e0_dinov2_large_v2/best.pt
+    sha256: cce0de2f1eab097cb6091886f587a9f334dd84ced1ca4dd5e08c3a765718a14c
+  e2:
+    path: artifacts/checkpoints/e0_convnext_tiny/best.pt
+    sha256: 09c88bd416057222abefeba52ebe88d710715ede791ec34198a23ae5e6e850a8
+  facenet:
+    path: artifacts/privacy/facenet.pt
+    sha256: 38855589cae480268e8c64c2556c7898c449428043aacce761fe43389c6a8c72
+  adaface:
+    path: artifacts/privacy/adaface.pt
+    sha256: 9953ec6b93d2bb7e771dcd2717f1e9b15ecd4760983557b006cbe00e598618d7
+
+phases:
+  preflight:
+    manifest: calibration_64
+    sample_count: 64
+    shards_per_logical_run: 4
+    seed: 1337
+
+  diagnose:
+    manifest: diagnose_18
+    sample_count: 18
+    shards_per_logical_run: 1
+    seed: 1337
+    repeats: 3
+    determinism_repeats_must_match: 3
+    arms:
+      - arm_id: native
+        family: native
+        mode: native
+      - arm_id: paper_eta_0p125
+        family: paper_split_constant
+        mode: paper_algorithm_split
+        step_size: 0.125
+        active_guidance_intervals: [I1, I2, I3]
+        collect_interval_diagnostics: true
+      - arm_id: paper_eta_0p1875
+        family: paper_split_constant
+        mode: paper_algorithm_split
+        step_size: 0.1875
+        active_guidance_intervals: [I1, I2, I3]
+        collect_interval_diagnostics: true
+      - arm_id: paper_eta_0p25
+        family: paper_split_constant
+        mode: paper_algorithm_split
+        step_size: 0.25
+        active_guidance_intervals: [I1, I2, I3]
+        collect_interval_diagnostics: true
+      - arm_id: paper_eta_0p3125
+        family: paper_split_constant
+        mode: paper_algorithm_split
+        step_size: 0.3125
+        active_guidance_intervals: [I1, I2, I3]
+        collect_interval_diagnostics: true
+      - arm_id: paper_eta_0p375
+        family: paper_split_constant
+        mode: paper_algorithm_split
+        step_size: 0.375
+        active_guidance_intervals: [I1, I2, I3]
+        collect_interval_diagnostics: true
+      - arm_id: paper_eta_0p5
+        family: paper_split_constant
+        mode: paper_algorithm_split
+        step_size: 0.5
+        active_guidance_intervals: [I1, I2, I3]
+        collect_interval_diagnostics: true
+      - arm_id: paper_eta_0p25_disable_i1
+        family: paper_split_interval_ablation
+        mode: paper_algorithm_split
+        step_size: 0.25
+        active_guidance_intervals: [I2, I3]
+        collect_interval_diagnostics: true
+      - arm_id: paper_eta_0p25_disable_i2
+        family: paper_split_interval_ablation
+        mode: paper_algorithm_split
+        step_size: 0.25
+        active_guidance_intervals: [I1, I3]
+        collect_interval_diagnostics: true
+      - arm_id: paper_eta_0p25_disable_i3
+        family: paper_split_interval_ablation
+        mode: paper_algorithm_split
+        step_size: 0.25
+        active_guidance_intervals: [I1, I2]
+        collect_interval_diagnostics: true
+      - arm_id: flow_map2_normalized_eta_0p125
+        family: flow_map2
+        mode: official_head_current_xt
+        sample_mode: flow_map2
+        optimization_mode: paper_normalized_direct_autograd
+        num_optim_iters: 1
+        step_size: 0.125
+        active_guidance_intervals: [I1, I2, I3]
+        collect_interval_diagnostics: true
+      - arm_id: flow_map2_normalized_eta_0p1875
+        family: flow_map2
+        mode: official_head_current_xt
+        sample_mode: flow_map2
+        optimization_mode: paper_normalized_direct_autograd
+        num_optim_iters: 1
+        step_size: 0.1875
+        active_guidance_intervals: [I1, I2, I3]
+        collect_interval_diagnostics: true
+      - arm_id: flow_map2_normalized_eta_0p25
+        family: flow_map2
+        mode: official_head_current_xt
+        sample_mode: flow_map2
+        optimization_mode: paper_normalized_direct_autograd
+        num_optim_iters: 1
+        step_size: 0.25
+        active_guidance_intervals: [I1, I2, I3]
+        collect_interval_diagnostics: true
+    gate:
+      difficult_severe_max: 3
+      control_severe_max: 1
+      e0_mean_min: 0.75
+      edev_vs_matched_native_min: 0.0
+      require_finite_diagnostics: true
+      max_candidates_per_family: 1
+      family_order: [flow_map2, paper_split_constant, paper_split_interval_ablation]
+      rank_order: [severe, edev_desc, e0_desc, arm_id]
+
+  calibrate:
+    manifest: calibration_64
+    sample_count: 64
+    shards_per_logical_run: 1
+    seeds: [1337, 2027, 3407]
+    candidate_slots: 3
+    collect_interval_diagnostics: false
+    gate:
+      severe_max_per_seed: 3
+      repeated_severe_same_id_max: 1
+      fid_native_margin_max: 3.0
+      kid_native_margin_max: 0.005
+      niqe_native_margin_max: 0.10
+      sharpness_absolute_min: 300.0
+      sharpness_native_ratio_min: 0.95
+      e0_min: 0.75
+      e0_delta_min: 0.30
+      edev_delta_min: 0.05
+      face_count_exact: 1
+      identity_delta_upper_95_max: 0.02
+      max_advancing_candidates: 2
+      rank_order: [severe, kid, fid, edev_desc, e0_desc, arm_id]
+
+  confirm512:
+    manifest: validate_512
+    sample_count: 512
+    shards_per_logical_run: 8
+    seed: 4549
+    candidate_slots: 2
+    visual_severe_max: 25
+    gate_ref: calibrate.gate
+    rank_order: [severe, kid, fid, edev_desc, e0_desc, arm_id]
+    winner_count: 1
+
+  full:
+    manifest: full_2048
+    visual_manifest: full_visual_64
+    sample_count: 2048
+    shards_per_logical_run: 16
+    seed: 7919
+    visual_severe_max: 3
+    gate_ref: calibrate.gate
+    representation:
+      e1_mean_delta_lower_95_min_exclusive: 0.0
+      e2_mean_delta_lower_95_min_exclusive: 0.0
+    privacy:
+      recognizers: [arcface, facenet, adaface]
+      identity_delta_upper_95_max: 0.02
+      require_complete_pairs: 2048
+    sealed_until_selection_lock:
+      - heldout_e1
+      - heldout_e2
+      - facenet
+      - adaface
+    report_only_metrics: [tar_at_far, eer, auc]
+    reselect_after_failure: false

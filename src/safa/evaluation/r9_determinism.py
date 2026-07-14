@@ -38,19 +38,21 @@ def is_r9_guidance_config(config: Mapping[str, Any]) -> bool:
 
 def validate_r9_execution_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if config.get("experiment_contract") != R9_EXPERIMENT_CONTRACT:
-        raise ValueError(
-            f"R9 experiment_contract must be {R9_EXPERIMENT_CONTRACT!r}"
-        )
+        raise ValueError(f"R9 experiment_contract must be {R9_EXPERIMENT_CONTRACT!r}")
     policy = config.get("determinism_policy")
     if not isinstance(policy, Mapping):
         raise ValueError("R9 config requires a determinism_policy mapping")
     normalized_policy = dict(policy)
     if normalized_policy != R9_DETERMINISM_POLICY:
-        raise ValueError("R9 determinism_policy must match the strict registered policy")
+        raise ValueError(
+            "R9 determinism_policy must match the strict registered policy"
+        )
     policy_sha256 = canonical_json_sha256(normalized_policy)
     declared_policy_sha256 = config.get("determinism_policy_sha256")
     if declared_policy_sha256 is not None and declared_policy_sha256 != policy_sha256:
-        raise ValueError("R9 determinism_policy_sha256 disagrees with the canonical policy")
+        raise ValueError(
+            "R9 determinism_policy_sha256 disagrees with the canonical policy"
+        )
     if config.get("attention_backend") != R9_ATTENTION_BACKEND:
         raise ValueError("R9 attention_backend must be explicitly locked to 'native'")
     return {
@@ -112,6 +114,20 @@ def assert_r9_strict_cuda_determinism(*, torch_module) -> None:
 
 def canonical_r9_arm_config_payload(config: Mapping[str, Any]) -> dict[str, Any]:
     contract = validate_r9_execution_config(config)
+    active_intervals = None
+    if config.get("mode") in {
+        "official_head_current_xt",
+        "paper_algorithm_split",
+    }:
+        value = config.get("active_guidance_intervals")
+        if not isinstance(value, list) or any(
+            interval not in {"I1", "I2", "I3"} for interval in value
+        ):
+            raise ValueError("R9 FMRG arm digest requires a canonical interval mask")
+        canonical = [interval for interval in ("I1", "I2", "I3") if interval in value]
+        if value != canonical or len(set(value)) != len(value):
+            raise ValueError("R9 FMRG interval mask must follow canonical order")
+        active_intervals = list(value)
     bound_digests = {}
     for field in (
         "semigroup_preflight_contract_sha256",
@@ -128,6 +144,7 @@ def canonical_r9_arm_config_payload(config: Mapping[str, Any]) -> dict[str, Any]
         "determinism_policy": contract["determinism_policy"],
         "determinism_policy_sha256": contract["determinism_policy_sha256"],
         "attention_backend": contract["attention_backend"],
+        "active_guidance_intervals": active_intervals,
         **bound_digests,
     }
 
@@ -144,6 +161,8 @@ def canonical_guidance_arm_config_digest(config: Mapping[str, Any]) -> str:
 
 def _require_sha256(value: Any, label: str) -> str:
     text = str(value)
-    if len(text) != 64 or any(character not in "0123456789abcdef" for character in text):
+    if len(text) != 64 or any(
+        character not in "0123456789abcdef" for character in text
+    ):
         raise ValueError(f"{label} must be a lowercase SHA256 digest")
     return text

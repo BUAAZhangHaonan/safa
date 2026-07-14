@@ -135,12 +135,39 @@ def test_r9_arm_digest_binds_preflight_contract_digest() -> None:
     config = _config()
     original = canonical_r9_arm_config_digest(config)
 
-    assert canonical_r9_arm_config_digest(
-        {**config, "semigroup_preflight_contract_sha256": "0" * 64}
-    ) != original
-    assert canonical_r9_arm_config_digest(
-        {**config, "r9_semigroup_gate_contract_sha256": "1" * 64}
-    ) != original
+    assert (
+        canonical_r9_arm_config_digest(
+            {**config, "semigroup_preflight_contract_sha256": "0" * 64}
+        )
+        != original
+    )
+    assert (
+        canonical_r9_arm_config_digest(
+            {**config, "r9_semigroup_gate_contract_sha256": "1" * 64}
+        )
+        != original
+    )
+
+
+def test_r9_fmrg_arm_digest_binds_mask_but_not_diagnostic_collection() -> None:
+    config = {
+        **_config(),
+        "mode": "paper_algorithm_split",
+        "phase": "diagnose",
+        "step_size": 0.25,
+        "active_guidance_intervals": ["I1", "I2"],
+        "collect_interval_diagnostics": False,
+    }
+    drop_i3 = canonical_r9_arm_config_digest(config)
+    drop_i2 = canonical_r9_arm_config_digest(
+        {**config, "active_guidance_intervals": ["I1", "I3"]}
+    )
+    diagnostics_on = canonical_r9_arm_config_digest(
+        {**config, "collect_interval_diagnostics": True}
+    )
+
+    assert drop_i3 != drop_i2
+    assert drop_i3 == diagnostics_on
 
 
 def test_load_ema_generator_overrides_checkpoint_auto_with_locked_native(

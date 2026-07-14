@@ -45,9 +45,7 @@ from safa.evaluation.r9_semigroup_contracts import (
 from safa.utils.sampling import make_x_init_for_sample_ids
 
 
-EXPECTED_CHECKPOINT_PATH = (
-    "artifacts/checkpoints/e15_meanflow_sit_b_face_mixed_h100_resume_2400ep/last_nopretrained.pt"
-)
+EXPECTED_CHECKPOINT_PATH = "artifacts/checkpoints/e15_meanflow_sit_b_face_mixed_h100_resume_2400ep/last_nopretrained.pt"
 EXPECTED_E0_CHECKPOINT_PATH = "artifacts/checkpoints/e0_medium_v1/best.pt"
 EXPECTED_EDEV_CHECKPOINT_PATH = "artifacts/checkpoints/e0_resnet18/best.pt"
 EXPECTED_VAE_PATH = "artifacts/checkpoints/external/sd-vae-ft-ema"
@@ -69,11 +67,36 @@ EXPECTED_MODEL_CONFIG: dict[str, Any] = {
     "sit_data_space": "latent",
 }
 SUPPORTED_MODES = frozenset(
-    {"native", "semigroup", "official_head_current_xt", "paper_algorithm_split", "initial_noise"}
+    {
+        "native",
+        "semigroup",
+        "official_head_current_xt",
+        "paper_algorithm_split",
+        "initial_noise",
+    }
 )
 _MODE_ALIASES = {"noise_oracle": "initial_noise"}
 FMRG_MODES = frozenset({"official_head_current_xt", "paper_algorithm_split"})
 _SAFE_SAMPLE_ID_RE = re.compile(r"[^A-Za-z0-9._-]+")
+R9_GUIDANCE_INTERVAL_IDS = ("I1", "I2", "I3")
+R9_GUIDANCE_INTERVAL_CONTRACT_FIELD = "r9_guidance_interval_contract"
+R9_PHASE_CONTRACT_FIELD = "r9_phase_contract"
+R9_PHASES = (
+    "semigroup",
+    "preflight",
+    "resource_smoke",
+    "diagnose",
+    "calibrate",
+    "confirm512",
+    "full",
+)
+R9_EDEV_PHASES = (
+    "resource_smoke",
+    "diagnose",
+    "calibrate",
+    "confirm512",
+    "full",
+)
 
 
 @dataclass(frozen=True)
@@ -127,7 +150,9 @@ def validate_checkpoint_contract(payload: Mapping[str, Any]) -> dict[str, Any]:
     for field, expected in EXPECTED_MODEL_CONFIG.items():
         actual = model_config.get(field)
         if actual != expected:
-            raise ValueError(f"checkpoint model_config.{field} must be {expected!r}, got {actual!r}")
+            raise ValueError(
+                f"checkpoint model_config.{field} must be {expected!r}, got {actual!r}"
+            )
     ema_state = payload.get("ema_model_state_dict")
     if not isinstance(ema_state, Mapping) or not ema_state:
         raise ValueError("checkpoint missing non-empty ema_model_state_dict")
@@ -160,7 +185,9 @@ def load_ema_generator(
     model_config["sit_pretrained_state_key"] = ""
     if r9_attention_backend is not None:
         if r9_attention_backend != R9_ATTENTION_BACKEND:
-            raise ValueError("R9 generator attention backend must be locked to 'native'")
+            raise ValueError(
+                "R9 generator attention backend must be locked to 'native'"
+            )
         model_config["attention_backend"] = str(r9_attention_backend)
     if generator_builder is None:
         from safa.models.generator import build_generator
@@ -204,7 +231,9 @@ def validate_guidance_config(config: Mapping[str, Any]) -> dict[str, Any]:
         and str(field) not in allowed_heldout_fields
     )
     if present_forbidden:
-        raise ValueError(f"guidance runner accepts only locked heldout E1/E2 assets: {present_forbidden!r}")
+        raise ValueError(
+            f"guidance runner accepts only locked heldout E1/E2 assets: {present_forbidden!r}"
+        )
     checkpoint = str(resolved.get("checkpoint", ""))
     if checkpoint != EXPECTED_CHECKPOINT_PATH:
         raise ValueError(
@@ -221,7 +250,9 @@ def validate_guidance_config(config: Mapping[str, Any]) -> dict[str, Any]:
         ("vae_scaling_factor", EXPECTED_VAE_SCALING_FACTOR),
     ):
         if resolved.get(field) != expected:
-            raise ValueError(f"guidance config {field} must be {expected!r}, got {resolved.get(field)!r}")
+            raise ValueError(
+                f"guidance config {field} must be {expected!r}, got {resolved.get(field)!r}"
+            )
     required_digests = (
         "checkpoint_sha256",
         "e0_sha256",
@@ -244,13 +275,17 @@ def validate_guidance_config(config: Mapping[str, Any]) -> dict[str, Any]:
     )
     missing_paths = [field for field in required_paths if not resolved.get(field)]
     if missing_paths:
-        raise ValueError(f"guidance config missing locked asset paths: {missing_paths!r}")
+        raise ValueError(
+            f"guidance config missing locked asset paths: {missing_paths!r}"
+        )
     if resolved.get("feature_source") != "cached_features":
         raise ValueError("guidance config feature_source must be 'cached_features'")
     mode = str(resolved.get("mode", resolved.get("route", "")))
     mode = _MODE_ALIASES.get(mode, mode)
     if mode not in SUPPORTED_MODES:
-        raise ValueError(f"guidance mode must be one of {sorted(SUPPORTED_MODES)}, got {mode!r}")
+        raise ValueError(
+            f"guidance mode must be one of {sorted(SUPPORTED_MODES)}, got {mode!r}"
+        )
     resolved["mode"] = mode
     resolved.pop("route", None)
     if mode == "official_head_current_xt":
@@ -278,13 +313,267 @@ def validate_guidance_config(config: Mapping[str, Any]) -> dict[str, Any]:
         ("expected_sit_patch_size", EXPECTED_MODEL_CONFIG["sit_patch_size"]),
     ):
         if field in resolved and resolved[field] != expected:
-            raise ValueError(f"guidance config {field} must be {expected!r}, got {resolved[field]!r}")
+            raise ValueError(
+                f"guidance config {field} must be {expected!r}, got {resolved[field]!r}"
+            )
     if is_r9_guidance_config(resolved):
         execution_contract = validate_r9_execution_config(resolved)
         resolved.update(execution_contract)
+        phase_contract = validate_r9_phase_contract(resolved)
+        resolved[R9_PHASE_CONTRACT_FIELD] = phase_contract
+        interval_contract = validate_r9_interval_guidance_config(resolved, mode=mode)
+        if interval_contract is not None:
+            resolved[R9_GUIDANCE_INTERVAL_CONTRACT_FIELD] = interval_contract
         if mode == "semigroup":
             validate_r9_semigroup_preflight_config(resolved)
+    else:
+        validate_r9_interval_guidance_config(resolved, mode=mode)
     return resolved
+
+
+def finalize_effective_guidance_config(
+    validated_config: Mapping[str, Any],
+    *,
+    locked_schedule: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Build the exact config consumed by generation and bind its arm digest."""
+    effective = dict(validated_config)
+    mode = str(effective["mode"])
+    if mode in FMRG_MODES:
+        if locked_schedule is None:
+            raise ValueError("FMRG effective config requires a locked schedule")
+        effective["locked_schedule"] = dict(locked_schedule)
+    elif locked_schedule is not None or "locked_schedule" in effective:
+        raise ValueError("non-FMRG effective config must not contain a locked schedule")
+    computed = canonical_guidance_arm_config_digest(effective)
+    declared = effective.get("arm_config_sha256")
+    if declared is not None and require_arm_config_digest(declared) != computed:
+        raise ValueError(
+            "declared arm config SHA256 disagrees with the effective guidance config"
+        )
+    effective["arm_config_sha256"] = computed
+    return effective
+
+
+def resolve_frozen_effective_guidance_config(
+    config: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve one YAML-owned config exactly as the generation entry point does."""
+    validated = validate_guidance_config(config)
+    schedule = None
+    if validated["mode"] in FMRG_MODES:
+        checkpoint_sha256 = str(validated["checkpoint_sha256"])
+        schedule = resolve_locked_schedule(
+            validated,
+            checkpoint_sha256=checkpoint_sha256,
+            explicit_t_cut=None,
+        )
+        _validate_semigroup_gate(
+            validated,
+            checkpoint_sha256,
+            float(schedule["t_cut"]),
+            str(schedule["semigroup_sample_id_manifest_sha256"]),
+        )
+    return finalize_effective_guidance_config(
+        validated,
+        locked_schedule=schedule,
+    )
+
+
+def validate_r9_phase_contract(config: Mapping[str, Any]) -> dict[str, Any]:
+    if not is_r9_guidance_config(config):
+        if R9_PHASE_CONTRACT_FIELD in config:
+            raise ValueError("R9 phase contract requires the R9 experiment contract")
+        raise ValueError("R9 phase contract requires the R9 experiment contract")
+    if "phase" not in config:
+        raise ValueError("R9 guidance config requires an explicit phase")
+    phase = config["phase"]
+    if not isinstance(phase, str) or phase not in R9_PHASES:
+        raise ValueError(f"R9 guidance phase must be one of {list(R9_PHASES)!r}")
+    edev_required = phase in R9_EDEV_PHASES
+    contract = {
+        "schema_version": 1,
+        "phase": phase,
+        "edev_required": edev_required,
+        "required_per_sample_edev_fields": (
+            ["edev_cosine", "native_edev_cosine"] if edev_required else []
+        ),
+        "required_summary_edev_fields": (
+            ["candidate_edev_source", "native_edev_source"] if edev_required else []
+        ),
+    }
+    declared = config.get(R9_PHASE_CONTRACT_FIELD)
+    if declared is not None and declared != contract:
+        raise ValueError("R9 phase contract disagrees with the effective config")
+    return contract
+
+
+def _edev_required_for_config(config: Mapping[str, Any]) -> bool:
+    if is_r9_guidance_config(config):
+        contract = validate_r9_phase_contract(config)
+        if config.get(R9_PHASE_CONTRACT_FIELD) != contract:
+            raise ValueError(
+                "R9 execution requires the validated phase contract from config preflight"
+            )
+        return bool(contract["edev_required"])
+    if R9_PHASE_CONTRACT_FIELD in config:
+        raise ValueError("R9 phase contract requires the R9 experiment contract")
+    return str(config.get("phase", "full")) == "calibration"
+
+
+def validate_r9_interval_guidance_config(
+    config: Mapping[str, Any], *, mode: str | None = None
+) -> dict[str, Any] | None:
+    resolved_mode = _MODE_ALIASES.get(
+        str(mode if mode is not None else config.get("mode", config.get("route", ""))),
+        str(mode if mode is not None else config.get("mode", config.get("route", ""))),
+    )
+    interval_fields = {
+        "active_guidance_intervals",
+        "collect_interval_diagnostics",
+        R9_GUIDANCE_INTERVAL_CONTRACT_FIELD,
+    }
+    present_fields = sorted(field for field in interval_fields if field in config)
+    if not is_r9_guidance_config(config):
+        if present_fields:
+            raise ValueError(
+                f"R9 interval guidance fields require the R9 experiment contract: {present_fields!r}"
+            )
+        return None
+    if resolved_mode not in FMRG_MODES:
+        if present_fields:
+            raise ValueError(
+                f"R9 interval guidance fields are invalid for mode {resolved_mode!r}"
+            )
+        return None
+
+    missing = [
+        field
+        for field in ("active_guidance_intervals", "collect_interval_diagnostics")
+        if field not in config
+    ]
+    if missing:
+        raise ValueError(
+            f"R9 FMRG config is missing interval guidance fields: {missing!r}"
+        )
+    active_value = config["active_guidance_intervals"]
+    if not isinstance(active_value, list):
+        raise ValueError("R9 active_guidance_intervals must be a YAML list")
+    if any(not isinstance(interval_id, str) for interval_id in active_value):
+        raise ValueError("R9 active_guidance_intervals must contain only interval IDs")
+    if len(set(active_value)) != len(active_value):
+        raise ValueError("R9 active_guidance_intervals must not contain duplicates")
+    unknown = sorted(set(active_value) - set(R9_GUIDANCE_INTERVAL_IDS))
+    if unknown:
+        raise ValueError(
+            f"R9 active_guidance_intervals contains unknown IDs: {unknown!r}"
+        )
+    canonical_active = [
+        interval_id
+        for interval_id in R9_GUIDANCE_INTERVAL_IDS
+        if interval_id in active_value
+    ]
+    if active_value != canonical_active:
+        raise ValueError(
+            "R9 active_guidance_intervals must follow canonical I1/I2/I3 order"
+        )
+    collect = config["collect_interval_diagnostics"]
+    if not isinstance(collect, bool):
+        raise ValueError("R9 collect_interval_diagnostics must be a boolean")
+    step_size = config.get("step_size")
+    if isinstance(step_size, bool) or not isinstance(step_size, (int, float)):
+        raise ValueError("R9 FMRG config requires an explicit numeric step_size")
+    if not math.isfinite(float(step_size)) or float(step_size) <= 0.0:
+        raise ValueError("R9 FMRG step_size must be positive and finite")
+
+    if resolved_mode == "official_head_current_xt":
+        if config.get("sample_mode") != "flow_map2":
+            raise ValueError(
+                "R9 official_head_current_xt requires sample_mode='flow_map2'"
+            )
+        if config.get("optimization_mode") != "paper_normalized_direct_autograd":
+            raise ValueError(
+                "R9 official_head_current_xt requires "
+                "optimization_mode='paper_normalized_direct_autograd'"
+            )
+        if config.get("num_optim_iters") != 1:
+            raise ValueError("R9 official_head_current_xt requires num_optim_iters=1")
+    else:
+        ignored = sorted(
+            field
+            for field in ("sample_mode", "optimization_mode", "num_optim_iters")
+            if field in config
+        )
+        if ignored:
+            raise ValueError(
+                f"R9 paper_algorithm_split rejects unused official algorithm fields: {ignored!r}"
+            )
+
+    expected_algorithm_trace, expected_diagnostic_trace = _expected_r9_interval_traces(
+        resolved_mode,
+        canonical_active,
+        collect=collect,
+    )
+    contract = {
+        "schema_version": 1,
+        "mode": resolved_mode,
+        "active_guidance_intervals": canonical_active,
+        "collect_interval_diagnostics": collect,
+        "expected_algorithm_nfe": len(expected_algorithm_trace),
+        "expected_diagnostic_nfe": len(expected_diagnostic_trace),
+        "expected_algorithm_trace": expected_algorithm_trace,
+        "expected_diagnostic_trace": expected_diagnostic_trace,
+    }
+    declared = config.get(R9_GUIDANCE_INTERVAL_CONTRACT_FIELD)
+    if declared is not None and declared != contract:
+        raise ValueError(
+            "R9 guidance interval contract disagrees with the effective config"
+        )
+    return contract
+
+
+def _expected_r9_interval_traces(
+    mode: str,
+    active_guidance_intervals: Sequence[str],
+    *,
+    collect: bool,
+) -> tuple[list[dict[str, float | str]], list[dict[str, float | str]]]:
+    active = set(active_guidance_intervals)
+    algorithm_trace: list[dict[str, float | str]] = []
+    diagnostic_trace: list[dict[str, float | str]] = []
+    for interval_id, t, s in (
+        ("I1", 1.0, 0.75),
+        ("I2", 0.75, 0.5),
+        ("I3", 0.5, 0.25),
+    ):
+        if mode == "official_head_current_xt":
+            if interval_id in active:
+                algorithm_trace.append({"t": t, "r": 0.0, "kind": mode})
+            algorithm_trace.append({"t": t, "r": s, "kind": mode})
+        elif mode == "paper_algorithm_split":
+            algorithm_trace.append({"t": t, "r": s, "kind": mode})
+            if interval_id in active:
+                algorithm_trace.append({"t": s, "r": 0.0, "kind": mode})
+        else:
+            raise ValueError(f"unsupported R9 interval guidance mode {mode!r}")
+        if collect:
+            diagnostic_trace.extend(
+                (
+                    {"t": t, "r": 0.0, "kind": "interval_diagnostic"},
+                    {"t": s, "r": 0.0, "kind": "interval_diagnostic"},
+                )
+            )
+            if interval_id in active:
+                diagnostic_trace.append(
+                    {"t": s, "r": 0.0, "kind": "interval_diagnostic"}
+                )
+    algorithm_trace.extend(
+        (
+            {"t": 0.25, "r": 0.125, "kind": mode},
+            {"t": 0.125, "r": 0.0, "kind": mode},
+        )
+    )
+    return algorithm_trace, diagnostic_trace
 
 
 def _prepare_sharded_guidance_config(
@@ -294,7 +583,9 @@ def _prepare_sharded_guidance_config(
     num_shards: int,
 ) -> dict[str, Any]:
     _validate_shard_coordinates(shard_index, num_shards)
-    cache_path, allowed_roots = _resolve_asset_digest_cache(config, num_shards=num_shards)
+    cache_path, allowed_roots = _resolve_asset_digest_cache(
+        config, num_shards=num_shards
+    )
     resolved = validate_guidance_config(config)
     if cache_path is None:
         return resolved
@@ -316,14 +607,20 @@ def _prepare_sharded_guidance_config(
 
 
 def _validate_shard_coordinates(shard_index: int, num_shards: int) -> None:
-    if isinstance(num_shards, bool) or not isinstance(num_shards, int) or num_shards <= 0:
+    if (
+        isinstance(num_shards, bool)
+        or not isinstance(num_shards, int)
+        or num_shards <= 0
+    ):
         raise ValueError(f"num_shards must be a positive integer, got {num_shards!r}")
     if (
         isinstance(shard_index, bool)
         or not isinstance(shard_index, int)
         or not 0 <= shard_index < num_shards
     ):
-        raise ValueError(f"shard_index must be in [0,{num_shards}), got {shard_index!r}")
+        raise ValueError(
+            f"shard_index must be in [0,{num_shards}), got {shard_index!r}"
+        )
 
 
 def _resolve_asset_digest_cache(
@@ -332,7 +629,9 @@ def _resolve_asset_digest_cache(
     cache_value = config.get("asset_digest_cache")
     if not cache_value or not str(cache_value).strip():
         if num_shards > 1:
-            raise ValueError("num_shards > 1 requires a non-empty shared asset_digest_cache")
+            raise ValueError(
+                "num_shards > 1 requires a non-empty shared asset_digest_cache"
+            )
         return None, (REPOSITORY_ROOT,)
 
     repository_root = REPOSITORY_ROOT.resolve()
@@ -341,13 +640,19 @@ def _resolve_asset_digest_cache(
     if explicit_root_value:
         explicit_root = _repository_relative_candidate(explicit_root_value)
         if explicit_root.is_symlink():
-            raise ValueError(f"asset_digest_cache_root must not be a symlink: {explicit_root}")
+            raise ValueError(
+                f"asset_digest_cache_root must not be a symlink: {explicit_root}"
+            )
         if explicit_root.exists() and not explicit_root.is_dir():
-            raise ValueError(f"asset_digest_cache_root must be a directory: {explicit_root}")
+            raise ValueError(
+                f"asset_digest_cache_root must be a directory: {explicit_root}"
+            )
         allowed_roots.append(explicit_root.resolve(strict=False))
 
     cache_candidate = _repository_relative_candidate(cache_value)
-    _require_asset_cache_target(cache_candidate, tuple(allowed_roots), "asset_digest_cache")
+    _require_asset_cache_target(
+        cache_candidate, tuple(allowed_roots), "asset_digest_cache"
+    )
     cache_path = cache_candidate.resolve(strict=False)
     if cache_path.exists() and not cache_path.is_file():
         raise ValueError(f"asset_digest_cache must be a file path: {cache_path}")
@@ -361,7 +666,9 @@ def _repository_relative_candidate(value: Any) -> Path:
     return Path(os.path.abspath(path))
 
 
-def _require_asset_cache_target(path: Path, allowed_roots: Sequence[Path], label: str) -> None:
+def _require_asset_cache_target(
+    path: Path, allowed_roots: Sequence[Path], label: str
+) -> None:
     if path.is_symlink():
         raise ValueError(f"{label} must not be a symlink: {path}")
     resolved = path.resolve(strict=False)
@@ -375,7 +682,9 @@ def _require_asset_cache_target(path: Path, allowed_roots: Sequence[Path], label
         matched_root = root_resolved
         break
     if matched_root is None:
-        raise ValueError(f"{label} must be inside the repository or an explicitly allowed root")
+        raise ValueError(
+            f"{label} must be inside the repository or an explicitly allowed root"
+        )
 
     relative = resolved.relative_to(matched_root)
     cursor = matched_root
@@ -413,7 +722,9 @@ def _register_shard_asset_cache_contract(
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             if contract_path.exists():
-                payload = _read_json_mapping(contract_path, "shard asset cache contract")
+                payload = _read_json_mapping(
+                    contract_path, "shard asset cache contract"
+                )
                 if payload.get("contract") != contract:
                     raise ValueError("existing shard asset cache contract disagrees")
                 registered = payload.get("registered_shards")
@@ -461,7 +772,9 @@ def asset_contract_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
     )
     missing = [field for field in required if not config.get(field)]
     if missing:
-        raise ValueError(f"guidance asset contract missing required fields: {missing!r}")
+        raise ValueError(
+            f"guidance asset contract missing required fields: {missing!r}"
+        )
     mode = _MODE_ALIASES.get(str(config.get("mode", "")), str(config.get("mode", "")))
     if mode not in SUPPORTED_MODES:
         raise ValueError(f"guidance asset contract has unsupported mode {mode!r}")
@@ -487,7 +800,9 @@ def asset_contract_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 
     def digest(path: Path, expected_field: str) -> str:
         if cache_path:
-            return cached_asset_digest(path, str(config[expected_field]), str(cache_path))
+            return cached_asset_digest(
+                path, str(config[expected_field]), str(cache_path)
+            )
         return _digest_path(path)
 
     checkpoint_digest = digest(checkpoint_path, "checkpoint_sha256")
@@ -501,20 +816,33 @@ def asset_contract_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
     ordered_manifest_ids = [str(row["sample_id"]) for row in ordered_manifest_rows]
     heldout_e1_digest = digest(heldout_e1_path, "heldout_e1_sha256")
     heldout_e2_digest = digest(heldout_e2_path, "heldout_e2_sha256")
-    _validate_expected_digest(config, ("checkpoint_sha256",), checkpoint_digest, "checkpoint")
+    _validate_expected_digest(
+        config, ("checkpoint_sha256",), checkpoint_digest, "checkpoint"
+    )
     _validate_expected_digest(config, ("e0_sha256",), e0_digest, "E0")
     _validate_expected_digest(config, ("edev_sha256",), edev_digest, "Edev")
     _validate_expected_digest(config, ("vae_digest",), vae_digest, "VAE")
     _validate_expected_digest(config, ("index_sha256",), index_digest, "real index")
-    _validate_expected_digest(config, ("features_digest",), features_digest, "target features")
     _validate_expected_digest(
-        config, ("sample_id_manifest_sha256",), sample_manifest_digest, "sample manifest"
+        config, ("features_digest",), features_digest, "target features"
     )
-    _validate_expected_digest(config, ("heldout_e1_sha256",), heldout_e1_digest, "heldout E1")
-    _validate_expected_digest(config, ("heldout_e2_sha256",), heldout_e2_digest, "heldout E2")
+    _validate_expected_digest(
+        config,
+        ("sample_id_manifest_sha256",),
+        sample_manifest_digest,
+        "sample manifest",
+    )
+    _validate_expected_digest(
+        config, ("heldout_e1_sha256",), heldout_e1_digest, "heldout E1"
+    )
+    _validate_expected_digest(
+        config, ("heldout_e2_sha256",), heldout_e2_digest, "heldout E2"
+    )
     scale = float(config["vae_scaling_factor"])
     if not math.isfinite(scale) or scale <= 0.0:
-        raise ValueError(f"vae_scaling_factor must be positive and finite, got {scale!r}")
+        raise ValueError(
+            f"vae_scaling_factor must be positive and finite, got {scale!r}"
+        )
     seed = int(config.get("sampling_seed", config.get("seed")))
     return {
         "checkpoint": {"path": str(checkpoint_path), "sha256": checkpoint_digest},
@@ -572,7 +900,7 @@ def build_frozen_runtime(
     e0, _ = encoder_loader(config["e0_checkpoint"], device="cpu")
     e0 = e0.to(device)
     edev = None
-    if str(config.get("phase", "full")) == "calibration":
+    if _edev_required_for_config(config):
         edev, _ = encoder_loader(config["edev_checkpoint"], device="cpu")
         edev = edev.to(device).eval().requires_grad_(False)
     codec_config = dict(config)
@@ -615,7 +943,9 @@ def build_frozen_runtime(
         input_sample_manifest_id_sha256=str(
             asset_contract["sample_manifest"]["ordered_sample_id_sha256"]
         ),
-        input_sample_manifest_count=int(asset_contract["sample_manifest"]["sample_count"]),
+        input_sample_manifest_count=int(
+            asset_contract["sample_manifest"]["sample_count"]
+        ),
         heldout_e1=dict(asset_contract["heldout_e1"]),
         heldout_e2=dict(asset_contract["heldout_e2"]),
     )
@@ -650,7 +980,9 @@ def resolve_locked_schedule(
         else _schedule_contract_sha256(manifest)
     )
     if computed_schedule_sha256 != schedule_contract_sha256:
-        raise ValueError("locked schedule contract SHA256 does not match its canonical payload")
+        raise ValueError(
+            "locked schedule contract SHA256 does not match its canonical payload"
+        )
     manifest_hash = manifest.get("checkpoint_sha256")
     if manifest_hash != checkpoint_sha256:
         raise ValueError(
@@ -667,24 +999,37 @@ def resolve_locked_schedule(
             continue
         parsed = _finite_open_unit(value, f"{source} t_cut")
         if not math.isclose(parsed, t_cut, rel_tol=0.0, abs_tol=1.0e-12):
-            raise ValueError(f"{source} t_cut {parsed} disagrees with locked manifest t_cut {t_cut}")
+            raise ValueError(
+                f"{source} t_cut {parsed} disagrees with locked manifest t_cut {t_cut}"
+            )
     guided = [1.0 - index * (1.0 - t_cut) / 3.0 for index in range(4)]
     unguided = [t_cut, t_cut / 2.0, 0.0]
     guided[-1] = t_cut
-    if manifest.get("guided_steps") != 3 or manifest.get("unguided_tail_intervals") != 2:
-        raise ValueError("locked schedule must register exactly 3 guided and 2 unguided intervals")
+    if (
+        manifest.get("guided_steps") != 3
+        or manifest.get("unguided_tail_intervals") != 2
+    ):
+        raise ValueError(
+            "locked schedule must register exactly 3 guided and 2 unguided intervals"
+        )
     for field, expected in (("guided_times", guided), ("unguided_times", unguided)):
         if not _float_sequences_equal(manifest.get(field), expected):
-            raise ValueError(f"locked schedule {field} disagrees with the uniform schedule")
+            raise ValueError(
+                f"locked schedule {field} disagrees with the uniform schedule"
+            )
     for field, expected in (("guided_times", guided), ("unguided_times", unguided)):
         if field in config and not _float_sequences_equal(config[field], expected):
-            raise ValueError(f"config {field} disagrees with the locked uniform schedule")
+            raise ValueError(
+                f"config {field} disagrees with the locked uniform schedule"
+            )
     report_path = _locked_path_binding(config, manifest, "semigroup_report")
     report_sha256 = _require_sha256(
         manifest.get("semigroup_report_sha256"), "semigroup_report_sha256"
     )
     if _digest_path(report_path) != report_sha256:
-        raise ValueError("locked semigroup report SHA256 does not match the report file")
+        raise ValueError(
+            "locked semigroup report SHA256 does not match the report file"
+        )
     sample_manifest_path = _locked_path_binding(
         config, manifest, "semigroup_sample_id_manifest"
     )
@@ -697,9 +1042,13 @@ def resolve_locked_schedule(
         "config semigroup_sample_id_manifest_sha256",
     )
     if config_semigroup_sha256 != sample_manifest_sha256:
-        raise ValueError("config semigroup sample manifest SHA256 disagrees with locked schedule")
+        raise ValueError(
+            "config semigroup sample manifest SHA256 disagrees with locked schedule"
+        )
     if _digest_path(sample_manifest_path) != sample_manifest_sha256:
-        raise ValueError("locked semigroup sample manifest SHA256 does not match the manifest file")
+        raise ValueError(
+            "locked semigroup sample manifest SHA256 does not match the manifest file"
+        )
     resolved_schedule = {
         "manifest": str(manifest_path),
         "manifest_sha256": _digest_path(manifest_path),
@@ -754,7 +1103,9 @@ def _locked_path_binding(
     config_value = config.get(field)
     manifest_value = manifest.get(field)
     if not config_value or not manifest_value:
-        raise ValueError(f"locked schedule requires {field} in both config and manifest")
+        raise ValueError(
+            f"locked schedule requires {field} in both config and manifest"
+        )
     config_path = Path(str(config_value))
     manifest_path = Path(str(manifest_value))
     if config_path.resolve() != manifest_path.resolve():
@@ -773,12 +1124,16 @@ def read_ordered_sample_manifest(path: str | Path) -> list[dict[str, Any]]:
             try:
                 row = json.loads(line)
             except json.JSONDecodeError as exc:
-                raise ValueError(f"{manifest_path}:{line_no}: invalid JSON: {exc.msg}") from exc
+                raise ValueError(
+                    f"{manifest_path}:{line_no}: invalid JSON: {exc.msg}"
+                ) from exc
             if not isinstance(row, dict):
                 raise ValueError(f"{manifest_path}:{line_no}: expected JSON object")
             sample_id = row.get("sample_id")
             if not isinstance(sample_id, str) or not sample_id:
-                raise ValueError(f"{manifest_path}:{line_no}: sample_id must be a non-empty string")
+                raise ValueError(
+                    f"{manifest_path}:{line_no}: sample_id must be a non-empty string"
+                )
             if sample_id in seen:
                 raise ValueError(f"duplicate sample_id in manifest: {sample_id!r}")
             seen.add(sample_id)
@@ -788,15 +1143,29 @@ def read_ordered_sample_manifest(path: str | Path) -> list[dict[str, Any]]:
     return rows
 
 
-def deterministic_shard(rows: Sequence[dict[str, Any]], shard_index: int, num_shards: int) -> list[dict[str, Any]]:
+def deterministic_shard(
+    rows: Sequence[dict[str, Any]], shard_index: int, num_shards: int
+) -> list[dict[str, Any]]:
     if isinstance(num_shards, bool) or int(num_shards) != num_shards or num_shards <= 0:
         raise ValueError(f"num_shards must be a positive integer, got {num_shards!r}")
-    if isinstance(shard_index, bool) or int(shard_index) != shard_index or not 0 <= shard_index < num_shards:
-        raise ValueError(f"shard_index must be in [0,{num_shards}), got {shard_index!r}")
-    return [dict(row) for position, row in enumerate(rows) if position % int(num_shards) == int(shard_index)]
+    if (
+        isinstance(shard_index, bool)
+        or int(shard_index) != shard_index
+        or not 0 <= shard_index < num_shards
+    ):
+        raise ValueError(
+            f"shard_index must be in [0,{num_shards}), got {shard_index!r}"
+        )
+    return [
+        dict(row)
+        for position, row in enumerate(rows)
+        if position % int(num_shards) == int(shard_index)
+    ]
 
 
-def resume_remaining_ids(expected_ids: Sequence[str], completed_rows: Sequence[Mapping[str, Any]]) -> list[str]:
+def resume_remaining_ids(
+    expected_ids: Sequence[str], completed_rows: Sequence[Mapping[str, Any]]
+) -> list[str]:
     expected = list(expected_ids)
     completed = [row.get("sample_id") for row in completed_rows]
     if any(not isinstance(sample_id, str) or not sample_id for sample_id in completed):
@@ -804,7 +1173,9 @@ def resume_remaining_ids(expected_ids: Sequence[str], completed_rows: Sequence[M
     if len(set(completed)) != len(completed):
         raise ValueError("resume rows contain duplicate sample IDs")
     if completed != expected[: len(completed)]:
-        raise ValueError("resume rows must be an exact prefix of the deterministic shard")
+        raise ValueError(
+            "resume rows must be an exact prefix of the deterministic shard"
+        )
     return expected[len(completed) :]
 
 
@@ -825,6 +1196,7 @@ def execute_guidance_mode(
         batch_size=x_init.shape[0], device=x_init.device, dtype=x_init.dtype
     )
     counted = CountedFlowMap(generator, kind=mode)
+    interval_contract = validate_r9_interval_guidance_config(config, mode=mode)
     if mode == "native":
         with torch.no_grad():
             latent = counted(x_init, transport_condition, t=1.0, r=0.0).detach()
@@ -843,7 +1215,11 @@ def execute_guidance_mode(
         return GuidanceResult(
             latent=report["direct_endpoint"],
             nfe=int(report["nfe"]),
-            diagnostics={"mode": mode, "semigroup": report, "flow_map_trace": list(counted.trace)},
+            diagnostics={
+                "mode": mode,
+                "semigroup": report,
+                "flow_map_trace": list(counted.trace),
+            },
         )
     if mode == "initial_noise":
         result = optimize_initial_noise(
@@ -877,8 +1253,19 @@ def execute_guidance_mode(
             optimization_mode=str(config["optimization_mode"]),
             num_optim_iters=int(config["num_optim_iters"]),
             step_size=float(config["step_size"]),
+            active_guidance_intervals=None
+            if interval_contract is None
+            else interval_contract["active_guidance_intervals"],
+            collect_interval_diagnostics=False
+            if interval_contract is None
+            else bool(interval_contract["collect_interval_diagnostics"]),
         )
-        return _result_with_trace(result, counted.trace, mode)
+        return _result_with_trace(
+            result,
+            counted.trace,
+            mode,
+            interval_contract=interval_contract,
+        )
     if mode == "paper_algorithm_split":
         result = sample_paper_algorithm_split(
             flow_map=counted,
@@ -890,8 +1277,19 @@ def execute_guidance_mode(
             guided_times=guided_times,
             unguided_times=unguided_times,
             step_size=float(config.get("step_size", config.get("eta", 0.25))),
+            active_guidance_intervals=None
+            if interval_contract is None
+            else interval_contract["active_guidance_intervals"],
+            collect_interval_diagnostics=False
+            if interval_contract is None
+            else bool(interval_contract["collect_interval_diagnostics"]),
         )
-        return _result_with_trace(result, counted.trace, mode)
+        return _result_with_trace(
+            result,
+            counted.trace,
+            mode,
+            interval_contract=interval_contract,
+        )
     raise AssertionError(f"unhandled guidance mode {mode!r}")
 
 
@@ -920,7 +1318,9 @@ def run_guidance_records(
 ) -> dict[str, Any]:
     invocation_started = time.perf_counter()
     output = Path(output_dir)
-    selected = deterministic_shard([dict(row) for row in records], shard_index, num_shards)
+    selected = deterministic_shard(
+        [dict(row) for row in records], shard_index, num_shards
+    )
     _validate_generation_records(selected)
     expected_ids = [str(row["sample_id"]) for row in selected]
     if not expected_ids:
@@ -932,11 +1332,28 @@ def run_guidance_records(
     resolved_config["mode"] = mode
     resolved_config.pop("route", None)
     r9_execution_contract = None
+    r9_phase_contract = None
+    r9_interval_contract = validate_r9_interval_guidance_config(
+        resolved_config, mode=mode
+    )
     if is_r9_guidance_config(resolved_config):
         r9_execution_contract = validate_r9_execution_config(resolved_config)
         if resolved_config.get("r9_execution_contract") != r9_execution_contract:
             raise ValueError(
                 "R9 run requires the applied strict execution contract from the runner preflight"
+            )
+        r9_phase_contract = validate_r9_phase_contract(resolved_config)
+        if resolved_config.get(R9_PHASE_CONTRACT_FIELD) != r9_phase_contract:
+            raise ValueError(
+                "R9 run requires the validated phase contract from config preflight"
+            )
+        if (
+            r9_interval_contract is not None
+            and resolved_config.get(R9_GUIDANCE_INTERVAL_CONTRACT_FIELD)
+            != r9_interval_contract
+        ):
+            raise ValueError(
+                "R9 run requires the validated interval guidance contract from config preflight"
             )
         assert_r9_strict_cuda_determinism(torch_module=torch)
     resolved_config = _bind_arm_config_digest(resolved_config)
@@ -978,25 +1395,34 @@ def run_guidance_records(
     for path in owned_paths:
         _require_contained(output, path, "guidance output")
     if completion_path.exists():
-        raise FileExistsError(f"refusing to replace completed output: {completion_path}")
+        raise FileExistsError(
+            f"refusing to replace completed output: {completion_path}"
+        )
     _validate_output_entries(
         output,
         mode=mode,
         contact_sheets=contact_enabled,
     )
-    if phase == "calibration" and runtime.edev is None:
-        raise ValueError("calibration guidance requires a frozen Edev checkpoint")
-    if phase != "calibration" and runtime.edev is not None:
-        raise ValueError("Edev must not be loaded or scored outside calibration")
+    edev_required = _edev_required_for_config(resolved_config)
+    if edev_required and runtime.edev is None:
+        raise ValueError(f"guidance phase {phase!r} requires a frozen Edev checkpoint")
+    if not edev_required and runtime.edev is not None:
+        raise ValueError(
+            f"Edev must not be loaded or scored in guidance phase {phase!r}"
+        )
     output.mkdir(parents=True, exist_ok=True)
     _require_safe_output_root(output)
     _prepare_owned_directory(output, generated_dir, "generated image directory")
     if mode != "native":
         _prepare_owned_directory(output, native_dir, "native image directory")
     if mode == "semigroup":
-        _prepare_owned_directory(output, semigroup_split_dir, "semigroup split image directory")
+        _prepare_owned_directory(
+            output, semigroup_split_dir, "semigroup split image directory"
+        )
     if contact_enabled and (output / "contact_sheets").exists():
-        _prepare_owned_directory(output, output / "contact_sheets", "contact sheet directory")
+        _prepare_owned_directory(
+            output, output / "contact_sheets", "contact sheet directory"
+        )
 
     resume_contract = {
         "checkpoint": {
@@ -1005,11 +1431,15 @@ def run_guidance_records(
             "state": runtime.checkpoint_state,
         },
         "e0": {
-            "path": "" if runtime.e0_checkpoint_path is None else str(runtime.e0_checkpoint_path),
+            "path": ""
+            if runtime.e0_checkpoint_path is None
+            else str(runtime.e0_checkpoint_path),
             "sha256": runtime.e0_checkpoint_sha256,
         },
         "edev": {
-            "path": "" if runtime.edev_checkpoint_path is None else str(runtime.edev_checkpoint_path),
+            "path": ""
+            if runtime.edev_checkpoint_path is None
+            else str(runtime.edev_checkpoint_path),
             "sha256": runtime.edev_checkpoint_sha256,
         },
         "vae": {
@@ -1018,7 +1448,9 @@ def run_guidance_records(
             "scaling_factor": runtime.vae_scaling_factor,
         },
         "real_index": {
-            "path": "" if runtime.real_index_path is None else str(runtime.real_index_path),
+            "path": ""
+            if runtime.real_index_path is None
+            else str(runtime.real_index_path),
             "sha256": runtime.real_index_sha256,
         },
         "target_features": {
@@ -1039,7 +1471,9 @@ def run_guidance_records(
         "heldout_e1": runtime.heldout_e1,
         "heldout_e2": runtime.heldout_e2,
         "r9_execution_contract": r9_execution_contract,
-        "seed": int(resolved_config.get("sampling_seed", resolved_config.get("seed", 0))),
+        "seed": int(
+            resolved_config.get("sampling_seed", resolved_config.get("seed", 0))
+        ),
         "schedule": resolved_config.get("locked_schedule"),
         "mode": mode,
         "arm_config_sha256": resolved_config["arm_config_sha256"],
@@ -1052,27 +1486,41 @@ def run_guidance_records(
             "ordered_sample_id_sha256": _sample_id_digest(expected_ids),
         },
     }
+    if r9_phase_contract is not None:
+        resume_contract[R9_PHASE_CONTRACT_FIELD] = r9_phase_contract
+    if r9_interval_contract is not None:
+        resume_contract[R9_GUIDANCE_INTERVAL_CONTRACT_FIELD] = r9_interval_contract
     if resume_contract_path.exists():
         existing_contract = _read_json_mapping(resume_contract_path, "resume contract")
         if existing_contract != _json_safe(resume_contract):
-            raise ValueError("existing resume contract disagrees with the fixed run contract")
+            raise ValueError(
+                "existing resume contract disagrees with the fixed run contract"
+            )
     else:
         _atomic_write_json(resume_contract_path, resume_contract, exclusive=True)
     _cleanup_known_temps(output)
 
     expected_manifest_rows = [
-        {"ordinal": ordinal, "sample_id": row["sample_id"], "source": str(row["source"])}
+        {
+            "ordinal": ordinal,
+            "sample_id": row["sample_id"],
+            "source": str(row["source"]),
+        }
         for ordinal, row in enumerate(selected)
     ]
     if sample_manifest_path.exists():
         existing_manifest = _read_optional_jsonl(sample_manifest_path)
         if existing_manifest != expected_manifest_rows:
-            raise ValueError("existing sample_id_manifest.jsonl disagrees with the deterministic shard")
+            raise ValueError(
+                "existing sample_id_manifest.jsonl disagrees with the deterministic shard"
+            )
     else:
         _write_jsonl(sample_manifest_path, expected_manifest_rows, mode="x")
 
     completed_rows = _read_optional_jsonl(per_sample_path)
-    expected_bindings = _expected_row_bindings(selected, generated_dir, native_dir, mode)
+    expected_bindings = _expected_row_bindings(
+        selected, generated_dir, native_dir, mode
+    )
     semigroup_split_bindings = (
         _expected_semigroup_split_bindings(
             selected,
@@ -1086,7 +1534,12 @@ def run_guidance_records(
         _require_contained(output, Path(str(binding["generated"])), "generated image")
         if mode != "native":
             _require_contained(output, Path(str(binding["native"])), "native image")
-    _validate_resume_rows(completed_rows, expected_bindings)
+    _validate_resume_rows(
+        completed_rows,
+        expected_bindings,
+        r9_interval_contract=r9_interval_contract,
+        r9_phase_contract=r9_phase_contract,
+    )
     completed_count = len(completed_rows)
     remaining_records = selected[completed_count:]
     _validate_owned_png_state(
@@ -1105,7 +1558,9 @@ def run_guidance_records(
     if schedule is not None and not isinstance(schedule, Mapping):
         raise ValueError("config.locked_schedule must be a mapping")
     batch_size = _positive_int(resolved_config.get("batch_size", 1), "batch_size")
-    sampling_seed = int(resolved_config.get("sampling_seed", resolved_config.get("seed", 0)))
+    sampling_seed = int(
+        resolved_config.get("sampling_seed", resolved_config.get("seed", 0))
+    )
     image_size = _positive_int(resolved_config.get("image_size", 32), "image_size")
     channels = _sample_channels(runtime.generator, resolved_config)
     sessions = _read_optional_jsonl(session_history_path)
@@ -1117,10 +1572,14 @@ def run_guidance_records(
         existing_by_id = {str(session["session_id"]): session for session in sessions}
         if recovered_id in existing_by_id:
             if not _same_session(existing_by_id[recovered_id], recovered):
-                raise ValueError("session journal disagrees with its committed history row")
+                raise ValueError(
+                    "session journal disagrees with its committed history row"
+                )
         else:
             if int(recovered.get("session_index", -1)) != len(sessions):
-                raise ValueError("session journal index does not follow session history")
+                raise ValueError(
+                    "session journal index does not follow session history"
+                )
             recovered["recovered_after_crash"] = True
             _append_jsonl(session_history_path, recovered)
             sessions.append(recovered)
@@ -1152,7 +1611,9 @@ def run_guidance_records(
     for batch_start in range(0, len(remaining_records), batch_size):
         batch = remaining_records[batch_start : batch_start + batch_size]
         sample_ids = [str(row["sample_id"]) for row in batch]
-        target_z0 = torch.stack([_as_float_tensor(row["z"]) for row in batch]).to(runtime.device)
+        target_z0 = torch.stack([_as_float_tensor(row["z"]) for row in batch]).to(
+            runtime.device
+        )
         x_init = make_x_init_for_sample_ids(
             sample_ids,
             sampling_seed,
@@ -1177,7 +1638,9 @@ def run_guidance_records(
             native_seconds = 0.0
         else:
             native_started = _algorithm_timer_start(runtime.device)
-            native_result = execute_matched_native(generator=runtime.generator, x_init=x_init)
+            native_result = execute_matched_native(
+                generator=runtime.generator, x_init=x_init
+            )
             native_seconds = _algorithm_timer_stop(runtime.device, native_started)
         session_candidate_seconds += candidate_seconds
         session_native_seconds += native_seconds
@@ -1194,28 +1657,38 @@ def run_guidance_records(
             source_io_seconds = time.perf_counter() - source_io_started
         with torch.no_grad():
             generated = runtime.codec.decode(candidate_result.latent)
-            native_images = generated if mode == "native" else runtime.codec.decode(native_result.latent)
+            native_images = (
+                generated
+                if mode == "native"
+                else runtime.codec.decode(native_result.latent)
+            )
             candidate_embedding = runtime.e0(normalize_for_e0(generated))["embedding"]
             native_embedding = runtime.e0(normalize_for_e0(native_images))["embedding"]
-            candidate_cosine = F.cosine_similarity(candidate_embedding, target_z0, dim=1)
+            candidate_cosine = F.cosine_similarity(
+                candidate_embedding, target_z0, dim=1
+            )
             native_cosine = F.cosine_similarity(native_embedding, target_z0, dim=1)
             edev_cosine = None
             native_edev_cosine = None
             if runtime.edev is not None:
                 if source_images is None:
-                    raise RuntimeError("calibration source images were not loaded")
+                    raise RuntimeError("Edev source images were not loaded")
                 edev_generated = runtime.edev(normalize_for_e0(generated))["embedding"]
                 edev_native = runtime.edev(normalize_for_e0(native_images))["embedding"]
                 edev_source = runtime.edev(normalize_for_e0(source_images))["embedding"]
                 edev_cosine = F.cosine_similarity(edev_generated, edev_source, dim=1)
-                native_edev_cosine = F.cosine_similarity(edev_native, edev_source, dim=1)
+                native_edev_cosine = F.cosine_similarity(
+                    edev_native, edev_source, dim=1
+                )
         tensors_to_check = [generated, native_images, candidate_cosine, native_cosine]
         if edev_cosine is not None:
             tensors_to_check.append(edev_cosine)
         if native_edev_cosine is not None:
             tensors_to_check.append(native_edev_cosine)
         if any(not torch.isfinite(tensor).all() for tensor in tensors_to_check):
-            raise FloatingPointError("guidance runner produced non-finite images or cosine values")
+            raise FloatingPointError(
+                "guidance runner produced non-finite images or cosine values"
+            )
         batch_semigroup = {}
         if mode == "semigroup":
             batch_semigroup = {
@@ -1227,7 +1700,9 @@ def run_guidance_records(
                     e0=runtime.e0,
                     direct_images=generated,
                     split_image_bindings=semigroup_split_bindings[
-                        completed_count + batch_start : completed_count + batch_start + len(batch)
+                        completed_count + batch_start : completed_count
+                        + batch_start
+                        + len(batch)
                     ],
                 )
             }
@@ -1252,13 +1727,28 @@ def run_guidance_records(
                 "native_trace": list(native_result.diagnostics["flow_map_trace"]),
                 "candidate_generation_seconds": per_sample_candidate_seconds,
                 "native_generation_seconds": per_sample_native_seconds,
-                "generation_seconds": per_sample_candidate_seconds + per_sample_native_seconds,
+                "generation_seconds": per_sample_candidate_seconds
+                + per_sample_native_seconds,
                 "io_seconds": 0.0,
                 "sample_id": sample_id,
                 "route_diagnostics": _per_sample_diagnostics(
                     candidate_result.diagnostics, local_index, len(sample_ids)
                 ),
             }
+            if r9_interval_contract is not None:
+                row.update(
+                    {
+                        "candidate_algorithm_nfe": int(
+                            candidate_result.diagnostics["algorithm_nfe"]
+                        ),
+                        "candidate_diagnostic_nfe": int(
+                            candidate_result.diagnostics["diagnostic_nfe"]
+                        ),
+                        "candidate_diagnostic_trace": list(
+                            candidate_result.diagnostics["diagnostic_flow_map_trace"]
+                        ),
+                    }
+                )
             if edev_cosine is not None:
                 row["edev_cosine"] = float(edev_cosine[local_index].detach().cpu())
             if native_edev_cosine is not None:
@@ -1268,7 +1758,9 @@ def run_guidance_records(
             if mode == "semigroup":
                 row["semigroup"] = batch_semigroup[sample_id]
             source_io_per_sample = source_io_seconds / len(sample_ids)
-            row["io_seconds"] = time.perf_counter() - row_io_started + source_io_per_sample
+            row["io_seconds"] = (
+                time.perf_counter() - row_io_started + source_io_per_sample
+            )
             committed_this_session = batch_start + local_index + 1
             _atomic_write_json(
                 session_journal_path,
@@ -1286,7 +1778,9 @@ def run_guidance_records(
                 ),
             )
             _append_jsonl(per_sample_path, row)
-            session_row_io_seconds += time.perf_counter() - row_io_started + source_io_per_sample
+            session_row_io_seconds += (
+                time.perf_counter() - row_io_started + source_io_per_sample
+            )
             _atomic_write_json(
                 session_journal_path,
                 _session_snapshot(
@@ -1306,8 +1800,14 @@ def run_guidance_records(
     generated_count = len(remaining_records)
     final_rows = _read_optional_jsonl(per_sample_path)
     if resume_remaining_ids(expected_ids, final_rows):
-        raise RuntimeError("guidance run ended before every deterministic shard sample was written")
-    _validate_resume_rows(final_rows, expected_bindings)
+        raise RuntimeError(
+            "guidance run ended before every deterministic shard sample was written"
+        )
+    _validate_resume_rows(
+        final_rows,
+        expected_bindings,
+        r9_interval_contract=r9_interval_contract,
+    )
     artifact_io_started = time.perf_counter()
     if mode == "semigroup":
         _atomic_write_json(
@@ -1315,7 +1815,8 @@ def run_guidance_records(
             {
                 "mode": mode,
                 "split_times": [
-                    float(value) for value in resolved_config.get("split_times", (0.25, 0.5, 0.75))
+                    float(value)
+                    for value in resolved_config.get("split_times", (0.25, 0.5, 0.75))
                 ],
                 "rows": [
                     {"sample_id": row["sample_id"], "splits": row["semigroup"]}
@@ -1332,7 +1833,8 @@ def run_guidance_records(
                 resolved_config.get("contact_sheet_rows", 8), "contact_sheet_rows"
             ),
             tile_size=_positive_int(
-                resolved_config.get("contact_sheet_tile_size", 128), "contact_sheet_tile_size"
+                resolved_config.get("contact_sheet_tile_size", 128),
+                "contact_sheet_tile_size",
             ),
         )
     session_artifact_io_seconds += time.perf_counter() - artifact_io_started
@@ -1358,12 +1860,27 @@ def run_guidance_records(
     max_memory = aggregate_session_memory(sessions)
     candidate_nfe = _single_row_value(final_rows, "candidate_nfe")
     native_nfe = _single_row_value(final_rows, "native_nfe")
+    candidate_algorithm_nfe = None
+    candidate_diagnostic_nfe = None
+    if r9_interval_contract is not None:
+        candidate_algorithm_nfe = _single_row_value(
+            final_rows, "candidate_algorithm_nfe"
+        )
+        candidate_diagnostic_nfe = _single_row_value(
+            final_rows, "candidate_diagnostic_nfe"
+        )
     cosine = {
         "candidate_e0_target": _finite_summary(
             [float(row["candidate_cosine"]) for row in final_rows]
         ),
-        "native_e0_target": _finite_summary([float(row["native_cosine"]) for row in final_rows]),
+        "native_e0_target": _finite_summary(
+            [float(row["native_cosine"]) for row in final_rows]
+        ),
     }
+    if edev_required and any("edev_cosine" not in row for row in final_rows):
+        raise ValueError(f"guidance phase {phase!r} is missing candidate Edev evidence")
+    if edev_required and any("native_edev_cosine" not in row for row in final_rows):
+        raise ValueError(f"guidance phase {phase!r} is missing native Edev evidence")
     if all("edev_cosine" in row for row in final_rows):
         cosine["candidate_edev_source"] = _finite_summary(
             [float(row["edev_cosine"]) for row in final_rows]
@@ -1418,6 +1935,23 @@ def run_guidance_records(
             "completion": str(completion_path),
         },
     }
+    if r9_interval_contract is not None:
+        manifest[R9_GUIDANCE_INTERVAL_CONTRACT_FIELD] = _json_safe(r9_interval_contract)
+        manifest["nfe"].update(
+            {
+                "candidate_algorithm": candidate_algorithm_nfe,
+                "candidate_diagnostic": candidate_diagnostic_nfe,
+            }
+        )
+        manifest["diagnostic_flow_map_traces"] = [
+            {
+                "sample_id": row["sample_id"],
+                "candidate": row["candidate_diagnostic_trace"],
+            }
+            for row in final_rows
+        ]
+    if r9_phase_contract is not None:
+        manifest[R9_PHASE_CONTRACT_FIELD] = _json_safe(r9_phase_contract)
     _atomic_write_json(generation_result_path, manifest)
     _atomic_write_json(run_manifest_path, manifest)
     _atomic_write_json(
@@ -1449,7 +1983,9 @@ def run_guidance_from_config(
     _require_safe_output_root(output)
     _require_contained(output, completion_path, "completion marker")
     if completion_path.exists():
-        raise FileExistsError(f"refusing to replace completed output: {completion_path}")
+        raise FileExistsError(
+            f"refusing to replace completed output: {completion_path}"
+        )
     resolved = _prepare_sharded_guidance_config(
         config,
         shard_index=shard_index,
@@ -1527,7 +2063,9 @@ def run_guidance_from_config(
     )
 
 
-def _records_from_feature_dataset(dataset, config: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _records_from_feature_dataset(
+    dataset, config: Mapping[str, Any]
+) -> list[dict[str, Any]]:
     seen_sample_ids = set()
     duplicate_sample_ids = set()
     for record in dataset.records:
@@ -1555,7 +2093,9 @@ def _records_from_feature_dataset(dataset, config: Mapping[str, Any]) -> list[di
         requested = [row["sample_id"] for row in manifest]
         missing = sorted(set(requested) - set(by_id))
         if missing:
-            raise ValueError(f"sample ID manifest is not covered by the feature dataset: {missing!r}")
+            raise ValueError(
+                f"sample ID manifest is not covered by the feature dataset: {missing!r}"
+            )
         all_records = [by_id[sample_id] for sample_id in requested]
     max_samples = config.get("max_samples")
     if max_samples is not None:
@@ -1577,7 +2117,9 @@ def _preflight_existing_resume_contract(
     path = output_dir / "resume_contract.json"
     if not path.exists():
         return
-    selected = deterministic_shard([dict(row) for row in records], shard_index, num_shards)
+    selected = deterministic_shard(
+        [dict(row) for row in records], shard_index, num_shards
+    )
     existing = _read_json_mapping(path, "resume contract")
     expected = {
         "checkpoint_path": str(checkpoint_path),
@@ -1595,7 +2137,9 @@ def _preflight_existing_resume_contract(
         "schedule": config.get("locked_schedule"),
         "mode": config["mode"],
         "config": dict(config),
-        "sample_id_sha256": _sample_id_digest(str(row["sample_id"]) for row in selected),
+        "sample_id_sha256": _sample_id_digest(
+            str(row["sample_id"]) for row in selected
+        ),
         "shard": {
             "index": int(shard_index),
             "count": int(num_shards),
@@ -1604,6 +2148,9 @@ def _preflight_existing_resume_contract(
                 str(row["sample_id"]) for row in selected
             ),
         },
+        R9_GUIDANCE_INTERVAL_CONTRACT_FIELD: config.get(
+            R9_GUIDANCE_INTERVAL_CONTRACT_FIELD
+        ),
     }
     actual = {
         "checkpoint_path": existing.get("checkpoint", {}).get("path"),
@@ -1623,6 +2170,9 @@ def _preflight_existing_resume_contract(
         "config": existing.get("config"),
         "sample_id_sha256": existing.get("sample_id_sha256"),
         "shard": existing.get("shard"),
+        R9_GUIDANCE_INTERVAL_CONTRACT_FIELD: existing.get(
+            R9_GUIDANCE_INTERVAL_CONTRACT_FIELD
+        ),
     }
     if _json_safe(actual) != _json_safe(expected):
         raise ValueError("existing resume contract disagrees before CUDA/model loading")
@@ -1641,7 +2191,9 @@ def _validate_semigroup_gate(
     if report.get("gate_passed") is not True:
         raise ValueError("semigroup report must record gate_passed=true")
     if report.get("checkpoint_sha256") != checkpoint_hash:
-        raise ValueError("semigroup report checkpoint SHA256 disagrees with the loaded checkpoint")
+        raise ValueError(
+            "semigroup report checkpoint SHA256 disagrees with the loaded checkpoint"
+        )
     locked_sample_manifest_sha256 = _require_sha256(
         locked_sample_id_manifest_sha256,
         "locked schedule semigroup_sample_id_manifest_sha256",
@@ -1663,10 +2215,13 @@ def _validate_semigroup_gate(
             "semigroup report sample_id_manifest_sha256 disagrees with locked schedule"
         )
     selected = _finite_open_unit(
-        report.get("selected_t_cut", report.get("t_cut")), "semigroup report selected t_cut"
+        report.get("selected_t_cut", report.get("t_cut")),
+        "semigroup report selected t_cut",
     )
     if not math.isclose(selected, t_cut, rel_tol=0.0, abs_tol=1.0e-12):
-        raise ValueError("semigroup report selected t_cut disagrees with the locked schedule")
+        raise ValueError(
+            "semigroup report selected t_cut disagrees with the locked schedule"
+        )
 
 
 def _semigroup_batch_rows(
@@ -1703,7 +2258,9 @@ def _validate_generation_records(records: Sequence[Mapping[str, Any]]) -> None:
     for index, row in enumerate(records):
         sample_id = row.get("sample_id")
         if not isinstance(sample_id, str) or not sample_id:
-            raise ValueError(f"generation record {index} requires a non-empty string sample_id")
+            raise ValueError(
+                f"generation record {index} requires a non-empty string sample_id"
+            )
         if sample_id in seen:
             raise ValueError(f"duplicate generation sample_id: {sample_id!r}")
         seen.add(sample_id)
@@ -1734,13 +2291,17 @@ def _expected_row_bindings(selected, generated_dir: Path, native_dir: Path, mode
 def _expected_semigroup_split_bindings(selected, output_dir: Path, split_times):
     split_keys = [str(float(value)) for value in split_times]
     if set(split_keys) != {"0.25", "0.5", "0.75"} or len(split_keys) != 3:
-        raise ValueError("semigroup split image bindings require registered splits 0.25,0.5,0.75")
+        raise ValueError(
+            "semigroup split image bindings require registered splits 0.25,0.5,0.75"
+        )
     bindings = []
     for ordinal, record in enumerate(selected):
         filename = f"{ordinal:08d}__{_safe_sample_id(str(record['sample_id']))}.png"
         bindings.append(
             {
-                split_key: str(output_dir / f"t_cut_{split_key.replace('.', 'p')}" / filename)
+                split_key: str(
+                    output_dir / f"t_cut_{split_key.replace('.', 'p')}" / filename
+                )
                 for split_key in split_keys
             }
         )
@@ -1749,14 +2310,20 @@ def _expected_semigroup_split_bindings(selected, output_dir: Path, split_times):
 
 def _validate_semigroup_split_state(rows, expected_bindings, output_dir: Path) -> None:
     expected_paths = {
-        Path(path).resolve() for binding in expected_bindings for path in binding.values()
+        Path(path).resolve()
+        for binding in expected_bindings
+        for path in binding.values()
     }
-    actual_paths = {path.resolve() for path in output_dir.glob("**/*") if path.is_file()}
+    actual_paths = {
+        path.resolve() for path in output_dir.glob("**/*") if path.is_file()
+    }
     if actual_paths - expected_paths:
         raise ValueError("semigroup split image directory contains unowned files")
     for index, row in enumerate(rows):
         splits = row.get("semigroup")
-        if not isinstance(splits, Mapping) or set(splits) != set(expected_bindings[index]):
+        if not isinstance(splits, Mapping) or set(splits) != set(
+            expected_bindings[index]
+        ):
             raise ValueError("resumed semigroup row has the wrong registered split set")
         for split_key, expected_path in expected_bindings[index].items():
             if splits[split_key].get("decoded_image") != expected_path:
@@ -1765,7 +2332,13 @@ def _validate_semigroup_split_state(rows, expected_bindings, output_dir: Path) -
                 raise FileNotFoundError("resumed semigroup decoded image is missing")
 
 
-def _validate_resume_rows(rows, expected_bindings) -> None:
+def _validate_resume_rows(
+    rows,
+    expected_bindings,
+    *,
+    r9_interval_contract: Mapping[str, Any] | None = None,
+    r9_phase_contract: Mapping[str, Any] | None = None,
+) -> None:
     if len(rows) > len(expected_bindings):
         raise ValueError("resume rows exceed the deterministic shard")
     for index, row in enumerate(rows):
@@ -1778,11 +2351,135 @@ def _validate_resume_rows(rows, expected_bindings) -> None:
                 )
         for field in ("candidate_nfe", "native_nfe", "candidate_trace", "native_trace"):
             if field not in row:
-                raise ValueError(f"resume row binding is missing required field {field!r}")
+                raise ValueError(
+                    f"resume row binding is missing required field {field!r}"
+                )
         if len(row["candidate_trace"]) != int(row["candidate_nfe"]):
-            raise ValueError(f"resume row candidate trace/NFE mismatch at ordinal {index}")
+            raise ValueError(
+                f"resume row candidate trace/NFE mismatch at ordinal {index}"
+            )
         if len(row["native_trace"]) != int(row["native_nfe"]):
             raise ValueError(f"resume row native trace/NFE mismatch at ordinal {index}")
+        if r9_phase_contract is not None and r9_phase_contract["edev_required"]:
+            missing_edev = [
+                field
+                for field in r9_phase_contract["required_per_sample_edev_fields"]
+                if field not in row
+            ]
+            if missing_edev:
+                raise ValueError(
+                    f"R9 resume row is missing Edev fields at ordinal {index}: "
+                    f"{missing_edev!r}"
+                )
+            for field in r9_phase_contract["required_per_sample_edev_fields"]:
+                value = row[field]
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                ):
+                    raise ValueError(
+                        f"R9 resume row {index} {field} must be finite numeric data"
+                    )
+        if r9_interval_contract is not None:
+            required_r9_fields = (
+                "candidate_algorithm_nfe",
+                "candidate_diagnostic_nfe",
+                "candidate_diagnostic_trace",
+                "route_diagnostics",
+            )
+            missing_r9_fields = [
+                field for field in required_r9_fields if field not in row
+            ]
+            if missing_r9_fields:
+                raise ValueError(
+                    f"R9 resume row is missing interval diagnostic fields at ordinal {index}: "
+                    f"{missing_r9_fields!r}"
+                )
+            algorithm_nfe = int(row["candidate_algorithm_nfe"])
+            diagnostic_nfe = int(row["candidate_diagnostic_nfe"])
+            if algorithm_nfe != int(row["candidate_nfe"]):
+                raise ValueError(
+                    f"R9 resume row legacy/algorithm NFE mismatch at ordinal {index}"
+                )
+            if algorithm_nfe != int(r9_interval_contract["expected_algorithm_nfe"]):
+                raise ValueError(
+                    f"R9 resume row algorithm NFE disagrees with its contract at ordinal {index}"
+                )
+            if (
+                row["candidate_trace"]
+                != r9_interval_contract["expected_algorithm_trace"]
+            ):
+                raise ValueError(
+                    f"R9 resume row algorithm trace disagrees with its contract at ordinal {index}"
+                )
+            if diagnostic_nfe != int(r9_interval_contract["expected_diagnostic_nfe"]):
+                raise ValueError(
+                    f"R9 resume row diagnostic NFE disagrees with its contract at ordinal {index}"
+                )
+            diagnostic_trace = row["candidate_diagnostic_trace"]
+            if (
+                not isinstance(diagnostic_trace, list)
+                or len(diagnostic_trace) != diagnostic_nfe
+            ):
+                raise ValueError(
+                    f"R9 resume row diagnostic trace/NFE mismatch at ordinal {index}"
+                )
+            if diagnostic_trace != r9_interval_contract["expected_diagnostic_trace"]:
+                raise ValueError(
+                    f"R9 resume row diagnostic trace disagrees with its contract at ordinal {index}"
+                )
+            if any(
+                not isinstance(entry, Mapping)
+                or entry.get("kind") != "interval_diagnostic"
+                for entry in diagnostic_trace
+            ):
+                raise ValueError(
+                    f"R9 resume row diagnostic trace has an invalid kind at ordinal {index}"
+                )
+            route_diagnostics = row["route_diagnostics"]
+            if not isinstance(route_diagnostics, Mapping):
+                raise ValueError(
+                    f"R9 resume row route_diagnostics must be a mapping at ordinal {index}"
+                )
+            expected_route_contract = {
+                "active_guidance_intervals": r9_interval_contract[
+                    "active_guidance_intervals"
+                ],
+                "interval_diagnostics_enabled": r9_interval_contract[
+                    "collect_interval_diagnostics"
+                ],
+                "algorithm_nfe": algorithm_nfe,
+                "diagnostic_nfe": diagnostic_nfe,
+            }
+            actual_route_contract = {
+                field: route_diagnostics.get(field) for field in expected_route_contract
+            }
+            if actual_route_contract != expected_route_contract:
+                raise ValueError(
+                    f"R9 resume row route diagnostic contract mismatch at ordinal {index}"
+                )
+            interval_diagnostics = route_diagnostics.get("interval_diagnostics")
+            if r9_interval_contract["collect_interval_diagnostics"]:
+                if (
+                    not isinstance(interval_diagnostics, Mapping)
+                    or tuple(interval_diagnostics) != R9_GUIDANCE_INTERVAL_IDS
+                ):
+                    raise ValueError(
+                        f"R9 resume row interval diagnostics are incomplete at ordinal {index}"
+                    )
+            elif interval_diagnostics != {}:
+                raise ValueError(
+                    f"R9 resume row unexpectedly contains interval diagnostics at ordinal {index}"
+                )
+            _require_finite_diagnostic_tree(
+                route_diagnostics,
+                label=f"R9 resume row {index} route diagnostics",
+            )
+            _require_finite_diagnostic_tree(
+                diagnostic_trace,
+                label=f"R9 resume row {index} diagnostic trace",
+            )
         for path_field in ("generated", "native"):
             if not Path(str(row[path_field])).is_file():
                 raise FileNotFoundError(
@@ -1793,23 +2490,33 @@ def _validate_resume_rows(rows, expected_bindings) -> None:
 def _validate_owned_png_state(
     *, generated_dir, native_dir, expected_bindings, completed_count: int, mode: str
 ) -> None:
-    actual_generated = {path.resolve() for path in generated_dir.iterdir() if path.is_file()}
+    actual_generated = {
+        path.resolve() for path in generated_dir.iterdir() if path.is_file()
+    }
     actual_native = (
         set()
         if mode == "native"
         else {path.resolve() for path in native_dir.iterdir() if path.is_file()}
     )
     completed_generated = {
-        Path(binding["generated"]).resolve() for binding in expected_bindings[:completed_count]
+        Path(binding["generated"]).resolve()
+        for binding in expected_bindings[:completed_count]
     }
     completed_native = (
         set()
         if mode == "native"
-        else {Path(binding["native"]).resolve() for binding in expected_bindings[:completed_count]}
+        else {
+            Path(binding["native"]).resolve()
+            for binding in expected_bindings[:completed_count]
+        }
     )
-    missing = (completed_generated - actual_generated) | (completed_native - actual_native)
+    missing = (completed_generated - actual_generated) | (
+        completed_native - actual_native
+    )
     if missing:
-        raise FileNotFoundError(f"completed resume row is missing owned PNGs: {sorted(map(str, missing))!r}")
+        raise FileNotFoundError(
+            f"completed resume row is missing owned PNGs: {sorted(map(str, missing))!r}"
+        )
     allowed_orphan_generated = set()
     allowed_orphan_native = set()
     if completed_count < len(expected_bindings):
@@ -1885,7 +2592,9 @@ def _require_contained(root: Path, target: Path, label: str) -> None:
     try:
         target_resolved.relative_to(root_resolved)
     except ValueError as exc:
-        raise ValueError(f"{label} resolves outside the guidance output root: {target}") from exc
+        raise ValueError(
+            f"{label} resolves outside the guidance output root: {target}"
+        ) from exc
 
 
 def _prepare_owned_directory(root: Path, directory: Path, label: str) -> None:
@@ -1898,14 +2607,20 @@ def _prepare_owned_directory(root: Path, directory: Path, label: str) -> None:
 
 def _cleanup_known_temps(output: Path) -> None:
     removed = False
-    for current, directory_names, file_names in os.walk(output, topdown=True, followlinks=False):
+    for current, directory_names, file_names in os.walk(
+        output, topdown=True, followlinks=False
+    ):
         current_path = Path(current)
         for name in directory_names:
             child = current_path / name
             if child.is_symlink():
-                raise ValueError(f"guidance output contains a symlink directory: {child}")
+                raise ValueError(
+                    f"guidance output contains a symlink directory: {child}"
+                )
             if name.startswith(".tmp-"):
-                raise ValueError(f"guidance output temporary entry is not a file: {child}")
+                raise ValueError(
+                    f"guidance output temporary entry is not a file: {child}"
+                )
         for name in file_names:
             child = current_path / name
             if child.is_symlink():
@@ -1914,7 +2629,9 @@ def _cleanup_known_temps(output: Path) -> None:
                 continue
             _require_contained(output, child, "temporary guidance output")
             if not child.is_file():
-                raise ValueError(f"guidance output temporary entry is not a file: {child}")
+                raise ValueError(
+                    f"guidance output temporary entry is not a file: {child}"
+                )
             child.unlink()
             removed = True
     if removed:
@@ -1930,7 +2647,9 @@ def _sample_channels(generator, config: Mapping[str, Any]) -> int:
 
 
 def _as_float_tensor(value) -> torch.Tensor:
-    tensor = value.detach() if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+    tensor = (
+        value.detach() if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+    )
     if tensor.ndim != 1 or not torch.is_floating_point(tensor):
         tensor = tensor.float()
     if tensor.ndim != 1 or not torch.isfinite(tensor).all():
@@ -1938,9 +2657,19 @@ def _as_float_tensor(value) -> torch.Tensor:
     return tensor
 
 
-def _per_sample_diagnostics(value: Any, index: int, batch_size: int) -> Any:
+def _per_sample_diagnostics(
+    value: Any,
+    index: int,
+    batch_size: int,
+    *,
+    _path: tuple[str, ...] = (),
+) -> Any:
     if isinstance(value, torch.Tensor):
         detached = value.detach().cpu()
+        if not torch.isfinite(detached).all().item():
+            raise FloatingPointError(
+                f"non-finite route diagnostic tensor at {'.'.join(_path) or '<root>'}"
+            )
         if detached.ndim == 0:
             return float(detached)
         if detached.ndim in {1, 2} and detached.shape[0] == batch_size:
@@ -1950,17 +2679,65 @@ def _per_sample_diagnostics(value: Any, index: int, batch_size: int) -> Any:
     if isinstance(value, Mapping):
         result = {}
         for key, item in value.items():
-            converted = _per_sample_diagnostics(item, index, batch_size)
+            converted = _per_sample_diagnostics(
+                item,
+                index,
+                batch_size,
+                _path=(*_path, str(key)),
+            )
             if converted is not None:
                 result[str(key)] = converted
         return result
     if isinstance(value, (list, tuple)):
-        if all(isinstance(item, (str, int, float, bool)) or item is None for item in value):
+        if all(
+            isinstance(item, (str, int, float, bool)) or item is None for item in value
+        ):
+            _require_finite_diagnostic_tree(
+                value,
+                label=f"route diagnostics {'.'.join(_path) or '<root>'}",
+            )
             return list(value)
+        if _path and _path[-1] == "interval_diagnostics":
+            converted_items = []
+            for item in value:
+                if not isinstance(item, Mapping):
+                    raise ValueError(
+                        "interval_diagnostics sequences must contain only mappings"
+                    )
+                converted_items.append(
+                    _per_sample_diagnostics(
+                        item,
+                        index,
+                        batch_size,
+                        _path=_path,
+                    )
+                )
+            return converted_items
         return None
+    if isinstance(value, float) and not math.isfinite(value):
+        raise FloatingPointError(
+            f"non-finite route diagnostic value at {'.'.join(_path) or '<root>'}"
+        )
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return None
+
+
+def _require_finite_diagnostic_tree(value: Any, *, label: str) -> None:
+    if isinstance(value, torch.Tensor):
+        if not torch.isfinite(value).all().item():
+            raise FloatingPointError(f"{label} contains a non-finite tensor")
+        return
+    if isinstance(value, Mapping):
+        for item in value.values():
+            _require_finite_diagnostic_tree(item, label=label)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _require_finite_diagnostic_tree(item, label=label)
+        return
+    if isinstance(value, float) and not math.isfinite(value):
+        raise FloatingPointError(f"{label} contains a non-finite value")
 
 
 def _safe_sample_id(sample_id: str) -> str:
@@ -2006,9 +2783,16 @@ def _load_source_images(paths, image_size: int, device, dtype) -> torch.Tensor:
     tensors = []
     for path in paths:
         with Image.open(path) as source:
-            rgb = source.convert("RGB").resize((image_size, image_size), Image.Resampling.BILINEAR)
+            rgb = source.convert("RGB").resize(
+                (image_size, image_size), Image.Resampling.BILINEAR
+            )
             data = torch.frombuffer(bytearray(rgb.tobytes()), dtype=torch.uint8)
-            tensor = data.reshape(image_size, image_size, 3).permute(2, 0, 1).float().div(255.0)
+            tensor = (
+                data.reshape(image_size, image_size, 3)
+                .permute(2, 0, 1)
+                .float()
+                .div(255.0)
+            )
             tensors.append(tensor)
     return torch.stack(tensors).to(device=device, dtype=dtype)
 
@@ -2034,10 +2818,14 @@ def _write_contact_sheets(rows, output: Path, *, rows_per_page: int, tile_size: 
     expected_pages = math.ceil(len(rows) / rows_per_page)
     expected_names = {f"page_{index:03d}.png" for index in range(expected_pages)}
     extras = sorted(
-        path.name for path in contact_dir.iterdir() if path.is_file() and path.name not in expected_names
+        path.name
+        for path in contact_dir.iterdir()
+        if path.is_file() and path.name not in expected_names
     )
     if extras:
-        raise ValueError(f"contact sheet directory contains unexpected pages: {extras!r}")
+        raise ValueError(
+            f"contact sheet directory contains unexpected pages: {extras!r}"
+        )
     for page_index in range(expected_pages):
         page_rows = rows[page_index * rows_per_page : (page_index + 1) * rows_per_page]
         sheet = Image.new("RGB", (tile_size * 3, tile_size * len(page_rows)))
@@ -2094,7 +2882,9 @@ def _append_jsonl(path: Path, row: Mapping[str, Any]) -> None:
     _atomic_replace_jsonl(path, [*rows, dict(row)])
 
 
-def _write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]], *, mode: str = "w") -> None:
+def _write_jsonl(
+    path: Path, rows: Sequence[Mapping[str, Any]], *, mode: str = "w"
+) -> None:
     if mode not in {"w", "x"}:
         raise ValueError(f"unsupported JSONL write mode: {mode!r}")
     if mode == "x" and path.exists():
@@ -2125,7 +2915,8 @@ def _atomic_replace_jsonl(
         with handle:
             for row in rows:
                 handle.write(
-                    json.dumps(_json_safe(dict(row)), sort_keys=True, allow_nan=False) + "\n"
+                    json.dumps(_json_safe(dict(row)), sort_keys=True, allow_nan=False)
+                    + "\n"
                 )
             handle.flush()
             os.fsync(handle.fileno())
@@ -2141,12 +2932,15 @@ def _atomic_replace_jsonl(
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps(_json_safe(dict(payload)), indent=2, sort_keys=True, allow_nan=False) + "\n",
+        json.dumps(_json_safe(dict(payload)), indent=2, sort_keys=True, allow_nan=False)
+        + "\n",
         encoding="utf-8",
     )
 
 
-def _atomic_write_json(path: Path, payload: Mapping[str, Any], *, exclusive: bool = False) -> None:
+def _atomic_write_json(
+    path: Path, payload: Mapping[str, Any], *, exclusive: bool = False
+) -> None:
     if exclusive and path.exists():
         raise FileExistsError(f"refusing to replace existing JSON: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2163,7 +2957,9 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any], *, exclusive: boo
     try:
         with handle:
             handle.write(
-                json.dumps(_json_safe(dict(payload)), indent=2, sort_keys=True, allow_nan=False)
+                json.dumps(
+                    _json_safe(dict(payload)), indent=2, sort_keys=True, allow_nan=False
+                )
                 + "\n"
             )
             handle.flush()
@@ -2218,14 +3014,20 @@ def _finite_open_unit(value: Any, label: str) -> float:
     try:
         parsed = float(value)
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"{label} must be finite and within (0,1), got {value!r}") from exc
+        raise ValueError(
+            f"{label} must be finite and within (0,1), got {value!r}"
+        ) from exc
     if not math.isfinite(parsed) or not 0.0 < parsed < 1.0:
         raise ValueError(f"{label} must be finite and within (0,1), got {value!r}")
     return parsed
 
 
 def _float_sequences_equal(left: Any, right: Sequence[float]) -> bool:
-    if not isinstance(left, Sequence) or isinstance(left, (str, bytes)) or len(left) != len(right):
+    if (
+        not isinstance(left, Sequence)
+        or isinstance(left, (str, bytes))
+        or len(left) != len(right)
+    ):
         return False
     try:
         return all(
@@ -2254,7 +3056,9 @@ def _digest_path(path: Path) -> str:
     if not path.is_dir():
         raise FileNotFoundError(f"asset path does not exist: {path}")
     digest = hashlib.sha256()
-    files = sorted(item for item in path.rglob("*") if item.is_file() or item.is_symlink())
+    files = sorted(
+        item for item in path.rglob("*") if item.is_file() or item.is_symlink()
+    )
     if not files:
         raise ValueError(f"asset directory contains no files: {path}")
     for file_path in files:
@@ -2270,7 +3074,9 @@ def _digest_path(path: Path) -> str:
     return digest.hexdigest()
 
 
-def cached_asset_digest(path: str | Path, expected_digest: str, cache_path: str | Path) -> str:
+def cached_asset_digest(
+    path: str | Path, expected_digest: str, cache_path: str | Path
+) -> str:
     asset = Path(path)
     expected = _require_sha256(expected_digest, "expected_digest")
     cache = Path(cache_path)
@@ -2350,7 +3156,9 @@ def _validate_expected_digest(
     if len(set(values)) > 1:
         raise ValueError(f"{label} expected digest fields disagree: {values!r}")
     if values and values[0] != actual:
-        raise ValueError(f"{label} asset digest mismatch: expected={values[0]} actual={actual}")
+        raise ValueError(
+            f"{label} asset digest mismatch: expected={values[0]} actual={actual}"
+        )
 
 
 def _require_sha256(value: Any, field: str) -> str:
@@ -2360,10 +3168,102 @@ def _require_sha256(value: Any, field: str) -> str:
     return text
 
 
-def _result_with_trace(result: GuidanceResult, trace, mode: str) -> GuidanceResult:
+def _result_with_trace(
+    result: GuidanceResult,
+    trace,
+    mode: str,
+    *,
+    interval_contract: Mapping[str, Any] | None = None,
+) -> GuidanceResult:
     if len(trace) != int(result.nfe):
         raise RuntimeError(f"{mode} flow-map trace length does not match NFE")
     diagnostics = dict(result.diagnostics)
+    if interval_contract is not None:
+        required = {
+            "active_guidance_intervals",
+            "interval_diagnostics_enabled",
+            "interval_diagnostics",
+            "algorithm_nfe",
+            "diagnostic_nfe",
+            "diagnostic_flow_map_trace",
+        }
+        missing = sorted(required - set(diagnostics))
+        if missing:
+            raise RuntimeError(
+                f"R9 guidance result is missing diagnostics: {missing!r}"
+            )
+        algorithm_nfe = int(diagnostics["algorithm_nfe"])
+        diagnostic_nfe = int(diagnostics["diagnostic_nfe"])
+        diagnostic_trace = diagnostics["diagnostic_flow_map_trace"]
+        if algorithm_nfe != int(result.nfe):
+            raise RuntimeError(
+                "R9 guidance result algorithm NFE disagrees with legacy NFE"
+            )
+        if algorithm_nfe != int(interval_contract["expected_algorithm_nfe"]):
+            raise RuntimeError(
+                "R9 guidance result algorithm NFE disagrees with its contract"
+            )
+        if diagnostic_nfe != int(interval_contract["expected_diagnostic_nfe"]):
+            raise RuntimeError(
+                "R9 guidance result diagnostic NFE disagrees with its contract"
+            )
+        if list(trace) != interval_contract["expected_algorithm_trace"]:
+            raise RuntimeError(
+                "R9 guidance result algorithm trace disagrees with its contract"
+            )
+        if (
+            not isinstance(diagnostic_trace, list)
+            or len(diagnostic_trace) != diagnostic_nfe
+        ):
+            raise RuntimeError(
+                "R9 guidance result diagnostic trace length disagrees with NFE"
+            )
+        if diagnostic_trace != interval_contract["expected_diagnostic_trace"]:
+            raise RuntimeError(
+                "R9 guidance result diagnostic trace disagrees with its contract"
+            )
+        if any(
+            not isinstance(entry, Mapping) or entry.get("kind") != "interval_diagnostic"
+            for entry in diagnostic_trace
+        ):
+            raise RuntimeError(
+                "R9 guidance result diagnostic trace contains an invalid kind"
+            )
+        if (
+            diagnostics["active_guidance_intervals"]
+            != interval_contract["active_guidance_intervals"]
+        ):
+            raise RuntimeError(
+                "R9 guidance result active interval mask disagrees with its contract"
+            )
+        if (
+            diagnostics["interval_diagnostics_enabled"]
+            is not interval_contract["collect_interval_diagnostics"]
+        ):
+            raise RuntimeError(
+                "R9 guidance result diagnostic toggle disagrees with its contract"
+            )
+        interval_diagnostics = diagnostics["interval_diagnostics"]
+        if interval_contract["collect_interval_diagnostics"]:
+            if (
+                not isinstance(interval_diagnostics, Mapping)
+                or tuple(interval_diagnostics) != R9_GUIDANCE_INTERVAL_IDS
+            ):
+                raise RuntimeError(
+                    "R9 guidance result interval diagnostics are incomplete"
+                )
+        elif interval_diagnostics != {}:
+            raise RuntimeError(
+                "R9 guidance result unexpectedly contains interval diagnostics"
+            )
+        _require_finite_diagnostic_tree(
+            diagnostics["interval_diagnostics"],
+            label="R9 guidance interval diagnostics",
+        )
+        _require_finite_diagnostic_tree(
+            diagnostic_trace,
+            label="R9 guidance diagnostic trace",
+        )
     diagnostics["mode"] = mode
     diagnostics["flow_map_trace"] = list(trace)
     return GuidanceResult(latent=result.latent, nfe=result.nfe, diagnostics=diagnostics)
@@ -2410,7 +3310,9 @@ def _session_snapshot(
     }
 
 
-def _validate_session_history(sessions, *, require_contiguous_indices: bool = True) -> None:
+def _validate_session_history(
+    sessions, *, require_contiguous_indices: bool = True
+) -> None:
     required = {
         "session_id",
         "session_index",
@@ -2448,8 +3350,12 @@ def _validate_session_history(sessions, *, require_contiguous_indices: bool = Tr
 
 
 def _same_session(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
-    left_core = {key: value for key, value in left.items() if key != "recovered_after_crash"}
-    right_core = {key: value for key, value in right.items() if key != "recovered_after_crash"}
+    left_core = {
+        key: value for key, value in left.items() if key != "recovered_after_crash"
+    }
+    right_core = {
+        key: value for key, value in right.items() if key != "recovered_after_crash"
+    }
     return _json_safe(left_core) == _json_safe(right_core)
 
 
@@ -2457,12 +3363,18 @@ def aggregate_session_memory(sessions) -> dict[str, int]:
     if not sessions:
         return {"allocated_bytes": 0, "reserved_bytes": 0}
     return {
-        "allocated_bytes": max(int(item["max_memory"]["allocated_bytes"]) for item in sessions),
-        "reserved_bytes": max(int(item["max_memory"]["reserved_bytes"]) for item in sessions),
+        "allocated_bytes": max(
+            int(item["max_memory"]["allocated_bytes"]) for item in sessions
+        ),
+        "reserved_bytes": max(
+            int(item["max_memory"]["reserved_bytes"]) for item in sessions
+        ),
     }
 
 
-def _aggregate_timing(rows, sessions, resumed_count: int, generated_count: int) -> dict[str, Any]:
+def _aggregate_timing(
+    rows, sessions, resumed_count: int, generated_count: int
+) -> dict[str, Any]:
     candidate = sum(float(row["candidate_generation_seconds"]) for row in rows)
     native = sum(float(row["native_generation_seconds"]) for row in rows)
     generation = candidate + native
@@ -2520,4 +3432,6 @@ def _algorithm_timer_stop(device: torch.device, started: float) -> float:
 def _cuda_peak_memory(device: torch.device) -> tuple[int, int]:
     if device.type != "cuda":
         return 0, 0
-    return torch.cuda.max_memory_allocated(device), torch.cuda.max_memory_reserved(device)
+    return torch.cuda.max_memory_allocated(device), torch.cuda.max_memory_reserved(
+        device
+    )
