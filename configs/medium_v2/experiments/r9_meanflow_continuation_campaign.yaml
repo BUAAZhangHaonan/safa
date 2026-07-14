@@ -1,6 +1,6 @@
 schema_version: 1
 contract_type: safa_r9_continuation_request_v1
-child_campaign_id: r9-report-only-formal-v5
+child_campaign_id: r9-report-only-formal-v6
 base_runtime:
   path: configs/medium_v2/experiments/r9_meanflow_campaign.yaml
   sha256: 7d84de7b33264e8ba25ed49b8e8410bd6fd3ac2cf540142b13da6a8511bb734c
@@ -11,10 +11,10 @@ source:
 evaluator_resources:
   arcface:
     mode: measured_single_worker
-    artifact_root: artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v5/evaluator_smoke/arcface-calibration64-v1
+    artifact_root: artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v6/evaluator_smoke/arcface-calibration64-v1
   quality:
     mode: measured_exclusive_bootstrap
-    artifact_root: artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v5/evaluator_smoke/quality-calibration64-v1
+    artifact_root: artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v6/evaluator_smoke/quality-calibration64-v1
   heldout:
     mode: exclusive_single_official_run
     smoke_execution: sealed_until_winner_lock

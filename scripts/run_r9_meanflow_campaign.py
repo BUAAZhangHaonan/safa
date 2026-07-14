@@ -83,7 +83,7 @@ from safa.evaluation.r9_semigroup_campaign_closure import (
 
 RUNTIME_CONFIG = Path("configs/medium_v2/experiments/r9_meanflow_campaign.yaml")
 CONTINUATION_RUNTIME_CONFIG = Path(R9_CONTINUATION_REQUEST_PATH)
-CONTINUATION_CHILD_CAMPAIGN_ID = "r9-report-only-formal-v5"
+CONTINUATION_CHILD_CAMPAIGN_ID = "r9-report-only-formal-v6"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PHASES = ("preflight", "diagnose", "calibrate", "confirm512", "full")
 CAMPAIGN_ID_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
