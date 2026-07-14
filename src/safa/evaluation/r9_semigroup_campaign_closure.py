@@ -290,6 +290,68 @@ def _validate_recovery_semigroup_metrics_are_finite(context: _Context) -> None:
                         )
 
 
+def _derive_recovery_visual_assessment(
+    condition_to_split: Mapping[str, str],
+    review_conditions: Any,
+) -> dict[str, dict[str, Any]]:
+    if (
+        not isinstance(condition_to_split, Mapping)
+        or not isinstance(review_conditions, Mapping)
+        or set(condition_to_split) != set(review_conditions)
+    ):
+        raise CampaignSemigroupClosureError(
+            "recovery visual assessment source inventory is invalid"
+        )
+    assessment: dict[str, dict[str, Any]] = {}
+    for condition_id, split in condition_to_split.items():
+        if (
+            not isinstance(condition_id, str)
+            or split not in SPLIT_KEYS
+            or split in assessment
+        ):
+            raise CampaignSemigroupClosureError(
+                "recovery visual assessment split mapping is invalid"
+            )
+        decision = review_conditions.get(condition_id)
+        if not isinstance(decision, Mapping) or set(decision) != {
+            "passed",
+            "severe_count",
+            "severe_sample_ids",
+        }:
+            raise CampaignSemigroupClosureError(
+                "recovery visual assessment reviewer decision is invalid"
+            )
+        severe_ids = decision.get("severe_sample_ids")
+        severe_count = decision.get("severe_count")
+        reviewer_passed = decision.get("passed")
+        if (
+            not isinstance(severe_ids, list)
+            or not all(isinstance(sample_id, str) for sample_id in severe_ids)
+            or len(set(severe_ids)) != len(severe_ids)
+            or isinstance(severe_count, bool)
+            or not isinstance(severe_count, int)
+            or severe_count < 0
+            or severe_count != len(severe_ids)
+            or not isinstance(reviewer_passed, bool)
+            or reviewer_passed != (severe_count == 0)
+        ):
+            raise CampaignSemigroupClosureError(
+                "recovery visual assessment reviewer decision mismatch"
+            )
+        assessment[split] = {
+            "condition_id": condition_id,
+            "severe_count": severe_count,
+            "severe_sample_ids": list(severe_ids),
+            "passed": severe_count
+            <= int(R9_SEMIGROUP_RECOVERY_POLICY["visual_severe_limit_per_split"]),
+        }
+    if set(assessment) != set(SPLIT_KEYS):
+        raise CampaignSemigroupClosureError(
+            "recovery visual assessment does not cover every split"
+        )
+    return assessment
+
+
 def finalize_campaign_semigroup_policy_recovery(
     *,
     config_path: Path,
@@ -374,17 +436,9 @@ def finalize_campaign_semigroup_policy_recovery(
             formal_campaign_id=source_formal_id,
             ordered_sample_id_sha256=_sample_id_digest(context.manifest_ids),
         )
-        visual_assessment: dict[str, dict[str, Any]] = {}
-        for condition_id, split in condition_to_split.items():
-            decision = review["conditions"][condition_id]
-            severe_count = int(decision["severe_count"])
-            visual_assessment[split] = {
-                "condition_id": condition_id,
-                "severe_count": severe_count,
-                "severe_sample_ids": list(decision["severe_sample_ids"]),
-                "passed": severe_count
-                <= int(R9_SEMIGROUP_RECOVERY_POLICY["visual_severe_limit_per_split"]),
-            }
+        visual_assessment = _derive_recovery_visual_assessment(
+            condition_to_split, review.get("conditions")
+        )
         if set(visual_assessment) != set(SPLIT_KEYS) or any(
             row["passed"] is not True for row in visual_assessment.values()
         ):
@@ -3389,7 +3443,7 @@ def _validate_published_closure(
         "schedule_contract_sha256"
     ) != canonical_r9_schedule_contract_sha256(schedule):
         raise CampaignSemigroupClosureError("sealed schedule canonical digest mismatch")
-    _validate_published_visual_review_chain(
+    condition_to_split = _validate_published_visual_review_chain(
         repo_root=repo_root,
         bootstrap_campaign_id=bootstrap_id,
         formal_campaign_id=visual_chain_formal_id,
@@ -3398,6 +3452,19 @@ def _validate_published_closure(
         blinding_map=blinding_map,
         review=review,
     )
+    if schema_version == 2:
+        expected_visual_assessment = _derive_recovery_visual_assessment(
+            condition_to_split, review.get("conditions")
+        )
+        published_visual_assessment = report.get("visual_assessment")
+        if not isinstance(
+            published_visual_assessment, Mapping
+        ) or canonical_json_sha256(
+            dict(published_visual_assessment)
+        ) != canonical_json_sha256(expected_visual_assessment):
+            raise CampaignSemigroupClosureError(
+                "sealed recovery visual assessment does not match review evidence"
+            )
     if (
         gate.get("schedule_contract_sha256") != schedule.get("schedule_contract_sha256")
         or schedule.get("r9_semigroup_gate_contract")
@@ -3462,7 +3529,7 @@ def _validate_published_visual_review_chain(
     assignment: Mapping[str, Any],
     blinding_map: Mapping[str, Any],
     review: Mapping[str, Any],
-) -> None:
+) -> dict[str, str]:
     _reject_assignment_decision_fields(assignment)
     if (
         evidence.get("evidence_manifest_sha256")
@@ -3564,7 +3631,7 @@ def _validate_published_visual_review_chain(
         raise CampaignSemigroupClosureError(
             "sealed visual review assignment does not bind 64 IDs"
         )
-    _validate_blinding_map_contract(
+    condition_to_split = _validate_blinding_map_contract(
         blinding_map,
         assignment=assignment,
         evidence_manifest_sha256=str(evidence["evidence_manifest_sha256"]),
@@ -3657,6 +3724,7 @@ def _validate_published_visual_review_chain(
         expected_sheets,
         label="sealed visual review contact sheets",
     )
+    return condition_to_split
 
 
 def _existing_file(value: Any, label: str, *, repo_root: Path | None = None) -> Path:

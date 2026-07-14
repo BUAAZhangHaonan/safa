@@ -1331,3 +1331,75 @@ def test_policy_recovery_resolver_rejects_coherently_rehashed_old_selection_rule
         resolve_formal_campaign_semigroup_closure(
             paths["policy_formal_id"], repo_root=paths["repo_root"]
         )
+
+
+@pytest.mark.parametrize(
+    "tamper_kind",
+    ("wrong_severe_ids", "boolean_severe_count", "negative_severe_count"),
+)
+def test_policy_recovery_resolver_rederives_visual_assessment_from_review(
+    tmp_path: Path,
+    tamper_kind: str,
+) -> None:
+    paths = _policy_recovery_fixture(tmp_path)
+    _recover(paths)
+    root = paths["policy_output"]
+    report_path = root / "semigroup_report.json"
+    gate_path = root / "gate_contract.json"
+    schedule_path = root / "locked_schedule_manifest.json"
+    seal_path = root / "closure_seal.json"
+    for path in (report_path, gate_path, schedule_path, seal_path):
+        path.chmod(0o644)
+
+    report = json.loads(report_path.read_text())
+    assessment = report["visual_assessment"]["0.25"]
+    if tamper_kind == "wrong_severe_ids":
+        assessment["severe_count"] = 0
+        assessment["severe_sample_ids"] = []
+    elif tamper_kind == "boolean_severe_count":
+        assessment["severe_count"] = True
+    elif tamper_kind == "negative_severe_count":
+        assessment["severe_count"] = -1
+        assessment["severe_sample_ids"] = []
+    else:
+        raise AssertionError(f"unregistered tamper kind: {tamper_kind}")
+    _write_json(report_path, report)
+
+    report_sha256 = _sha(report_path)
+    schedule = json.loads(schedule_path.read_text())
+    schedule["semigroup_report_sha256"] = report_sha256
+    schedule["schedule_contract_sha256"] = (
+        closure_module.canonical_r9_schedule_contract_sha256(schedule)
+    )
+
+    gate = json.loads(gate_path.read_text())
+    gate["semigroup_report_sha256"] = report_sha256
+    gate["schedule_contract_sha256"] = schedule["schedule_contract_sha256"]
+    gate["gate_contract_sha256"] = _canonical_digest(gate, "gate_contract_sha256")
+    _write_json(gate_path, gate)
+    schedule["r9_semigroup_gate_contract_sha256"] = _sha(gate_path)
+    _write_json(schedule_path, schedule)
+
+    seal = json.loads(seal_path.read_text())
+    for name, path in (
+        ("semigroup_report", report_path),
+        ("gate_contract", gate_path),
+        ("locked_schedule_manifest", schedule_path),
+    ):
+        seal["artifacts"][name]["sha256"] = _sha(path)
+    seal["bindings"].update(
+        {
+            "semigroup_report_sha256": report_sha256,
+            "gate_contract_sha256": gate["gate_contract_sha256"],
+            "gate_contract_file_sha256": _sha(gate_path),
+            "schedule_contract_sha256": schedule["schedule_contract_sha256"],
+            "schedule_manifest_file_sha256": _sha(schedule_path),
+        }
+    )
+    seal["closure_seal_sha256"] = _canonical_digest(seal, "closure_seal_sha256")
+    _write_json(seal_path, seal)
+
+    with pytest.raises(CampaignSemigroupClosureError, match="visual assessment"):
+        resolve_formal_campaign_semigroup_closure(
+            paths["policy_formal_id"], repo_root=paths["repo_root"]
+        )
