@@ -34,6 +34,7 @@ PHASE_SAMPLE_COUNTS = {
 }
 EVALUATION_REPAIR_FILENAME = "evaluation_repair_contract.json"
 EVALUATION_REPAIR_V2_FILENAME = "evaluation_repair_contract_v2.json"
+EVALUATION_REPAIR_V3_FILENAME = "evaluation_repair_contract_v3.json"
 FORBIDDEN_DERIVED_INPUT_FIELDS = frozenset(
     {"passed", "severe_count", "severe_failure_count", "failures", "verdict"}
 )
@@ -1191,8 +1192,7 @@ def _evaluate_quality(
         raw_contract, "quality_raw_evidence_sha256"
     )
     raw_path = (
-        request.phase_root
-        / "evaluator_evidence"
+        _evaluator_evidence_root(request)
         / "quality"
         / f"{run['logical_run_id']}__{role}.json"
     )
@@ -1214,6 +1214,52 @@ def _evaluate_quality(
         {key: value for key, value in normalized.items() if key != "raw_evidence_path"}
     )
     return normalized
+
+
+def _evaluator_evidence_root(request: PhaseResultsRequest) -> Path:
+    repo_root = request.repo_root.resolve()
+    repair_candidates = (
+        (
+            EVALUATION_REPAIR_V3_FILENAME,
+            "safa_r9_evaluation_repair_contract_v3",
+        ),
+        (
+            EVALUATION_REPAIR_V2_FILENAME,
+            "safa_r9_evaluation_repair_contract_v2",
+        ),
+        (EVALUATION_REPAIR_FILENAME, "safa_r9_evaluation_repair_contract_v1"),
+    )
+    for filename, contract_type in repair_candidates:
+        path = _contained_path(
+            repo_root,
+            request.phase_root / filename,
+            "evaluation repair contract",
+        )
+        if not path.exists():
+            continue
+        repair = _read_digest_contract(
+            path,
+            digest_field="repair_contract_sha256",
+            contract_type=contract_type,
+        )
+        if repair.get("campaign_id") != request.campaign_id or repair.get(
+            "phase"
+        ) != request.phase:
+            raise PhaseResultsError("evaluation repair campaign or phase mismatch")
+        return _contained_path(
+            repo_root,
+            request.phase_root.parent
+            / "evaluation_repairs"
+            / str(repair["repair_contract_sha256"])
+            / request.phase
+            / "evaluator_evidence",
+            "repair evaluator evidence root",
+        )
+    return _contained_path(
+        repo_root,
+        request.phase_root / "evaluator_evidence",
+        "evaluator evidence root",
+    )
 
 
 def _validate_quality_per_sample_metrics(
@@ -1529,8 +1575,7 @@ def _evaluate_arcface(
         raw_contract, "arcface_raw_evidence_sha256"
     )
     raw_path = (
-        request.phase_root
-        / "evaluator_evidence"
+        _evaluator_evidence_root(request)
         / "arcface"
         / f"{run['logical_run_id']}.json"
     )
@@ -2887,7 +2932,16 @@ def evaluation_repair_binding(
         request.phase_root / EVALUATION_REPAIR_V2_FILENAME,
         "superseding evaluation repair contract",
     )
-    if v2_path.exists():
+    v3_path = _contained_path(
+        repo_root,
+        request.phase_root / EVALUATION_REPAIR_V3_FILENAME,
+        "second superseding evaluation repair contract",
+    )
+    if v3_path.exists():
+        path = v3_path
+        contract_type = "safa_r9_evaluation_repair_contract_v3"
+        required_fields = {"supersedes"}
+    elif v2_path.exists():
         path = v2_path
         contract_type = "safa_r9_evaluation_repair_contract_v2"
         required_fields = {"supersedes"}
@@ -3046,7 +3100,10 @@ def evaluation_repair_binding(
         "request_binding": "full_repair_sha256_in_logical_run_id",
     }:
         raise PhaseResultsError("evaluation repair policy changed")
-    if contract_type == "safa_r9_evaluation_repair_contract_v2":
+    if contract_type in {
+        "safa_r9_evaluation_repair_contract_v2",
+        "safa_r9_evaluation_repair_contract_v3",
+    }:
         _validate_superseded_repair(
             repair.get("supersedes"),
             request=request,
@@ -3076,11 +3133,43 @@ def _validate_superseded_repair(
         "policy",
     }:
         raise PhaseResultsError("superseded evaluation repair fields are invalid")
+    prior_value = value.get("repair")
+    if not isinstance(prior_value, Mapping):
+        raise PhaseResultsError("superseded evaluation repair binding is invalid")
+    prior_filename = Path(str(prior_value.get("path", ""))).name
+    if prior_filename == EVALUATION_REPAIR_FILENAME:
+        prior_contract_type = "safa_r9_evaluation_repair_contract_v1"
+        expected_failure = {
+            "exception_type": "NameError",
+            "symbol": "manifest_ids",
+            "message": "NameError: name 'manifest_ids' is not defined",
+        }
+        expected_counts = {
+            "file_count": 8,
+            "result_count": 2,
+            "quality_result_count": 2,
+            "arcface_result_count": 0,
+        }
+    elif prior_filename == EVALUATION_REPAIR_V2_FILENAME:
+        prior_contract_type = "safa_r9_evaluation_repair_contract_v2"
+        expected_failure = {
+            "exception_type": "CampaignContractError",
+            "symbol": "raw_evidence_namespace",
+            "message": "immutable contract already exists with other content",
+        }
+        expected_counts = {
+            "file_count": 4,
+            "result_count": 1,
+            "quality_result_count": 1,
+            "arcface_result_count": 0,
+        }
+    else:
+        raise PhaseResultsError("superseded evaluation repair version is invalid")
     prior_binding = _validate_repair_file_binding(
-        value.get("repair"),
+        prior_value,
         repo_root=repo_root,
         digest_field="repair_contract_sha256",
-        contract_type="safa_r9_evaluation_repair_contract_v1",
+        contract_type=prior_contract_type,
         label="superseded evaluation repair",
     )
     prior = _read_json_mapping(
@@ -3100,6 +3189,15 @@ def _validate_superseded_repair(
         != prior_phase_results_sha256
     ):
         raise PhaseResultsError("superseded repair phase implementation mismatch")
+    if prior_contract_type == "safa_r9_evaluation_repair_contract_v2":
+        _validate_superseded_repair(
+            prior.get("supersedes"),
+            request=request,
+            repo_root=repo_root,
+            prior_phase_results_sha256=str(
+                prior_implementations.get("prior_phase_results_sha256")
+            ),
+        )
     failure = value.get("failure")
     if not isinstance(failure, Mapping) or set(failure) != {
         "exception_type",
@@ -3107,9 +3205,9 @@ def _validate_superseded_repair(
         "controller_log",
     }:
         raise PhaseResultsError("superseded repair failure fields are invalid")
-    if failure.get("exception_type") != "NameError" or failure.get(
-        "symbol"
-    ) != "manifest_ids":
+    if failure.get("exception_type") != expected_failure[
+        "exception_type"
+    ] or failure.get("symbol") != expected_failure["symbol"]:
         raise PhaseResultsError("superseded repair failure identity changed")
     log_path = _validate_repair_implementation_binding(
         failure.get("controller_log"),
@@ -3120,7 +3218,7 @@ def _validate_superseded_repair(
         log_text = log_path.read_text(encoding="utf-8")
     except UnicodeDecodeError as error:
         raise PhaseResultsError("superseded controller log is not UTF-8") from error
-    if "NameError: name 'manifest_ids' is not defined" not in log_text:
+    if expected_failure["message"] not in log_text:
         raise PhaseResultsError("superseded controller log lacks the registered failure")
     attempt = value.get("evaluation_attempt")
     if not isinstance(attempt, Mapping):
@@ -3130,12 +3228,7 @@ def _validate_superseded_repair(
         raise PhaseResultsError("superseded evaluation namespace is invalid")
     if attempt != evaluation_attempt_inventory(repo_root, Path(namespace_root)):
         raise PhaseResultsError("superseded evaluation inventory mismatch")
-    if (
-        attempt.get("file_count") != 8
-        or attempt.get("result_count") != 2
-        or attempt.get("quality_result_count") != 2
-        or attempt.get("arcface_result_count") != 0
-    ):
+    if {field: attempt.get(field) for field in expected_counts} != expected_counts:
         raise PhaseResultsError("superseded evaluation result counts changed")
     if value.get("policy") != {
         "prior_repair_usage": "input_evidence_only",

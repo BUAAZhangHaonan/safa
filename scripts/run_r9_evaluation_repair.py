@@ -16,6 +16,7 @@ from safa.evaluation.r9_phase_results import (
     AWAITING_VISUAL_REVIEW_EXIT_CODE,
     EVALUATION_REPAIR_FILENAME,
     EVALUATION_REPAIR_V2_FILENAME,
+    EVALUATION_REPAIR_V3_FILENAME,
     PhaseResultsError,
     PhaseResultsRequest,
     evaluation_attempt_inventory,
@@ -268,8 +269,9 @@ def _build_repair_contract(
             raise EvaluationRepairError(f"v6 locked {name} implementation changed")
     generation_inventory = generation_evidence_inventory(request)
     supersedes = None
+    superseded_version = None
     if supersedes_repair_sha256 is not None:
-        supersedes = _build_supersedes_binding(
+        supersedes, superseded_version = _build_supersedes_binding(
             request,
             supersedes_repair_sha256=supersedes_repair_sha256,
             prior_phase_results_sha256=prior,
@@ -277,11 +279,11 @@ def _build_repair_contract(
         )
     contract = {
         "schema_version": 1,
-        "contract_type": (
-            "safa_r9_evaluation_repair_contract_v2"
-            if supersedes is not None
-            else "safa_r9_evaluation_repair_contract_v1"
-        ),
+        "contract_type": {
+            None: "safa_r9_evaluation_repair_contract_v1",
+            1: "safa_r9_evaluation_repair_contract_v2",
+            2: "safa_r9_evaluation_repair_contract_v3",
+        }[superseded_version],
         "campaign_id": request.campaign_id,
         "phase": request.phase,
         "campaign_runtime": runtime_binding,
@@ -327,15 +329,47 @@ def _build_supersedes_binding(
     supersedes_repair_sha256: str,
     prior_phase_results_sha256: str,
     generation_inventory: Mapping[str, Any],
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], int]:
     expected_sha256 = _require_sha256(
         supersedes_repair_sha256, "superseded repair SHA256"
     )
-    prior_path = request.phase_root / EVALUATION_REPAIR_FILENAME
+    v2_path = request.phase_root / EVALUATION_REPAIR_V2_FILENAME
+    if v2_path.exists():
+        prior_path = v2_path
+        prior_contract_type = "safa_r9_evaluation_repair_contract_v2"
+        prior_version = 2
+        controller_log = request.phase_root / "evaluation_repair_v2_controller.log"
+        expected_failure = {
+            "exception_type": "CampaignContractError",
+            "symbol": "raw_evidence_namespace",
+            "message": "immutable contract already exists with other content",
+        }
+        expected_counts = {
+            "file_count": 4,
+            "result_count": 1,
+            "quality_result_count": 1,
+            "arcface_result_count": 0,
+        }
+    else:
+        prior_path = request.phase_root / EVALUATION_REPAIR_FILENAME
+        prior_contract_type = "safa_r9_evaluation_repair_contract_v1"
+        prior_version = 1
+        controller_log = request.phase_root / "evaluation_repair_controller.log"
+        expected_failure = {
+            "exception_type": "NameError",
+            "symbol": "manifest_ids",
+            "message": "NameError: name 'manifest_ids' is not defined",
+        }
+        expected_counts = {
+            "file_count": 8,
+            "result_count": 2,
+            "quality_result_count": 2,
+            "arcface_result_count": 0,
+        }
     prior_binding = _contract_binding(
         prior_path,
         digest_field="repair_contract_sha256",
-        contract_type="safa_r9_evaluation_repair_contract_v1",
+        contract_type=prior_contract_type,
     )
     if prior_binding["contract_sha256"] != expected_sha256:
         raise EvaluationRepairError("superseded repair SHA256 mismatch")
@@ -369,26 +403,20 @@ def _build_supersedes_binding(
         "result_count": attempt["result_count"],
         "quality_result_count": attempt["quality_result_count"],
         "arcface_result_count": attempt["arcface_result_count"],
-    } != {
-        "file_count": 8,
-        "result_count": 2,
-        "quality_result_count": 2,
-        "arcface_result_count": 0,
-    }:
+    } != expected_counts:
         raise EvaluationRepairError("superseded evaluation attempt counts changed")
-    controller_log = request.phase_root / "evaluation_repair_controller.log"
     log_binding = _implementation_binding(controller_log.relative_to(REPO_ROOT))
     try:
         log_text = controller_log.read_text(encoding="utf-8")
     except UnicodeDecodeError as error:
         raise EvaluationRepairError("superseded controller log is not UTF-8") from error
-    if "NameError: name 'manifest_ids' is not defined" not in log_text:
-        raise EvaluationRepairError("superseded controller log lacks NameError")
+    if expected_failure["message"] not in log_text:
+        raise EvaluationRepairError("superseded controller log lacks registered error")
     return {
         "repair": prior_binding,
         "failure": {
-            "exception_type": "NameError",
-            "symbol": "manifest_ids",
+            "exception_type": expected_failure["exception_type"],
+            "symbol": expected_failure["symbol"],
             "controller_log": log_binding,
         },
         "evaluation_attempt": attempt,
@@ -397,7 +425,7 @@ def _build_supersedes_binding(
             "prior_evaluation_results_usage": "input_evidence_only",
             "prior_namespace_reuse": False,
         },
-    }
+    }, prior_version
 
 
 def _repair_logical_run_id(repair_sha256: str, logical_run_id: str) -> str:
@@ -428,11 +456,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     contract["repair_contract_sha256"] = driver._canonical_json_sha256(contract)
-    repair_path = request.phase_root / (
-        EVALUATION_REPAIR_V2_FILENAME
-        if args.supersedes_repair_sha256 is not None
-        else EVALUATION_REPAIR_FILENAME
-    )
+    repair_path = request.phase_root / {
+        "safa_r9_evaluation_repair_contract_v1": EVALUATION_REPAIR_FILENAME,
+        "safa_r9_evaluation_repair_contract_v2": EVALUATION_REPAIR_V2_FILENAME,
+        "safa_r9_evaluation_repair_contract_v3": EVALUATION_REPAIR_V3_FILENAME,
+    }[str(contract["contract_type"])]
     write_immutable_contract(
         repair_path, contract, digest_field="repair_contract_sha256"
     )

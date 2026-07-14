@@ -1366,11 +1366,11 @@ def test_automatic_evidence_uses_validated_manifest_ids_on_real_build_path(
 
 def _repair_fixture(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> tuple[PhaseResultsRequest, Path, dict[str, Any], dict[str, Path]]:
+) -> tuple[PhaseResultsRequest, Path, dict[str, Any], dict[str, Any]]:
     repo_root = tmp_path / "repo"
     phase_root = repo_root / "phase"
     phase_root.mkdir(parents=True)
-    _, run_spec = _make_run(
+    run, run_spec = _make_run(
         phase_root, "shard", collect=False, operational_tag="worker"
     )
     runtime = {"schema_version": 1, "campaign_id": "campaign"}
@@ -1503,6 +1503,7 @@ def _repair_fixture(
         "request": failed_request_path,
         "result": failed_result_path,
         "implementation": implementation_paths["repair_runner"],
+        "run": run,
     }
     return request, repair_path, repair, paths
 
@@ -1552,8 +1553,8 @@ def test_evaluation_repair_binding_rejects_tampering(
 
 def _superseding_repair_fixture(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> tuple[PhaseResultsRequest, Path, dict[str, Any], dict[str, Path]]:
-    request, prior_path, prior, _ = _repair_fixture(tmp_path, monkeypatch)
+) -> tuple[PhaseResultsRequest, Path, dict[str, Any], dict[str, Any]]:
+    request, prior_path, prior, base_paths = _repair_fixture(tmp_path, monkeypatch)
     repo_root = request.repo_root
     prior_sha256 = prior["repair_contract_sha256"]
     namespace = repo_root / "evaluation_repairs" / prior_sha256
@@ -1633,6 +1634,7 @@ def _superseding_repair_fixture(
         "log": controller_log,
         "namespace": namespace_files["candidate:result.json"],
         "implementation": current_paths["repair_runner"],
+        "run": base_paths["run"],
     }
 
 
@@ -1662,6 +1664,191 @@ def test_superseding_evaluation_repair_rejects_tampering(
         _write_json(v2_path, v2)
     with pytest.raises(PhaseResultsError):
         evaluation_repair_binding(request)
+
+
+def _second_superseding_repair_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[PhaseResultsRequest, Path, dict[str, Any], dict[str, Any]]:
+    request, v2_path, v2, v2_paths = _superseding_repair_fixture(
+        tmp_path, monkeypatch
+    )
+    repo_root = request.repo_root
+    v2_sha256 = v2["repair_contract_sha256"]
+    namespace = repo_root / "evaluation_repairs" / v2_sha256
+    namespace_files = {}
+    unit = namespace / "diagnose" / "evaluator_runs" / "quality" / "candidate"
+    for filename in ("attempt.json", "request.json", "result.json", "worker.log"):
+        path = unit / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"v2:{filename}\n", encoding="utf-8")
+        namespace_files[filename] = path
+    controller_log = request.phase_root / "evaluation_repair_v2_controller.log"
+    controller_log.write_text(
+        "CampaignContractError: immutable contract already exists with other content\n",
+        encoding="utf-8",
+    )
+    current_implementations = {}
+    current_paths: dict[str, Path] = {}
+    for name in (
+        "repaired_phase_results",
+        "driver",
+        "evaluator_worker",
+        "quality",
+        "repair_runner",
+    ):
+        path = repo_root / "implementations_v3" / f"{name}.py"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"# v3 {name}\n", encoding="utf-8")
+        current_paths[name] = path
+        current_implementations[name] = {
+            "path": str(path.relative_to(repo_root)),
+            "sha256": _sha256(path),
+        }
+    monkeypatch.setattr(
+        phase_results, "__file__", str(current_paths["repaired_phase_results"])
+    )
+    v3 = json.loads(json.dumps(v2))
+    v3.pop("repair_contract_sha256")
+    v3["contract_type"] = "safa_r9_evaluation_repair_contract_v3"
+    v3["implementations"] = {
+        "source_git_commit": "d" * 40,
+        "prior_phase_results_sha256": v2["implementations"][
+            "repaired_phase_results"
+        ]["sha256"],
+        **current_implementations,
+    }
+    v3["supersedes"] = {
+        "repair": {
+            "path": str(v2_path.relative_to(repo_root)),
+            "file_sha256": _sha256(v2_path),
+            "contract_sha256": v2_sha256,
+        },
+        "failure": {
+            "exception_type": "CampaignContractError",
+            "symbol": "raw_evidence_namespace",
+            "controller_log": {
+                "path": str(controller_log.relative_to(repo_root)),
+                "sha256": _sha256(controller_log),
+            },
+        },
+        "evaluation_attempt": phase_results.evaluation_attempt_inventory(
+            repo_root, namespace
+        ),
+        "policy": {
+            "prior_repair_usage": "input_evidence_only",
+            "prior_evaluation_results_usage": "input_evidence_only",
+            "prior_namespace_reuse": False,
+        },
+    }
+    v3["repair_contract_sha256"] = _canonical_digest(
+        v3, "repair_contract_sha256"
+    )
+    v3_path = request.phase_root / phase_results.EVALUATION_REPAIR_V3_FILENAME
+    _write_json(v3_path, v3)
+    return request, v3_path, v3, {
+        "prior": v2_path,
+        "log": controller_log,
+        "namespace": namespace_files["result.json"],
+        "implementation": current_paths["repair_runner"],
+        "run": v2_paths["run"],
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation", ["prior", "log", "namespace", "implementation", "policy"]
+)
+def test_v3_repair_binds_v2_failure_and_rejects_tampering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    request, v3_path, v3, paths = _second_superseding_repair_fixture(
+        tmp_path, monkeypatch
+    )
+    binding = evaluation_repair_binding(request)
+    assert binding["contract_sha256"] == v3["repair_contract_sha256"]
+    if mutation in {"prior", "log", "namespace", "implementation"}:
+        paths[mutation].write_bytes(paths[mutation].read_bytes() + b"tamper")
+    else:
+        v3["supersedes"]["policy"]["prior_namespace_reuse"] = True
+        v3["repair_contract_sha256"] = _canonical_digest(
+            v3, "repair_contract_sha256"
+        )
+        _write_json(v3_path, v3)
+    with pytest.raises(PhaseResultsError):
+        evaluation_repair_binding(request)
+
+
+def test_v3_quality_raw_evidence_stays_in_full_sha_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request, _, v3, paths = _second_superseding_repair_fixture(
+        tmp_path, monkeypatch
+    )
+    run = paths["run"]
+
+    def evaluator(evaluation) -> dict[str, Any]:
+        sample_ids = [sample.sample_id for sample in evaluation.samples]
+        binding = {
+            "schema_version": 1,
+            "algorithm_config_sha256": evaluation.algorithm_config_sha256,
+            "runner_arm_config_sha256": evaluation.runner_arm_config_sha256,
+            "semantic_output_sha256": evaluation.semantic_output_sha256,
+            "evidence_binding_sha256": evaluation.evidence_binding_sha256,
+            "generation_result_set_sha256": evaluation.generation_result_set_sha256,
+            "per_sample_set_sha256": evaluation.per_sample_set_sha256,
+            "manifest_sha256": request.manifest_sha256,
+            "source_index_sha256": request.source_index_sha256,
+            "ordered_sample_id_sha256": hashlib.sha256(
+                "".join(f"{sample_id}\n" for sample_id in sample_ids).encode()
+            ).hexdigest(),
+            "real_asset_manifest_sha256": _asset_manifest_digest(
+                evaluation.samples, "source"
+            ),
+            "generated_asset_manifest_sha256": _asset_manifest_digest(
+                evaluation.samples, "candidate"
+            ),
+        }
+        return {
+            "metrics": ["fid", "kid", "niqe", "sharpness"],
+            "num_generated": len(sample_ids),
+            "num_real": len(sample_ids),
+            "sample_id_manifest": str(request.manifest_path),
+            "sample_id_count": len(sample_ids),
+            "sample_id_sha256": binding["ordered_sample_id_sha256"],
+            "r9_evidence_binding": binding,
+            "quality_contract": {
+                "schema_version": 1,
+                "metrics": ["fid", "kid", "niqe", "sharpness"],
+                "sample_id_manifest_sha256": request.manifest_sha256,
+                "per_sample_jsonl_sha256": "8" * 64,
+                "real_asset_manifest_sha256": binding[
+                    "real_asset_manifest_sha256"
+                ],
+                "generated_asset_manifest_sha256": binding[
+                    "generated_asset_manifest_sha256"
+                ],
+            },
+            "fid": 10.0,
+            "kid_mean": 0.01,
+            "iqa": {"method": "niqe", "mean": 4.0},
+            "sharpness": {
+                "definition": "grayscale_laplacian_variance",
+                "mean": 350.0,
+            },
+            "per_sample_metrics": _quality_per_sample_contract(sample_ids),
+        }
+
+    result = _evaluate_quality(
+        request, run, _sample_evidence(run), "candidate", evaluator
+    )
+    expected_root = (
+        request.phase_root.parent
+        / "evaluation_repairs"
+        / v3["repair_contract_sha256"]
+        / request.phase
+        / "evaluator_evidence"
+    )
+    assert Path(result["raw_evidence_path"]).is_relative_to(expected_root)
+    assert not (request.phase_root / "evaluator_evidence").exists()
 
 
 def _heldout_fixture(
