@@ -24,6 +24,28 @@ R9_SEMIGROUP_GATE_CONTRACT = "safa_r9_semigroup_gate_v1"
 R9_PREFLIGHT_SAMPLE_COUNT = 64
 R9_LOCKED_SCHEDULE_SCHEMA_VERSION = 3
 R9_SELECTION_RULE = "smallest_numeric_t_cut_passing_all_registered_thresholds"
+R9_SEMIGROUP_RECOVERY_POLICY_VERSION = "safa_r9_semigroup_recovery_policy_v1"
+R9_SEMIGROUP_RECOVERY_SELECTION_RULE = "policy_locked_t_cut_0p25_report_only"
+R9_SEMIGROUP_RECOVERY_AUTHORIZATION_ID = (
+    "user-authorized-r9-report-only-visual-limit-1-lock-025-2026-07-14"
+)
+R9_SEMIGROUP_RECOVERY_POLICY = {
+    "schema_version": 1,
+    "contract_type": R9_SEMIGROUP_RECOVERY_POLICY_VERSION,
+    "numerical_metrics_role": "report_only",
+    "visual_severe_limit_per_split": 1,
+    "selected_t_cut": 0.25,
+    "technical_hard_failures": [
+        "contract_mismatch",
+        "determinism_mismatch",
+        "non_finite_metric",
+        "out_of_memory",
+    ],
+    "visual_metrics_role": "reported_with_registered_limit",
+}
+R9_SEMIGROUP_RECOVERY_POLICY_SHA256 = canonical_json_sha256(
+    R9_SEMIGROUP_RECOVERY_POLICY
+)
 
 
 def canonical_r9_schedule_contract_sha256(payload: Mapping[str, Any]) -> str:
@@ -58,7 +80,10 @@ def validate_r9_locked_schedule_bindings(
         schedule_manifest.get("schedule_contract_sha256"),
         "schedule_contract_sha256",
     )
-    if canonical_r9_schedule_contract_sha256(schedule_manifest) != declared_schedule_sha256:
+    if (
+        canonical_r9_schedule_contract_sha256(schedule_manifest)
+        != declared_schedule_sha256
+    ):
         raise ValueError("R9 locked schedule canonical SHA256 disagrees")
 
     preflight_path = _bound_contract_path(
@@ -95,6 +120,34 @@ def validate_r9_locked_schedule_bindings(
     report = _read_json_mapping(report_path, "R9 semigroup report")
     if report.get("gate_passed") is not True:
         raise ValueError("R9 semigroup report must record gate_passed=true")
+    recovery_report = (
+        report.get("schema_version") == 2
+        and report.get("contract_type") == "safa_r9_semigroup_recovery_report_v2"
+    )
+    if recovery_report:
+        candidates = report.get("candidates")
+        selected = report.get("selected_t_cut")
+        if (
+            report.get("policy_sha256") != R9_SEMIGROUP_RECOVERY_POLICY_SHA256
+            or report.get("policy_version") != R9_SEMIGROUP_RECOVERY_POLICY_VERSION
+            or report.get("numerical_metrics_role") != "report_only"
+            or report.get("selection_rule") != R9_SEMIGROUP_RECOVERY_SELECTION_RULE
+            or selected != 0.25
+            or not isinstance(candidates, list)
+            or not any(
+                isinstance(candidate, Mapping)
+                and candidate.get("t_cut") == 0.25
+                and candidate.get("passed") is True
+                and isinstance(candidate.get("numeric_threshold_pass"), bool)
+                for candidate in candidates
+            )
+            or schedule_manifest.get("selection_rule")
+            != R9_SEMIGROUP_RECOVERY_SELECTION_RULE
+            or schedule_manifest.get("recovery_policy_sha256")
+            != R9_SEMIGROUP_RECOVERY_POLICY_SHA256
+            or schedule_manifest.get("numerical_metrics_role") != "report_only"
+        ):
+            raise ValueError("R9 recovery report/schedule policy binding mismatch")
 
     gate_path = _bound_contract_path(
         config, schedule_manifest, "r9_semigroup_gate_contract"
@@ -114,17 +167,21 @@ def validate_r9_locked_schedule_bindings(
         schedule_sha256=declared_schedule_sha256,
     )
     if validated_gate.get("semigroup_report_sha256") != report_file_sha256:
-        raise ValueError("R9 gate semigroup report SHA256 disagrees with the locked report")
+        raise ValueError(
+            "R9 gate semigroup report SHA256 disagrees with the locked report"
+        )
     if validated_gate.get("schedule_contract_sha256") != declared_schedule_sha256:
         raise ValueError("R9 gate schedule SHA256 disagrees with the locked schedule")
     if schedule_manifest.get("checkpoint_sha256") != validated_gate.get(
         "checkpoint_sha256"
     ):
         raise ValueError("R9 gate checkpoint SHA256 disagrees with the locked schedule")
-    if schedule_manifest.get("semigroup_sample_id_manifest_sha256") != validated_gate.get(
-        "sample_id_manifest_sha256"
-    ):
-        raise ValueError("R9 gate sample manifest SHA256 disagrees with the locked schedule")
+    if schedule_manifest.get(
+        "semigroup_sample_id_manifest_sha256"
+    ) != validated_gate.get("sample_id_manifest_sha256"):
+        raise ValueError(
+            "R9 gate sample manifest SHA256 disagrees with the locked schedule"
+        )
     return validated_gate
 
 
@@ -133,8 +190,13 @@ def canonical_r9_semigroup_preflight_payload(
 ) -> dict[str, Any]:
     execution = validate_r9_execution_config(config)
     if config.get("mode") != "semigroup" or config.get("phase") != "semigroup":
-        raise ValueError("R9 semigroup preflight config requires mode=phase='semigroup'")
-    if _positive_int(config.get("max_samples"), "max_samples") != R9_PREFLIGHT_SAMPLE_COUNT:
+        raise ValueError(
+            "R9 semigroup preflight config requires mode=phase='semigroup'"
+        )
+    if (
+        _positive_int(config.get("max_samples"), "max_samples")
+        != R9_PREFLIGHT_SAMPLE_COUNT
+    ):
         raise ValueError("R9 semigroup preflight must contain exactly 64 samples")
     split_times = _finite_sequence(config.get("split_times"), "split_times")
     if split_times != [0.25, 0.5, 0.75]:
@@ -143,9 +205,7 @@ def canonical_r9_semigroup_preflight_payload(
         config.get("registered_t_cut_candidates"), "registered_t_cut_candidates"
     )
     if candidates != [0.75, 0.5, 0.25]:
-        raise ValueError(
-            "R9 registered_t_cut_candidates must be [0.75, 0.5, 0.25]"
-        )
+        raise ValueError("R9 registered_t_cut_candidates must be [0.75, 0.5, 0.25]")
     thresholds = config.get("semigroup_thresholds")
     if not isinstance(thresholds, Mapping):
         raise ValueError("R9 semigroup preflight requires semigroup_thresholds")
@@ -187,9 +247,7 @@ def canonical_r9_semigroup_preflight_digest(config: Mapping[str, Any]) -> str:
     return canonical_json_sha256(canonical_r9_semigroup_preflight_payload(config))
 
 
-def validate_r9_semigroup_preflight_config(
-    config: Mapping[str, Any]
-) -> dict[str, Any]:
+def validate_r9_semigroup_preflight_config(config: Mapping[str, Any]) -> dict[str, Any]:
     payload = canonical_r9_semigroup_preflight_payload(config)
     computed = canonical_json_sha256(payload)
     declared = _require_sha256(
@@ -213,9 +271,7 @@ def build_r9_semigroup_gate_contract(
     schedule_contract_sha256: str | None,
 ) -> dict[str, Any]:
     preflight = validate_r9_semigroup_preflight_config(config)
-    report_sha256 = _require_sha256(
-        semigroup_report_sha256, "semigroup_report_sha256"
-    )
+    report_sha256 = _require_sha256(semigroup_report_sha256, "semigroup_report_sha256")
     effective_sha256 = _require_sha256(
         effective_config_sha256, "effective_config_sha256"
     )
@@ -276,7 +332,9 @@ def validate_r9_semigroup_gate_contract(
         schedule_contract_sha256=payload.get("schedule_contract_sha256"),
     )
     if dict(payload) != expected:
-        raise ValueError("R9 semigroup gate contract disagrees with its bound preflight")
+        raise ValueError(
+            "R9 semigroup gate contract disagrees with its bound preflight"
+        )
     return expected
 
 
@@ -301,9 +359,10 @@ def _validate_r9_preflight_payload(payload: Mapping[str, Any]) -> None:
     if not isinstance(checkpoint, Mapping) or not checkpoint.get("path"):
         raise ValueError("R9 preflight checkpoint binding is invalid")
     _require_sha256(checkpoint.get("sha256"), "preflight checkpoint_sha256")
-    if not isinstance(sample_manifest, Mapping) or sample_manifest.get(
-        "sample_count"
-    ) != R9_PREFLIGHT_SAMPLE_COUNT:
+    if (
+        not isinstance(sample_manifest, Mapping)
+        or sample_manifest.get("sample_count") != R9_PREFLIGHT_SAMPLE_COUNT
+    ):
         raise ValueError("R9 preflight sample manifest binding is invalid")
     _require_sha256(sample_manifest.get("sha256"), "preflight sample manifest SHA256")
     if not isinstance(schedule, Mapping) or schedule.get("split_times") != [
@@ -326,11 +385,17 @@ def _validate_gate_against_locked_files(
 ) -> dict[str, Any]:
     if not isinstance(payload, Mapping):
         raise ValueError("R9 semigroup gate contract must be a mapping")
-    declared = _require_sha256(payload.get("gate_contract_sha256"), "gate_contract_sha256")
+    declared = _require_sha256(
+        payload.get("gate_contract_sha256"), "gate_contract_sha256"
+    )
     canonical = dict(payload)
     canonical.pop("gate_contract_sha256", None)
     if canonical_json_sha256(canonical) != declared:
         raise ValueError("R9 semigroup gate canonical SHA256 disagrees")
+    recovery_report = (
+        report.get("schema_version") == 2
+        and report.get("contract_type") == "safa_r9_semigroup_recovery_report_v2"
+    )
     report_expected = {
         "gate_passed": True,
         "checkpoint_sha256": preflight["checkpoint"]["sha256"],
@@ -338,8 +403,20 @@ def _validate_gate_against_locked_files(
         "attention_backend_requested": R9_ATTENTION_BACKEND,
         "attention_backend_resolved": R9_ATTENTION_BACKEND,
         "sample_id_manifest_sha256": preflight["sample_manifest"]["sha256"],
-        "selection_rule": R9_SELECTION_RULE,
+        "selection_rule": (
+            R9_SEMIGROUP_RECOVERY_SELECTION_RULE
+            if recovery_report
+            else R9_SELECTION_RULE
+        ),
     }
+    if recovery_report:
+        report_expected.update(
+            {
+                "policy_version": R9_SEMIGROUP_RECOVERY_POLICY_VERSION,
+                "policy_sha256": R9_SEMIGROUP_RECOVERY_POLICY_SHA256,
+                "numerical_metrics_role": "report_only",
+            }
+        )
     for field, expected_value in report_expected.items():
         if report.get(field) != expected_value:
             raise ValueError(f"R9 semigroup report {field} binding mismatch")
@@ -353,8 +430,12 @@ def _validate_gate_against_locked_files(
     ):
         raise ValueError("R9 semigroup report selected_t_cut has no passing candidate")
     expected = {
-        "schema_version": 1,
-        "contract_type": R9_SEMIGROUP_GATE_CONTRACT,
+        "schema_version": 2 if recovery_report else 1,
+        "contract_type": (
+            "safa_r9_semigroup_recovery_gate_v2"
+            if recovery_report
+            else R9_SEMIGROUP_GATE_CONTRACT
+        ),
         "experiment_contract": R9_EXPERIMENT_CONTRACT,
         "preflight_contract_sha256": canonical_json_sha256(preflight),
         "determinism_policy_sha256": preflight["determinism_policy_sha256"],
@@ -373,10 +454,20 @@ def _validate_gate_against_locked_files(
         "selected_t_cut": report.get("selected_t_cut"),
         "schedule_contract_sha256": schedule_sha256,
     }
+    if recovery_report:
+        expected.update(
+            {
+                "recovery_policy_sha256": R9_SEMIGROUP_RECOVERY_POLICY_SHA256,
+                "numerical_metrics_role": "report_only",
+                "selection_rule": R9_SEMIGROUP_RECOVERY_SELECTION_RULE,
+            }
+        )
     for digest_field in ("effective_config_sha256", "arm_config_sha256"):
         _require_sha256(expected[digest_field], digest_field)
     if canonical != expected:
-        raise ValueError("R9 semigroup gate disagrees with preflight/report/schedule bindings")
+        raise ValueError(
+            "R9 semigroup gate disagrees with preflight/report/schedule bindings"
+        )
     return dict(payload)
 
 
@@ -418,7 +509,9 @@ def merge_r9_semigroup_shards(
         if not isinstance(rows, list) or len(rows) != 16:
             raise ValueError(f"R9 shard {shard_index} must contain exactly 16 rows")
         expected_ids = manifest_ids[shard_index::4]
-        actual_ids = [str(row.get("sample_id")) for row in rows if isinstance(row, Mapping)]
+        actual_ids = [
+            str(row.get("sample_id")) for row in rows if isinstance(row, Mapping)
+        ]
         if len(actual_ids) != 16 or actual_ids != expected_ids:
             raise ValueError(f"R9 shard {shard_index} IDs violate modulo-4 order")
         _validate_r9_generation_result(
@@ -436,7 +529,9 @@ def merge_r9_semigroup_shards(
             if sample_id in rows_by_id:
                 raise ValueError(f"duplicate R9 semigroup sample ID: {sample_id}")
             splits = row.get("splits")
-            if not isinstance(splits, Mapping) or set(map(str, splits)) != set(split_keys):
+            if not isinstance(splits, Mapping) or set(map(str, splits)) != set(
+                split_keys
+            ):
                 raise ValueError("R9 semigroup row has an incomplete split set")
             rows_by_id[sample_id] = row
         shard_contracts.append(
@@ -457,11 +552,25 @@ def merge_r9_semigroup_shards(
     thresholds = preflight["thresholds"]
     candidates = []
     for split_key in split_keys:
-        split_rows = [rows_by_id[sample_id]["splits"][split_key] for sample_id in manifest_ids]
-        residuals = [_finite_metric(row.get("latent_residual"), "latent_residual") for row in split_rows]
-        cosines = [_finite_metric(row.get("endpoint_e0_cosine"), "endpoint_e0_cosine") for row in split_rows]
-        pixel_l1 = [_finite_metric(row.get("decoded_pixel_l1"), "decoded_pixel_l1") for row in split_rows]
-        psnr = [_finite_metric(row.get("decoded_psnr"), "decoded_psnr") for row in split_rows]
+        split_rows = [
+            rows_by_id[sample_id]["splits"][split_key] for sample_id in manifest_ids
+        ]
+        residuals = [
+            _finite_metric(row.get("latent_residual"), "latent_residual")
+            for row in split_rows
+        ]
+        cosines = [
+            _finite_metric(row.get("endpoint_e0_cosine"), "endpoint_e0_cosine")
+            for row in split_rows
+        ]
+        pixel_l1 = [
+            _finite_metric(row.get("decoded_pixel_l1"), "decoded_pixel_l1")
+            for row in split_rows
+        ]
+        psnr = [
+            _finite_metric(row.get("decoded_psnr"), "decoded_psnr")
+            for row in split_rows
+        ]
         median = float(statistics.median(residuals))
         p90 = _percentile(residuals, 0.90)
         cosine = float(statistics.median(cosines))
@@ -528,9 +637,13 @@ def finalize_r9_semigroup_preflight(
     report_path = output / "semigroup_report.json"
     gate_path = output / "gate_contract.json"
     schedule_path = output / "locked_schedule_manifest.json"
-    existing = [path for path in (report_path, gate_path, schedule_path) if path.exists()]
+    existing = [
+        path for path in (report_path, gate_path, schedule_path) if path.exists()
+    ]
     if existing:
-        raise FileExistsError(f"refusing to replace finalized R9 contracts: {existing!r}")
+        raise FileExistsError(
+            f"refusing to replace finalized R9 contracts: {existing!r}"
+        )
     report = merge_r9_semigroup_shards(
         config, shard_dirs, visual_pass_by_split=visual_pass_by_split
     )
@@ -623,9 +736,9 @@ def _validate_r9_generation_result(
 ) -> None:
     if payload.get("status") != "complete" or payload.get("mode") != "semigroup":
         raise ValueError(f"R9 shard {shard_index} generation result is incomplete")
-    if payload.get("sample_count") != 16 or payload.get("sample_id_sha256") != _sample_id_digest(
-        expected_ids
-    ):
+    if payload.get("sample_count") != 16 or payload.get(
+        "sample_id_sha256"
+    ) != _sample_id_digest(expected_ids):
         raise ValueError(f"R9 shard {shard_index} sample contract mismatch")
     if payload.get("shard") != {"index": shard_index, "count": 4}:
         raise ValueError(f"R9 shard {shard_index} coordinates mismatch")
@@ -657,12 +770,17 @@ def _validate_r9_generation_result(
         ("arm_config_sha256", arm_sha256),
     ):
         if run_config.get(field) != expected:
-            raise ValueError(f"R9 shard {shard_index} effective config {field} mismatch")
+            raise ValueError(
+                f"R9 shard {shard_index} effective config {field} mismatch"
+            )
     resume = payload.get("resume_contract")
-    manifest = resume.get("input_sample_manifest") if isinstance(resume, Mapping) else None
-    if not isinstance(manifest, Mapping) or manifest.get("sha256") != preflight[
-        "sample_manifest"
-    ]["sha256"]:
+    manifest = (
+        resume.get("input_sample_manifest") if isinstance(resume, Mapping) else None
+    )
+    if (
+        not isinstance(manifest, Mapping)
+        or manifest.get("sha256") != preflight["sample_manifest"]["sha256"]
+    ):
         raise ValueError(f"R9 shard {shard_index} input manifest mismatch")
 
 
@@ -676,10 +794,14 @@ def _read_manifest_ids(path: Path) -> list[str]:
             try:
                 row = json.loads(line)
             except json.JSONDecodeError as exc:
-                raise ValueError(f"invalid R9 manifest JSON at line {line_number}") from exc
+                raise ValueError(
+                    f"invalid R9 manifest JSON at line {line_number}"
+                ) from exc
             sample_id = row.get("sample_id") if isinstance(row, Mapping) else None
             if not isinstance(sample_id, str) or not sample_id or sample_id in seen:
-                raise ValueError("R9 manifest contains an invalid or duplicate sample_id")
+                raise ValueError(
+                    "R9 manifest contains an invalid or duplicate sample_id"
+                )
             seen.add(sample_id)
             ids.append(sample_id)
     return ids
@@ -775,7 +897,9 @@ def _finite_open_unit(value: Any, label: str) -> float:
 
 def _require_sha256(value: Any, label: str) -> str:
     text = str(value)
-    if len(text) != 64 or any(character not in "0123456789abcdef" for character in text):
+    if len(text) != 64 or any(
+        character not in "0123456789abcdef" for character in text
+    ):
         raise ValueError(f"{label} must be a lowercase SHA256 digest")
     return text
 
@@ -792,7 +916,9 @@ def _bound_contract_path(
     if config_path.resolve() != schedule_path.resolve():
         raise ValueError(f"R9 config {field} disagrees with the locked schedule")
     if not schedule_path.is_file():
-        raise FileNotFoundError(f"R9 locked {field} file does not exist: {schedule_path}")
+        raise FileNotFoundError(
+            f"R9 locked {field} file does not exist: {schedule_path}"
+        )
     return schedule_path
 
 
@@ -807,7 +933,9 @@ def _bound_file_sha256(
     if config is not None:
         configured = _require_sha256(config.get(digest_field), f"config {digest_field}")
         if configured != declared:
-            raise ValueError(f"R9 config {digest_field} disagrees with the locked schedule")
+            raise ValueError(
+                f"R9 config {digest_field} disagrees with the locked schedule"
+            )
     actual = _sha256_path(path)
     if actual != declared:
         raise ValueError(f"R9 locked {digest_field} does not match the bound file")

@@ -113,10 +113,10 @@ evaluation:
   resource_smokes:
     arcface:
       mode: measured_single_worker
-      artifact_root: artifacts/r9_meanflow_flow_map_guidance/shared/evaluator_smoke/arcface-calibration64-v2
+      artifact_root: artifacts/r9_meanflow_flow_map_guidance/shared/evaluator_smoke/arcface-calibration64-v3
     quality:
       mode: measured_exclusive_bootstrap
-      artifact_root: artifacts/r9_meanflow_flow_map_guidance/shared/evaluator_smoke/quality-calibration64-v2
+      artifact_root: artifacts/r9_meanflow_flow_map_guidance/shared/evaluator_smoke/quality-calibration64-v3
     heldout:
       mode: exclusive_single_official_run
       smoke_execution: sealed_until_winner_lock
@@ -127,7 +127,7 @@ evaluation:
     path: scripts/run_r9_phase_evaluator.py
     sha256: 1e7be33cd517305d4e18a094ab643993fff79f95dbaf970e5c31f67c901cda42
     implementation_path: src/safa/evaluation/r9_evaluator_worker.py
-    implementation_sha256: 603b2ff61c064b3fd1bbc90e659cabacf0ea1479e75e9538edfb4db638245cd4
+    implementation_sha256: c1f38e08d65727756b6d9ed27e680e8a06a858953fb8e1568bf3b1903ade5f86
   quality:
     script:
       path: scripts/eval_generation_quality.py
@@ -284,11 +284,13 @@ phases:
         active_guidance_intervals: [I1, I2, I3]
         collect_interval_diagnostics: true
     gate:
-      difficult_severe_max: 3
-      control_severe_max: 1
-      e0_mean_min: 0.75
-      edev_vs_matched_native_min: 0.0
+      metrics_role: report_only
+      difficult_severe_reference: 3
+      control_severe_reference: 1
+      e0_mean_reference: 0.75
+      edev_vs_matched_native_reference: 0.0
       require_finite_diagnostics: true
+      require_bitwise_repeat_identity: true
       max_candidates_per_family: 1
       family_order: [flow_map2, paper_split_constant, paper_split_interval_ablation]
       rank_order: [severe, edev_desc, e0_desc, arm_id]

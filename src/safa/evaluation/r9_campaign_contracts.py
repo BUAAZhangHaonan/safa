@@ -641,14 +641,6 @@ def build_a_gate_contract(
             digest = _require_sha256(repeat.get("run_sha256"), "repeat run SHA256")
             repeat_digests.append(digest)
             repeat_failures = []
-            if difficult > 3:
-                repeat_failures.append("difficult_severe_count_gt_3")
-            if control > 1:
-                repeat_failures.append("control_severe_count_gt_1")
-            if e0 < 0.75:
-                repeat_failures.append("e0_mean_lt_0.75")
-            if edev_delta < 0:
-                repeat_failures.append("edev_below_matched_native")
             if not diagnostics_finite:
                 repeat_failures.append("diagnostics_nonfinite_or_contract_mismatch")
             failures.extend(
@@ -667,6 +659,14 @@ def build_a_gate_contract(
             )
         if len(set(repeat_digests)) != 1:
             failures.append("three_repeats_not_bitwise_identical")
+        severe_sort_key = max(
+            row["difficult_severe_count"] + row["control_severe_count"]
+            for row in normalized_repeats
+        )
+        edev_sort_value = statistics.fmean(
+            row["edev_delta_vs_matched_native"] for row in normalized_repeats
+        )
+        e0_sort_value = statistics.fmean(row["e0_mean"] for row in normalized_repeats)
         evaluated.append(
             {
                 "arm_id": arm_id,
@@ -674,16 +674,21 @@ def build_a_gate_contract(
                 "config_sha256": config_sha,
                 "output_sha256": output_sha,
                 "repeat_results": normalized_repeats,
-                "severe_sort_key": max(
-                    row["difficult_severe_count"] + row["control_severe_count"]
-                    for row in normalized_repeats
-                ),
-                "edev_sort_value": statistics.fmean(
-                    row["edev_delta_vs_matched_native"] for row in normalized_repeats
-                ),
-                "e0_sort_value": statistics.fmean(
-                    row["e0_mean"] for row in normalized_repeats
-                ),
+                "severe_sort_key": severe_sort_key,
+                "edev_sort_value": edev_sort_value,
+                "e0_sort_value": e0_sort_value,
+                "observations": {
+                    "metrics_role": "report_only",
+                    "severe_count_max": severe_sort_key,
+                    "difficult_severe_count_max": max(
+                        row["difficult_severe_count"] for row in normalized_repeats
+                    ),
+                    "control_severe_count_max": max(
+                        row["control_severe_count"] for row in normalized_repeats
+                    ),
+                    "e0_mean": e0_sort_value,
+                    "edev_delta_vs_matched_native_mean": edev_sort_value,
+                },
                 "failures": failures,
                 "passed": not failures,
             }
@@ -714,12 +719,15 @@ def build_a_gate_contract(
         context=bound_context,
         seeds=[1337],
         thresholds={
-            "difficult_severe_max": 3,
-            "control_severe_max": 1,
-            "e0_mean_min": 0.75,
-            "edev_delta_min": 0.0,
+            "numerical_metrics_role": "report_only",
+            "visual_metrics_role": "observation_only",
+            "difficult_severe_reference": 3,
+            "control_severe_reference": 1,
+            "e0_mean_reference": 0.75,
+            "edev_delta_reference": 0.0,
             "repeat_count": 3,
             "bitwise_identical_required": True,
+            "finite_diagnostics_and_contract_required": True,
             "max_one_per_family": True,
         },
         evaluated=evaluated,
@@ -1847,11 +1855,13 @@ def _validate_runtime_phases(value: Any, *, seeds: Mapping[str, Any]) -> dict[st
     _require_gate_values(
         diagnose.get("gate"),
         {
-            "difficult_severe_max": 3,
-            "control_severe_max": 1,
-            "e0_mean_min": 0.75,
-            "edev_vs_matched_native_min": 0.0,
+            "metrics_role": "report_only",
+            "difficult_severe_reference": 3,
+            "control_severe_reference": 1,
+            "e0_mean_reference": 0.75,
+            "edev_vs_matched_native_reference": 0.0,
             "require_finite_diagnostics": True,
+            "require_bitwise_repeat_identity": True,
             "max_candidates_per_family": 1,
             "family_order": [
                 "flow_map2",

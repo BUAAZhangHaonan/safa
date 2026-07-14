@@ -800,11 +800,13 @@ def _runtime(
                 "determinism_repeats_must_match": 3,
                 "arms": diagnose_arms,
                 "gate": {
-                    "difficult_severe_max": 3,
-                    "control_severe_max": 1,
-                    "e0_mean_min": 0.75,
-                    "edev_vs_matched_native_min": 0.0,
+                    "metrics_role": "report_only",
+                    "difficult_severe_reference": 3,
+                    "control_severe_reference": 1,
+                    "e0_mean_reference": 0.75,
+                    "edev_vs_matched_native_reference": 0.0,
                     "require_finite_diagnostics": True,
+                    "require_bitwise_repeat_identity": True,
                     "max_candidates_per_family": 1,
                     "family_order": [
                         "flow_map2",
@@ -928,6 +930,7 @@ def _a_arm(
     e0: float = 0.80,
     edev_delta: float = 0.06,
     digest: str = SHA_A,
+    diagnostics_finite: bool = True,
 ) -> dict[str, object]:
     return {
         "arm_id": arm_id,
@@ -942,7 +945,7 @@ def _a_arm(
                 "control_severe_count": control,
                 "e0_mean": e0,
                 "edev_delta_vs_matched_native": edev_delta,
-                "diagnostics_finite": True,
+                "diagnostics_finite": diagnostics_finite,
             }
             for index in range(3)
         ],
@@ -1498,24 +1501,47 @@ def test_a_gate_binds_diagnose_pairs_and_selects_at_most_one_per_family() -> Non
         _context(), arms, diagnose_manifest=_diagnose_manifest()
     )
 
-    assert gate["selected_arm_ids"] == ["flow-best", "ablation"]
+    assert gate["selected_arm_ids"] == ["flow-best", "paper-fail", "ablation"]
     assert gate["diagnose_manifest"]["difficult_count"] == 9
-    assert gate["failures"] == [
-        {
-            "arm_id": "paper-fail",
-            "reasons": [
-                "repeat_0:difficult_severe_count_gt_3",
-                "repeat_1:difficult_severe_count_gt_3",
-                "repeat_2:difficult_severe_count_gt_3",
-            ],
-        }
-    ]
-    zero = build_a_gate_contract(
+    assert gate["failures"] == []
+    paper = next(row for row in gate["arms"] if row["arm_id"] == "paper-fail")
+    assert paper["passed"] is True
+    assert paper["observations"]["severe_count_max"] == 4
+    assert gate["thresholds"]["numerical_metrics_role"] == "report_only"
+    report_only = build_a_gate_contract(
         _context(),
         [_a_arm("only-fail", "flow_map2", difficult=9)],
         diagnose_manifest=_diagnose_manifest(),
     )
-    assert zero["verdict"] == "stop_zero_candidates"
+    assert report_only["verdict"] == "continue"
+    assert report_only["selected_arm_ids"] == ["only-fail"]
+
+
+def test_a_gate_keeps_repeat_and_finite_contracts_as_hard_failures() -> None:
+    nonfinite = _a_arm("nonfinite", "flow_map2", diagnostics_finite=False)
+    mismatch = _a_arm("mismatch", "paper_split_constant")
+    mismatch["repeat_results"][2]["run_sha256"] = SHA_D
+
+    gate = build_a_gate_contract(
+        _context(), [nonfinite, mismatch], diagnose_manifest=_diagnose_manifest()
+    )
+
+    assert gate["selected_arm_ids"] == []
+    assert gate["verdict"] == "stop_zero_candidates"
+    assert gate["failures"] == [
+        {
+            "arm_id": "nonfinite",
+            "reasons": [
+                "repeat_0:diagnostics_nonfinite_or_contract_mismatch",
+                "repeat_1:diagnostics_nonfinite_or_contract_mismatch",
+                "repeat_2:diagnostics_nonfinite_or_contract_mismatch",
+            ],
+        },
+        {
+            "arm_id": "mismatch",
+            "reasons": ["three_repeats_not_bitwise_identical"],
+        },
+    ]
 
 
 def test_b_gate_allows_partial_arm_failure_limits_two_and_rejects_repeat_severe() -> (

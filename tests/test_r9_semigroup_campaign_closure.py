@@ -24,10 +24,15 @@ import safa.evaluation.r9_semigroup_campaign_closure as closure_module
 from safa.evaluation.r9_semigroup_campaign_closure import (
     CampaignSemigroupClosureError,
     finalize_campaign_semigroup_closure,
+    finalize_campaign_semigroup_policy_recovery,
     prepare_campaign_semigroup_visual_review,
     resolve_formal_campaign_semigroup_closure,
 )
 from safa.evaluation.r9_semigroup_contracts import (
+    R9_SEMIGROUP_RECOVERY_AUTHORIZATION_ID,
+    R9_SEMIGROUP_RECOVERY_POLICY_SHA256,
+    R9_SEMIGROUP_RECOVERY_POLICY_VERSION,
+    R9_SEMIGROUP_RECOVERY_SELECTION_RULE,
     canonical_r9_semigroup_preflight_digest,
 )
 
@@ -1104,3 +1109,225 @@ def test_prepare_cli_requires_config_shards_and_formal_campaign() -> None:
         ]
     )
     assert parsed.formal_campaign_id == "formal-r9-v2"
+
+
+def _policy_recovery_fixture(
+    tmp_path: Path, *, latent_residual: float = 0.5, severe_count: int = 1
+) -> dict[str, Any]:
+    paths = _fixture(tmp_path, latent_residual=latent_residual)
+    review = json.loads(paths["review_path"].read_text(encoding="utf-8"))
+    severe_ids = paths["sample_ids"][:severe_count]
+    for condition_id in review["conditions"]:
+        review["conditions"][condition_id] = {
+            "passed": severe_count == 0,
+            "severe_count": severe_count,
+            "severe_sample_ids": list(severe_ids),
+        }
+    review["visual_review_sha256"] = _canonical_digest(review, "visual_review_sha256")
+    _write_json(paths["review_path"], review)
+    terminal = _finalize(paths)
+    assert terminal["terminal_failure"] is True
+    source_failure = paths["output_root"] / "closure_failure.json"
+    paths["blinding_map_path"].chmod(0o400)
+    policy_id = "policy-preflight-r9-v2"
+    formal_id = "formal-r9-policy-v2"
+    policy_output = (
+        paths["repo_root"]
+        / "artifacts"
+        / "r9_meanflow_flow_map_guidance"
+        / "semigroup_campaign_closures"
+        / f"{policy_id}__for__{formal_id}"
+    )
+    return {
+        **paths,
+        "source_failure": source_failure,
+        "source_formal_id": paths["formal_id"],
+        "policy_id": policy_id,
+        "policy_formal_id": formal_id,
+        "policy_output": policy_output,
+    }
+
+
+def _recover(paths: dict[str, Any]) -> dict[str, Any]:
+    return finalize_campaign_semigroup_policy_recovery(
+        config_path=paths["config_path"],
+        shard_root=paths["shard_root"],
+        policy_campaign_id=paths["policy_id"],
+        formal_campaign_id=paths["policy_formal_id"],
+        output_root=paths["policy_output"],
+        visual_review_path=paths["review_path"],
+        source_terminal_failure_path=paths["source_failure"],
+        user_recovery_authorization_id=R9_SEMIGROUP_RECOVERY_AUTHORIZATION_ID,
+        repo_root=paths["repo_root"],
+    )
+
+
+def test_policy_recovery_treats_numeric_thresholds_as_report_only_and_locks_025(
+    tmp_path: Path,
+) -> None:
+    paths = _policy_recovery_fixture(tmp_path, latent_residual=0.5, severe_count=1)
+
+    result = _recover(paths)
+
+    assert result["gate_passed"] is True
+    assert result["selected_t_cut"] == 0.25
+    report = json.loads((paths["policy_output"] / "semigroup_report.json").read_text())
+    assert report["numerical_metrics_role"] == "report_only"
+    assert report["selected_t_cut"] == 0.25
+    assert all(
+        candidate["numeric_threshold_pass"] is False
+        for candidate in report["candidates"]
+    )
+    assert all(candidate["passed"] is True for candidate in report["candidates"])
+    assert all(row["severe_count"] == 1 for row in report["visual_assessment"].values())
+    assert report["policy_version"] == R9_SEMIGROUP_RECOVERY_POLICY_VERSION
+    assert report["policy_sha256"] == R9_SEMIGROUP_RECOVERY_POLICY_SHA256
+
+
+def test_policy_recovery_visual_limit_is_one_per_split(tmp_path: Path) -> None:
+    passing = _policy_recovery_fixture(tmp_path / "one", severe_count=1)
+    assert _recover(passing)["gate_passed"] is True
+
+    failing = _policy_recovery_fixture(tmp_path / "two", severe_count=2)
+    with pytest.raises(CampaignSemigroupClosureError, match="visual severe limit"):
+        _recover(failing)
+    assert not failing["policy_output"].exists()
+
+
+@pytest.mark.parametrize(
+    ("metric", "value"),
+    (("latent_residual", float("nan")), ("endpoint_e0_cosine", float("inf"))),
+)
+def test_policy_recovery_still_hard_fails_nonfinite_metrics(
+    tmp_path: Path, metric: str, value: float
+) -> None:
+    paths = _policy_recovery_fixture(tmp_path)
+    semigroup_path = paths["shard_root"] / "shard_0" / "semigroup.json"
+    payload = json.loads(semigroup_path.read_text(encoding="utf-8"))
+    payload["rows"][0]["splits"]["0.25"][metric] = value
+    semigroup_path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=True),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CampaignSemigroupClosureError, match="non-finite"):
+        _recover(paths)
+    assert not paths["policy_output"].exists()
+
+
+def test_policy_recovery_still_hard_fails_contract_tamper(tmp_path: Path) -> None:
+    paths = _policy_recovery_fixture(tmp_path)
+    generation_path = paths["shard_root"] / "shard_0" / "generation_result.json"
+    generation = json.loads(generation_path.read_text(encoding="utf-8"))
+    generation["checkpoint"]["sha256"] = "0" * 64
+    _write_json(generation_path, generation)
+    _write_json(generation_path.with_name("run_manifest.json"), generation)
+
+    with pytest.raises(CampaignSemigroupClosureError, match="checkpoint"):
+        _recover(paths)
+    assert not paths["policy_output"].exists()
+
+
+def test_policy_recovery_seal_and_resolver_bind_exact_policy(tmp_path: Path) -> None:
+    paths = _policy_recovery_fixture(tmp_path)
+    _recover(paths)
+    seal_path = paths["policy_output"] / "closure_seal.json"
+    seal = json.loads(seal_path.read_text(encoding="utf-8"))
+    assert seal["schema_version"] == 2
+    assert seal["policy_campaign"]["campaign_id"] == paths["policy_id"]
+    assert seal["source_review"]["state_at_recovery"] == "previously_revealed"
+    assert seal["source_review"]["formal_campaign_id"] == paths["source_formal_id"]
+    assert seal["policy"]["policy_sha256"] == R9_SEMIGROUP_RECOVERY_POLICY_SHA256
+    assert seal["policy"]["numerical_metrics_role"] == "report_only"
+    assert seal["policy"]["visual_severe_limit_per_split"] == 1
+    assert seal["policy"]["selected_t_cut"] == 0.25
+    assert (
+        seal["authorization"]["authorization_id"]
+        == R9_SEMIGROUP_RECOVERY_AUTHORIZATION_ID
+    )
+    report = json.loads((paths["policy_output"] / "semigroup_report.json").read_text())
+    gate = json.loads((paths["policy_output"] / "gate_contract.json").read_text())
+    schedule = json.loads(
+        (paths["policy_output"] / "locked_schedule_manifest.json").read_text()
+    )
+    assert report["selection_rule"] == R9_SEMIGROUP_RECOVERY_SELECTION_RULE
+    assert gate["selection_rule"] == R9_SEMIGROUP_RECOVERY_SELECTION_RULE
+    assert schedule["selection_rule"] == R9_SEMIGROUP_RECOVERY_SELECTION_RULE
+    assert gate["recovery_policy_sha256"] == R9_SEMIGROUP_RECOVERY_POLICY_SHA256
+    assert schedule["recovery_policy_sha256"] == R9_SEMIGROUP_RECOVERY_POLICY_SHA256
+
+    resolved = resolve_formal_campaign_semigroup_closure(
+        paths["policy_formal_id"], repo_root=paths["repo_root"]
+    )
+    assert resolved is not None
+    assert resolved["policy_campaign_id"] == paths["policy_id"]
+    assert resolved["bootstrap_campaign_id"] == paths["bootstrap_id"]
+    assert resolved["policy_sha256"] == R9_SEMIGROUP_RECOVERY_POLICY_SHA256
+
+    seal_path.chmod(0o644)
+    seal["policy"]["visual_severe_limit_per_split"] = 2
+    seal["closure_seal_sha256"] = _canonical_digest(seal, "closure_seal_sha256")
+    _write_json(seal_path, seal)
+    with pytest.raises(CampaignSemigroupClosureError, match="policy"):
+        resolve_formal_campaign_semigroup_closure(
+            paths["policy_formal_id"], repo_root=paths["repo_root"]
+        )
+
+
+def test_policy_recovery_resolver_rejects_coherently_rehashed_old_selection_rule(
+    tmp_path: Path,
+) -> None:
+    paths = _policy_recovery_fixture(tmp_path)
+    _recover(paths)
+    root = paths["policy_output"]
+    report_path = root / "semigroup_report.json"
+    gate_path = root / "gate_contract.json"
+    schedule_path = root / "locked_schedule_manifest.json"
+    seal_path = root / "closure_seal.json"
+    for path in (report_path, gate_path, schedule_path, seal_path):
+        path.chmod(0o644)
+
+    report = json.loads(report_path.read_text())
+    report["selection_rule"] = (
+        "smallest_numeric_t_cut_passing_all_registered_thresholds"
+    )
+    _write_json(report_path, report)
+
+    schedule = json.loads(schedule_path.read_text())
+    schedule["selection_rule"] = report["selection_rule"]
+    schedule["schedule_contract_sha256"] = (
+        closure_module.canonical_r9_schedule_contract_sha256(schedule)
+    )
+
+    gate = json.loads(gate_path.read_text())
+    gate["selection_rule"] = report["selection_rule"]
+    gate["semigroup_report_sha256"] = _sha(report_path)
+    gate["schedule_contract_sha256"] = schedule["schedule_contract_sha256"]
+    gate["gate_contract_sha256"] = _canonical_digest(gate, "gate_contract_sha256")
+    _write_json(gate_path, gate)
+    schedule["r9_semigroup_gate_contract_sha256"] = _sha(gate_path)
+    _write_json(schedule_path, schedule)
+
+    seal = json.loads(seal_path.read_text())
+    for name, path in (
+        ("semigroup_report", report_path),
+        ("gate_contract", gate_path),
+        ("locked_schedule_manifest", schedule_path),
+    ):
+        seal["artifacts"][name]["sha256"] = _sha(path)
+    seal["bindings"].update(
+        {
+            "semigroup_report_sha256": _sha(report_path),
+            "gate_contract_sha256": gate["gate_contract_sha256"],
+            "gate_contract_file_sha256": _sha(gate_path),
+            "schedule_contract_sha256": schedule["schedule_contract_sha256"],
+            "schedule_manifest_file_sha256": _sha(schedule_path),
+        }
+    )
+    seal["closure_seal_sha256"] = _canonical_digest(seal, "closure_seal_sha256")
+    _write_json(seal_path, seal)
+
+    with pytest.raises(CampaignSemigroupClosureError, match="policy semantics"):
+        resolve_formal_campaign_semigroup_closure(
+            paths["policy_formal_id"], repo_root=paths["repo_root"]
+        )

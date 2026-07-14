@@ -25,6 +25,11 @@ from safa.evaluation.r9_determinism import (
 )
 from safa.evaluation.r9_semigroup_contracts import (
     R9_LOCKED_SCHEDULE_SCHEMA_VERSION,
+    R9_SEMIGROUP_RECOVERY_AUTHORIZATION_ID,
+    R9_SEMIGROUP_RECOVERY_POLICY,
+    R9_SEMIGROUP_RECOVERY_POLICY_SHA256,
+    R9_SEMIGROUP_RECOVERY_POLICY_VERSION,
+    R9_SEMIGROUP_RECOVERY_SELECTION_RULE,
     R9_SELECTION_RULE,
     build_r9_semigroup_gate_contract,
     canonical_r9_schedule_contract_sha256,
@@ -243,6 +248,199 @@ def finalize_campaign_semigroup_closure(
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
         raise CampaignSemigroupClosureError(
             f"semigroup campaign closure failed: {exc}"
+        ) from exc
+
+
+def _validate_recovery_semigroup_metrics_are_finite(context: _Context) -> None:
+    for shard_dir in context.shard_dirs:
+        raw_semigroup = _read_json(
+            shard_dir / "semigroup.json", "semigroup recovery evidence"
+        )
+        rows = raw_semigroup.get("rows")
+        if not isinstance(rows, list):
+            raise CampaignSemigroupClosureError(
+                "semigroup recovery evidence rows are invalid"
+            )
+        for row in rows:
+            splits = row.get("splits") if isinstance(row, Mapping) else None
+            if not isinstance(splits, Mapping):
+                raise CampaignSemigroupClosureError(
+                    "semigroup recovery split evidence is invalid"
+                )
+            for split in SPLIT_KEYS:
+                metrics = splits.get(split)
+                if not isinstance(metrics, Mapping):
+                    raise CampaignSemigroupClosureError(
+                        "semigroup recovery split evidence is incomplete"
+                    )
+                for metric in (
+                    "latent_residual",
+                    "endpoint_e0_cosine",
+                    "decoded_pixel_l1",
+                    "decoded_psnr",
+                ):
+                    value = metrics.get(metric)
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(float(value))
+                    ):
+                        raise CampaignSemigroupClosureError(
+                            f"non-finite semigroup recovery metric: {metric}"
+                        )
+
+
+def finalize_campaign_semigroup_policy_recovery(
+    *,
+    config_path: Path,
+    shard_root: Path,
+    policy_campaign_id: str,
+    formal_campaign_id: str,
+    output_root: Path,
+    visual_review_path: Path,
+    source_terminal_failure_path: Path,
+    user_recovery_authorization_id: str,
+    repo_root: Path = REPOSITORY_ROOT,
+) -> dict[str, Any]:
+    """Seal the user-authorized report-only recovery policy exactly once."""
+
+    try:
+        context = _load_context(config_path, shard_root, repo_root=repo_root)
+        _validate_recovery_semigroup_metrics_are_finite(context)
+        evidence = _build_evidence(context)
+        review, source_formal_id, assignment = _validate_visual_review_without_map(
+            visual_review_path,
+            context=context,
+            evidence=evidence,
+        )
+        policy_id = _require_campaign_id(str(policy_campaign_id), "policy campaign ID")
+        formal_id = _require_campaign_id(str(formal_campaign_id), "formal campaign ID")
+        if policy_id in {context.bootstrap_campaign_id, formal_id}:
+            raise CampaignSemigroupClosureError(
+                "policy, bootstrap, and formal campaign IDs must be distinct"
+            )
+        if user_recovery_authorization_id != R9_SEMIGROUP_RECOVERY_AUTHORIZATION_ID:
+            raise CampaignSemigroupClosureError(
+                "user recovery authorization ID is not registered"
+            )
+        output = _validate_output_root(
+            output_root,
+            repo_root=context.repo_root,
+            bootstrap_campaign_id=policy_id,
+            formal_campaign_id=formal_id,
+        )
+        source_failure = _existing_file(
+            source_terminal_failure_path,
+            "source terminal closure failure",
+            repo_root=context.repo_root,
+        )
+        source_failure_payload = _validate_terminal_failure(
+            source_failure.parent,
+            formal_campaign_id=source_formal_id,
+            repo_root=context.repo_root,
+        )
+        if (
+            source_failure.name != "closure_failure.json"
+            or source_failure_payload.get("bootstrap_campaign_id")
+            != context.bootstrap_campaign_id
+        ):
+            raise CampaignSemigroupClosureError(
+                "source terminal failure does not bind the bootstrap campaign"
+            )
+
+        map_binding = assignment["blinding_map"]
+        map_path = _existing_file(
+            map_binding["path"],
+            "revealed visual review blinding map",
+            repo_root=context.repo_root,
+        )
+        if stat.S_IMODE(map_path.stat().st_mode) != stat.S_IRUSR:
+            raise CampaignSemigroupClosureError(
+                "policy recovery requires the previously revealed read-only map"
+            )
+        if _sha256_file(map_path) != _require_sha(
+            map_binding.get("file_sha256"),
+            "visual review blinding map file SHA256",
+        ):
+            raise CampaignSemigroupClosureError(
+                "visual review blinding map file SHA256 mismatch"
+            )
+        blinding_map = _read_json(map_path, "revealed visual review blinding map")
+        condition_to_split = _validate_blinding_map_contract(
+            blinding_map,
+            assignment=assignment,
+            evidence_manifest_sha256=str(evidence["evidence_manifest_sha256"]),
+            bootstrap_campaign_id=context.bootstrap_campaign_id,
+            formal_campaign_id=source_formal_id,
+            ordered_sample_id_sha256=_sample_id_digest(context.manifest_ids),
+        )
+        visual_assessment: dict[str, dict[str, Any]] = {}
+        for condition_id, split in condition_to_split.items():
+            decision = review["conditions"][condition_id]
+            severe_count = int(decision["severe_count"])
+            visual_assessment[split] = {
+                "condition_id": condition_id,
+                "severe_count": severe_count,
+                "severe_sample_ids": list(decision["severe_sample_ids"]),
+                "passed": severe_count
+                <= int(R9_SEMIGROUP_RECOVERY_POLICY["visual_severe_limit_per_split"]),
+            }
+        if set(visual_assessment) != set(SPLIT_KEYS) or any(
+            row["passed"] is not True for row in visual_assessment.values()
+        ):
+            raise CampaignSemigroupClosureError(
+                "visual severe limit exceeded under recovery policy"
+            )
+        with _working_directory(context.repo_root):
+            report = merge_r9_semigroup_shards(
+                context.config,
+                context.shard_dirs,
+                visual_pass_by_split={split: True for split in SPLIT_KEYS},
+            )
+        candidates = []
+        for candidate in report["candidates"]:
+            split = str(candidate["t_cut"])
+            normalized = dict(candidate)
+            normalized["numeric_threshold_pass"] = bool(candidate["passed"])
+            normalized["visual_pass"] = visual_assessment[split]["passed"]
+            normalized["passed"] = bool(normalized["visual_pass"])
+            candidates.append(normalized)
+        report = {
+            **report,
+            "schema_version": 2,
+            "contract_type": "safa_r9_semigroup_recovery_report_v2",
+            "gate_passed": True,
+            "selected_t_cut": 0.25,
+            "t_cut": 0.25,
+            "candidates": candidates,
+            "selection_rule": R9_SEMIGROUP_RECOVERY_SELECTION_RULE,
+            "numerical_metrics_role": "report_only",
+            "visual_assessment": visual_assessment,
+            "policy_version": R9_SEMIGROUP_RECOVERY_POLICY_VERSION,
+            "policy_sha256": R9_SEMIGROUP_RECOVERY_POLICY_SHA256,
+        }
+        return _publish_closure(
+            context=context,
+            evidence=evidence,
+            assignment=assignment,
+            blinding_map=blinding_map,
+            review=review,
+            review_source=Path(visual_review_path),
+            report=report,
+            output_root=output,
+            formal_campaign_id=formal_id,
+            recovery={
+                "policy_campaign_id": policy_id,
+                "source_formal_campaign_id": source_formal_id,
+                "source_terminal_failure_path": source_failure,
+                "authorization_id": user_recovery_authorization_id,
+            },
+        )
+    except CampaignSemigroupClosureError:
+        raise
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        raise CampaignSemigroupClosureError(
+            f"semigroup policy recovery failed: {exc}"
         ) from exc
 
 
@@ -2414,6 +2612,7 @@ def _publish_closure(
     report: Mapping[str, Any],
     output_root: Path,
     formal_campaign_id: str,
+    recovery: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     preflight = canonical_r9_semigroup_preflight_payload(context.config)
     arm_sha256 = canonical_r9_arm_config_digest(context.config)
@@ -2456,6 +2655,15 @@ def _publish_closure(
         _write_exclusive_json(
             output_root / "semigroup_report.json", report, canonical=False
         )
+        if recovery is not None:
+            _write_exclusive_json(
+                output_root / "recovery_policy.json",
+                {
+                    **R9_SEMIGROUP_RECOVERY_POLICY,
+                    "policy_sha256": R9_SEMIGROUP_RECOVERY_POLICY_SHA256,
+                },
+                canonical=True,
+            )
         report_sha256 = _sha256_file(output_root / "semigroup_report.json")
         if (
             _sha256_file(output_root / "preflight_contract.json")
@@ -2509,8 +2717,19 @@ def _publish_closure(
             "guided_times": guided,
             "unguided_tail_intervals": 2,
             "unguided_times": [t_cut, t_cut / 2.0, 0.0],
-            "selection_rule": R9_SELECTION_RULE,
+            "selection_rule": (
+                R9_SEMIGROUP_RECOVERY_SELECTION_RULE
+                if recovery is not None
+                else R9_SELECTION_RULE
+            ),
         }
+        if recovery is not None:
+            schedule.update(
+                {
+                    "recovery_policy_sha256": R9_SEMIGROUP_RECOVERY_POLICY_SHA256,
+                    "numerical_metrics_role": "report_only",
+                }
+            )
         schedule["schedule_contract_sha256"] = canonical_r9_schedule_contract_sha256(
             schedule
         )
@@ -2522,7 +2741,21 @@ def _publish_closure(
             selected_t_cut=t_cut,
             schedule_contract_sha256=schedule["schedule_contract_sha256"],
         )
-        validate_r9_semigroup_gate_contract(gate, context.config)
+        if recovery is not None:
+            gate.update(
+                {
+                    "schema_version": 2,
+                    "contract_type": "safa_r9_semigroup_recovery_gate_v2",
+                    "recovery_policy_sha256": R9_SEMIGROUP_RECOVERY_POLICY_SHA256,
+                    "numerical_metrics_role": "report_only",
+                    "selection_rule": R9_SEMIGROUP_RECOVERY_SELECTION_RULE,
+                }
+            )
+            gate["gate_contract_sha256"] = _contract_digest(
+                gate, "gate_contract_sha256"
+            )
+        else:
+            validate_r9_semigroup_gate_contract(gate, context.config)
         _write_exclusive_json(output_root / "gate_contract.json", gate, canonical=True)
         schedule["r9_semigroup_gate_contract"] = gate_path
         schedule["r9_semigroup_gate_contract_sha256"] = _sha256_file(
@@ -2556,12 +2789,15 @@ def _publish_closure(
             raise CampaignSemigroupClosureError(
                 "source visual review path must be repository-relative"
             )
+        closure_artifacts = _CLOSURE_ARTIFACTS + (
+            ("recovery_policy.json",) if recovery is not None else ()
+        )
         artifacts = {
             name.removesuffix(".json"): {
                 "path": _path_text(output_root / name, context.repo_root),
                 "sha256": _sha256_file(output_root / name),
             }
-            for name in _CLOSURE_ARTIFACTS
+            for name in closure_artifacts
             if name != "closure_seal.json"
         }
         seal = {
@@ -2634,13 +2870,63 @@ def _publish_closure(
                 "gate_contract": gate_path,
             },
         }
+        if recovery is not None:
+            source_failure_path = _existing_file(
+                recovery["source_terminal_failure_path"],
+                "source terminal closure failure",
+                repo_root=context.repo_root,
+            )
+            source_failure_payload = _read_json(
+                source_failure_path, "source terminal closure failure"
+            )
+            seal.update(
+                {
+                    "schema_version": 2,
+                    "contract_type": "safa_r9_semigroup_campaign_closure_v2",
+                    "policy_campaign": {
+                        "campaign_id": recovery["policy_campaign_id"],
+                        "relationship": "user_authorized_recovery_of_terminal_preflight",
+                    },
+                    "source_review": {
+                        "state_at_recovery": "previously_revealed",
+                        "formal_campaign_id": recovery["source_formal_campaign_id"],
+                        "terminal_failure": {
+                            "path": _path_text(source_failure_path, context.repo_root),
+                            "file_sha256": _sha256_file(source_failure_path),
+                            "contract_sha256": source_failure_payload[
+                                "failure_contract_sha256"
+                            ],
+                        },
+                    },
+                    "policy": {
+                        **R9_SEMIGROUP_RECOVERY_POLICY,
+                        "policy_version": R9_SEMIGROUP_RECOVERY_POLICY_VERSION,
+                        "policy_sha256": R9_SEMIGROUP_RECOVERY_POLICY_SHA256,
+                    },
+                    "authorization": {
+                        "authorization_id": recovery["authorization_id"],
+                        "scope": "r9_semigroup_report_only_visual_limit_1_lock_025",
+                    },
+                }
+            )
+            seal["bindings"].update(
+                {
+                    "recovery_policy_file_sha256": artifacts["recovery_policy"][
+                        "sha256"
+                    ],
+                    "recovery_policy_sha256": R9_SEMIGROUP_RECOVERY_POLICY_SHA256,
+                    "source_terminal_failure_file_sha256": _sha256_file(
+                        source_failure_path
+                    ),
+                }
+            )
         seal["closure_seal_sha256"] = _contract_digest(seal, "closure_seal_sha256")
         _write_exclusive_json(output_root / "closure_seal.json", seal, canonical=True)
     except Exception:
         # A partially published root is intentionally left visible and cannot be reused.
         raise
-    return {
-        "schema_version": 1,
+    result = {
+        "schema_version": 2 if recovery is not None else 1,
         "gate_passed": True,
         "selected_t_cut": selected_t_cut,
         "bootstrap_campaign_id": context.bootstrap_campaign_id,
@@ -2648,6 +2934,14 @@ def _publish_closure(
         "output_root": _path_text(output_root, context.repo_root),
         "closure_seal_sha256": seal["closure_seal_sha256"],
     }
+    if recovery is not None:
+        result.update(
+            {
+                "policy_campaign_id": recovery["policy_campaign_id"],
+                "policy_sha256": R9_SEMIGROUP_RECOVERY_POLICY_SHA256,
+            }
+        )
+    return result
 
 
 def _validate_published_closure(
@@ -2660,7 +2954,7 @@ def _validate_published_closure(
         closure_root / "closure_seal.json", "campaign closure seal"
     )
     seal = _read_json(seal_path, "campaign closure seal")
-    expected_seal_fields = {
+    common_seal_fields = {
         "schema_version",
         "contract_type",
         "bootstrap_campaign",
@@ -2673,10 +2967,24 @@ def _validate_published_closure(
         "formal_campaign_required_bindings",
         "closure_seal_sha256",
     }
+    schema_version = seal.get("schema_version")
+    if schema_version == 1:
+        expected_seal_fields = common_seal_fields
+        expected_contract_type = "safa_r9_semigroup_campaign_closure_v1"
+    elif schema_version == 2:
+        expected_seal_fields = common_seal_fields | {
+            "policy_campaign",
+            "source_review",
+            "policy",
+            "authorization",
+        }
+        expected_contract_type = "safa_r9_semigroup_campaign_closure_v2"
+    else:
+        expected_seal_fields = set()
+        expected_contract_type = None
     if (
         set(seal) != expected_seal_fields
-        or seal.get("schema_version") != 1
-        or seal.get("contract_type") != "safa_r9_semigroup_campaign_closure_v1"
+        or seal.get("contract_type") != expected_contract_type
         or seal.get("gate_passed") is not True
         or seal.get("reselection_allowed") is not False
     ):
@@ -2711,9 +3019,29 @@ def _validate_published_closure(
     bootstrap_id = _require_campaign_id(
         str(bootstrap.get("campaign_id", "")), "bootstrap campaign ID"
     )
+    if schema_version == 2:
+        policy_campaign = seal.get("policy_campaign")
+        if (
+            not isinstance(policy_campaign, Mapping)
+            or set(policy_campaign) != {"campaign_id", "relationship"}
+            or policy_campaign.get("relationship")
+            != "user_authorized_recovery_of_terminal_preflight"
+        ):
+            raise CampaignSemigroupClosureError(
+                "campaign closure recovery policy relationship mismatch"
+            )
+        closure_prefix_id = _require_campaign_id(
+            str(policy_campaign.get("campaign_id", "")), "policy campaign ID"
+        )
+        if closure_prefix_id in {bootstrap_id, formal_campaign_id}:
+            raise CampaignSemigroupClosureError(
+                "campaign closure policy/bootstrap/formal IDs are not distinct"
+            )
+    else:
+        closure_prefix_id = bootstrap_id
     if (
         bootstrap_id == formal_campaign_id
-        or closure_root.name != f"{bootstrap_id}__for__{formal_campaign_id}"
+        or closure_root.name != f"{closure_prefix_id}__for__{formal_campaign_id}"
     ):
         raise CampaignSemigroupClosureError(
             "campaign closure directory/CID relationship mismatch"
@@ -2778,16 +3106,19 @@ def _validate_published_closure(
             "sealed bootstrap shard root is unavailable"
         )
 
+    expected_artifact_files = dict(_PUBLISHED_ARTIFACT_FILES)
+    if schema_version == 2:
+        expected_artifact_files["recovery_policy"] = "recovery_policy.json"
     artifacts = seal.get("artifacts")
     if not isinstance(artifacts, Mapping) or set(artifacts) != set(
-        _PUBLISHED_ARTIFACT_FILES
+        expected_artifact_files
     ):
         raise CampaignSemigroupClosureError(
             "campaign closure artifact inventory is not canonical"
         )
     artifact_paths: dict[str, Path] = {}
     artifact_hashes: dict[str, str] = {}
-    for artifact_name, filename in _PUBLISHED_ARTIFACT_FILES.items():
+    for artifact_name, filename in expected_artifact_files.items():
         binding = artifacts[artifact_name]
         if not isinstance(binding, Mapping) or set(binding) != {"path", "sha256"}:
             raise CampaignSemigroupClosureError(
@@ -2834,6 +3165,12 @@ def _validate_published_closure(
         "schedule_contract_sha256",
         "schedule_manifest_file_sha256",
     }
+    if schema_version == 2:
+        expected_binding_fields |= {
+            "recovery_policy_file_sha256",
+            "recovery_policy_sha256",
+            "source_terminal_failure_file_sha256",
+        }
     if not isinstance(bindings, Mapping) or set(bindings) != expected_binding_fields:
         raise CampaignSemigroupClosureError(
             "campaign closure seal bindings are not canonical"
@@ -2862,6 +3199,49 @@ def _validate_published_closure(
     schedule = _read_json(
         artifact_paths["locked_schedule_manifest"], "sealed schedule manifest"
     )
+    if schema_version == 2:
+        candidates = report.get("candidates")
+        visual_assessment = report.get("visual_assessment")
+        if (
+            report.get("schema_version") != 2
+            or report.get("contract_type") != "safa_r9_semigroup_recovery_report_v2"
+            or report.get("policy_version") != R9_SEMIGROUP_RECOVERY_POLICY_VERSION
+            or report.get("policy_sha256") != R9_SEMIGROUP_RECOVERY_POLICY_SHA256
+            or report.get("numerical_metrics_role") != "report_only"
+            or report.get("selection_rule") != R9_SEMIGROUP_RECOVERY_SELECTION_RULE
+            or report.get("selected_t_cut") != 0.25
+            or not isinstance(candidates, list)
+            or not any(
+                isinstance(candidate, Mapping)
+                and candidate.get("t_cut") == 0.25
+                and candidate.get("passed") is True
+                and isinstance(candidate.get("numeric_threshold_pass"), bool)
+                for candidate in candidates
+            )
+            or not isinstance(visual_assessment, Mapping)
+            or set(visual_assessment) != set(SPLIT_KEYS)
+            or any(
+                not isinstance(row, Mapping)
+                or row.get("passed") is not True
+                or not isinstance(row.get("severe_count"), int)
+                or row.get("severe_count")
+                > int(R9_SEMIGROUP_RECOVERY_POLICY["visual_severe_limit_per_split"])
+                for row in visual_assessment.values()
+            )
+            or schedule.get("selection_rule") != R9_SEMIGROUP_RECOVERY_SELECTION_RULE
+            or schedule.get("recovery_policy_sha256")
+            != R9_SEMIGROUP_RECOVERY_POLICY_SHA256
+            or schedule.get("numerical_metrics_role") != "report_only"
+            or schedule.get("t_cut") != 0.25
+            or gate.get("schema_version") != 2
+            or gate.get("contract_type") != "safa_r9_semigroup_recovery_gate_v2"
+            or gate.get("recovery_policy_sha256") != R9_SEMIGROUP_RECOVERY_POLICY_SHA256
+            or gate.get("numerical_metrics_role") != "report_only"
+            or gate.get("selection_rule") != R9_SEMIGROUP_RECOVERY_SELECTION_RULE
+        ):
+            raise CampaignSemigroupClosureError(
+                "sealed recovery report/schedule policy semantics mismatch"
+            )
     expected_bindings = {
         "preflight_contract_sha256": artifact_hashes["preflight_contract"],
         "effective_config_sha256": canonical_json_sha256(effective),
@@ -2879,10 +3259,100 @@ def _validate_published_closure(
         "schedule_contract_sha256": schedule.get("schedule_contract_sha256"),
         "schedule_manifest_file_sha256": artifact_hashes["locked_schedule_manifest"],
     }
+    if schema_version == 2:
+        expected_bindings.update(
+            {
+                "recovery_policy_file_sha256": artifact_hashes["recovery_policy"],
+                "recovery_policy_sha256": R9_SEMIGROUP_RECOVERY_POLICY_SHA256,
+                "source_terminal_failure_file_sha256": seal["source_review"][
+                    "terminal_failure"
+                ]["file_sha256"],
+            }
+        )
     for field, expected in expected_bindings.items():
         if bindings.get(field) != expected:
             raise CampaignSemigroupClosureError(
                 f"campaign closure seal binding mismatch: {field}"
+            )
+    visual_chain_formal_id = formal_campaign_id
+    if schema_version == 2:
+        expected_policy = {
+            **R9_SEMIGROUP_RECOVERY_POLICY,
+            "policy_version": R9_SEMIGROUP_RECOVERY_POLICY_VERSION,
+            "policy_sha256": R9_SEMIGROUP_RECOVERY_POLICY_SHA256,
+        }
+        published_policy = _read_json(
+            artifact_paths["recovery_policy"], "sealed recovery policy"
+        )
+        if (
+            published_policy
+            != {
+                **R9_SEMIGROUP_RECOVERY_POLICY,
+                "policy_sha256": R9_SEMIGROUP_RECOVERY_POLICY_SHA256,
+            }
+            or seal.get("policy") != expected_policy
+        ):
+            raise CampaignSemigroupClosureError(
+                "campaign closure recovery policy binding mismatch"
+            )
+        if seal.get("authorization") != {
+            "authorization_id": R9_SEMIGROUP_RECOVERY_AUTHORIZATION_ID,
+            "scope": "r9_semigroup_report_only_visual_limit_1_lock_025",
+        }:
+            raise CampaignSemigroupClosureError(
+                "campaign closure recovery authorization mismatch"
+            )
+        source_review = seal.get("source_review")
+        if (
+            not isinstance(source_review, Mapping)
+            or set(source_review)
+            != {"state_at_recovery", "formal_campaign_id", "terminal_failure"}
+            or source_review.get("state_at_recovery") != "previously_revealed"
+        ):
+            raise CampaignSemigroupClosureError(
+                "campaign closure source review recovery state mismatch"
+            )
+        visual_chain_formal_id = _require_campaign_id(
+            str(source_review.get("formal_campaign_id", "")),
+            "source formal campaign ID",
+        )
+        terminal_binding = source_review.get("terminal_failure")
+        if not isinstance(terminal_binding, Mapping) or set(terminal_binding) != {
+            "path",
+            "file_sha256",
+            "contract_sha256",
+        }:
+            raise CampaignSemigroupClosureError(
+                "campaign closure source terminal failure binding mismatch"
+            )
+        terminal_path = _resolve_config_path(
+            repo_root,
+            terminal_binding.get("path"),
+            "source terminal closure failure",
+        )
+        if (
+            terminal_path.name != "closure_failure.json"
+            or _sha256_file(terminal_path)
+            != _require_sha(
+                terminal_binding.get("file_sha256"),
+                "source terminal failure file SHA256",
+            )
+            or bindings.get("source_terminal_failure_file_sha256")
+            != terminal_binding.get("file_sha256")
+        ):
+            raise CampaignSemigroupClosureError(
+                "campaign closure source terminal failure SHA256 mismatch"
+            )
+        terminal_payload = _validate_terminal_failure(
+            terminal_path.parent,
+            formal_campaign_id=visual_chain_formal_id,
+            repo_root=repo_root,
+        )
+        if terminal_payload.get("failure_contract_sha256") != terminal_binding.get(
+            "contract_sha256"
+        ):
+            raise CampaignSemigroupClosureError(
+                "campaign closure source terminal failure contract mismatch"
             )
     source_review_text = str(bindings.get("visual_review_source_path", ""))
     if Path(source_review_text).is_absolute():
@@ -2922,7 +3392,7 @@ def _validate_published_closure(
     _validate_published_visual_review_chain(
         repo_root=repo_root,
         bootstrap_campaign_id=bootstrap_id,
-        formal_campaign_id=formal_campaign_id,
+        formal_campaign_id=visual_chain_formal_id,
         evidence=evidence,
         assignment=assignment,
         blinding_map=blinding_map,
@@ -2954,7 +3424,7 @@ def _validate_published_closure(
         raise CampaignSemigroupClosureError(
             "campaign closure formal required bindings mismatch"
         )
-    return {
+    resolved = {
         "bootstrap_campaign_id": bootstrap_id,
         "formal_campaign_id": formal_campaign_id,
         "closure": {
@@ -2973,6 +3443,14 @@ def _validate_published_closure(
             "contract_sha256": gate["gate_contract_sha256"],
         },
     }
+    if schema_version == 2:
+        resolved.update(
+            {
+                "policy_campaign_id": closure_prefix_id,
+                "policy_sha256": R9_SEMIGROUP_RECOVERY_POLICY_SHA256,
+            }
+        )
+    return resolved
 
 
 def _validate_published_visual_review_chain(
