@@ -26,6 +26,7 @@ from safa.evaluation.r9_phase_results import (
     _algorithm_config_digest,
     _asset_manifest_digest,
     _build_paired_metric_rows_contract,
+    _build_automatic_evidence,
     _canonical_digest,
     _evaluate_arcface,
     _evaluate_quality,
@@ -1259,6 +1260,110 @@ def test_quality_accepts_producer_binding_and_rejects_wrong_provenance(
             )
 
 
+def test_automatic_evidence_uses_validated_manifest_ids_on_real_build_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    native, _ = _make_run(
+        tmp_path, "native_automatic", collect=False, operational_tag="worker"
+    )
+    candidate, _ = _make_run(
+        tmp_path, "candidate_automatic", collect=False, operational_tag="worker"
+    )
+    native = dict(native)
+    candidate = dict(candidate)
+    native.update({"arm_id": "native", "family": "native"})
+    candidate.update({"arm_id": "candidate", "family": "flow_map2"})
+    candidate["rows"][0]["native_sha256"] = native["rows"][0][
+        "candidate_sha256"
+    ]
+    candidate["rows"][0]["metrics"]["native_cosine"] = native["rows"][0][
+        "metrics"
+    ]["candidate_cosine"]
+    candidate["rows"][0]["metrics"]["native_edev_cosine"] = native["rows"][0][
+        "metrics"
+    ]["edev_cosine"]
+    request = replace(
+        _evaluation_request(tmp_path, candidate),
+        phase="calibrate",
+        phase_root=tmp_path / "phase",
+        upstream_gate={"gate_contract_sha256": "8" * 64},
+    )
+    validated = {
+        "request": request,
+        "manifest_ids": ["sample_0"],
+        "run_plan": {"runs": ["native_automatic", "candidate_automatic"]},
+        "run_plan_sha256": "3" * 64,
+        "manifest_path": request.manifest_path,
+        "source_index_path": request.source_index_path,
+        "visual_manifest_path": None,
+        "visual_manifest_rows": None,
+    }
+
+    def quality(*args, **kwargs):
+        raise AssertionError("outer quality callback must be consumed by patched evaluator")
+
+    def arcface(*args, **kwargs):
+        raise AssertionError("outer ArcFace callback must be consumed by patched evaluator")
+
+    def fake_quality(_request, run, _samples, role, _evaluator):
+        is_native = role == "native"
+        return {
+            "fid": 9.0 if is_native else 10.0,
+            "kid": 0.009 if is_native else 0.01,
+            "niqe": 3.9 if is_native else 4.0,
+            "sharpness": 360.0 if is_native else 350.0,
+            "per_sample_metrics": _quality_per_sample_contract(
+                ["sample_0"],
+                niqe=3.9 if is_native else 4.0,
+                sharpness=360.0 if is_native else 350.0,
+            ),
+            "raw_evidence_path": str(tmp_path / f"{run['logical_run_id']}.json"),
+            "raw_evidence_sha256": "4" * 64,
+            "quality_evidence_sha256": "5" * 64,
+        }
+
+    monkeypatch.setattr(phase_results, "_evaluate_quality", fake_quality)
+    monkeypatch.setattr(
+        phase_results,
+        "_evaluate_arcface",
+        lambda *_: {
+            "exact_one": True,
+            "source_exact_one_count": 1,
+            "native_exact_one_count": 1,
+            "candidate_exact_one_count": 1,
+            "paired_exact_one_count": 1,
+            "failure_sample_ids": [],
+            "rows": [
+                {
+                    "sample_id": "sample_0",
+                    "source_candidate_cosine": 0.1,
+                    "source_native_cosine": 0.2,
+                }
+            ],
+            "arcface_evidence_sha256": "6" * 64,
+            "raw_evidence_path": str(tmp_path / "arcface.json"),
+            "raw_evidence_sha256": "7" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        phase_results,
+        "_materialize_visual_unit",
+        lambda _validated, run: {"unit_id": str(run["logical_run_id"])},
+    )
+    automatic = _build_automatic_evidence(
+        validated,
+        [native, candidate],
+        quality_evaluator=quality,
+        arcface_evaluator=arcface,
+        heldout_evaluator=None,
+    )
+    assert automatic["manifest"]["sample_count"] == 1
+    assert automatic["manifest"]["ordered_sample_id_sha256"] == hashlib.sha256(
+        b"sample_0\n"
+    ).hexdigest()
+    assert automatic["arms"][0]["paired_metric_rows"]["sample_count"] == 1
+
+
 def _repair_fixture(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[PhaseResultsRequest, Path, dict[str, Any], dict[str, Path]]:
@@ -1441,6 +1546,120 @@ def test_evaluation_repair_binding_rejects_tampering(
         )
     if mutation not in {"request", "result", "implementation"}:
         _write_json(repair_path, repair)
+    with pytest.raises(PhaseResultsError):
+        evaluation_repair_binding(request)
+
+
+def _superseding_repair_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[PhaseResultsRequest, Path, dict[str, Any], dict[str, Path]]:
+    request, prior_path, prior, _ = _repair_fixture(tmp_path, monkeypatch)
+    repo_root = request.repo_root
+    prior_sha256 = prior["repair_contract_sha256"]
+    namespace = repo_root / "evaluation_repairs" / prior_sha256
+    namespace_files: dict[str, Path] = {}
+    for unit_id in ("candidate", "native"):
+        unit = namespace / "calibrate" / "evaluator_runs" / "quality" / unit_id
+        for filename in ("attempt.json", "request.json", "result.json", "worker.log"):
+            path = unit / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"{unit_id}:{filename}\n", encoding="utf-8")
+            namespace_files[f"{unit_id}:{filename}"] = path
+    controller_log = request.phase_root / "evaluation_repair_controller.log"
+    controller_log.write_text(
+        "Traceback\nNameError: name 'manifest_ids' is not defined\n",
+        encoding="utf-8",
+    )
+    current_implementations = {}
+    current_paths: dict[str, Path] = {}
+    for name in (
+        "repaired_phase_results",
+        "driver",
+        "evaluator_worker",
+        "quality",
+        "repair_runner",
+    ):
+        path = repo_root / "implementations_v2" / f"{name}.py"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"# current {name}\n", encoding="utf-8")
+        current_paths[name] = path
+        current_implementations[name] = {
+            "path": str(path.relative_to(repo_root)),
+            "sha256": _sha256(path),
+        }
+    monkeypatch.setattr(
+        phase_results, "__file__", str(current_paths["repaired_phase_results"])
+    )
+    v2 = json.loads(json.dumps(prior))
+    v2.pop("repair_contract_sha256")
+    v2["contract_type"] = "safa_r9_evaluation_repair_contract_v2"
+    v2["implementations"] = {
+        "source_git_commit": "c" * 40,
+        "prior_phase_results_sha256": prior["implementations"][
+            "repaired_phase_results"
+        ]["sha256"],
+        **current_implementations,
+    }
+    v2["supersedes"] = {
+        "repair": {
+            "path": str(prior_path.relative_to(repo_root)),
+            "file_sha256": _sha256(prior_path),
+            "contract_sha256": prior_sha256,
+        },
+        "failure": {
+            "exception_type": "NameError",
+            "symbol": "manifest_ids",
+            "controller_log": {
+                "path": str(controller_log.relative_to(repo_root)),
+                "sha256": _sha256(controller_log),
+            },
+        },
+        "evaluation_attempt": phase_results.evaluation_attempt_inventory(
+            repo_root, namespace
+        ),
+        "policy": {
+            "prior_repair_usage": "input_evidence_only",
+            "prior_evaluation_results_usage": "input_evidence_only",
+            "prior_namespace_reuse": False,
+        },
+    }
+    v2["repair_contract_sha256"] = _canonical_digest(
+        v2, "repair_contract_sha256"
+    )
+    v2_path = request.phase_root / phase_results.EVALUATION_REPAIR_V2_FILENAME
+    _write_json(v2_path, v2)
+    return request, v2_path, v2, {
+        "prior": prior_path,
+        "log": controller_log,
+        "namespace": namespace_files["candidate:result.json"],
+        "implementation": current_paths["repair_runner"],
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["prior", "log", "namespace", "implementation", "policy", "prior_phase"],
+)
+def test_superseding_evaluation_repair_rejects_tampering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    request, v2_path, v2, paths = _superseding_repair_fixture(
+        tmp_path, monkeypatch
+    )
+    binding = evaluation_repair_binding(request)
+    assert binding["contract_sha256"] == v2["repair_contract_sha256"]
+    assert binding["path"].endswith(phase_results.EVALUATION_REPAIR_V2_FILENAME)
+    if mutation in {"prior", "log", "namespace", "implementation"}:
+        paths[mutation].write_bytes(paths[mutation].read_bytes() + b"tamper")
+    elif mutation == "policy":
+        v2["supersedes"]["policy"]["prior_namespace_reuse"] = True
+    elif mutation == "prior_phase":
+        v2["implementations"]["prior_phase_results_sha256"] = "d" * 64
+    if mutation in {"policy", "prior_phase"}:
+        v2["repair_contract_sha256"] = _canonical_digest(
+            v2, "repair_contract_sha256"
+        )
+        _write_json(v2_path, v2)
     with pytest.raises(PhaseResultsError):
         evaluation_repair_binding(request)
 

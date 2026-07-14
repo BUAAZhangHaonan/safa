@@ -15,8 +15,10 @@ from safa.evaluation.r9_campaign_contracts import write_immutable_contract
 from safa.evaluation.r9_phase_results import (
     AWAITING_VISUAL_REVIEW_EXIT_CODE,
     EVALUATION_REPAIR_FILENAME,
+    EVALUATION_REPAIR_V2_FILENAME,
     PhaseResultsError,
     PhaseResultsRequest,
+    evaluation_attempt_inventory,
     evaluation_repair_binding,
     generation_evidence_inventory,
     materialize_phase_results,
@@ -49,6 +51,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--failed-unit-id", required=True)
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--prior-phase-results-sha256", required=True)
+    parser.add_argument("--supersedes-repair-sha256")
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--allow-busy-gpus", action="store_true")
     args = parser.parse_args(argv)
@@ -201,6 +204,7 @@ def _build_repair_contract(
     failed_unit_id: str,
     source_commit: str,
     prior_phase_results_sha256: str,
+    supersedes_repair_sha256: str | None,
 ) -> dict[str, Any]:
     prior = _require_sha256(
         prior_phase_results_sha256, "prior phase-results SHA256"
@@ -262,13 +266,26 @@ def _build_repair_contract(
         }[name]
         if locked.get(locked_name) != binding:
             raise EvaluationRepairError(f"v6 locked {name} implementation changed")
+    generation_inventory = generation_evidence_inventory(request)
+    supersedes = None
+    if supersedes_repair_sha256 is not None:
+        supersedes = _build_supersedes_binding(
+            request,
+            supersedes_repair_sha256=supersedes_repair_sha256,
+            prior_phase_results_sha256=prior,
+            generation_inventory=generation_inventory,
+        )
     contract = {
         "schema_version": 1,
-        "contract_type": "safa_r9_evaluation_repair_contract_v1",
+        "contract_type": (
+            "safa_r9_evaluation_repair_contract_v2"
+            if supersedes is not None
+            else "safa_r9_evaluation_repair_contract_v1"
+        ),
         "campaign_id": request.campaign_id,
         "phase": request.phase,
         "campaign_runtime": runtime_binding,
-        "generation_evidence": generation_evidence_inventory(request),
+        "generation_evidence": generation_inventory,
         "failed_evaluation": {
             "evaluator": "quality",
             "unit_id": failed_unit_id,
@@ -299,7 +316,88 @@ def _build_repair_contract(
             "request_binding": "full_repair_sha256_in_logical_run_id",
         },
     }
+    if supersedes is not None:
+        contract["supersedes"] = supersedes
     return contract
+
+
+def _build_supersedes_binding(
+    request: PhaseResultsRequest,
+    *,
+    supersedes_repair_sha256: str,
+    prior_phase_results_sha256: str,
+    generation_inventory: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected_sha256 = _require_sha256(
+        supersedes_repair_sha256, "superseded repair SHA256"
+    )
+    prior_path = request.phase_root / EVALUATION_REPAIR_FILENAME
+    prior_binding = _contract_binding(
+        prior_path,
+        digest_field="repair_contract_sha256",
+        contract_type="safa_r9_evaluation_repair_contract_v1",
+    )
+    if prior_binding["contract_sha256"] != expected_sha256:
+        raise EvaluationRepairError("superseded repair SHA256 mismatch")
+    prior = _read_mapping(prior_path, "superseded repair")
+    prior_implementations = prior.get("implementations")
+    if (
+        prior.get("campaign_id") != request.campaign_id
+        or prior.get("phase") != request.phase
+        or prior.get("generation_evidence") != generation_inventory
+        or not isinstance(prior_implementations, Mapping)
+        or not isinstance(prior_implementations.get("repaired_phase_results"), Mapping)
+        or prior_implementations["repaired_phase_results"].get("sha256")
+        != prior_phase_results_sha256
+    ):
+        raise EvaluationRepairError("superseded repair binding changed")
+    if prior.get("policy") != {
+        "generation_execution": "forbidden",
+        "expected_generation_worker_count": 0,
+        "old_failed_result_usage": "input_evidence_only",
+        "old_attempt_retry_allowed": False,
+        "evaluation_namespace": "evaluation_repairs/{repair_contract_sha256}",
+        "request_binding": "full_repair_sha256_in_logical_run_id",
+    }:
+        raise EvaluationRepairError("superseded repair policy changed")
+    namespace_root = (
+        request.phase_root.parent / "evaluation_repairs" / expected_sha256
+    )
+    attempt = evaluation_attempt_inventory(REPO_ROOT, namespace_root)
+    if {
+        "file_count": attempt["file_count"],
+        "result_count": attempt["result_count"],
+        "quality_result_count": attempt["quality_result_count"],
+        "arcface_result_count": attempt["arcface_result_count"],
+    } != {
+        "file_count": 8,
+        "result_count": 2,
+        "quality_result_count": 2,
+        "arcface_result_count": 0,
+    }:
+        raise EvaluationRepairError("superseded evaluation attempt counts changed")
+    controller_log = request.phase_root / "evaluation_repair_controller.log"
+    log_binding = _implementation_binding(controller_log.relative_to(REPO_ROOT))
+    try:
+        log_text = controller_log.read_text(encoding="utf-8")
+    except UnicodeDecodeError as error:
+        raise EvaluationRepairError("superseded controller log is not UTF-8") from error
+    if "NameError: name 'manifest_ids' is not defined" not in log_text:
+        raise EvaluationRepairError("superseded controller log lacks NameError")
+    return {
+        "repair": prior_binding,
+        "failure": {
+            "exception_type": "NameError",
+            "symbol": "manifest_ids",
+            "controller_log": log_binding,
+        },
+        "evaluation_attempt": attempt,
+        "policy": {
+            "prior_repair_usage": "input_evidence_only",
+            "prior_evaluation_results_usage": "input_evidence_only",
+            "prior_namespace_reuse": False,
+        },
+    }
 
 
 def _repair_logical_run_id(repair_sha256: str, logical_run_id: str) -> str:
@@ -323,9 +421,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         failed_unit_id=str(args.failed_unit_id),
         source_commit=str(args.source_commit),
         prior_phase_results_sha256=str(args.prior_phase_results_sha256),
+        supersedes_repair_sha256=(
+            None
+            if args.supersedes_repair_sha256 is None
+            else str(args.supersedes_repair_sha256)
+        ),
     )
     contract["repair_contract_sha256"] = driver._canonical_json_sha256(contract)
-    repair_path = request.phase_root / EVALUATION_REPAIR_FILENAME
+    repair_path = request.phase_root / (
+        EVALUATION_REPAIR_V2_FILENAME
+        if args.supersedes_repair_sha256 is not None
+        else EVALUATION_REPAIR_FILENAME
+    )
     write_immutable_contract(
         repair_path, contract, digest_field="repair_contract_sha256"
     )
