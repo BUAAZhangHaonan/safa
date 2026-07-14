@@ -100,6 +100,42 @@ def test_confirm_continuation_all_is_exactly_c_and_d() -> None:
     ] == ["native", *selected]
 
 
+def test_confirm_request_locks_generation_batch_benchmark() -> None:
+    payload, _, _ = driver.load_confirm_continuation_request()
+    assert payload["generation_batch_benchmark"] == {
+        "contract_path": (
+            "artifacts/r9_meanflow_flow_map_guidance/campaigns/"
+            "r9-report-only-formal-v7/generation_batch_benchmark.json"
+        ),
+        "output_root": (
+            "artifacts/r9_meanflow_flow_map_guidance/campaigns/"
+            "r9-report-only-formal-v7/generation_batch_benchmark"
+        ),
+        "manifest": "calibration_64",
+        "sample_count": 8,
+        "seed": 4549,
+        "required_arms": [
+            "native",
+            "paper_eta_0p125",
+            "flow_map2_normalized_eta_0p125",
+        ],
+        "batch_sizes": [2, 4],
+        "record_final_latent_sha256": True,
+    }
+
+
+def test_confirm_execute_barrier_requires_materialized_batch_benchmark() -> None:
+    with pytest.raises(RuntimeError, match="generation_batch_benchmark.json"):
+        driver._require_generation_batch_benchmark_before_confirm(
+            is_confirm_continuation=True,
+            campaign_runtime={"campaign_runtime_sha256": "a" * 64},
+        )
+    driver._require_generation_batch_benchmark_before_confirm(
+        is_confirm_continuation=True,
+        campaign_runtime={"generation_batch_benchmark": {"contract_sha256": "a" * 64}},
+    )
+
+
 def test_continuation_request_is_source_only_and_all_starts_at_b() -> None:
     payload, request_path, source = driver.load_continuation_request()
     request = driver.yaml.safe_load((driver.REPO_ROOT / request_path).read_text())
@@ -403,6 +439,42 @@ def test_confirm_and_full_sharding_contracts() -> None:
     assert {run.manifest_key for run in full.runs} == {"full_2048"}
 
 
+def test_confirm_launch_schedule_is_latin_rotated_and_gpu_balanced() -> None:
+    selected = ["paper_eta_0p125", "flow_map2_normalized_eta_0p125"]
+    plan = driver.build_phase_plan(
+        runtime(),
+        phase="confirm512",
+        campaign_id="r9-test",
+        promoted_arm_ids=selected,
+    )
+    schedule = driver._generation_launch_schedule(plan)
+    assert len(schedule) == 48
+    assert [row["launch_index"] for row in schedule] == list(range(48))
+    assert len(
+        {(row["logical_run_id"], row["shard_index"]) for row in schedule}
+    ) == 48
+    first_arm_each_shard = [
+        schedule[shard * 3]["arm_ref"] for shard in range(16)
+    ]
+    assert first_arm_each_shard[:6] == [
+        "native",
+        "paper_eta_0p125",
+        "flow_map2_normalized_eta_0p125",
+        "native",
+        "paper_eta_0p125",
+        "flow_map2_normalized_eta_0p125",
+    ]
+    for arm_id in ["native", *selected]:
+        counts = {
+            gpu: sum(
+                row["arm_ref"] == arm_id and row["preferred_gpu_index"] == gpu
+                for row in schedule
+            )
+            for gpu in range(4)
+        }
+        assert counts == {0: 4, 1: 4, 2: 4, 3: 4}
+
+
 def test_dry_run_performs_no_write(tmp_path: Path) -> None:
     payload = runtime()
     payload["campaign_root"] = str(tmp_path / "campaigns")
@@ -410,6 +482,248 @@ def test_dry_run_performs_no_write(tmp_path: Path) -> None:
     rendered = json.loads(driver.render_dry_run(payload, plans))
     assert rendered["runtime_has_cli_algorithm_overrides"] is False
     assert not (tmp_path / "campaigns").exists()
+
+
+def test_confirm_dry_run_reports_six_benchmark_runs_without_writes(
+    tmp_path: Path,
+) -> None:
+    payload = runtime()
+    payload["campaign_root"] = str(tmp_path / "campaigns")
+    payload["generation_batch_benchmark"] = {
+        "contract_path": "artifacts/benchmark.json",
+        "output_root": "artifacts/benchmark",
+        "manifest": "calibration_64",
+        "sample_count": 8,
+        "seed": 4549,
+        "required_arms": [
+            "native",
+            "paper_eta_0p125",
+            "flow_map2_normalized_eta_0p125",
+        ],
+        "batch_sizes": [2, 4],
+        "record_final_latent_sha256": True,
+    }
+    plans = driver.build_requested_plans(
+        payload,
+        phase="confirm512",
+        campaign_id=driver.CONFIRM_CONTINUATION_CHILD_CAMPAIGN_ID,
+        continuation_selected_arm_ids=[
+            "paper_eta_0p125",
+            "flow_map2_normalized_eta_0p125",
+        ],
+        continuation_start_phase="confirm512",
+    )
+    rendered = json.loads(driver.render_dry_run(payload, plans))
+    assert rendered["generation_batch_benchmark"] == {
+        "logical_run_count": 6,
+        "sample_run_count": 48,
+        "arms": payload["generation_batch_benchmark"]["required_arms"],
+        "batch_sizes": [2, 4],
+        "contract_materialized": False,
+    }
+    assert not (tmp_path / "campaigns").exists()
+
+
+def test_generation_batch_launcher_materializes_six_measured_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(driver, "REPO_ROOT", tmp_path)
+    manifest = tmp_path / "calibration.jsonl"
+    manifest.write_text(
+        "".join(json.dumps({"sample_id": f"sample-{i}"}) + "\n" for i in range(8)),
+        encoding="utf-8",
+    )
+    runtime_payload = {
+        "python": sys.executable,
+        "generation_script": "scripts/run_meanflow_guidance.py",
+        "generation_batch_benchmark": {
+            "contract_path": "artifacts/benchmark.json",
+            "output_root": "artifacts/benchmark_runs",
+            "manifest": "calibration_64",
+            "sample_count": 8,
+            "seed": 4549,
+            "required_arms": [
+                "native",
+                "paper_eta_0p125",
+                "flow_map2_normalized_eta_0p125",
+            ],
+            "batch_sizes": [2, 4],
+            "record_final_latent_sha256": True,
+        },
+    }
+    campaign_runtime = {
+        "campaign_id": driver.CONFIRM_CONTINUATION_CHILD_CAMPAIGN_ID,
+        "campaign_root": "artifacts/campaign",
+        "campaign_runtime_sha256": "1" * 64,
+        "continuation": {"contract_sha256": "2" * 64},
+    }
+    manifest_contract = {
+        "manifest_contracts_sha256": "3" * 64,
+        "manifests": {
+            "calibration_64": {
+                "path": str(manifest.relative_to(tmp_path)),
+                "sha256": driver._sha256_path(manifest),
+                "sample_count": 64,
+            }
+        },
+    }
+    monkeypatch.setattr(
+        driver,
+        "_continuation_for_runtime",
+        lambda *a, **k: {
+            "confirm_continuation_sha256": "2" * 64,
+            "selected_arms": [],
+        },
+    )
+    monkeypatch.setattr(
+        driver,
+        "build_run_runtime_config",
+        lambda _runtime, _campaign, _manifests, run: {
+            "seed": run.seed,
+            "sampling_seed": run.seed,
+            "mode": "native" if run.arm_ref == "native" else "paper_algorithm_split",
+            "arm_config_sha256": "4" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        driver, "resolve_frozen_effective_guidance_config", lambda config: config
+    )
+    monkeypatch.setattr(driver, "validate_worker_completion", lambda run: {})
+
+    class Probe:
+        snapshots = tuple(
+            SimpleNamespace(
+                index=index,
+                uuid=f"GPU-{index}",
+                total_bytes=32 * 1024**3,
+                free_bytes=30 * 1024**3,
+            )
+            for index in range(4)
+        )
+
+        def gpu_snapshots(self):
+            return self.snapshots
+
+        def gpu_snapshot(self, index, *, expected_uuid):
+            row = self.snapshots[index]
+            assert row.uuid == expected_uuid
+            return row
+
+        @staticmethod
+        def ram_snapshot():
+            return SimpleNamespace(
+                used_bytes=10 * 1024**3,
+                total_bytes=128 * 1024**3,
+            )
+
+    launches = []
+
+    class Process:
+        pid = 12345
+
+        def __init__(self):
+            self.returncode = None
+            self.poll_count = 0
+
+        def poll(self):
+            self.poll_count += 1
+            if self.poll_count == 1:
+                return None
+            self.returncode = 0
+            return 0
+
+        def wait(self):
+            self.returncode = 0
+            return 0
+
+    def process_factory(command, *, env, **kwargs):
+        del kwargs
+        config_path = tmp_path / command[command.index("--config") + 1]
+        config = driver.yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        output = tmp_path / command[command.index("--output-dir") + 1]
+        output.mkdir(parents=True, exist_ok=True)
+        logical_id = output.name
+        arm_id = logical_id.rsplit("__batch_", 1)[0]
+        launches.append((arm_id, config["batch_size"], env["CUDA_VISIBLE_DEVICES"]))
+        rows = []
+        for ordinal in range(8):
+            generated = output / f"candidate-{ordinal}.png"
+            native = output / f"native-{ordinal}.png"
+            generated.write_bytes(f"{arm_id}:candidate:{ordinal}".encode())
+            native.write_bytes(f"{arm_id}:native:{ordinal}".encode())
+            rows.append(
+                {
+                    "sample_id": f"sample-{ordinal}",
+                    "ordinal": ordinal,
+                    "shard": 0,
+                    "source": str(tmp_path / "source.png"),
+                    "generated": str(generated),
+                    "native": str(native),
+                    "candidate_cosine": 0.7,
+                    "native_cosine": 0.1,
+                    "edev_cosine": 0.6,
+                    "native_edev_cosine": 0.2,
+                    "candidate_nfe": 7,
+                    "native_nfe": 1,
+                    "candidate_trace": [{"kind": "candidate"}],
+                    "native_trace": [{"kind": "native"}],
+                    "route_diagnostics": {"finite": True},
+                    "candidate_latent_sha256": driver.hashlib.sha256(
+                        f"{arm_id}:candidate:{ordinal}".encode()
+                    ).hexdigest(),
+                    "native_latent_sha256": driver.hashlib.sha256(
+                        f"{arm_id}:native:{ordinal}".encode()
+                    ).hexdigest(),
+                    "candidate_generation_seconds": float(config["batch_size"]),
+                    "native_generation_seconds": float(config["batch_size"]),
+                    "io_seconds": float(config["batch_size"]),
+                }
+            )
+        (output / "per_sample.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+        )
+        (output / "generation_result.json").write_text(
+            json.dumps(
+                {
+                    "status": "complete",
+                    "sample_count": 8,
+                    "config": {
+                        "batch_size": config["batch_size"],
+                        "seed": 4549,
+                        "record_final_latent_sha256": True,
+                    },
+                    "max_memory": {
+                        "allocated_bytes": 4 * 1024**3 - 1,
+                        "reserved_bytes": 4 * 1024**3,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return Process()
+
+    (tmp_path / "source.png").write_bytes(b"source")
+    contract = driver.run_generation_batch_benchmark(
+        runtime_payload,
+        campaign_runtime,
+        manifest_contract,
+        probe=Probe(),
+        process_factory=process_factory,
+        rss_sampler=lambda _pid: 2 * 1024**3,
+        sleep=lambda _seconds: None,
+    )
+    assert launches == [
+        ("native", 2, "GPU-0"),
+        ("native", 4, "GPU-0"),
+        ("paper_eta_0p125", 2, "GPU-1"),
+        ("paper_eta_0p125", 4, "GPU-1"),
+        ("flow_map2_normalized_eta_0p125", 2, "GPU-2"),
+        ("flow_map2_normalized_eta_0p125", 4, "GPU-2"),
+    ]
+    assert contract["status"] == "ready"
+    assert contract["decision"]["selected_batch_size"] == 4
+    assert (tmp_path / "artifacts/benchmark_runs/benchmark_request.json").is_file()
+    assert (tmp_path / "artifacts/benchmark.json").is_file()
 
 
 def test_generation_commands_have_zero_semantic_cli_overrides() -> None:
@@ -626,6 +940,58 @@ def test_run_runtime_config_binds_registered_arm_and_campaign_hashes() -> None:
     assert preflight["phase"] == "semigroup"
     assert preflight["r9_phase_contract"]["phase"] == "semigroup"
     assert len(preflight["arm_config_sha256"]) == 64
+
+
+def test_confirm_runtime_config_binds_measured_batch_resource_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload, manifest_contract, campaign_runtime = _run_runtime_inputs()
+    campaign_runtime.update(
+        {
+            "campaign_id": driver.CONFIRM_CONTINUATION_CHILD_CAMPAIGN_ID,
+            "continuation": {"contract_sha256": "8" * 64},
+            "generation_batch_benchmark": {
+                "path": "artifacts/benchmark.json",
+                "file_sha256": "9" * 64,
+                "contract_sha256": "a" * 64,
+            },
+            "resources": {
+                "generation_batch_size": 4,
+                "generation_slots_per_gpu": 2,
+                "gpu_slot_claim_bytes": 6_000_000_000,
+                "ram_slot_budget_bytes": 3_000_000_000,
+            },
+        }
+    )
+    monkeypatch.setattr(driver, "_formal_closure_for_runtime", lambda *a, **k: None)
+    monkeypatch.setattr(
+        driver,
+        "_continuation_for_runtime",
+        lambda *a, **k: {
+            "confirm_continuation_sha256": "8" * 64,
+            "selected_arms": [
+                {"arm_id": "paper_eta_0p125", "config_sha256": "b" * 64},
+                {
+                    "arm_id": "flow_map2_normalized_eta_0p125",
+                    "config_sha256": "c" * 64,
+                },
+            ],
+        },
+    )
+    run = driver.build_phase_plan(
+        payload,
+        phase="confirm512",
+        campaign_id=driver.CONFIRM_CONTINUATION_CHILD_CAMPAIGN_ID,
+        promoted_arm_ids=["paper_eta_0p125", "flow_map2_normalized_eta_0p125"],
+    ).runs[0]
+    config = driver.build_run_runtime_config(
+        payload, campaign_runtime, manifest_contract, run
+    )
+    assert config["batch_size"] == 4
+    assert config["r9_generation_batch_benchmark_sha256"] == "a" * 64
+    assert config["r9_generation_gpu_slot_claim_bytes"] == 6_000_000_000
+    assert config["r9_generation_ram_slot_budget_bytes"] == 3_000_000_000
+    assert config["r9_generation_slots_per_gpu"] == 2
 
 
 def test_formal_preflight_binds_closure_seal_and_its_schedule(
@@ -1975,8 +2341,8 @@ def test_execute_round_robin_respects_heterogeneous_gpu_capacity(
         ("GPU-3", 0),
         ("GPU-1", 1),
         ("GPU-2", 1),
-        ("GPU-3", 1),
         ("GPU-2", 2),
+        ("GPU-3", 1),
         ("GPU-3", 2),
         ("GPU-3", 3),
     ]

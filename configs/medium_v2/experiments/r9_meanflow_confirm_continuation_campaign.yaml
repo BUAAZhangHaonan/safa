@@ -15,6 +15,15 @@ source:
 selection:
   path: artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v7/calibration_report_only_selection.json
   materialization: build_from_frozen_source_o_excl
+generation_batch_benchmark:
+  contract_path: artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v7/generation_batch_benchmark.json
+  output_root: artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v7/generation_batch_benchmark
+  manifest: calibration_64
+  sample_count: 8
+  seed: 4549
+  required_arms: [native, paper_eta_0p125, flow_map2_normalized_eta_0p125]
+  batch_sizes: [2, 4]
+  record_final_latent_sha256: true
 semigroup_closure_campaign_id: r9-report-only-formal-v2
 evaluator_resources:
   arcface:

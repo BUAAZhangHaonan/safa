@@ -1558,6 +1558,11 @@ def run_guidance_records(
     if schedule is not None and not isinstance(schedule, Mapping):
         raise ValueError("config.locked_schedule must be a mapping")
     batch_size = _positive_int(resolved_config.get("batch_size", 1), "batch_size")
+    record_final_latent_sha256 = resolved_config.get(
+        "record_final_latent_sha256", False
+    )
+    if not isinstance(record_final_latent_sha256, bool):
+        raise ValueError("record_final_latent_sha256 must be boolean")
     sampling_seed = int(
         resolved_config.get("sampling_seed", resolved_config.get("seed", 0))
     )
@@ -1735,6 +1740,13 @@ def run_guidance_records(
                     candidate_result.diagnostics, local_index, len(sample_ids)
                 ),
             }
+            if record_final_latent_sha256:
+                row["candidate_latent_sha256"] = _tensor_sha256(
+                    candidate_result.latent[local_index]
+                )
+                row["native_latent_sha256"] = _tensor_sha256(
+                    native_result.latent[local_index]
+                )
             if r9_interval_contract is not None:
                 row.update(
                     {
@@ -3412,6 +3424,18 @@ def _cuda_reset(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
+
+
+def _tensor_sha256(tensor: torch.Tensor) -> str:
+    detached = tensor.detach().contiguous().cpu()
+    header = json.dumps(
+        {"dtype": str(detached.dtype), "shape": list(detached.shape)},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(header)
+    digest.update(detached.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
 
 
 def _cuda_sync(device: torch.device) -> None:

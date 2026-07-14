@@ -686,12 +686,29 @@ class R9ResourceScheduler:
         probe: ResourceProbe,
         lock_backend: SlotLockBackend,
         peer_status_probe: PeerStatusProbe | None = None,
+        gpu_slot_claim_bytes: int = R9_GPU_SLOT_CLAIM_BYTES,
+        gpu_headroom_bytes: int = R9_GPU_HEADROOM_BYTES,
+        max_gpu_slots: int = R9_MAX_GPU_SLOTS,
+        ram_slot_budget_bytes_override: int | None = None,
     ) -> None:
         _require_nonempty(campaign_id, "campaign ID")
         _require_sha256(resource_contract_sha256, "resource contract SHA256")
         self.campaign_id = campaign_id
         self.resource_contract_sha256 = resource_contract_sha256
-        self.ram_slot_budget_bytes = ram_slot_budget_bytes(smoke_peak_rss_bytes)
+        self.ram_slot_budget_bytes = (
+            ram_slot_budget_bytes(smoke_peak_rss_bytes)
+            if ram_slot_budget_bytes_override is None
+            else ram_slot_budget_bytes_override
+        )
+        _require_positive_int(self.ram_slot_budget_bytes, "RAM slot budget bytes")
+        _require_positive_int(gpu_slot_claim_bytes, "GPU slot claim bytes")
+        _require_nonnegative_int(gpu_headroom_bytes, "GPU headroom bytes")
+        _require_positive_int(max_gpu_slots, "max GPU slots")
+        self.gpu_slot_claim_bytes = gpu_slot_claim_bytes
+        self.gpu_headroom_bytes = gpu_headroom_bytes
+        self.max_gpu_slots = max_gpu_slots
+        if self.max_gpu_slots > R9_MAX_GPU_SLOTS:
+            raise ResourceContractError("max GPU slots exceeds the R9 limit")
         self._probe = probe
         self._lock_backend = lock_backend
         self._peer_status_probe = peer_status_probe
@@ -732,7 +749,7 @@ class R9ResourceScheduler:
             return AdmissionDecision(
                 status=AdmissionStatus.RESUMED,
                 worker_id=request.worker_id,
-                gpu_capacity=gpu_slot_capacity(
+                gpu_capacity=self._gpu_slot_capacity(
                     _select_gpu_snapshot(
                         self._probe.gpu_snapshots(),
                         index=request.gpu_index,
@@ -779,7 +796,7 @@ class R9ResourceScheduler:
                 worker_id=request.worker_id,
                 reason=str(error),
             )
-        capacity = gpu_slot_capacity(gpu)
+        capacity = self._gpu_slot_capacity(gpu)
         if capacity == 0:
             return AdmissionDecision(
                 status=AdmissionStatus.GPU_LIMIT,
@@ -896,6 +913,24 @@ class R9ResourceScheduler:
         self._lock_backend.release(lease)
         del self._active[worker_id]
 
+    def release_all_workers_after_failure(self) -> tuple[str, ...]:
+        """Release every active lease after a campaign-wide peer failure."""
+        if self._failure is None:
+            raise ResourceContractError(
+                "bulk worker release requires a recorded campaign failure"
+            )
+        worker_ids = tuple(
+            lease.worker_id
+            for lease in sorted(
+                self._active.values(),
+                key=lambda lease: (lease.launch_ordinal, lease.worker_id),
+            )
+        )
+        for worker_id in worker_ids:
+            lease = self._active.pop(worker_id)
+            self._lock_backend.release(lease)
+        return worker_ids
+
     def _enforce_ram_hard_limit(self, snapshot: RamSnapshot) -> CampaignFailure | None:
         if snapshot.used_bytes * 100 < snapshot.total_bytes * R9_RAM_HARD_LIMIT_PERCENT:
             return None
@@ -931,6 +966,12 @@ class R9ResourceScheduler:
             slot_budget_bytes=slot_budget_bytes,
             reserved_bytes=reserved_bytes,
         )
+
+    def _gpu_slot_capacity(self, snapshot: GpuSnapshot) -> int:
+        usable_bytes = snapshot.free_bytes - self.gpu_headroom_bytes
+        if usable_bytes <= 0:
+            return 0
+        return min(self.max_gpu_slots, usable_bytes // self.gpu_slot_claim_bytes)
 
     def _raise_if_failed(self) -> None:
         if self._failure is not None:

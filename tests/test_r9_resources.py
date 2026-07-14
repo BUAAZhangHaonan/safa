@@ -723,6 +723,46 @@ def test_worker_failures_are_terminal_with_no_retry_or_degradation(
     assert probe.ram_calls == ram_calls_before
 
 
+def test_campaign_failure_bulk_release_clears_every_peer_lease(
+    tmp_path: Path,
+) -> None:
+    scheduler = R9ResourceScheduler(
+        campaign_id="campaign",
+        resource_contract_sha256=CONTRACT_SHA,
+        smoke_peak_rss_bytes=100,
+        probe=_Probe(
+            (_gpu(0),),
+            RamSnapshot(total_bytes=100_000, available_bytes=90_000),
+        ),
+        lock_backend=FcntlSlotLockBackend(tmp_path),
+    )
+    scheduler.admit_worker(_request("failed", ordinal=0))
+    scheduler.admit_worker(_request("peer-1", ordinal=1))
+    scheduler.admit_worker(_request("peer-2", ordinal=2))
+
+    with pytest.raises(CampaignFailedError):
+        scheduler.fail_worker("failed", kind=FailureKind.PEER_FAILURE)
+
+    assert scheduler.release_all_workers_after_failure() == ("peer-1", "peer-2")
+    assert scheduler.active_leases == ()
+    assert scheduler.release_all_workers_after_failure() == ()
+
+
+def test_bulk_release_is_forbidden_before_campaign_failure(tmp_path: Path) -> None:
+    scheduler = R9ResourceScheduler(
+        campaign_id="campaign",
+        resource_contract_sha256=CONTRACT_SHA,
+        smoke_peak_rss_bytes=100,
+        probe=_Probe(
+            (_gpu(0),),
+            RamSnapshot(total_bytes=100_000, available_bytes=90_000),
+        ),
+        lock_backend=FcntlSlotLockBackend(tmp_path),
+    )
+    with pytest.raises(ResourceContractError, match="recorded campaign failure"):
+        scheduler.release_all_workers_after_failure()
+
+
 def test_newest_worker_selection_refuses_ambiguous_ordinals() -> None:
     with pytest.raises(ResourceContractError, match="unique launch ordinals"):
         newest_worker_for_termination(

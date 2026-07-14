@@ -208,6 +208,10 @@ def validate_campaign_runtime(
         )
     expected_fields = R9_RUNTIME_FIELDS | (
         {"continuation"} if "continuation" in normalized else set()
+    ) | (
+        {"generation_batch_benchmark"}
+        if "generation_batch_benchmark" in normalized
+        else set()
     )
     if set(normalized) != expected_fields:
         missing = sorted(expected_fields - set(normalized))
@@ -241,6 +245,7 @@ def validate_campaign_runtime(
     )
     normalized["campaign_root"] = str(campaign_root.relative_to(root))
     closure_campaign_id = str(normalized["campaign_id"])
+    continuation_payload = None
     if "continuation" in normalized:
         from safa.evaluation.r9_continuation_contracts import (
             continuation_contract_binding,
@@ -271,6 +276,7 @@ def validate_campaign_runtime(
         if payload.get("child_campaign_id") != normalized["campaign_id"]:
             raise CampaignContractError("continuation child campaign ID mismatch")
         normalized["continuation"] = expected_binding
+        continuation_payload = payload
         if "semigroup_closure_campaign_id" in payload:
             closure_campaign_id = str(payload["semigroup_closure_campaign_id"])
         else:
@@ -279,6 +285,45 @@ def validate_campaign_runtime(
                     "campaign_id"
                 )
             )
+    benchmark_payload = None
+    if "generation_batch_benchmark" in normalized:
+        if continuation_payload is None:
+            raise CampaignContractError(
+                "generation batch benchmark requires a continuation"
+            )
+        from safa.evaluation.r9_generation_batch_benchmark import (
+            validate_generation_batch_benchmark_contract,
+        )
+
+        binding, benchmark_payload = _validate_bound_json_contract(
+            normalized["generation_batch_benchmark"],
+            repo_root=root,
+            label="generation batch benchmark",
+        )
+        continuation_digest = continuation_payload.get(
+            "continuation_contract_sha256",
+            continuation_payload.get("confirm_continuation_sha256"),
+        )
+        try:
+            benchmark_payload = validate_generation_batch_benchmark_contract(
+                benchmark_payload,
+                repo_root=root,
+                expected_campaign_id=str(normalized["campaign_id"]),
+                expected_continuation_contract_sha256=str(continuation_digest),
+            )
+        except ValueError as error:
+            raise CampaignContractError(
+                "generation batch benchmark validation failed"
+            ) from error
+        if (
+            binding["contract_sha256"]
+            != benchmark_payload["generation_batch_benchmark_sha256"]
+            or benchmark_payload.get("status") != "ready"
+        ):
+            raise CampaignContractError(
+                "generation batch benchmark binding is not ready"
+            )
+        normalized["generation_batch_benchmark"] = binding
     normalized["campaign_template"] = _validate_bound_file(
         normalized.get("campaign_template"),
         repo_root=root,
@@ -340,6 +385,32 @@ def validate_campaign_runtime(
         manifests=normalized["manifests"],
         checkpoint_sha256=normalized["checkpoint"]["sha256"],
     )
+    if benchmark_payload is not None:
+        decision = _json_mapping(
+            benchmark_payload.get("decision"), "generation batch decision"
+        )
+        resources = normalized["resources"]
+        if any(
+            resources.get(field) != expected
+            for field, expected in (
+                (
+                    "gpu_slot_claim_bytes",
+                    decision.get("selected_gpu_slot_claim_bytes"),
+                ),
+                (
+                    "ram_slot_budget_bytes",
+                    decision.get("selected_ram_slot_budget_bytes"),
+                ),
+                ("generation_batch_size", decision.get("selected_batch_size")),
+                (
+                    "generation_slots_per_gpu",
+                    decision.get("selected_slots_per_gpu"),
+                ),
+            )
+        ):
+            raise CampaignContractError(
+                "runtime resources disagree with generation batch benchmark"
+            )
     normalized["bootstrap"] = _validate_runtime_bootstrap(normalized.get("bootstrap"))
     normalized["evaluation"] = _validate_runtime_evaluation(
         normalized.get("evaluation"),
@@ -1866,18 +1937,25 @@ def _validate_runtime_resources(
         "physical_gpus": [0, 1, 2, 3],
         "global_slot_lock_root": "/tmp/safa-r9-gpu-slots-v1",
         "max_slots_per_gpu": 4,
-        "gpu_slot_claim_bytes": 4_938_792_960,
         "gpu_headroom_bytes": 2 * 1024**3,
         "ram_admission_percent": 85,
         "ram_hard_limit_percent": 90,
         "require_tmux": True,
         "retry_count": 0,
     }
-    if not isinstance(value, Mapping) or set(value) != {
+    benchmark_fields = {
+        "generation_batch_size",
+        "generation_slots_per_gpu",
+    }
+    has_benchmark = isinstance(value, Mapping) and benchmark_fields.issubset(value)
+    expected_fields = {
         *expected,
+        "gpu_slot_claim_bytes",
         "resource_smoke",
         "ram_slot_budget_bytes",
-    }:
+        *(benchmark_fields if has_benchmark else set()),
+    }
+    if not isinstance(value, Mapping) or set(value) != expected_fields:
         raise CampaignContractError("runtime resources fields are not canonical")
     for field, expected_value in expected.items():
         if value.get(field) != expected_value:
@@ -1929,10 +2007,14 @@ def _validate_runtime_resources(
     peak_rss = result["peak_rss_bytes"]
     expected_budget = (peak_rss * 110 + 99) // 100
     budget = _strict_int(value.get("ram_slot_budget_bytes"), "RAM slot budget bytes")
-    if budget != expected_budget:
+    if budget <= 0 or (not has_benchmark and budget != expected_budget):
         raise CampaignContractError("RAM slot budget must equal ceil(smoke RSS * 1.10)")
-    return {
+    slot_claim = _strict_int(value.get("gpu_slot_claim_bytes"), "GPU slot claim bytes")
+    if slot_claim <= 0 or (not has_benchmark and slot_claim != 4_938_792_960):
+        raise CampaignContractError("GPU slot claim bytes are invalid")
+    normalized = {
         **expected,
+        "gpu_slot_claim_bytes": slot_claim,
         "resource_smoke": {
             "required": True,
             "run_id": run_id,
@@ -1947,6 +2029,22 @@ def _validate_runtime_resources(
         },
         "ram_slot_budget_bytes": budget,
     }
+    if has_benchmark:
+        batch_size = _strict_int(
+            value.get("generation_batch_size"), "generation batch size"
+        )
+        slots = _strict_int(
+            value.get("generation_slots_per_gpu"), "generation slots per GPU"
+        )
+        if (batch_size, slots) not in {(4, 2), (2, 4)}:
+            raise CampaignContractError("generation batch/slot policy is invalid")
+        normalized.update(
+            {
+                "generation_batch_size": batch_size,
+                "generation_slots_per_gpu": slots,
+            }
+        )
+    return normalized
 
 
 def _validate_runtime_evaluation(

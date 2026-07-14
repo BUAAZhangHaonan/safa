@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from typing import Any, Mapping, Sequence
 
@@ -70,6 +71,13 @@ from safa.evaluation.r9_phase_results import (
 )
 from safa.evaluation.r9_evaluator_resources import (
     materialize_evaluator_resource_profiles,
+)
+from safa.evaluation.r9_generation_batch_benchmark import (
+    BatchRunEvidence,
+    BenchmarkGpuSnapshot,
+    build_generation_batch_benchmark_contract,
+    materialize_generation_batch_benchmark_contract,
+    validate_generation_batch_benchmark_contract,
 )
 from safa.evaluation.r9_resources import (
     AdmissionStatus,
@@ -281,6 +289,7 @@ def load_confirm_continuation_request(
         "base_runtime",
         "source",
         "selection",
+        "generation_batch_benchmark",
         "semigroup_closure_campaign_id",
         "evaluator_resources",
     }
@@ -363,6 +372,32 @@ def load_confirm_continuation_request(
         raise ValueError("confirm evaluator resources are not canonical")
     evaluation["resource_smokes"] = resources
     runtime["evaluation"] = evaluation
+    batch_benchmark = _mapping(
+        request.get("generation_batch_benchmark"),
+        "confirm generation batch benchmark",
+    )
+    if batch_benchmark != {
+        "contract_path": (
+            "artifacts/r9_meanflow_flow_map_guidance/campaigns/"
+            "r9-report-only-formal-v7/generation_batch_benchmark.json"
+        ),
+        "output_root": (
+            "artifacts/r9_meanflow_flow_map_guidance/campaigns/"
+            "r9-report-only-formal-v7/generation_batch_benchmark"
+        ),
+        "manifest": "calibration_64",
+        "sample_count": 8,
+        "seed": 4549,
+        "required_arms": [
+            "native",
+            "paper_eta_0p125",
+            "flow_map2_normalized_eta_0p125",
+        ],
+        "batch_sizes": [2, 4],
+        "record_final_latent_sha256": True,
+    }:
+        raise ValueError("confirm generation batch benchmark declaration changed")
+    runtime["generation_batch_benchmark"] = batch_benchmark
     source["request_contract_type"] = str(request["contract_type"])
     return runtime, Path(str(request_path.relative_to(repo_root.resolve()))), source
 
@@ -742,6 +777,26 @@ def build_effective_campaign_runtime(
     }
     if continuation_binding is not None:
         effective["continuation"] = continuation_binding
+    benchmark = _generation_batch_benchmark_for_runtime(
+        runtime,
+        campaign_id=campaign_id,
+        repo_root=repo_root,
+        continuation_contract=continuation_contract,
+        manifests=manifest_contract["manifests"],
+    )
+    if benchmark is not None:
+        effective["generation_batch_benchmark"] = benchmark["binding"]
+        decision = benchmark["decision"]
+        resources["gpu_slot_claim_bytes"] = decision[
+            "selected_gpu_slot_claim_bytes"
+        ]
+        resources["ram_slot_budget_bytes"] = decision[
+            "selected_ram_slot_budget_bytes"
+        ]
+        resources["generation_batch_size"] = decision["selected_batch_size"]
+        resources["generation_slots_per_gpu"] = decision[
+            "selected_slots_per_gpu"
+        ]
     diagnose_contract = manifest_contract["provenance"]["diagnose_18"]
     if resources.get("resource_smoke", {}).get("result") is None:
         claim = dict(effective)
@@ -754,6 +809,64 @@ def build_effective_campaign_runtime(
         continuation_contract=continuation_contract,
     )
     return validated_runtime, manifest_contract, diagnose_contract
+
+
+def _generation_batch_benchmark_for_runtime(
+    runtime: Mapping[str, Any],
+    *,
+    campaign_id: str,
+    repo_root: Path,
+    continuation_contract: Mapping[str, Any] | None,
+    manifests: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    declaration_value = runtime.get("generation_batch_benchmark")
+    if declaration_value is None:
+        return None
+    if continuation_contract is None:
+        raise ValueError("generation batch benchmark requires a continuation")
+    declaration = _mapping(declaration_value, "generation batch benchmark")
+    relative = Path(str(declaration.get("contract_path")))
+    if relative.is_absolute():
+        raise ValueError("generation batch benchmark path must be relative")
+    path = (repo_root.resolve() / relative).resolve()
+    try:
+        path.relative_to(repo_root.resolve())
+    except ValueError as error:
+        raise ValueError("generation batch benchmark path escapes repo root") from error
+    if not path.is_file():
+        return None
+    payload = validate_generation_batch_benchmark_contract(
+        _read_json_mapping(path, "generation batch benchmark"),
+        repo_root=repo_root,
+        expected_campaign_id=campaign_id,
+        expected_continuation_contract_sha256=_continuation_digest(
+            continuation_contract
+        ),
+    )
+    manifest = _mapping(payload.get("manifest"), "benchmark manifest")
+    expected_manifest = _mapping(
+        manifests.get(str(declaration["manifest"])), "declared benchmark manifest"
+    )
+    if (
+        manifest.get("path") != expected_manifest.get("path")
+        or manifest.get("sha256") != expected_manifest.get("sha256")
+        or manifest.get("sample_count") != declaration.get("sample_count")
+        or payload.get("seed") != declaration.get("seed")
+        or [row["arm_id"] for row in payload.get("arms", [])]
+        != sorted(declaration.get("required_arms", []))
+    ):
+        raise ValueError("generation batch benchmark disagrees with its request")
+    if payload.get("status") != "ready":
+        raise ResourceContractError("generation batch benchmark blocked confirm512")
+    decision = _mapping(payload.get("decision"), "batch benchmark decision")
+    return {
+        "binding": {
+            "path": str(path.relative_to(repo_root.resolve())),
+            "file_sha256": _sha256_path(path),
+            "contract_sha256": payload["generation_batch_benchmark_sha256"],
+        },
+        "decision": decision,
+    }
 
 
 def _bound_file(
@@ -1131,6 +1244,22 @@ def render_dry_run(
             for plan in plans
         ],
     }
+    benchmark = runtime.get("generation_batch_benchmark")
+    if benchmark is not None:
+        declaration = _mapping(benchmark, "generation batch benchmark")
+        payload["generation_batch_benchmark"] = {
+            "logical_run_count": len(declaration["required_arms"])
+            * len(declaration["batch_sizes"]),
+            "sample_run_count": len(declaration["required_arms"])
+            * len(declaration["batch_sizes"])
+            * int(declaration["sample_count"]),
+            "arms": list(declaration["required_arms"]),
+            "batch_sizes": list(declaration["batch_sizes"]),
+            "contract_materialized": bool(
+                effective_runtime
+                and effective_runtime.get("generation_batch_benchmark")
+            ),
+        }
     return json.dumps(payload, indent=2, sort_keys=True)
 
 
@@ -1258,6 +1387,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if effective_runtime.get("campaign_runtime_sha256") is None:
         raise RuntimeError("resource smoke did not produce a final campaign runtime")
+    if is_confirm_continuation and effective_runtime.get(
+        "generation_batch_benchmark"
+    ) is None:
+        run_generation_batch_benchmark(
+            runtime,
+            effective_runtime,
+            manifest_contract,
+        )
+        effective_runtime, manifest_contract, diagnose_contract = (
+            build_effective_campaign_runtime(
+                runtime,
+                campaign_id=str(args.campaign_id),
+                repo_root=REPO_ROOT,
+                runtime_config_path=runtime_config_path,
+                continuation_contract_override=confirm_continuation,
+            )
+        )
+        if effective_runtime.get("campaign_runtime_sha256") is None:
+            raise RuntimeError(
+                "generation batch benchmark did not produce a final campaign runtime"
+            )
+    _require_generation_batch_benchmark_before_confirm(
+        is_confirm_continuation=is_confirm_continuation,
+        campaign_runtime=effective_runtime,
+    )
     _write_immutable_bytes(
         REPO_ROOT / plans[0].campaign_root / "campaign_runtime.json",
         (
@@ -1294,6 +1448,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         arcface_evaluator=evaluators.arcface,
         heldout_evaluator=evaluators.heldout,
     )
+
+
+def _require_generation_batch_benchmark_before_confirm(
+    *, is_confirm_continuation: bool, campaign_runtime: Mapping[str, Any]
+) -> None:
+    if is_confirm_continuation and campaign_runtime.get(
+        "generation_batch_benchmark"
+    ) is None:
+        raise RuntimeError(
+            "confirm512 is blocked until generation_batch_benchmark.json is materialized"
+        )
 
 
 def execute_dynamic_campaign(
@@ -1397,6 +1562,7 @@ def execute_dynamic_campaign(
                 quality_evaluator=quality_evaluator,
                 arcface_evaluator=arcface_evaluator,
                 heldout_evaluator=heldout_evaluator,
+                evaluator_parallelism=4,
             )
             if closure.status == "awaiting_visual_review":
                 _print_phase_closure(phase, closure)
@@ -1674,6 +1840,8 @@ class R9ProductionEvaluatorCallbacks:
         if self._poll_interval_seconds <= 0:
             raise ValueError("evaluator poll interval must be positive")
         self._launch_counter = 0
+        self._scheduler_lock = threading.RLock()
+        self._active_evaluator_processes: dict[str, Any] = {}
 
     def quality(self, request: QualityEvaluationRequest) -> Mapping[str, Any]:
         payload = {
@@ -1804,19 +1972,24 @@ class R9ProductionEvaluatorCallbacks:
             raise RuntimeError(
                 "evaluator attempt exists without a completed result; automatic retry is forbidden"
             )
-        self._launch_counter += 1
+        with self._scheduler_lock:
+            self._launch_counter += 1
+            launch_counter = self._launch_counter
         worker_id = f"evaluator:{evaluator}:{phase}:{unit_id}"
         lease = None
         while lease is None:
-            lease = _admit_worker(
-                self._scheduler,
-                worker_id=worker_id,
-                launch_ordinal=50_000 + self._launch_counter,
-                gpu_bindings=self._gpu_bindings,
-                ram_slot_budget_bytes=self._evaluator_ram_slot_budgets[evaluator],
-            )
+            with self._scheduler_lock:
+                lease = _admit_worker(
+                    self._scheduler,
+                    worker_id=worker_id,
+                    launch_ordinal=50_000 + launch_counter,
+                    gpu_bindings=self._gpu_bindings,
+                    ram_slot_budget_bytes=self._evaluator_ram_slot_budgets[evaluator],
+                    start_gpu_index=(launch_counter - 1) % 4,
+                )
             if lease is None:
-                self._scheduler.enforce_actual_ram_limit()
+                with self._scheduler_lock:
+                    self._scheduler.enforce_actual_ram_limit()
                 self._sleep(self._poll_interval_seconds)
         self._peer_status_store.record_admitted(worker_id)
         environment = dict(os.environ)
@@ -1826,6 +1999,7 @@ class R9ProductionEvaluatorCallbacks:
         environment["SAFA_R9_GPU_SLOT"] = str(lease.slot_index)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         process = None
+        worker_terminal = False
         try:
             try:
                 _write_exclusive_bytes(
@@ -1859,24 +2033,30 @@ class R9ProductionEvaluatorCallbacks:
                     stdout=log,
                     stderr=subprocess.STDOUT,
                 )
+                with self._scheduler_lock:
+                    self._active_evaluator_processes[worker_id] = process
                 self._peer_status_store.record_running(
                     worker_id, pid=_positive_int(process.pid, "evaluator PID")
                 )
                 while process.poll() is None:
                     try:
-                        self._scheduler.enforce_actual_ram_limit()
+                        with self._scheduler_lock:
+                            self._scheduler.enforce_actual_ram_limit()
                     except CampaignFailedError:
                         _terminate_process(process)
                         self._peer_status_store.record_terminal(
                             worker_id, state="terminated"
                         )
+                        worker_terminal = True
                         raise
                     self._sleep(self._poll_interval_seconds)
                 if process.returncode != 0:
                     self._peer_status_store.record_terminal(worker_id, state="failed")
-                    self._scheduler.fail_worker(
-                        worker_id, kind=FailureKind.PEER_FAILURE
-                    )
+                    worker_terminal = True
+                    with self._scheduler_lock:
+                        self._scheduler.fail_worker(
+                            worker_id, kind=FailureKind.PEER_FAILURE
+                        )
             result = _load_evaluator_result(
                 output_path,
                 evaluator=evaluator,
@@ -1886,24 +2066,45 @@ class R9ProductionEvaluatorCallbacks:
                 quality_script_sha256=self._quality_script_sha256,
             )
         except BaseException:
-            if process is not None and process.poll() is None:
-                _terminate_process(process)
-            if worker_id in {
-                active.worker_id for active in self._scheduler.active_leases
-            }:
-                try:
-                    self._peer_status_store.record_terminal(worker_id, state="failed")
-                    self._scheduler.fail_worker(
-                        worker_id, kind=FailureKind.CONTRACT_MISMATCH
-                    )
-                except CampaignFailedError:
-                    pass
+            self._terminate_evaluator_peers(
+                current_worker_id=worker_id,
+                current_worker_terminal=worker_terminal,
+            )
             _cleanup_evaluator_work_root(root / "work", evaluator_root=root)
             raise
         _cleanup_evaluator_work_root(root / "work", evaluator_root=root)
         self._peer_status_store.record_terminal(worker_id, state="succeeded")
-        self._scheduler.release_worker(worker_id)
+        with self._scheduler_lock:
+            self._active_evaluator_processes.pop(worker_id, None)
+            self._scheduler.release_worker(worker_id)
         return result
+
+    def _terminate_evaluator_peers(
+        self, *, current_worker_id: str, current_worker_terminal: bool
+    ) -> None:
+        with self._scheduler_lock:
+            processes = dict(self._active_evaluator_processes)
+            active_worker_ids = {
+                lease.worker_id for lease in self._scheduler.active_leases
+            }
+        for worker_id, process in processes:
+            if process.poll() is None:
+                _terminate_process(process)
+        terminal_worker_ids = active_worker_ids | set(processes)
+        if current_worker_terminal:
+            terminal_worker_ids.discard(current_worker_id)
+        for worker_id in sorted(terminal_worker_ids):
+            self._peer_status_store.record_terminal(worker_id, state="terminated")
+        with self._scheduler_lock:
+            self._active_evaluator_processes.clear()
+            if self._scheduler.failure is None:
+                try:
+                    self._scheduler.fail_worker(
+                        current_worker_id, kind=FailureKind.CONTRACT_MISMATCH
+                    )
+                except CampaignFailedError:
+                    pass
+            self._scheduler.release_all_workers_after_failure()
 
     def _validate_current_worker_contract(self) -> None:
         for path_field, digest_field, label in (
@@ -2409,6 +2610,243 @@ def run_resource_smoke(
         os.close(lock_fd)
 
 
+def run_generation_batch_benchmark(
+    runtime: Mapping[str, Any],
+    campaign_runtime: Mapping[str, Any],
+    manifest_contract: Mapping[str, Any],
+    *,
+    probe: Any | None = None,
+    process_factory: Any = subprocess.Popen,
+    rss_sampler: Any | None = None,
+    sleep: Any = time.sleep,
+    poll_interval_seconds: float = 0.1,
+) -> dict[str, Any]:
+    """Run the fixed six-run batch equivalence and measured resource benchmark."""
+    declaration = _mapping(
+        runtime.get("generation_batch_benchmark"), "generation batch benchmark"
+    )
+    contract_path = REPO_ROOT / str(declaration["contract_path"])
+    continuation = _continuation_for_runtime(campaign_runtime)
+    if continuation is None:
+        raise ValueError("generation batch benchmark requires a continuation")
+    continuation_sha = _continuation_digest(continuation)
+    if contract_path.is_file():
+        return validate_generation_batch_benchmark_contract(
+            _read_json_mapping(contract_path, "generation batch benchmark"),
+            repo_root=REPO_ROOT,
+            expected_campaign_id=str(campaign_runtime["campaign_id"]),
+            expected_continuation_contract_sha256=continuation_sha,
+        )
+    output_root = REPO_ROOT / str(declaration["output_root"])
+    request_path = output_root / "benchmark_request.json"
+    if request_path.exists():
+        raise RuntimeError(
+            "generation benchmark request exists without a final contract; retry is forbidden"
+        )
+    resource_probe = SystemResourceProbe() if probe is None else probe
+    snapshots = tuple(
+        row for row in resource_probe.gpu_snapshots() if row.index in {0, 1, 2, 3}
+    )
+    if tuple(row.index for row in snapshots) != (0, 1, 2, 3):
+        raise ResourceContractError("generation benchmark requires GPUs 0-3")
+    manifests = _mapping(manifest_contract.get("manifests"), "manifests")
+    manifest_key = str(declaration["manifest"])
+    manifest = _mapping(manifests.get(manifest_key), "benchmark manifest")
+    sample_count = _positive_int(declaration["sample_count"], "benchmark samples")
+    seed = _positive_int(declaration["seed"], "benchmark seed")
+    arms = tuple(str(value) for value in declaration["required_arms"])
+    batch_sizes = tuple(int(value) for value in declaration["batch_sizes"])
+    if arms != (
+        "native",
+        "paper_eta_0p125",
+        "flow_map2_normalized_eta_0p125",
+    ) or batch_sizes != (2, 4):
+        raise ValueError("generation benchmark matrix changed")
+    runs: list[tuple[RunSpec, int, int]] = []
+    request_runs: list[dict[str, Any]] = []
+    ordinal = 0
+    for arm_index, arm_id in enumerate(arms):
+        for batch_size in batch_sizes:
+            logical_id = f"{arm_id}__batch_{batch_size}"
+            relative_output = Path(str(declaration["output_root"])) / logical_id
+            relative_config = (
+                Path(str(campaign_runtime["campaign_root"]))
+                / "runtime_configs"
+                / "generation_batch_benchmark"
+                / f"{logical_id}.yaml"
+            )
+            run = RunSpec(
+                phase="confirm512",
+                logical_run_id=logical_id,
+                arm_ref=arm_id,
+                seed=seed,
+                repeat_index=None,
+                shard_index=0,
+                num_shards=1,
+                sample_count=sample_count,
+                manifest_key=manifest_key,
+                runtime_config=relative_config,
+                output_dir=relative_output,
+                command=(),
+            )
+            config = build_run_runtime_config(
+                runtime, campaign_runtime, manifest_contract, run
+            )
+            config.update(
+                {
+                    "experiment_name": f"generation_batch_benchmark__{logical_id}",
+                    "out_dir": str(relative_output),
+                    "max_samples": sample_count,
+                    "batch_size": batch_size,
+                    "record_final_latent_sha256": True,
+                }
+            )
+            config = resolve_frozen_effective_guidance_config(config)
+            content = yaml.safe_dump(config, sort_keys=False).encode("utf-8")
+            _write_immutable_bytes(REPO_ROOT / relative_config, content)
+            gpu_index = arm_index
+            command = (
+                str(runtime["python"]),
+                str(runtime["generation_script"]),
+                "--config",
+                str(relative_config),
+                "--output-dir",
+                str(relative_output),
+                "--shard-index",
+                "0",
+                "--num-shards",
+                "1",
+            )
+            bound_run = RunSpec(**{**run.__dict__, "command": command})
+            runs.append((bound_run, batch_size, gpu_index))
+            request_runs.append(
+                {
+                    "arm_id": arm_id,
+                    "batch_size": batch_size,
+                    "gpu_index": gpu_index,
+                    "gpu_uuid": snapshots[gpu_index].uuid,
+                    "runtime_config": str(relative_config),
+                    "runtime_config_sha256": hashlib.sha256(content).hexdigest(),
+                    "output_dir": str(relative_output),
+                }
+            )
+            ordinal += 1
+    request = {
+        "schema_version": 1,
+        "contract_type": "safa_r9_generation_batch_benchmark_request_v1",
+        "campaign_id": str(campaign_runtime["campaign_id"]),
+        "campaign_runtime_sha256": _require_sha256(
+            campaign_runtime.get("campaign_runtime_sha256"),
+            "benchmark source runtime SHA256",
+        ),
+        "continuation_contract_sha256": continuation_sha,
+        "manifest": {
+            "path": str(manifest["path"]),
+            "sha256": str(manifest["sha256"]),
+            "sample_count": sample_count,
+        },
+        "seed": seed,
+        "runs": request_runs,
+        "gpu_snapshots": [
+            {
+                "index": row.index,
+                "uuid": row.uuid,
+                "total_bytes": row.total_bytes,
+                "free_bytes": row.free_bytes,
+            }
+            for row in snapshots
+        ],
+        "retry_count": 0,
+    }
+    request["benchmark_request_sha256"] = _canonical_json_sha256(request)
+    _write_exclusive_bytes(
+        request_path,
+        (
+            json.dumps(request, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            + "\n"
+        ).encode(),
+    )
+    sampler = _process_tree_rss_bytes if rss_sampler is None else rss_sampler
+    evidence: list[BatchRunEvidence] = []
+    for run, batch_size, gpu_index in runs:
+        snapshot = resource_probe.gpu_snapshot(
+            gpu_index, expected_uuid=snapshots[gpu_index].uuid
+        )
+        ram_before = resource_probe.ram_snapshot()
+        if ram_before.used_bytes * 100 >= ram_before.total_bytes * 85:
+            raise ResourceContractError(
+                "generation benchmark cannot launch at or above 85% RAM"
+            )
+        environment = dict(os.environ)
+        environment["CUDA_VISIBLE_DEVICES"] = snapshot.uuid
+        log_path = output_root / "controller_logs" / f"{run.logical_run_id}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        peak_rss = 0
+        with log_path.open("xb") as log:
+            process = process_factory(
+                run.command,
+                cwd=REPO_ROOT,
+                env=environment,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+            while process.poll() is None:
+                rss_bytes, reaped = _sample_or_reap_process_tree(process, sampler)
+                if reaped is not None:
+                    break
+                if rss_bytes is None:
+                    raise AssertionError("benchmark RSS sample is missing")
+                peak_rss = max(peak_rss, rss_bytes)
+                ram = resource_probe.ram_snapshot()
+                if ram.used_bytes * 100 >= ram.total_bytes * 90:
+                    _terminate_process(process)
+                    raise ResourceContractError(
+                        "generation benchmark crossed the 90% RAM hard limit"
+                    )
+                sleep(poll_interval_seconds)
+            returncode = process.wait() if process.returncode is None else process.returncode
+        if returncode != 0:
+            raise ResourceContractError(
+                f"generation benchmark worker failed once with exit code {returncode}"
+            )
+        if peak_rss <= 0:
+            raise ResourceContractError("generation benchmark measured no positive RSS")
+        validate_worker_completion(run)
+        evidence.append(
+            BatchRunEvidence(
+                arm_id=run.arm_ref,
+                batch_size=batch_size,
+                output_dir=run.output_dir,
+                gpu_uuid=snapshot.uuid,
+                free_vram_before_bytes=snapshot.free_bytes,
+                peak_process_tree_rss_bytes=peak_rss,
+            )
+        )
+    contract = build_generation_batch_benchmark_contract(
+        repo_root=REPO_ROOT,
+        campaign_id=str(campaign_runtime["campaign_id"]),
+        manifest_path=Path(str(manifest["path"])),
+        manifest_sha256=str(manifest["sha256"]),
+        sample_count=sample_count,
+        seed=seed,
+        continuation_contract_sha256=continuation_sha,
+        request_sha256=request["benchmark_request_sha256"],
+        required_arm_ids=arms,
+        gpu_snapshots=[
+            BenchmarkGpuSnapshot(
+                index=row.index,
+                uuid=row.uuid,
+                total_bytes=row.total_bytes,
+                free_bytes=row.free_bytes,
+            )
+            for row in snapshots
+        ],
+        evidence=evidence,
+    )
+    materialize_generation_batch_benchmark_contract(contract_path, contract)
+    return contract
+
+
 def _sample_or_reap_process_tree(
     process: Any, sampler: Any
 ) -> tuple[int | None, int | None]:
@@ -2529,9 +2967,10 @@ def execute_campaign(
 ) -> int:
     """Refill all admitted GPU slots and fail the campaign on any peer error."""
     bindings = _validate_gpu_bindings(gpu_bindings)
-    pending: list[tuple[RunSpec, int]] = []
+    pending: list[tuple[RunSpec, int, int]] = []
     for plan in plans:
-        for run_index, run in enumerate(plan.runs):
+        for run_index, scheduled in enumerate(_generation_launch_schedule(plan)):
+            run = scheduled["run"]
             runtime_config = REPO_ROOT / run.runtime_config
             if not runtime_config.is_file():
                 raise FileNotFoundError(
@@ -2541,14 +2980,19 @@ def execute_campaign(
             if completion.is_file():
                 validate_worker_completion(run)
                 continue
-            pending.append((run, _stable_launch_ordinal(run.phase, run_index)))
+            pending.append(
+                (
+                    run,
+                    _stable_launch_ordinal(run.phase, run_index),
+                    int(scheduled["preferred_gpu_index"]),
+                )
+            )
     active: dict[str, ActiveWorker] = {}
-    next_gpu_index = min(bindings)
     while pending or active:
         launched = False
         pending_index = 0
         while pending_index < len(pending):
-            run, launch_ordinal = pending[pending_index]
+            run, launch_ordinal, preferred_gpu_index = pending[pending_index]
             worker_id = f"{run.phase}:{run.logical_run_id}:shard-{run.shard_index}"
             lease = _admit_worker(
                 scheduler,
@@ -2556,12 +3000,11 @@ def execute_campaign(
                 launch_ordinal=launch_ordinal,
                 gpu_bindings=bindings,
                 ram_slot_budget_bytes=scheduler.ram_slot_budget_bytes,
-                start_gpu_index=next_gpu_index,
+                start_gpu_index=preferred_gpu_index,
             )
             if lease is None:
                 pending_index += 1
                 continue
-            next_gpu_index = _next_gpu_index(bindings, lease.gpu_uuid)
             try:
                 peer_status_store.record_admitted(worker_id)
             except (OSError, ResourceContractError, ValueError):
@@ -2673,6 +3116,51 @@ def _stable_launch_ordinal(phase: str, run_index: int) -> int:
     if phase not in bases or run_index < 0 or run_index >= 1_000:
         raise ValueError("R9 stable launch ordinal input is invalid")
     return bases[phase] + run_index
+
+
+def _generation_launch_schedule(plan: PhasePlan) -> tuple[dict[str, Any], ...]:
+    """Pre-register a deterministic shard-major Latin rotation over four GPUs."""
+    by_logical: dict[str, dict[int, RunSpec]] = {}
+    logical_order: list[str] = []
+    for run in plan.runs:
+        if run.logical_run_id not in by_logical:
+            by_logical[run.logical_run_id] = {}
+            logical_order.append(run.logical_run_id)
+        shards = by_logical[run.logical_run_id]
+        if run.shard_index in shards:
+            raise ValueError("launch schedule repeats a logical shard")
+        shards[run.shard_index] = run
+    if len(logical_order) != plan.logical_run_count:
+        raise ValueError("launch schedule logical-run count mismatch")
+    schedule = []
+    logical_count = len(logical_order)
+    shard_counts = {run.num_shards for run in plan.runs}
+    if len(shard_counts) != 1:
+        raise ValueError("launch schedule requires one shard count per phase")
+    shard_count = next(iter(shard_counts))
+    for logical_index, logical_run_id in enumerate(logical_order):
+        if set(by_logical[logical_run_id]) != set(range(shard_count)):
+            raise ValueError("launch schedule logical run has incomplete shards")
+    launch_index = 0
+    for shard_index in range(shard_count):
+        for offset in range(logical_count):
+            logical_index = (shard_index + offset) % logical_count
+            logical_run_id = logical_order[logical_index]
+            run = by_logical[logical_run_id][shard_index]
+            schedule.append(
+                {
+                    "launch_index": launch_index,
+                    "logical_run_id": logical_run_id,
+                    "arm_ref": run.arm_ref,
+                    "shard_index": shard_index,
+                    "preferred_gpu_index": (shard_index + logical_index) % 4,
+                    "run": run,
+                }
+            )
+            launch_index += 1
+    if len(schedule) != len(plan.runs):
+        raise ValueError("launch schedule does not cover every shard")
+    return tuple(schedule)
 
 
 def _cleanup_active_workers(
@@ -2799,6 +3287,10 @@ def validate_worker_completion(run: RunSpec) -> dict[str, Any]:
         "schedule_contract_sha256",
         "r9_semigroup_gate_contract",
         "r9_semigroup_gate_contract_sha256",
+        "r9_generation_batch_benchmark_sha256",
+        "r9_generation_gpu_slot_claim_bytes",
+        "r9_generation_ram_slot_budget_bytes",
+        "r9_generation_slots_per_gpu",
     ):
         if field in config and result_config.get(field) != config[field]:
             raise ValueError(f"generation config field {field} mismatch")
@@ -2844,8 +3336,14 @@ def build_resource_scheduler(
     resources = _mapping(campaign_runtime.get("resources"), "resources")
     smoke = _mapping(resources.get("resource_smoke"), "resource_smoke")
     result = _mapping(smoke.get("result"), "resource_smoke result")
+    result_path = _repo_path(
+        REPO_ROOT, result.get("path"), "resource smoke result contract"
+    )
+    result_payload = validate_resource_smoke_contract(
+        _read_json_mapping(result_path, "resource smoke result contract")
+    )
     peak_rss_bytes = _positive_int(
-        result.get("peak_rss_bytes"), "resource smoke peak RSS bytes"
+        result_payload.get("peak_rss_bytes"), "resource smoke peak RSS bytes"
     )
     resource_contract_sha256 = _canonical_json_sha256(resources)
     resource_probe = SystemResourceProbe() if probe is None else probe
@@ -2875,6 +3373,18 @@ def build_resource_scheduler(
         probe=resource_probe,
         lock_backend=locks,
         peer_status_probe=status_store,
+        gpu_slot_claim_bytes=_positive_int(
+            resources.get("gpu_slot_claim_bytes"), "GPU slot claim bytes"
+        ),
+        gpu_headroom_bytes=_positive_int(
+            resources.get("gpu_headroom_bytes"), "GPU headroom bytes"
+        ),
+        max_gpu_slots=_positive_int(
+            resources.get("max_slots_per_gpu"), "max GPU slots"
+        ),
+        ram_slot_budget_bytes_override=_positive_int(
+            resources.get("ram_slot_budget_bytes"), "RAM slot budget bytes"
+        ),
     )
     return scheduler, gpu_bindings, status_store
 
@@ -3047,9 +3557,35 @@ def build_run_runtime_config(
     )
     continuation = _continuation_for_runtime(campaign_runtime)
     if continuation is not None:
-        config["r9_continuation_contract_sha256"] = continuation[
-            "continuation_contract_sha256"
-        ]
+        config["r9_continuation_contract_sha256"] = _continuation_digest(
+            continuation
+        )
+    batch_benchmark = campaign_runtime.get("generation_batch_benchmark")
+    if batch_benchmark is not None:
+        binding = _mapping(batch_benchmark, "generation batch benchmark binding")
+        resources = _mapping(campaign_runtime.get("resources"), "resources")
+        config.update(
+            {
+                "batch_size": _positive_int(
+                    resources.get("generation_batch_size"),
+                    "generation batch size",
+                ),
+                "r9_generation_batch_benchmark_sha256": _require_sha256(
+                    binding.get("contract_sha256"),
+                    "generation batch benchmark SHA256",
+                ),
+                "r9_generation_gpu_slot_claim_bytes": _positive_int(
+                    resources.get("gpu_slot_claim_bytes"), "GPU slot claim bytes"
+                ),
+                "r9_generation_ram_slot_budget_bytes": _positive_int(
+                    resources.get("ram_slot_budget_bytes"), "RAM slot budget bytes"
+                ),
+                "r9_generation_slots_per_gpu": _positive_int(
+                    resources.get("generation_slots_per_gpu"),
+                    "generation slots per GPU",
+                ),
+            }
+        )
     if formal_closure is not None:
         closure_binding = _mapping(formal_closure.get("closure"), "semigroup closure")
         config.update(
@@ -3148,6 +3684,9 @@ def materialize_phase_runtime_configs(
                 "continuation_contract_sha256": config.get(
                     "r9_continuation_contract_sha256"
                 ),
+                "generation_batch_benchmark_sha256": config.get(
+                    "r9_generation_batch_benchmark_sha256"
+                ),
             }
         )
     payload = {
@@ -3158,12 +3697,16 @@ def materialize_phase_runtime_configs(
         "campaign_runtime_sha256": campaign_runtime["campaign_runtime_sha256"],
         "manifest_contracts_sha256": manifest_contract["manifest_contracts_sha256"],
         "runs": records,
+        "launch_schedule": [
+            {key: value for key, value in row.items() if key != "run"}
+            for row in _generation_launch_schedule(plan)
+        ],
     }
     continuation = _continuation_for_runtime(campaign_runtime)
     if continuation is not None:
-        payload["continuation_contract_sha256"] = continuation[
-            "continuation_contract_sha256"
-        ]
+        payload["continuation_contract_sha256"] = _continuation_digest(
+            continuation
+        )
     payload["runtime_configs_sha256"] = _canonical_json_sha256(payload)
     contract_path = REPO_ROOT / plan.campaign_root / plan.phase / "runtime_configs.json"
     _write_immutable_bytes(

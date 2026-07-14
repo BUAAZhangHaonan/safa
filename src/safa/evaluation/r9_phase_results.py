@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import hashlib
 import json
@@ -326,12 +327,19 @@ def materialize_phase_results(
     quality_evaluator: QualityEvaluator | None = None,
     arcface_evaluator: ArcFaceEvaluator | None = None,
     heldout_evaluator: HeldoutEvaluator | None = None,
+    evaluator_parallelism: int = 1,
 ) -> PhaseClosureOutcome:
     """Aggregate completed generation into immutable evidence, then bound-exit."""
     state = resume_phase_results(request)
     if state.status != "needs_generation":
         return state
     validated = _validate_request(request)
+    if (
+        isinstance(evaluator_parallelism, bool)
+        or not isinstance(evaluator_parallelism, int)
+        or not 1 <= evaluator_parallelism <= 4
+    ):
+        raise PhaseResultsError("evaluator parallelism must be in [1,4]")
     runs = [_load_run_evidence(validated, spec) for spec in request.runs]
     automatic = _build_automatic_evidence(
         validated,
@@ -339,6 +347,7 @@ def materialize_phase_results(
         quality_evaluator=quality_evaluator,
         arcface_evaluator=arcface_evaluator,
         heldout_evaluator=heldout_evaluator,
+        evaluator_parallelism=evaluator_parallelism,
     )
     write_immutable_contract(
         request.phase_root / "automatic_evidence.json",
@@ -811,6 +820,7 @@ def _build_automatic_evidence(
     quality_evaluator: QualityEvaluator | None,
     arcface_evaluator: ArcFaceEvaluator | None,
     heldout_evaluator: HeldoutEvaluator | None,
+    evaluator_parallelism: int = 1,
 ) -> dict[str, Any]:
     request: PhaseResultsRequest = validated["request"]
     manifest_ids = list(validated["manifest_ids"])
@@ -827,6 +837,20 @@ def _build_automatic_evidence(
     for candidate in candidates:
         key = (int(candidate["seed"]), candidate["repeat_index"])
         _validate_matched_native(candidate, native_by_key[key])
+    precomputed: dict[tuple[str, str, str], Any] = {}
+    if request.phase != "diagnose" and evaluator_parallelism > 1:
+        if quality_evaluator is None or arcface_evaluator is None:
+            raise PhaseResultsError(
+                f"{request.phase} requires explicit quality and ArcFace evaluators"
+            )
+        precomputed = _parallel_phase_evaluations(
+            request=request,
+            candidates=candidates,
+            native_by_key=native_by_key,
+            quality_evaluator=quality_evaluator,
+            arcface_evaluator=arcface_evaluator,
+            max_workers=evaluator_parallelism,
+        )
     visual_units = []
     automatic_arms = []
     grouped: dict[str, list[Mapping[str, Any]]] = {}
@@ -897,19 +921,15 @@ def _build_automatic_evidence(
                 native = native_by_key[(int(run["seed"]), run["repeat_index"])]
                 candidate_samples = _sample_evidence(run)
                 native_samples = _sample_evidence(native)
-                candidate_quality = _evaluate_quality(
-                    request,
-                    run,
-                    candidate_samples,
-                    "candidate",
-                    quality_evaluator,
+                candidate_quality = precomputed.get(
+                    ("quality", str(run["logical_run_id"]), "candidate")
+                ) or _evaluate_quality(
+                    request, run, candidate_samples, "candidate", quality_evaluator
                 )
-                native_quality = _evaluate_quality(
-                    request,
-                    native,
-                    native_samples,
-                    "native",
-                    quality_evaluator,
+                native_quality = precomputed.get(
+                    ("quality", str(native["logical_run_id"]), "native")
+                ) or _evaluate_quality(
+                    request, native, native_samples, "native", quality_evaluator
                 )
                 paired_metric_rows.extend(
                     _paired_metric_rows(
@@ -919,7 +939,9 @@ def _build_automatic_evidence(
                         manifest_ids=manifest_ids,
                     )
                 )
-                arcface = _evaluate_arcface(
+                arcface = precomputed.get(
+                    ("arcface", str(run["logical_run_id"]), "candidate")
+                ) or _evaluate_arcface(
                     request, run, candidate_samples, arcface_evaluator
                 )
                 exact_one = bool(arcface["exact_one"])
@@ -1117,6 +1139,59 @@ def _sample_evidence(run: Mapping[str, Any]) -> tuple[SampleEvidence, ...]:
         )
         for row in run["rows"]
     )
+
+
+def _parallel_phase_evaluations(
+    *,
+    request: PhaseResultsRequest,
+    candidates: Sequence[Mapping[str, Any]],
+    native_by_key: Mapping[tuple[int, int | None], Mapping[str, Any]],
+    quality_evaluator: QualityEvaluator,
+    arcface_evaluator: ArcFaceEvaluator,
+    max_workers: int,
+) -> dict[tuple[str, str, str], Any]:
+    tasks: dict[tuple[str, str, str], tuple[Callable[..., Any], tuple[Any, ...]]] = {}
+    for run in sorted(candidates, key=lambda row: str(row["logical_run_id"])):
+        native = native_by_key[(int(run["seed"]), run["repeat_index"])]
+        candidate_samples = _sample_evidence(run)
+        native_samples = _sample_evidence(native)
+        candidate_key = ("quality", str(run["logical_run_id"]), "candidate")
+        native_key = ("quality", str(native["logical_run_id"]), "native")
+        arcface_key = ("arcface", str(run["logical_run_id"]), "candidate")
+        tasks.setdefault(
+            candidate_key,
+            (
+                _evaluate_quality,
+                (request, run, candidate_samples, "candidate", quality_evaluator),
+            ),
+        )
+        tasks.setdefault(
+            native_key,
+            (
+                _evaluate_quality,
+                (request, native, native_samples, "native", quality_evaluator),
+            ),
+        )
+        tasks.setdefault(
+            arcface_key,
+            (
+                _evaluate_arcface,
+                (request, run, candidate_samples, arcface_evaluator),
+            ),
+        )
+    futures: dict[tuple[str, str, str], Future[Any]] = {}
+    with ThreadPoolExecutor(
+        max_workers=min(max_workers, len(tasks)),
+        thread_name_prefix="safa-r9-evaluator",
+    ) as executor:
+        for key, (function, arguments) in tasks.items():
+            futures[key] = executor.submit(function, *arguments)
+        try:
+            return {key: futures[key].result() for key in tasks}
+        except BaseException:
+            for future in futures.values():
+                future.cancel()
+            raise
 
 
 def _evaluate_quality(
