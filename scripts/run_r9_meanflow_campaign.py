@@ -101,9 +101,9 @@ RUNTIME_CONFIG = Path("configs/medium_v2/experiments/r9_meanflow_campaign.yaml")
 CONTINUATION_RUNTIME_CONFIG = Path(R9_CONTINUATION_REQUEST_PATH)
 CONTINUATION_CHILD_CAMPAIGN_ID = "r9-report-only-formal-v6"
 CONFIRM_CONTINUATION_RUNTIME_CONFIG = Path(
-    "configs/medium_v2/experiments/r9_meanflow_confirm_continuation_campaign.yaml"
+    "configs/medium_v2/experiments/r9_meanflow_confirm_continuation_campaign_v8.yaml"
 )
-CONFIRM_CONTINUATION_CHILD_CAMPAIGN_ID = "r9-report-only-formal-v7"
+CONFIRM_CONTINUATION_CHILD_CAMPAIGN_ID = "r9-report-only-formal-v8"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PHASES = ("preflight", "diagnose", "calibrate", "confirm512", "full")
 CAMPAIGN_ID_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
@@ -339,7 +339,7 @@ def load_confirm_continuation_request(
     if selection != {
         "path": (
             "artifacts/r9_meanflow_flow_map_guidance/campaigns/"
-            "r9-report-only-formal-v7/calibration_report_only_selection.json"
+            "r9-report-only-formal-v8/calibration_report_only_selection.json"
         ),
         "materialization": "build_from_frozen_source_o_excl",
     }:
@@ -379,11 +379,11 @@ def load_confirm_continuation_request(
     if batch_benchmark != {
         "contract_path": (
             "artifacts/r9_meanflow_flow_map_guidance/campaigns/"
-            "r9-report-only-formal-v7/generation_batch_benchmark.json"
+            "r9-report-only-formal-v8/generation_batch_benchmark.json"
         ),
         "output_root": (
             "artifacts/r9_meanflow_flow_map_guidance/campaigns/"
-            "r9-report-only-formal-v7/generation_batch_benchmark"
+            "r9-report-only-formal-v8/generation_batch_benchmark"
         ),
         "manifest": "calibration_64",
         "sample_count": 8,
@@ -3819,55 +3819,142 @@ def _write_exclusive_bytes(path: Path, content: bytes) -> None:
         os.close(descriptor)
 
 
-def _process_tree_rss_bytes(root_pid: int, *, proc_root: Path = Path("/proc")) -> int:
+def _read_proc_stat_identity(
+    pid: int, *, proc_root: Path
+) -> tuple[int, int, str] | None:
+    stat_path = proc_root / str(pid) / "stat"
+    try:
+        raw = stat_path.read_bytes().strip()
+    except FileNotFoundError:
+        return None
+    left = raw.find(b"(")
+    right = raw.rfind(b")")
+    if left < 0 or right <= left:
+        raise ResourceContractError(f"process {pid} stat format is invalid")
+    declared_pid = raw[:left].strip()
+    fields = raw[right + 1 :].split()
+    valid_states = b"RSDZTWtXxKWPIN"
+    if (
+        len(fields) < 20
+        or len(fields[0]) != 1
+        or fields[0][0] not in valid_states
+    ):
+        raise ResourceContractError(f"process {pid} stat format is invalid")
+    if not declared_pid.isdigit() or not fields[19].isdigit():
+        raise ResourceContractError(f"process {pid} stat numeric field is invalid")
+    parsed_pid = int(declared_pid)
+    starttime = int(fields[19])
+    if parsed_pid != pid or starttime < 0:
+        raise ResourceContractError(f"process {pid} stat identity is invalid")
+    return parsed_pid, starttime, fields[0].decode("ascii")
+
+
+def _sample_proc_rss_and_children(
+    pid: int,
+    *,
+    expected_starttime: int | None,
+    proc_root: Path,
+    page_size_bytes: int,
+) -> tuple[int, int, tuple[tuple[int, int], ...]] | None:
+    first = _read_proc_stat_identity(pid, proc_root=proc_root)
+    if first is None:
+        return None
+    if expected_starttime is not None and first[1] != expected_starttime:
+        return None
+    if first[2] == "Z":
+        return 0, first[1], ()
+    statm_path = proc_root / str(pid) / "statm"
+    statm_raw: bytes | None
+    statm_error: OSError | None = None
+    try:
+        statm_raw = statm_path.read_bytes()
+    except OSError as error:
+        statm_raw = None
+        statm_error = error
+    child_identities: set[tuple[int, int]] = set()
+    children_error: Exception | None = None
+    task_root = proc_root / str(pid) / "task"
+    try:
+        task_dirs = tuple(
+            path for path in task_root.iterdir() if path.name.isdecimal()
+        )
+    except OSError as error:
+        task_dirs = ()
+        children_error = error
+    for task_dir in task_dirs:
+        try:
+            children_raw = (task_dir / "children").read_bytes()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            children_error = error
+            continue
+        for token in children_raw.split():
+            if not token.isdigit() or int(token) <= 0:
+                children_error = ResourceContractError(
+                    f"live process {pid} children format is invalid"
+                )
+                continue
+            child_pid = int(token)
+            try:
+                child = _read_proc_stat_identity(child_pid, proc_root=proc_root)
+            except ResourceContractError as error:
+                children_error = error
+                continue
+            if child is not None:
+                child_identities.add((child_pid, child[1]))
+    second = _read_proc_stat_identity(pid, proc_root=proc_root)
+    if second is None or second[:2] != first[:2]:
+        return None
+    if second[2] == "Z":
+        return 0, first[1], ()
+    if statm_raw is None:
+        detail = "vanished" if isinstance(statm_error, FileNotFoundError) else "unreadable"
+        raise ResourceContractError(f"live process {pid} statm {detail}")
+    statm_fields = statm_raw.split()
+    if len(statm_fields) < 2 or not statm_fields[1].isdigit():
+        raise ResourceContractError(f"live process {pid} statm format is invalid")
+    if children_error is not None:
+        raise ResourceContractError(
+            f"live process {pid} children snapshot is invalid"
+        ) from children_error
+    resident_pages = int(statm_fields[1])
+    return resident_pages * page_size_bytes, first[1], tuple(sorted(child_identities))
+
+
+def _process_tree_rss_bytes(
+    root_pid: int,
+    *,
+    proc_root: Path = Path("/proc"),
+) -> int:
     if isinstance(root_pid, bool) or not isinstance(root_pid, int) or root_pid <= 0:
         raise ValueError("process-tree root PID must be a positive integer")
-    pending = [root_pid]
-    seen: set[int] = set()
-    total_kib = 0
+    page_size = int(os.sysconf("SC_PAGE_SIZE"))
+    if page_size <= 0:
+        raise ValueError("page size must be positive")
+    pending: list[tuple[int, int | None]] = [(root_pid, None)]
+    seen: set[tuple[int, int]] = set()
+    total_bytes = 0
     while pending:
-        pid = pending.pop()
-        if pid in seen:
-            continue
-        seen.add(pid)
-        status_path = proc_root / str(pid) / "status"
-        children_path = proc_root / str(pid) / "task" / str(pid) / "children"
-        try:
-            lines = status_path.read_text(encoding="utf-8").splitlines()
-        except FileNotFoundError:
+        pid, expected_starttime = pending.pop()
+        sampled = _sample_proc_rss_and_children(
+            pid,
+            expected_starttime=expected_starttime,
+            proc_root=proc_root,
+            page_size_bytes=page_size,
+        )
+        if sampled is None:
             if pid == root_pid:
                 raise _ProcessTreeRootExitObserved(root_pid, "vanished") from None
             continue
-        rss_lines = [line for line in lines if line.startswith("VmRSS:")]
-        if len(rss_lines) != 1:
-            if pid == root_pid:
-                state_lines = [line for line in lines if line.startswith("State:")]
-                if len(state_lines) != 1:
-                    raise ResourceContractError(
-                        f"process {pid} has no unique process state"
-                    )
-                state_fields = state_lines[0].split()
-                if len(state_fields) < 2:
-                    raise ResourceContractError(
-                        f"process {pid} process state format is invalid"
-                    )
-                state = state_fields[1]
-                if state == "Z":
-                    raise _ProcessTreeRootExitObserved(root_pid, "zombie")
-                raise ResourceContractError(
-                    f"process {pid} has no unique VmRSS while in live state {state}"
-                )
-            raise ResourceContractError(f"process {pid} has no unique VmRSS")
-        fields = rss_lines[0].split()
-        if len(fields) != 3 or fields[2] != "kB":
-            raise ResourceContractError(f"process {pid} VmRSS format is invalid")
-        total_kib += int(fields[1])
-        try:
-            children = children_path.read_text(encoding="utf-8").split()
-        except FileNotFoundError:
-            children = []
-        pending.extend(int(value) for value in children)
-    return total_kib * 1024
+        rss_bytes, starttime, children = sampled
+        identity = (pid, starttime)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        total_bytes += rss_bytes
+        pending.extend(children)
+    return total_bytes
 
 
 def _logical_runs(

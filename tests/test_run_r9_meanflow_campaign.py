@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 import importlib.util
 import json
 import os
@@ -105,11 +106,11 @@ def test_confirm_request_locks_generation_batch_benchmark() -> None:
     assert payload["generation_batch_benchmark"] == {
         "contract_path": (
             "artifacts/r9_meanflow_flow_map_guidance/campaigns/"
-            "r9-report-only-formal-v7/generation_batch_benchmark.json"
+            "r9-report-only-formal-v8/generation_batch_benchmark.json"
         ),
         "output_root": (
             "artifacts/r9_meanflow_flow_map_guidance/campaigns/"
-            "r9-report-only-formal-v7/generation_batch_benchmark"
+            "r9-report-only-formal-v8/generation_batch_benchmark"
         ),
         "manifest": "calibration_64",
         "sample_count": 8,
@@ -122,6 +123,19 @@ def test_confirm_request_locks_generation_batch_benchmark() -> None:
         "batch_sizes": [2, 4],
         "record_final_latent_sha256": True,
     }
+
+
+def test_failed_v7_request_is_preserved_unchanged() -> None:
+    path = ROOT / (
+        "configs/medium_v2/experiments/"
+        "r9_meanflow_confirm_continuation_campaign.yaml"
+    )
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == (
+        "70ca0bdb38a7b180fd9be57e9253f44ab5374d39edfb33c8213befa2929fee21"
+    )
+    assert driver.CONFIRM_CONTINUATION_RUNTIME_CONFIG.name == (
+        "r9_meanflow_confirm_continuation_campaign_v8.yaml"
+    )
 
 
 def test_confirm_execute_barrier_requires_materialized_batch_benchmark() -> None:
@@ -1622,7 +1636,7 @@ def test_resource_smoke_measures_rss_and_exclusively_writes_contract(
             process.wait()
     assert contract["peak_rss_bytes"] > 0
     assert rss_samples == 2
-    assert observed_exit_reasons == ["zombie"]
+    assert observed_exit_reasons == []
     assert process is not None and process.returncode == 0
     result_path = tmp_path / declaration["output_path"]
     assert json.loads(result_path.read_text(encoding="utf-8")) == contract
@@ -1639,36 +1653,156 @@ def test_process_tree_rss_classifies_reaped_root_as_vanished() -> None:
     assert observed.value.reason == "vanished"
 
 
-def test_process_tree_rss_live_root_without_vmrss_is_hard_failure(
+def _proc_stat(
+    pid: int,
+    *,
+    state: str = "S",
+    starttime: int = 41,
+    comm: bytes = b"test",
+) -> bytes:
+    suffix = [state.encode("ascii"), *([b"0"] * 18), str(starttime).encode("ascii")]
+    return str(pid).encode("ascii") + b" (" + comm + b") " + b" ".join(suffix) + b"\n"
+
+
+def _write_proc_node(
+    proc_root: Path,
+    pid: int,
+    *,
+    state: str = "S",
+    starttime: int = 41,
+    resident_pages: int = 7,
+    children: str = "",
+    comm: bytes = b"test",
+) -> None:
+    root = proc_root / str(pid)
+    task = root / "task" / str(pid)
+    task.mkdir(parents=True)
+    (root / "stat").write_bytes(
+        _proc_stat(pid, state=state, starttime=starttime, comm=comm)
+    )
+    (root / "statm").write_text(
+        f"10 {resident_pages} 0 0 0 0 0\n", encoding="ascii"
+    )
+    (task / "children").write_text(children, encoding="ascii")
+
+
+def test_process_tree_rss_exec_transition_uses_zero_statm_resident(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root_pid = 123
+    proc_root = tmp_path / "proc"
+    _write_proc_node(
+        proc_root,
+        root_pid,
+        state="R",
+        resident_pages=0,
+        comm=b"exec ) transition \xff",
+    )
+    monkeypatch.setattr(driver.os, "sysconf", lambda name: 16384)
+    assert driver._process_tree_rss_bytes(root_pid, proc_root=proc_root) == 0
+
+
+@pytest.mark.parametrize("page_size", [4096, 16384])
+def test_process_tree_rss_multiplies_statm_resident_by_system_page_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    page_size: int,
+) -> None:
+    root_pid = 123
+    proc_root = tmp_path / "proc"
+    _write_proc_node(proc_root, root_pid, resident_pages=7)
+    monkeypatch.setattr(driver.os, "sysconf", lambda name: page_size)
+    assert driver._process_tree_rss_bytes(root_pid, proc_root=proc_root) == 7 * page_size
+
+
+def test_process_tree_rss_exit_between_identity_reads_is_excluded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root_pid = 123
+    proc_root = tmp_path / "proc"
+    _write_proc_node(proc_root, root_pid)
+    stat_path = proc_root / str(root_pid) / "stat"
+    original = Path.read_bytes
+    reads = 0
+
+    def vanish_on_second_read(path: Path) -> bytes:
+        nonlocal reads
+        if path == stat_path:
+            reads += 1
+            if reads == 2:
+                raise FileNotFoundError(path)
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", vanish_on_second_read)
+    with pytest.raises(driver._ProcessTreeRootExitObserved, match="vanished"):
+        driver._process_tree_rss_bytes(root_pid, proc_root=proc_root)
+
+
+def test_process_tree_rss_pid_reuse_between_identity_reads_is_excluded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root_pid = 123
+    proc_root = tmp_path / "proc"
+    _write_proc_node(proc_root, root_pid, starttime=41)
+    stat_path = proc_root / str(root_pid) / "stat"
+    original = Path.read_bytes
+    reads = 0
+
+    def reuse_on_second_read(path: Path) -> bytes:
+        nonlocal reads
+        if path == stat_path:
+            reads += 1
+            if reads == 2:
+                return _proc_stat(root_pid, starttime=42)
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", reuse_on_second_read)
+    with pytest.raises(driver._ProcessTreeRootExitObserved, match="vanished"):
+        driver._process_tree_rss_bytes(root_pid, proc_root=proc_root)
+
+
+def test_process_tree_rss_zombie_is_zero_without_statm(tmp_path: Path) -> None:
+    root_pid = 123
+    proc_root = tmp_path / "proc"
+    root = proc_root / str(root_pid)
+    root.mkdir(parents=True)
+    (root / "stat").write_bytes(_proc_stat(root_pid, state="Z"))
+    assert driver._process_tree_rss_bytes(root_pid, proc_root=proc_root) == 0
+
+
+def test_process_tree_rss_stable_live_malformed_statm_is_hard_failure(
     tmp_path: Path,
 ) -> None:
     root_pid = 123
     proc_root = tmp_path / "proc"
-    status = proc_root / str(root_pid) / "status"
-    status.parent.mkdir(parents=True)
-    status.write_text("Name:\ttest\nState:\tS (sleeping)\n", encoding="utf-8")
-
+    _write_proc_node(proc_root, root_pid)
+    (proc_root / str(root_pid) / "statm").write_bytes(b"10 not-a-number\n")
     with pytest.raises(
         driver.ResourceContractError,
-        match=r"process 123 has no unique VmRSS while in live state S",
+        match=r"live process 123 statm format is invalid",
     ):
         driver._process_tree_rss_bytes(root_pid, proc_root=proc_root)
 
 
 def test_process_tree_rss_ignores_descendant_that_vanishes_during_scan(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root_pid = 123
     proc_root = tmp_path / "proc"
-    root = proc_root / str(root_pid)
-    (root / "task" / str(root_pid)).mkdir(parents=True)
-    (root / "status").write_text(
-        "Name:\ttest\nState:\tS (sleeping)\nVmRSS:\t17 kB\n",
-        encoding="utf-8",
+    _write_proc_node(
+        proc_root,
+        root_pid,
+        resident_pages=17,
+        children="456\n",
     )
-    (root / "task" / str(root_pid) / "children").write_text("456\n", encoding="utf-8")
-
-    assert driver._process_tree_rss_bytes(root_pid, proc_root=proc_root) == 17 * 1024
+    monkeypatch.setattr(driver.os, "sysconf", lambda name: 16384)
+    assert (
+        driver._process_tree_rss_bytes(root_pid, proc_root=proc_root) == 17 * 16384
+    )
 
 
 def test_root_exit_wait_timeout_while_process_is_live_is_hard_failure(

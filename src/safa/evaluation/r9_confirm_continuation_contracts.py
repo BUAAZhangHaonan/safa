@@ -37,7 +37,7 @@ def build_confirm_continuation_contract(
 ) -> dict[str, Any]:
     root = Path(repo_root).resolve()
     if child_campaign_id != CHILD_CAMPAIGN_ID:
-        raise ConfirmContinuationContractError("confirm continuation child must be v7")
+        raise ConfirmContinuationContractError("confirm continuation child must be v8")
     locked_selection = validate_calibration_report_only_selection_contract(
         (
             build_calibration_report_only_selection_contract(repo_root=root)

@@ -14,7 +14,7 @@ from safa.evaluation.r9_campaign_contracts import (
 
 
 SOURCE_CAMPAIGN_ID = "r9-report-only-formal-v6"
-CHILD_CAMPAIGN_ID = "r9-report-only-formal-v7"
+CHILD_CAMPAIGN_ID = "r9-report-only-formal-v8"
 SOURCE_PHASE = "calibrate"
 SOURCE_ROOT = Path(
     "artifacts/r9_meanflow_flow_map_guidance/campaigns"
@@ -58,7 +58,7 @@ EXPECTED_BOOTSTRAP_SHA256 = {
 
 
 class CalibrationSelectionContractError(ValueError):
-    """Raised when frozen Phase-B evidence cannot support the v7 transition."""
+    """Raised when frozen Phase-B evidence cannot support the v8 transition."""
 
 
 def build_calibration_report_only_selection_contract(
@@ -66,7 +66,7 @@ def build_calibration_report_only_selection_contract(
 ) -> dict[str, Any]:
     root = Path(repo_root).resolve()
     if child_campaign_id != CHILD_CAMPAIGN_ID:
-        raise CalibrationSelectionContractError("selection child campaign must be v7")
+        raise CalibrationSelectionContractError("selection child campaign must be v8")
     phase_root = root / SOURCE_ROOT / SOURCE_PHASE
     runtime_path = root / SOURCE_ROOT / "campaign_runtime.json"
     gate_path = phase_root / "gate_contract.json"
