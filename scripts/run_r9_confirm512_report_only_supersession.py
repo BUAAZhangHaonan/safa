@@ -15,6 +15,7 @@ from safa.evaluation.r9_confirm512_report_only_supersession import (
     AWAITING_VISUAL_REVIEW_EXIT_CODE,
     Confirm512SupersessionError,
     Confirm512SupersessionRequest,
+    FAILED_V2_CONTRACT_SHA256,
     SOURCE_REPAIR_SHA256,
     build_report_only_supersession,
     finalize_report_only_selection,
@@ -30,6 +31,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--campaign-id", required=True)
     parser.add_argument("--source-repair-id", required=True)
     parser.add_argument("--source-repair-sha256", required=True)
+    parser.add_argument("--failed-v2-sha256", required=True)
     parser.add_argument("--supersession-id", required=True)
     parser.add_argument("--phase", choices=("prepare", "finalize"), required=True)
     parser.add_argument("--execute", action="store_true")
@@ -39,6 +41,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def _build(args: argparse.Namespace):
     if str(args.source_repair_sha256) != SOURCE_REPAIR_SHA256:
         raise Confirm512SupersessionError("source repair SHA256 is not formal v1")
+    if str(args.failed_v2_sha256) != FAILED_V2_CONTRACT_SHA256:
+        raise Confirm512SupersessionError("failed v2 SHA256 is not frozen")
     _, effective, plan, phase_request = source_runner._load_campaign(
         str(args.campaign_id)
     )
@@ -66,6 +70,12 @@ def _build(args: argparse.Namespace):
         raise Confirm512SupersessionError("reconstructed source namespace changed")
     return build_report_only_supersession(
         Confirm512SupersessionRequest(
+            failed_v2_namespace_root=(
+                campaign_root
+                / "confirm512_supersessions"
+                / "report-only-v2"
+                / str(args.failed_v2_sha256)
+            ),
             repo_root=REPO_ROOT,
             campaign_root=campaign_root,
             source_namespace_root=source_namespace,

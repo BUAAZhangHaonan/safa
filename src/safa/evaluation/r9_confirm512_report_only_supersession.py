@@ -33,7 +33,16 @@ UNIQUE_ARCFACE_MISS = (
     "val:Manually_Annotated_Images/344/"
     "f22b6a6870032b7296c7f03febb8c9f8fee7e8199a38b4933b523219.jpg"
 )
-CONTRACT_TYPE = "safa_r9_confirm512_report_only_supersession_v2"
+FAILED_V2_CONTRACT_SHA256 = (
+    "5fce8f37fc2fa465145b23d68f874e60446c05a7b575dc6f120c3757d85ff38b"
+)
+FAILED_V2_MODULE_SHA256 = (
+    "118ca1fef04d3632052e1fb187dbba7ab15255dd4526bbbdb9b41543f0c219cd"
+)
+FAILED_V2_LOG_SHA256 = (
+    "49b566da7265a82f34d8c1bbeaa3556036d4219a49da4b37e7a234f8b918f64d"
+)
+CONTRACT_TYPE = "safa_r9_confirm512_report_only_supersession_v3"
 AWAITING_VISUAL_REVIEW_EXIT_CODE = 20
 
 
@@ -46,6 +55,7 @@ class Confirm512SupersessionRequest:
     repo_root: Path
     campaign_root: Path
     source_namespace_root: Path
+    failed_v2_namespace_root: Path
     supersession_root: Path
     supersession_id: str
     campaign_id: str
@@ -106,6 +116,67 @@ def _bind_digest(
     }
 
 
+def _bind_failed_v2_prepare(namespace_root: Path) -> dict[str, Any]:
+    root = namespace_root.resolve()
+    expected_files = {"controller.prepare.log", "supersession_contract.json"}
+    observed = {
+        str(path.relative_to(root))
+        for path in root.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
+    if observed != expected_files:
+        raise Confirm512SupersessionError(
+            "failed v2 namespace inventory is not the exact two frozen files"
+        )
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            raise Confirm512SupersessionError("failed v2 namespace contains a symlink")
+    contract, contract_binding = _bind_digest(
+        root / "supersession_contract.json",
+        digest_field="supersession_contract_sha256",
+        contract_type="safa_r9_confirm512_report_only_supersession_v2",
+    )
+    if contract["supersession_contract_sha256"] != FAILED_V2_CONTRACT_SHA256:
+        raise Confirm512SupersessionError("failed v2 contract SHA256 changed")
+    log_path = root / "controller.prepare.log"
+    if _sha256_file(log_path) != FAILED_V2_LOG_SHA256:
+        raise Confirm512SupersessionError("failed v2 controller log SHA256 changed")
+    log_text = log_path.read_text(encoding="utf-8")
+    if (
+        "AttributeError: 'PreparedConfirm512Supersession' object has no attribute 'source'"
+        not in log_text
+    ):
+        raise Confirm512SupersessionError("failed v2 log lacks the registered error")
+    if contract.get("execution") != {
+        "generation_execution_count": 0,
+        "evaluator_execution_count": 0,
+        "visual_evidence_unit_count": 2,
+    }:
+        raise Confirm512SupersessionError("failed v2 zero-execution contract changed")
+    inventory_rows = [
+        {
+            "path": name,
+            "size_bytes": (root / name).stat().st_size,
+            "sha256": _sha256_file(root / name),
+        }
+        for name in sorted(expected_files)
+    ]
+    return {
+        "classification": "prepare_implementation_attribute_error",
+        "contract": contract_binding,
+        "failure_log": {
+            "path": str(log_path),
+            "file_sha256": FAILED_V2_LOG_SHA256,
+        },
+        "old_implementation_module_sha256": FAILED_V2_MODULE_SHA256,
+        "namespace_inventory": inventory_rows,
+        "namespace_inventory_sha256": _canonical_json_sha256({"files": inventory_rows}),
+        "generation_execution_count": 0,
+        "evaluator_execution_count": 0,
+        "visual_evidence_materialized": False,
+    }
+
+
 def _complete_case_privacy(
     rows: Sequence[Mapping[str, Any]], *, bootstrap_seed: int
 ) -> dict[str, Any]:
@@ -154,16 +225,16 @@ def _materialize_visual_evidence(
     prepared: PreparedConfirm512Supersession,
 ) -> tuple[dict[str, Any], ...]:
     phase_root = prepared.namespace_root / "confirm512"
-    request = replace(prepared.source.phase_request, phase_root=phase_root)
-    validated = dict(prepared.source.validated_phase_request)
+    request = replace(prepared.request.source.phase_request, phase_root=phase_root)
+    validated = dict(prepared.request.source.validated_phase_request)
     validated["request"] = request
     units = []
     for arm_id in EXPECTED_ARMS[1:]:
-        run = dict(prepared.source.canonical_runs[arm_id])
-        run["logical_run_id"] = f"report_only_v2__{arm_id}"
+        run = dict(prepared.request.source.canonical_runs[arm_id])
+        run["logical_run_id"] = f"report_only_v3__{arm_id}"
         units.append(_materialize_visual_unit(validated, run))
     if len(units) != 2:
-        raise Confirm512SupersessionError("v2 requires two complete visual units")
+        raise Confirm512SupersessionError("v3 requires two complete visual units")
     return tuple(units)
 
 
@@ -189,8 +260,8 @@ def materialize_visual_stage(
     )
     units = _materialize_visual_evidence(prepared)
     automatic = {
-        "schema_version": 2,
-        "contract_type": "safa_r9_confirm512_report_only_automatic_v2",
+        "schema_version": 3,
+        "contract_type": "safa_r9_confirm512_report_only_automatic_v3",
         "campaign_id": prepared.request.campaign_id,
         "supersession_contract_sha256": prepared.contract_sha256,
         "source_automatic_evidence_sha256": prepared.source_automatic[
@@ -206,13 +277,13 @@ def materialize_visual_stage(
         automatic, "automatic_evidence_sha256"
     )
     write_immutable_contract(
-        prepared.namespace_root / "confirm512" / "automatic_evidence_v2.json",
+        prepared.namespace_root / "confirm512" / "automatic_evidence_v3.json",
         automatic,
         digest_field="automatic_evidence_sha256",
     )
     awaiting = {
-        "schema_version": 2,
-        "contract_type": "safa_r9_confirm512_report_only_status_v2",
+        "schema_version": 3,
+        "contract_type": "safa_r9_confirm512_report_only_status_v3",
         "status": "awaiting_visual_review",
         "campaign_id": prepared.request.campaign_id,
         "supersession_contract_sha256": prepared.contract_sha256,
@@ -277,9 +348,11 @@ def build_report_only_supersession(
         raise Confirm512SupersessionError("source repair SHA256 is not frozen v1")
     campaign_root = request.campaign_root.resolve()
     source_root = request.source_namespace_root.resolve()
+    failed_v2_root = request.failed_v2_namespace_root.resolve()
     supersession_root = request.supersession_root.resolve()
     for path, label in (
         (source_root, "source namespace"),
+        (failed_v2_root, "failed v2 namespace"),
         (supersession_root, "supersession root"),
     ):
         try:
@@ -288,6 +361,12 @@ def build_report_only_supersession(
             raise Confirm512SupersessionError(
                 f"{label} escapes the campaign"
             ) from error
+    failed_v2_binding = _bind_failed_v2_prepare(failed_v2_root)
+    implementation_binding = {
+        "path": str(Path(__file__).resolve()),
+        "file_sha256": _sha256_file(Path(__file__).resolve()),
+        "supersedes_module_sha256": FAILED_V2_MODULE_SHA256,
+    }
     source_contract, source_contract_binding = _bind_digest(
         source_root / "repair_contract.json",
         digest_field="repair_contract_sha256",
@@ -354,7 +433,7 @@ def build_report_only_supersession(
             )
     if len(evaluator_results) != 5:
         raise Confirm512SupersessionError(
-            "v2 must bind exactly five v1 evaluator results"
+            "v3 must bind exactly five v1 evaluator results"
         )
     source_arms = {
         str(row["arm_id"]): row
@@ -407,7 +486,7 @@ def build_report_only_supersession(
             }
         )
     contract = {
-        "schema_version": 2,
+        "schema_version": 3,
         "contract_type": CONTRACT_TYPE,
         "campaign_id": request.campaign_id,
         "supersession_id": request.supersession_id,
@@ -418,7 +497,9 @@ def build_report_only_supersession(
             "source_gate": gate_binding,
             "source_repair_result": result_binding,
             "source_gate_verdict": gate["verdict"],
+            "failed_v2_prepare": failed_v2_binding,
         },
+        "implementation": implementation_binding,
         "evaluator_results": evaluator_bindings,
         "generation_inventory_sha256": inventory["inventory_sha256"],
         "generation_inventory_counts": {
@@ -477,9 +558,9 @@ def finalize_report_only_selection(
     """Lock one winner only after both immutable 512-sample reviews validate."""
     awaiting = materialize_visual_stage(prepared)
     automatic, _ = _bind_digest(
-        prepared.namespace_root / "confirm512" / "automatic_evidence_v2.json",
+        prepared.namespace_root / "confirm512" / "automatic_evidence_v3.json",
         digest_field="automatic_evidence_sha256",
-        contract_type="safa_r9_confirm512_report_only_automatic_v2",
+        contract_type="safa_r9_confirm512_report_only_automatic_v3",
     )
     review_rows = []
     missing = []
@@ -517,7 +598,7 @@ def finalize_report_only_selection(
             "awaiting_visual_review_sha256": awaiting["awaiting_visual_review_sha256"],
         }
     if len(review_rows) != 2:
-        raise Confirm512SupersessionError("v2 requires exactly two complete reviews")
+        raise Confirm512SupersessionError("v3 requires exactly two complete reviews")
     arm_by_id = {str(row["arm_id"]): row for row in prepared.arms}
     ranked = sorted(
         review_rows,
@@ -528,8 +609,8 @@ def finalize_report_only_selection(
     winner_review = ranked[0]
     winner = arm_by_id[str(winner_review["arm_id"])]
     gate = {
-        "schema_version": 2,
-        "contract_type": "safa_r9_confirm512_report_only_gate_v2",
+        "schema_version": 3,
+        "contract_type": "safa_r9_confirm512_report_only_gate_v3",
         "campaign_id": prepared.request.campaign_id,
         "supersession_contract_sha256": prepared.contract_sha256,
         "automatic_evidence_sha256": automatic["automatic_evidence_sha256"],
@@ -557,20 +638,20 @@ def finalize_report_only_selection(
     gate["gate_contract_sha256"] = _canonical_digest(gate, "gate_contract_sha256")
     phase_root = prepared.namespace_root / "confirm512"
     write_immutable_contract(
-        phase_root / "gate_contract_v2.json",
+        phase_root / "gate_contract_v3.json",
         gate,
         digest_field="gate_contract_sha256",
     )
     selection = {
-        "schema_version": 2,
-        "contract_type": "safa_r9_confirm512_report_only_selection_v2",
+        "schema_version": 3,
+        "contract_type": "safa_r9_confirm512_report_only_selection_v3",
         "campaign_id": prepared.request.campaign_id,
         "supersession_contract_sha256": prepared.contract_sha256,
         "source_repair_sha256": SOURCE_REPAIR_SHA256,
         "automatic_evidence_sha256": automatic["automatic_evidence_sha256"],
         "gate_contract_sha256": gate["gate_contract_sha256"],
         "generation_inventory_sha256": prepared.contract["generation_inventory_sha256"],
-        "manifest_sha256": prepared.source.phase_request.manifest_sha256,
+        "manifest_sha256": prepared.request.source.phase_request.manifest_sha256,
         "visual_reviews": review_rows,
         "winner": {
             "arm_id": winner["arm_id"],

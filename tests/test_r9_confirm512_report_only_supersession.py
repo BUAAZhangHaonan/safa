@@ -146,14 +146,14 @@ def test_finalize_stays_awaiting_until_both_reviews_exist(
     ]
     automatic = {
         "schema_version": 2,
-        "contract_type": "safa_r9_confirm512_report_only_automatic_v2",
+        "contract_type": "safa_r9_confirm512_report_only_automatic_v3",
         "visual_units": units,
     }
     automatic["automatic_evidence_sha256"] = v2._canonical_digest(
         automatic, "automatic_evidence_sha256"
     )
     write_immutable_contract(
-        namespace / "confirm512" / "automatic_evidence_v2.json",
+        namespace / "confirm512" / "automatic_evidence_v3.json",
         automatic,
         digest_field="automatic_evidence_sha256",
     )
@@ -201,8 +201,10 @@ def test_runner_dry_run_executes_no_materializer(
                 "canonical-native-v1",
                 "--source-repair-sha256",
                 v2.SOURCE_REPAIR_SHA256,
+                "--failed-v2-sha256",
+                v2.FAILED_V2_CONTRACT_SHA256,
                 "--supersession-id",
-                "report-only-v2",
+                "report-only-v3",
                 "--phase",
                 "prepare",
             ]
@@ -245,14 +247,14 @@ def test_finalize_locks_winner_only_after_both_complete_reviews(
         )
     automatic = {
         "schema_version": 2,
-        "contract_type": "safa_r9_confirm512_report_only_automatic_v2",
+        "contract_type": "safa_r9_confirm512_report_only_automatic_v3",
         "visual_units": units,
     }
     automatic["automatic_evidence_sha256"] = v2._canonical_digest(
         automatic, "automatic_evidence_sha256"
     )
     write_immutable_contract(
-        namespace / "confirm512" / "automatic_evidence_v2.json",
+        namespace / "confirm512" / "automatic_evidence_v3.json",
         automatic,
         digest_field="automatic_evidence_sha256",
     )
@@ -303,7 +305,12 @@ def test_finalize_locks_winner_only_after_both_complete_reviews(
     )
     prepared = SimpleNamespace(
         namespace_root=namespace,
-        request=SimpleNamespace(campaign_id="campaign"),
+        request=SimpleNamespace(
+            campaign_id="campaign",
+            source=SimpleNamespace(
+                phase_request=SimpleNamespace(manifest_sha256="8" * 64)
+            ),
+        ),
         contract_sha256="6" * 64,
         contract={
             "policy": {
@@ -323,7 +330,6 @@ def test_finalize_locks_winner_only_after_both_complete_reviews(
             },
             "generation_inventory_sha256": "7" * 64,
         },
-        source=SimpleNamespace(phase_request=SimpleNamespace(manifest_sha256="8" * 64)),
         arms=arms,
     )
     result = v2.finalize_report_only_selection(prepared)
@@ -333,3 +339,51 @@ def test_finalize_locks_winner_only_after_both_complete_reviews(
     selection = json.loads((namespace / "selection.json").read_text())
     assert selection["winner"]["arm_id"] == "paper_eta_0p125"
     assert selection["next_stage"] == "new_v9_full_continuation_required"
+
+
+def test_failed_v2_binding_rejects_log_and_namespace_tamper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "failed-v2"
+    root.mkdir()
+    contract = {
+        "schema_version": 2,
+        "contract_type": "safa_r9_confirm512_report_only_supersession_v2",
+        "execution": {
+            "generation_execution_count": 0,
+            "evaluator_execution_count": 0,
+            "visual_evidence_unit_count": 2,
+        },
+    }
+    contract["supersession_contract_sha256"] = v2._canonical_digest(
+        contract, "supersession_contract_sha256"
+    )
+    write_immutable_contract(
+        root / "supersession_contract.json",
+        contract,
+        digest_field="supersession_contract_sha256",
+    )
+    log = root / "controller.prepare.log"
+    log.write_text(
+        "AttributeError: 'PreparedConfirm512Supersession' object has no attribute 'source'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        v2, "FAILED_V2_CONTRACT_SHA256", contract["supersession_contract_sha256"]
+    )
+    monkeypatch.setattr(v2, "FAILED_V2_LOG_SHA256", v2._sha256_file(log))
+    binding = v2._bind_failed_v2_prepare(root)
+    assert binding["generation_execution_count"] == 0
+    assert binding["evaluator_execution_count"] == 0
+    assert binding["visual_evidence_materialized"] is False
+    log.write_text("tampered", encoding="utf-8")
+    with pytest.raises(v2.Confirm512SupersessionError, match="log SHA256"):
+        v2._bind_failed_v2_prepare(root)
+    log.write_text(
+        "AttributeError: 'PreparedConfirm512Supersession' object has no attribute 'source'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(v2, "FAILED_V2_LOG_SHA256", v2._sha256_file(log))
+    (root / "extra").write_text("x", encoding="utf-8")
+    with pytest.raises(v2.Confirm512SupersessionError, match="exact two"):
+        v2._bind_failed_v2_prepare(root)
