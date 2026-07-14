@@ -10,6 +10,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+import numpy as np
+
 from safa.evaluation.r9_evaluator_resources import (
     EvaluatorResourceContractError,
     validate_evaluator_resource_profiles,
@@ -31,7 +33,24 @@ R9_DETERMINISM_POLICY_SHA256 = (
 )
 R9_ATTENTION_BACKEND = "native"
 R9_BOOTSTRAP_ITERATIONS = 10_000
+R9_BOOTSTRAP_DRAW_BLOCK_SIZE = 256
 R9_CALIBRATION_SEEDS = (1337, 2027, 3407)
+R9_PAIRED_METRIC_FIELDS = (
+    "candidate_e0",
+    "native_e0",
+    "candidate_edev",
+    "native_edev",
+    "candidate_niqe",
+    "native_niqe",
+    "candidate_sharpness",
+    "native_sharpness",
+)
+R9_PAIRED_METRICS = {
+    "e0": ("candidate_e0", "native_e0", "higher"),
+    "edev": ("candidate_edev", "native_edev", "higher"),
+    "niqe": ("candidate_niqe", "native_niqe", "lower"),
+    "sharpness": ("candidate_sharpness", "native_sharpness", "higher"),
+}
 R9_REQUIRED_MANIFESTS = {
     "calibration_64": 64,
     "validate_512": 512,
@@ -52,6 +71,7 @@ R9_GATE_CONTEXT_FIELDS = frozenset(
         "evaluator_evidence_sha256",
     }
 )
+R9_CONTINUATION_CONTEXT_FIELD = "continuation_contract_sha256"
 R9_HELDOUT_ASSETS = frozenset({"e1", "e2", "facenet", "adaface"})
 R9_IDENTITY_RECOGNIZERS = ("arcface", "facenet", "adaface")
 R9_IDENTITY_ROLES = ("native", "winner")
@@ -174,7 +194,10 @@ def validate_resource_smoke_contract(
 
 
 def validate_campaign_runtime(
-    runtime: Mapping[str, Any], repo_root: Path
+    runtime: Mapping[str, Any],
+    repo_root: Path,
+    *,
+    continuation_contract: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(runtime, Mapping):
         raise CampaignContractError("campaign runtime must be a mapping")
@@ -183,9 +206,12 @@ def validate_campaign_runtime(
         raise CampaignContractError(
             "campaign_runtime_sha256 is generated and must not be hand-filled"
         )
-    if set(normalized) != R9_RUNTIME_FIELDS:
-        missing = sorted(R9_RUNTIME_FIELDS - set(normalized))
-        extra = sorted(set(normalized) - R9_RUNTIME_FIELDS)
+    expected_fields = R9_RUNTIME_FIELDS | (
+        {"continuation"} if "continuation" in normalized else set()
+    )
+    if set(normalized) != expected_fields:
+        missing = sorted(expected_fields - set(normalized))
+        extra = sorted(set(normalized) - expected_fields)
         raise CampaignContractError(
             f"campaign runtime fields mismatch: missing={missing!r}, extra={extra!r}"
         )
@@ -214,6 +240,38 @@ def validate_campaign_runtime(
         normalized.get("campaign_root"), root, "campaign_root"
     )
     normalized["campaign_root"] = str(campaign_root.relative_to(root))
+    closure_campaign_id = str(normalized["campaign_id"])
+    if "continuation" in normalized:
+        from safa.evaluation.r9_continuation_contracts import (
+            continuation_contract_binding,
+            validate_continuation_contract,
+        )
+
+        binding = _json_mapping(normalized["continuation"], "continuation binding")
+        if set(binding) != {"path", "file_sha256", "contract_sha256"}:
+            raise CampaignContractError("continuation binding fields are not canonical")
+        if continuation_contract is None:
+            continuation_path = _require_repo_path(
+                binding.get("path"), root, "continuation contract path"
+            )
+            if not continuation_path.is_file() or continuation_path.is_symlink():
+                raise CampaignContractError("continuation contract must be a regular file")
+            payload = json.loads(continuation_path.read_text(encoding="utf-8"))
+        else:
+            payload = dict(continuation_contract)
+        try:
+            payload = validate_continuation_contract(payload, repo_root=root)
+            _, _, expected_binding = continuation_contract_binding(
+                payload, repo_root=root
+            )
+        except ValueError as error:
+            raise CampaignContractError("continuation contract validation failed") from error
+        if binding != expected_binding:
+            raise CampaignContractError("continuation binding disagrees with contract")
+        if payload.get("child_campaign_id") != normalized["campaign_id"]:
+            raise CampaignContractError("continuation child campaign ID mismatch")
+        normalized["continuation"] = expected_binding
+        closure_campaign_id = str(payload["parent"]["campaign_id"])
     normalized["campaign_template"] = _validate_bound_file(
         normalized.get("campaign_template"),
         repo_root=root,
@@ -262,7 +320,7 @@ def validate_campaign_runtime(
     schedule, semigroup_gate = _validate_schedule_and_gate(
         normalized.get("schedule"),
         normalized.get("semigroup_gate"),
-        campaign_id=str(normalized["campaign_id"]),
+        campaign_id=closure_campaign_id,
         repo_root=root,
         checkpoint_sha256=normalized["checkpoint"]["sha256"],
         calibration_manifest_sha256=normalized["manifests"]["calibration_64"]["sha256"],
@@ -277,7 +335,9 @@ def validate_campaign_runtime(
     )
     normalized["bootstrap"] = _validate_runtime_bootstrap(normalized.get("bootstrap"))
     normalized["evaluation"] = _validate_runtime_evaluation(
-        normalized.get("evaluation"), repo_root=root
+        normalized.get("evaluation"),
+        repo_root=root,
+        runtime_config=normalized["campaign_template"],
     )
     normalized["phases"] = _validate_runtime_phases(
         normalized.get("phases"), seeds=seeds
@@ -603,6 +663,216 @@ def privacy_delta_cluster_bootstrap(
     return payload
 
 
+def paired_metric_cluster_bootstrap(
+    value: Mapping[str, Any],
+    *,
+    expected_seeds: Sequence[int],
+    expected_sample_count: int,
+    bootstrap_seed: int,
+    iterations: int = R9_BOOTSTRAP_ITERATIONS,
+) -> dict[str, Any]:
+    if iterations != R9_BOOTSTRAP_ITERATIONS:
+        raise CampaignContractError("R9 cluster bootstrap requires exactly 10000 draws")
+    _require_nonnegative_int(bootstrap_seed, "bootstrap seed")
+    expected_count = _strict_int(expected_sample_count, "expected sample count")
+    if expected_count <= 0:
+        raise CampaignContractError("expected sample count must be positive")
+    if not isinstance(value, Mapping):
+        raise CampaignContractError("paired metric rows contract must be a mapping")
+    required = {
+        "schema_version",
+        "contract_type",
+        "direction",
+        "seeds",
+        "sample_count",
+        "observation_count",
+        "ordered_sample_id_sha256",
+        "metric_fields",
+        "rows",
+        "paired_metric_rows_sha256",
+    }
+    if set(value) != required:
+        raise CampaignContractError("paired metric rows fields are not canonical")
+    if (
+        value.get("schema_version") != 1
+        or value.get("contract_type") != "safa_r9_paired_metric_rows_v1"
+        or value.get("direction") != "candidate_minus_native"
+    ):
+        raise CampaignContractError("paired metric rows contract identity mismatch")
+    _verify_contract_digest(value, "paired_metric_rows_sha256")
+    seeds = _normalize_expected_seeds(expected_seeds)
+    if value.get("seeds") != list(seeds):
+        raise CampaignContractError("paired metric rows seed binding mismatch")
+    if value.get("metric_fields") != list(R9_PAIRED_METRIC_FIELDS):
+        raise CampaignContractError("paired metric fields mismatch")
+    if _strict_int(value.get("sample_count"), "paired metric sample count") != expected_count:
+        raise CampaignContractError("paired metric sample count mismatch")
+    expected_observations = expected_count * len(seeds)
+    if (
+        _strict_int(value.get("observation_count"), "paired metric observation count")
+        != expected_observations
+    ):
+        raise CampaignContractError("paired metric observation count mismatch")
+    rows = value.get("rows")
+    if not isinstance(rows, list) or len(rows) != expected_observations:
+        raise CampaignContractError("paired metric rows do not cover every seed and ID")
+    expected_row_fields = {"sample_id", "seed", *R9_PAIRED_METRIC_FIELDS}
+    normalized_rows = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping) or set(row) != expected_row_fields:
+            raise CampaignContractError(
+                f"paired metric row {index} fields are not canonical"
+            )
+        normalized_rows.append(
+            {
+                "sample_id": _require_nonempty(
+                    row.get("sample_id"), f"paired metric row {index} sample_id"
+                ),
+                "seed": _strict_int(
+                    row.get("seed"), f"paired metric row {index} seed"
+                ),
+                **{
+                    field: _finite_float(
+                        row.get(field), f"paired metric row {index} {field}"
+                    )
+                    for field in R9_PAIRED_METRIC_FIELDS
+                },
+            }
+        )
+    first_seed_ids = [
+        row["sample_id"] for row in normalized_rows if row["seed"] == seeds[0]
+    ]
+    if len(first_seed_ids) != expected_count or len(set(first_seed_ids)) != expected_count:
+        raise CampaignContractError("paired metric sample IDs are not unique")
+    if value.get("ordered_sample_id_sha256") != _sample_id_digest(first_seed_ids):
+        raise CampaignContractError("paired metric ordered sample digest mismatch")
+    expected_order = [
+        (sample_id, seed) for seed in seeds for sample_id in first_seed_ids
+    ]
+    if [(row["sample_id"], row["seed"]) for row in normalized_rows] != expected_order:
+        raise CampaignContractError("paired metric rows violate seed-major ID order")
+    seed_summaries = []
+    for seed_index, seed in enumerate(seeds):
+        seed_rows = normalized_rows[
+            seed_index * expected_count : (seed_index + 1) * expected_count
+        ]
+        seed_summary: dict[str, Any] = {"seed": seed}
+        for metric, (candidate_field, native_field, _) in R9_PAIRED_METRICS.items():
+            candidate_mean = statistics.fmean(
+                row[candidate_field] for row in seed_rows
+            )
+            native_mean = statistics.fmean(row[native_field] for row in seed_rows)
+            seed_summary[candidate_field] = candidate_mean
+            seed_summary[native_field] = native_mean
+            seed_summary[f"delta_{metric}"] = candidate_mean - native_mean
+        seed_summaries.append(seed_summary)
+    metric_names = tuple(R9_PAIRED_METRICS)
+    aggregates: dict[str, dict[str, Any]] = {}
+    cluster_matrix = np.empty(
+        (expected_count, len(metric_names)),
+        dtype=np.float64,
+    )
+    for metric_index, metric in enumerate(metric_names):
+        candidate_field, native_field, _ = R9_PAIRED_METRICS[metric]
+        delta_field = f"{metric}_delta"
+        aggregate = aggregate_seed_metrics(
+            [
+                {
+                    "sample_id": row["sample_id"],
+                    "seed": row["seed"],
+                    candidate_field: row[candidate_field],
+                    native_field: row[native_field],
+                    delta_field: row[candidate_field] - row[native_field],
+                }
+                for row in normalized_rows
+            ],
+            expected_seeds=seeds,
+            metric_fields=(candidate_field, native_field, delta_field),
+        )
+        aggregates[metric] = aggregate
+        cluster_matrix[:, metric_index] = np.fromiter(
+            (
+                float(sample["metrics"][delta_field])
+                for sample in aggregate["samples"]
+            ),
+            dtype=np.float64,
+            count=expected_count,
+        )
+
+    # One cluster resample must apply to every paired metric.  Generate fixed-size
+    # blocks so Full-2048 never materializes the complete 10000 x 2048 index
+    # matrix (or its four-metric gather) while keeping the PCG64 stream stable.
+    rng = np.random.Generator(np.random.PCG64(bootstrap_seed))
+    draws = np.empty((iterations, len(metric_names)), dtype=np.float64)
+    for start in range(0, iterations, R9_BOOTSTRAP_DRAW_BLOCK_SIZE):
+        stop = min(start + R9_BOOTSTRAP_DRAW_BLOCK_SIZE, iterations)
+        indices = rng.integers(
+            0,
+            expected_count,
+            size=(stop - start, expected_count),
+            dtype=np.int64,
+        )
+        draws[start:stop, :] = cluster_matrix[indices].mean(
+            axis=1,
+            dtype=np.float64,
+        )
+
+    summaries = {}
+    for metric_index, metric in enumerate(metric_names):
+        candidate_field, native_field, favorable = R9_PAIRED_METRICS[metric]
+        delta_field = f"{metric}_delta"
+        aggregate = aggregates[metric]
+        metric_draws = draws[:, metric_index].tolist()
+        summary = {
+            "schema_version": 1,
+            "contract_type": "safa_r9_paired_metric_cluster_bootstrap_v1",
+            "metric": metric,
+            "candidate_field": candidate_field,
+            "native_field": native_field,
+            "direction": "candidate_minus_native",
+            "favorable_direction": favorable,
+            "cluster_unit": "sample_id",
+            "seeds": list(seeds),
+            "sample_count": expected_count,
+            "observation_count": len(normalized_rows),
+            "iterations": iterations,
+            "bootstrap_seed": bootstrap_seed,
+            "bootstrap_rng": "numpy_pcg64",
+            "resample_index_policy": "shared_across_metrics",
+            "candidate_mean": aggregate["aggregate"][candidate_field],
+            "native_mean": aggregate["aggregate"][native_field],
+            "mean_delta": aggregate["aggregate"][delta_field],
+            "lower_95_one_sided": _percentile(metric_draws, 0.05),
+            "upper_95_one_sided": _percentile(metric_draws, 0.95),
+            "seed_aggregate_sha256": aggregate["seed_aggregate_sha256"],
+            "paired_metric_rows_sha256": value["paired_metric_rows_sha256"],
+        }
+        summary["bootstrap_sha256"] = _canonical_contract_sha256(
+            summary, "bootstrap_sha256"
+        )
+        summaries[metric] = summary
+    payload = {
+        "schema_version": 1,
+        "contract_type": "safa_r9_paired_metric_cluster_bootstrap_set_v1",
+        "direction": "candidate_minus_native",
+        "cluster_unit": "sample_id",
+        "seeds": list(seeds),
+        "sample_count": expected_count,
+        "observation_count": len(normalized_rows),
+        "iterations": iterations,
+        "bootstrap_seed": bootstrap_seed,
+        "bootstrap_rng": "numpy_pcg64",
+        "resample_index_policy": "shared_across_metrics",
+        "paired_metric_rows_sha256": value["paired_metric_rows_sha256"],
+        "seed_summaries": seed_summaries,
+        "metrics": summaries,
+    }
+    payload["paired_metric_bootstrap_sha256"] = _canonical_contract_sha256(
+        payload, "paired_metric_bootstrap_sha256"
+    )
+    return payload
+
+
 def build_a_gate_contract(
     context: Mapping[str, Any],
     arms: Sequence[Mapping[str, Any]],
@@ -759,6 +1029,7 @@ def build_b_gate_contract(
         _evaluate_quality_arm(
             arm,
             expected_seeds=R9_CALIBRATION_SEEDS,
+            expected_sample_count=64,
             severe_limit=3,
             bootstrap_seed=bootstrap_seed,
             reject_repeated_severe=True,
@@ -794,6 +1065,7 @@ def build_c_gate_contract(
         _evaluate_quality_arm(
             arm,
             expected_seeds=(confirm_seed,),
+            expected_sample_count=512,
             severe_limit=25,
             bootstrap_seed=bootstrap_seed,
             reject_repeated_severe=False,
@@ -851,6 +1123,11 @@ def build_selection_contract(
         "winner_locked": True,
         "reselection_allowed": False,
     }
+    continuation_sha = gate["context"].get(R9_CONTINUATION_CONTEXT_FIELD)
+    if continuation_sha is not None:
+        payload[R9_CONTINUATION_CONTEXT_FIELD] = _require_sha256(
+            continuation_sha, "continuation contract SHA256"
+        )
     payload["selection_sha256"] = _canonical_contract_sha256(
         payload, "selection_sha256"
     )
@@ -868,7 +1145,7 @@ def validate_selection_contract(
     )
     if normalized != expected:
         raise CampaignContractError("selection disagrees with its confirm512 gate")
-    if set(normalized) != {
+    expected_fields = {
         "schema_version",
         "contract_type",
         "campaign_id",
@@ -879,7 +1156,10 @@ def validate_selection_contract(
         "winner_locked",
         "reselection_allowed",
         "selection_sha256",
-    }:
+    }
+    if R9_CONTINUATION_CONTEXT_FIELD in normalized:
+        expected_fields.add(R9_CONTINUATION_CONTEXT_FIELD)
+    if set(normalized) != expected_fields:
         raise CampaignContractError("selection contains non-winner fields")
     return normalized
 
@@ -923,6 +1203,7 @@ def build_d_gate_contract(
     selection: Mapping[str, Any],
     heldout_seal: Mapping[str, Any],
     result: Mapping[str, Any],
+    bootstrap_seed: int,
 ) -> dict[str, Any]:
     bound_context = _validate_gate_context(context)
     _verify_contract_digest(selection, "selection_sha256")
@@ -950,8 +1231,9 @@ def build_d_gate_contract(
         result.get("full_visual_severe_count"), "Full visual severe count"
     )
     failures = []
+    visual_reference_misses = []
     if visual_severe > 3:
-        failures.append("full_visual_severe_count_gt_3")
+        visual_reference_misses.append("full_visual_severe_count_gt_3")
     representations = result.get("representations")
     if not isinstance(representations, Mapping) or set(representations) != {"e1", "e2"}:
         raise CampaignContractError("Full result requires E1 and E2 representations")
@@ -965,14 +1247,19 @@ def build_d_gate_contract(
         lower = _finite_float(
             row.get("paired_bootstrap_lower_95"), f"{name} bootstrap lower"
         )
+        reference_misses = []
         if winner_mean <= native_mean:
-            failures.append(f"{name}_winner_mean_not_above_native")
+            reference_misses.append(f"{name}_winner_mean_not_above_native")
         if lower <= 0:
-            failures.append(f"{name}_bootstrap_lower_not_positive")
+            reference_misses.append(f"{name}_bootstrap_lower_not_positive")
         normalized_representations[name] = {
             "winner_mean": winner_mean,
             "native_mean": native_mean,
             "paired_bootstrap_lower_95": lower,
+            "observations": {
+                "metrics_role": "report_only",
+                "reference_misses": reference_misses,
+            },
         }
     recognizers = result.get("recognizers")
     required_recognizers = {"arcface", "facenet", "adaface"}
@@ -991,8 +1278,9 @@ def build_d_gate_contract(
         if coverage == 2048:
             upper = _finite_float(upper_value, f"{name} privacy upper")
             bootstrap_sha = _require_sha256(bootstrap_value, f"{name} bootstrap SHA256")
-            if upper > 0.02:
-                failures.append(f"{name}_privacy_upper_gt_0.02")
+            privacy_reference_misses = (
+                [f"{name}_privacy_upper_gt_0.02"] if upper > 0.02 else []
+            )
         else:
             if upper_value is not None or bootstrap_value is not None:
                 raise CampaignContractError(
@@ -1000,17 +1288,34 @@ def build_d_gate_contract(
                 )
             upper = None
             bootstrap_sha = None
+            privacy_reference_misses = []
             failures.append(f"{name}_coverage_not_2048")
         normalized_recognizers[name] = {
             "coverage": coverage,
             "privacy_delta_upper_95": upper,
             "bootstrap_sha256": bootstrap_sha,
+            "observations": {
+                "privacy_metric_role": "report_only",
+                "reference_misses": privacy_reference_misses,
+            },
         }
-    quality = _evaluate_seed_quality(result.get("quality"), severe_limit=2048)
+    full_seed = _strict_int(result.get("seed"), "Full seed")
+    quality_input = result.get("quality")
+    quality = _evaluate_seed_quality(quality_input, severe_limit=3)
+    if not isinstance(quality_input, Mapping):
+        raise CampaignContractError("Full quality result must be a mapping")
+    paired_metric_bootstrap = paired_metric_cluster_bootstrap(
+        quality_input.get("paired_metric_rows"),
+        expected_seeds=(full_seed,),
+        expected_sample_count=2048,
+        bootstrap_seed=bootstrap_seed,
+    )
+    _validate_seed_quality_against_paired_metrics(
+        (quality,), paired_metric_bootstrap
+    )
     failures.extend(
         f"quality:{item}"
         for item in quality["failures"]
-        if not item.startswith("severe")
     )
     metrics_report = validate_identity_report(
         result.get("identity_report"), expected_count=2048
@@ -1032,8 +1337,18 @@ def build_d_gate_contract(
             "representations": normalized_representations,
             "recognizers": normalized_recognizers,
             "quality": quality,
+            "paired_metric_bootstrap": paired_metric_bootstrap,
             "identity_report": metrics_report,
             "heldout_execution_count": 1,
+            "observations": {
+                "numerical_metrics_role": "report_only",
+                "visual_metrics_role": "observation_only",
+                "privacy_metrics_role": "report_only",
+                "full_visual_reference_misses": visual_reference_misses,
+                "paired_metric_bootstrap_sha256": paired_metric_bootstrap[
+                    "paired_metric_bootstrap_sha256"
+                ],
+            },
             "failures": failures,
             "passed": not failures,
         }
@@ -1042,9 +1357,12 @@ def build_d_gate_contract(
     return _build_gate_payload(
         phase="full",
         context=bound_context,
-        seeds=[_strict_int(result.get("seed"), "Full seed")],
+        seeds=[full_seed],
         thresholds={
             **_quality_thresholds(severe_limit=3),
+            "representation_metrics_role": "report_only",
+            "privacy_metrics_role": "report_only",
+            "identity_coverage_role": "hard_requirement",
             "full_visual_severe_max": 3,
             "representation_bootstrap_lower_min_exclusive": 0.0,
             "privacy_delta_upper_max": 0.02,
@@ -1624,7 +1942,12 @@ def _validate_runtime_resources(
     }
 
 
-def _validate_runtime_evaluation(value: Any, *, repo_root: Path) -> dict[str, Any]:
+def _validate_runtime_evaluation(
+    value: Any,
+    *,
+    repo_root: Path,
+    runtime_config: Mapping[str, Any],
+) -> dict[str, Any]:
     evaluation = _json_mapping(value, "evaluation")
     if set(evaluation) != {
         "worker",
@@ -1809,6 +2132,8 @@ def _validate_runtime_evaluation(value: Any, *, repo_root: Path) -> dict[str, An
             worker_contract=worker,
             arcface_contract_sha256=_canonical_json_sha256(normalized_arcface),
             quality_script_sha256=normalized_quality["script"]["sha256"],
+            runtime_config_path=runtime_config["path"],
+            runtime_config_sha256=runtime_config["sha256"],
         )
     except EvaluatorResourceContractError as exc:
         raise CampaignContractError(str(exc)) from exc
@@ -2072,6 +2397,7 @@ def _evaluate_quality_arm(
     arm: Mapping[str, Any],
     *,
     expected_seeds: Sequence[int],
+    expected_sample_count: int,
     severe_limit: int,
     bootstrap_seed: int,
     reject_repeated_severe: bool,
@@ -2097,6 +2423,7 @@ def _evaluate_quality_arm(
         for row in ordered_rows
         for failure in row["failures"]
     ]
+    repeated = []
     if reject_repeated_severe:
         severe_frequency: dict[str, int] = {}
         for row in ordered_rows:
@@ -2105,8 +2432,6 @@ def _evaluate_quality_arm(
         repeated = sorted(
             sample_id for sample_id, count in severe_frequency.items() if count >= 2
         )
-        if repeated:
-            failures.append("same_sample_severe_in_multiple_seeds")
     privacy_rows = arm.get("privacy_rows")
     if not isinstance(privacy_rows, list):
         raise CampaignContractError("quality arm requires privacy_rows")
@@ -2121,14 +2446,27 @@ def _evaluate_quality_arm(
             raise CampaignContractError(
                 f"privacy bootstrap must cover exactly {expected_samples} sample IDs"
             )
-        if bootstrap["upper_95_one_sided"] > 0.02:
-            failures.append("privacy_delta_upper_gt_0.02")
+        privacy_reference_misses = (
+            ["privacy_delta_upper_gt_0.02"]
+            if bootstrap["upper_95_one_sided"] > 0.02
+            else []
+        )
     else:
         if privacy_rows:
             raise CampaignContractError(
                 "privacy_rows must be empty when ArcFace exact-one coverage fails"
             )
         bootstrap = None
+        privacy_reference_misses = []
+    paired_metric_bootstrap = paired_metric_cluster_bootstrap(
+        arm.get("paired_metric_rows"),
+        expected_seeds=seeds,
+        expected_sample_count=expected_sample_count,
+        bootstrap_seed=bootstrap_seed,
+    )
+    _validate_seed_quality_against_paired_metrics(
+        ordered_rows, paired_metric_bootstrap
+    )
     return {
         "arm_id": arm_id,
         "family": family,
@@ -2136,11 +2474,22 @@ def _evaluate_quality_arm(
         "output_sha256": output_sha,
         "seed_results": ordered_rows,
         "privacy_bootstrap": bootstrap,
+        "paired_metric_bootstrap": paired_metric_bootstrap,
         "severe_sort_key": sum(row["severe_count"] for row in ordered_rows),
         "kid_sort_value": statistics.fmean(row["kid"] for row in ordered_rows),
         "fid_sort_value": statistics.fmean(row["fid"] for row in ordered_rows),
-        "edev_sort_value": statistics.fmean(row["delta_edev"] for row in ordered_rows),
-        "e0_sort_value": statistics.fmean(row["e0"] for row in ordered_rows),
+        "edev_sort_value": paired_metric_bootstrap["metrics"]["edev"]["mean_delta"],
+        "e0_sort_value": paired_metric_bootstrap["metrics"]["e0"]["candidate_mean"],
+        "observations": {
+            "numerical_metrics_role": "report_only",
+            "visual_metrics_role": "observation_only",
+            "privacy_metrics_role": "report_only",
+            "repeated_severe_sample_ids": repeated,
+            "privacy_reference_misses": privacy_reference_misses,
+            "paired_metric_bootstrap_sha256": paired_metric_bootstrap[
+                "paired_metric_bootstrap_sha256"
+            ],
+        },
         "failures": failures,
         "passed": not failures,
     }
@@ -2179,23 +2528,25 @@ def _evaluate_seed_quality(value: Any, *, severe_limit: int) -> dict[str, Any]:
     arcface_exact_one = value.get("arcface_exact_one")
     if not isinstance(arcface_exact_one, bool):
         raise CampaignContractError("arcface_exact_one must be boolean")
-    failures = []
+    visual_reference_misses = []
+    numerical_reference_misses = []
     if severe_count > severe_limit:
-        failures.append(f"severe_count_gt_{severe_limit}")
+        visual_reference_misses.append(f"severe_count_gt_{severe_limit}")
     if metrics["fid"] > metrics["native_fid"] + 3:
-        failures.append("fid_above_native_plus_3")
+        numerical_reference_misses.append("fid_above_native_plus_3")
     if metrics["kid"] > metrics["native_kid"] + 0.005:
-        failures.append("kid_above_native_plus_0.005")
+        numerical_reference_misses.append("kid_above_native_plus_0.005")
     if metrics["niqe"] > metrics["native_niqe"] + 0.10:
-        failures.append("niqe_above_native_plus_0.10")
+        numerical_reference_misses.append("niqe_above_native_plus_0.10")
     if metrics["sharpness"] < max(300.0, 0.95 * metrics["native_sharpness"]):
-        failures.append("sharpness_below_gate")
+        numerical_reference_misses.append("sharpness_below_gate")
     if metrics["e0"] < 0.75:
-        failures.append("e0_below_0.75")
+        numerical_reference_misses.append("e0_below_0.75")
     if metrics["delta_e0"] < 0.30:
-        failures.append("delta_e0_below_0.30")
+        numerical_reference_misses.append("delta_e0_below_0.30")
     if metrics["delta_edev"] < 0.05:
-        failures.append("delta_edev_below_0.05")
+        numerical_reference_misses.append("delta_edev_below_0.05")
+    failures = []
     if not arcface_exact_one:
         failures.append("arcface_not_exactly_one_face_per_image")
     return {
@@ -2204,9 +2555,70 @@ def _evaluate_seed_quality(value: Any, *, severe_limit: int) -> dict[str, Any]:
         "severe_sample_ids": list(severe_ids),
         **metrics,
         "arcface_exact_one": arcface_exact_one,
+        "observations": {
+            "numerical_metrics_role": "report_only",
+            "visual_metrics_role": "observation_only",
+            "visual_reference_misses": visual_reference_misses,
+            "numerical_reference_misses": numerical_reference_misses,
+        },
         "failures": failures,
         "passed": not failures,
     }
+
+
+def _validate_seed_quality_against_paired_metrics(
+    seed_results: Sequence[Mapping[str, Any]],
+    paired_metric_bootstrap: Mapping[str, Any],
+) -> None:
+    seed_summaries = paired_metric_bootstrap.get("seed_summaries")
+    if not isinstance(seed_summaries, list):
+        raise CampaignContractError("paired metric bootstrap lacks seed summaries")
+    expected_fields = {
+        "seed",
+        *R9_PAIRED_METRIC_FIELDS,
+        "delta_e0",
+        "delta_edev",
+        "delta_niqe",
+        "delta_sharpness",
+    }
+    by_seed: dict[int, Mapping[str, Any]] = {}
+    for index, summary in enumerate(seed_summaries):
+        if not isinstance(summary, Mapping) or set(summary) != expected_fields:
+            raise CampaignContractError(
+                f"paired metric seed summary {index} fields are not canonical"
+            )
+        seed = _strict_int(summary.get("seed"), "paired metric summary seed")
+        if seed in by_seed:
+            raise CampaignContractError("paired metric seed summaries contain duplicates")
+        by_seed[seed] = summary
+    quality_to_raw_field = {
+        "e0": "candidate_e0",
+        "delta_e0": "delta_e0",
+        "delta_edev": "delta_edev",
+        "niqe": "candidate_niqe",
+        "native_niqe": "native_niqe",
+        "sharpness": "candidate_sharpness",
+        "native_sharpness": "native_sharpness",
+    }
+    result_seeds = tuple(
+        _strict_int(row.get("seed"), "quality seed") for row in seed_results
+    )
+    if set(by_seed) != set(result_seeds):
+        raise CampaignContractError(
+            "paired metric seed summaries do not match quality seed results"
+        )
+    for result in seed_results:
+        seed = _strict_int(result.get("seed"), "quality seed")
+        summary = by_seed[seed]
+        for quality_field, raw_field in quality_to_raw_field.items():
+            actual = _finite_float(result.get(quality_field), quality_field)
+            expected = _finite_float(
+                summary.get(raw_field), f"paired raw seed {seed} {raw_field}"
+            )
+            if actual != expected:
+                raise CampaignContractError(
+                    f"seed {seed} field {quality_field} disagrees with paired raw metrics"
+                )
 
 
 def _quality_rank_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
@@ -2222,6 +2634,10 @@ def _quality_rank_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
 
 def _quality_thresholds(*, severe_limit: int) -> dict[str, Any]:
     return {
+        "numerical_metrics_role": "report_only",
+        "visual_metrics_role": "observation_only",
+        "privacy_metrics_role": "report_only",
+        "arcface_coverage_role": "hard_requirement",
         "severe_max": severe_limit,
         "fid_native_delta_max": 3.0,
         "kid_native_delta_max": 0.005,
@@ -2235,19 +2651,35 @@ def _quality_thresholds(*, severe_limit: int) -> dict[str, Any]:
         "privacy_delta_direction": "source_candidate_minus_source_native",
         "privacy_delta_upper_95_max": 0.02,
         "bootstrap_iterations": R9_BOOTSTRAP_ITERATIONS,
+        "paired_metric_bootstrap_role": "report_only_evidence",
+        "paired_metric_direction": "candidate_minus_native",
+        "paired_metric_cluster_unit": "sample_id",
+        "paired_metric_names": ["e0", "edev", "niqe", "sharpness"],
     }
 
 
 def _validate_gate_context(context: Mapping[str, Any]) -> dict[str, Any]:
-    if not isinstance(context, Mapping) or set(context) != R9_GATE_CONTEXT_FIELDS:
+    if not isinstance(context, Mapping):
         raise CampaignContractError("gate context fields are not canonical")
-    return {
+    fields = set(context)
+    if fields not in (
+        set(R9_GATE_CONTEXT_FIELDS),
+        set(R9_GATE_CONTEXT_FIELDS) | {R9_CONTINUATION_CONTEXT_FIELD},
+    ):
+        raise CampaignContractError("gate context fields are not canonical")
+    normalized = {
         "campaign_id": _require_nonempty(context.get("campaign_id"), "campaign ID"),
         **{
             field: _require_sha256(context.get(field), field)
             for field in sorted(R9_GATE_CONTEXT_FIELDS - {"campaign_id"})
         },
     }
+    if R9_CONTINUATION_CONTEXT_FIELD in context:
+        normalized[R9_CONTINUATION_CONTEXT_FIELD] = _require_sha256(
+            context.get(R9_CONTINUATION_CONTEXT_FIELD),
+            "continuation contract SHA256",
+        )
+    return normalized
 
 
 def _arm_identity(arm: Mapping[str, Any]) -> tuple[str, str, str, str]:

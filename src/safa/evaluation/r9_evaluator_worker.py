@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import re
+import statistics
 import tempfile
 from typing import Any, Callable, Mapping, Sequence
 
@@ -807,6 +808,7 @@ def evaluate_quality_request(
     _validate_quality_raw(
         result,
         sample_count=len(samples),
+        sample_ids=sample_ids,
         manifest_sha256=manifest_sha256,
         ordered_sample_id_sha256=ordered_sample_id_sha256,
         real_asset_sha256=real_asset_sha256,
@@ -1386,6 +1388,7 @@ def _validate_quality_raw(
     raw: Mapping[str, Any],
     *,
     sample_count: int,
+    sample_ids: Sequence[str],
     manifest_sha256: str,
     ordered_sample_id_sha256: str,
     real_asset_sha256: str,
@@ -1426,7 +1429,83 @@ def _validate_quality_raw(
         (sharpness.get("mean"), "Sharpness"),
     ):
         _finite_float(value, label)
+    _validate_quality_per_sample_metrics(
+        raw.get("per_sample_metrics"),
+        sample_ids=sample_ids,
+        niqe_mean=_finite_float(iqa.get("mean"), "NIQE"),
+        sharpness_mean=_finite_float(sharpness.get("mean"), "Sharpness"),
+    )
     _assert_finite_json(raw, "quality output")
+
+
+def _validate_quality_per_sample_metrics(
+    value: Any,
+    *,
+    sample_ids: Sequence[str],
+    niqe_mean: float,
+    sharpness_mean: float,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise R9EvaluatorError("quality output lacks per_sample_metrics")
+    required = {
+        "schema_version",
+        "contract_type",
+        "sample_count",
+        "ordered_sample_id_sha256",
+        "metric_fields",
+        "rows",
+        "per_sample_metrics_sha256",
+    }
+    if set(value) != required:
+        raise R9EvaluatorError("per_sample_metrics fields are not canonical")
+    _assert_finite_json(value, "per_sample_metrics")
+    _validate_digest_contract(
+        value,
+        digest_field="per_sample_metrics_sha256",
+        contract_type="safa_r9_quality_per_sample_metrics_v1",
+    )
+    expected_ids = list(sample_ids)
+    if value.get("sample_count") != len(expected_ids):
+        raise R9EvaluatorError("per_sample_metrics count mismatch")
+    if value.get("ordered_sample_id_sha256") != _sample_id_sha256(expected_ids):
+        raise R9EvaluatorError("per_sample_metrics ordered sample digest mismatch")
+    if value.get("metric_fields") != ["niqe", "sharpness"]:
+        raise R9EvaluatorError("per_sample_metrics metric fields mismatch")
+    rows = value.get("rows")
+    if not isinstance(rows, list) or len(rows) != len(expected_ids):
+        raise R9EvaluatorError("per_sample_metrics rows do not cover the manifest")
+    normalized_rows = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping) or set(row) != {
+            "sample_id",
+            "niqe",
+            "sharpness",
+        }:
+            raise R9EvaluatorError(
+                f"per_sample_metrics row {index} fields are not canonical"
+            )
+        normalized_rows.append(
+            {
+                "sample_id": row.get("sample_id"),
+                "niqe": _finite_float(row.get("niqe"), "per-sample NIQE"),
+                "sharpness": _finite_float(
+                    row.get("sharpness"), "per-sample Sharpness"
+                ),
+            }
+        )
+    if [row["sample_id"] for row in normalized_rows] != expected_ids:
+        raise R9EvaluatorError("per_sample_metrics rows violate manifest order")
+    if statistics.fmean(row["niqe"] for row in normalized_rows) != niqe_mean:
+        raise R9EvaluatorError("per-sample NIQE summary mismatch")
+    if (
+        statistics.fmean(row["sharpness"] for row in normalized_rows)
+        != sharpness_mean
+    ):
+        raise R9EvaluatorError("per-sample Sharpness summary mismatch")
+    return {
+        **{key: value[key] for key in required - {"rows"}},
+        "rows": normalized_rows,
+    }
 
 
 def _validate_common_request(

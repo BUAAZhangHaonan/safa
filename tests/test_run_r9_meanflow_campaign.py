@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -42,6 +43,209 @@ def test_execute_requires_allow_busy_gpus() -> None:
         driver.parse_args(
             ["--phase", "diagnose", "--campaign-id", "r9-test", "--execute"]
         )
+
+
+def test_continuation_cli_rejects_parent_phases_and_source_overrides() -> None:
+    for phase in ("preflight", "diagnose"):
+        with pytest.raises(SystemExit):
+            driver.parse_args(
+                [
+                    "--phase",
+                    phase,
+                    "--campaign-id",
+                    driver.CONTINUATION_CHILD_CAMPAIGN_ID,
+                ]
+            )
+    with pytest.raises(SystemExit):
+        driver.parse_args(
+            [
+                "--phase",
+                "calibrate",
+                "--campaign-id",
+                driver.CONTINUATION_CHILD_CAMPAIGN_ID,
+                "--parent-campaign-id",
+                "other",
+            ]
+        )
+
+
+def test_continuation_request_is_source_only_and_all_starts_at_b() -> None:
+    payload, request_path, source = driver.load_continuation_request()
+    request = driver.yaml.safe_load((driver.REPO_ROOT / request_path).read_text())
+    assert set(request) == {
+        "schema_version",
+        "contract_type",
+        "child_campaign_id",
+        "base_runtime",
+        "source",
+        "evaluator_resources",
+    }
+    assert "continuation_contract_sha256" not in request
+    assert set(request["source"]) == {
+        "parent_campaign_id",
+        "diagnose_gate_contract_sha256",
+        "diagnose_phase_results_sha256",
+    }
+    for kind in ("arcface", "quality"):
+        assert request["evaluator_resources"][kind]["artifact_root"].startswith(
+            "artifacts/r9_meanflow_flow_map_guidance/campaigns/"
+            f"{driver.CONTINUATION_CHILD_CAMPAIGN_ID}/evaluator_smoke/"
+        )
+    selected = [
+        "flow_map2_normalized_eta_0p125",
+        "paper_eta_0p125",
+        "paper_eta_0p25_disable_i2",
+    ]
+    plans = driver.build_requested_plans(
+        payload,
+        phase="all",
+        campaign_id=driver.CONTINUATION_CHILD_CAMPAIGN_ID,
+        continuation_selected_arm_ids=selected,
+    )
+    assert [plan.phase for plan in plans] == ["calibrate", "confirm512", "full"]
+    assert [run.arm_ref for run in plans[0].runs if run.seed == 1337] == [
+        "native",
+        *selected,
+    ]
+    assert source == request["source"]
+
+
+def test_continuation_calibrate_imports_only_parent_selected_arms(monkeypatch) -> None:
+    selected = [
+        {"arm_id": "flow_map2_normalized_eta_0p125"},
+        {"arm_id": "paper_eta_0p125"},
+        {"arm_id": "paper_eta_0p25_disable_i2"},
+    ]
+    monkeypatch.setattr(
+        driver,
+        "_continuation_for_runtime",
+        lambda *args, **kwargs: {"selected_arms": selected},
+    )
+    promoted, winner = driver.resolve_phase_promotion(
+        {},
+        {
+            "campaign_root": "artifacts/child",
+            "continuation": {"contract_sha256": "a" * 64},
+        },
+        phase="calibrate",
+        campaign_id=driver.CONTINUATION_CHILD_CAMPAIGN_ID,
+    )
+    assert promoted == [row["arm_id"] for row in selected]
+    assert winner is None
+
+
+def test_continuation_rejects_candidate_config_drift(monkeypatch) -> None:
+    payload = runtime()
+    arm_id = "flow_map2_normalized_eta_0p125"
+    monkeypatch.setattr(driver, "_formal_closure_for_runtime", lambda *a, **k: None)
+    monkeypatch.setattr(driver, "_bind_locked_schedule", lambda *a, **k: None)
+    monkeypatch.setattr(
+        driver,
+        "_continuation_for_runtime",
+        lambda *a, **k: {
+            "continuation_contract_sha256": "1" * 64,
+            "selected_arms": [
+                {"arm_id": arm_id, "config_sha256": "2" * 64}
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        driver,
+        "resolve_frozen_effective_guidance_config",
+        lambda config: {**config, "arm_config_sha256": "3" * 64},
+    )
+    run = driver.RunSpec(
+        phase="calibrate",
+        logical_run_id=f"{arm_id}__seed_1337",
+        arm_ref=arm_id,
+        seed=1337,
+        repeat_index=None,
+        shard_index=0,
+        num_shards=1,
+        sample_count=64,
+        manifest_key="calibration_64",
+        runtime_config=Path("runtime.yaml"),
+        output_dir=Path("output"),
+        command=(),
+    )
+    calibration = payload["manifests"]["calibration_64"]
+    manifest_contract = {
+        "manifest_contracts_sha256": "4" * 64,
+        "manifests": {"calibration_64": calibration},
+    }
+    campaign_runtime = {
+        "campaign_id": driver.CONTINUATION_CHILD_CAMPAIGN_ID,
+        "campaign_runtime_sha256": "5" * 64,
+        "checkpoint": payload["checkpoint"],
+        "continuation": {"contract_sha256": "1" * 64},
+    }
+
+    with pytest.raises(ValueError, match="config drifted"):
+        driver.build_run_runtime_config(
+            payload, campaign_runtime, manifest_contract, run
+        )
+
+
+def test_full_gate_forwards_runtime_bootstrap_seed(
+    monkeypatch, tmp_path: Path
+) -> None:
+    manifest_sha = "1" * 64
+    runtime_sha = "2" * 64
+    manifests_sha = "3" * 64
+    captured: dict[str, int] = {}
+    results = {
+        "phase_results_sha256": "4" * 64,
+        "automatic_evidence_sha256": "5" * 64,
+        "run_plan_sha256": "6" * 64,
+        "campaign_runtime_sha256": runtime_sha,
+        "manifest_contracts_sha256": manifests_sha,
+        "manifest_sha256": manifest_sha,
+        "result": {"arm_id": "winner"},
+    }
+
+    monkeypatch.setattr(driver, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(driver, "_load_phase_results", lambda *a, **k: results)
+    monkeypatch.setattr(driver, "_validate_phase_evidence_chain", lambda *a, **k: {})
+    monkeypatch.setattr(
+        driver, "_phase_evaluator_evidence_sha256", lambda *a, **k: "7" * 64
+    )
+    monkeypatch.setattr(driver, "_continuation_for_runtime", lambda *a, **k: None)
+    monkeypatch.setattr(driver, "_load_gate", lambda *a, **k: {})
+    monkeypatch.setattr(driver, "_read_json_mapping", lambda *a, **k: {})
+    monkeypatch.setattr(
+        driver,
+        "validate_selection_contract",
+        lambda *a, **k: {"winner": {"arm_id": "winner"}},
+    )
+    monkeypatch.setattr(driver, "_require_selection_continuation", lambda *a: None)
+    monkeypatch.setattr(driver, "_require_gate_continuation", lambda *a: None)
+    monkeypatch.setattr(driver, "write_immutable_contract", lambda *a, **k: None)
+
+    def build_d(*args, bootstrap_seed: int, **kwargs):
+        del args, kwargs
+        captured["bootstrap_seed"] = bootstrap_seed
+        return {"verdict": "pass"}
+
+    monkeypatch.setattr(driver, "build_d_gate_contract", build_d)
+    gate = driver.finalize_phase_gate(
+        {},
+        {
+            "campaign_root": "child",
+            "campaign_runtime_sha256": runtime_sha,
+            "checkpoint": {"sha256": "8" * 64},
+            "bootstrap": {"seed": 91637},
+        },
+        {
+            "manifest_contracts_sha256": manifests_sha,
+            "manifests": {"full_2048": {"sha256": manifest_sha}},
+        },
+        {},
+        phase="full",
+        campaign_id="r9-child-v3",
+    )
+
+    assert gate == {"verdict": "pass"}
+    assert captured == {"bootstrap_seed": 91637}
 
 
 @pytest.mark.parametrize(
@@ -180,12 +384,21 @@ def test_runtime_resource_constants_are_exact() -> None:
     }
 
 
-def test_effective_evaluation_uses_exact_arcface_declaration_and_reconstructs_full_contract() -> (
-    None
-):
-    payload = runtime()
-    declaration = driver._build_effective_evaluation(payload, repo_root=ROOT)
-    declared_arcface = declaration["arcface"]
+def test_sealed_v2_remains_immutable_and_continuation_binds_current_evaluator() -> None:
+    payload, request_path, _ = driver.load_continuation_request()
+    request = driver.yaml.safe_load((ROOT / request_path).read_text(encoding="utf-8"))
+    base_path = ROOT / request["base_runtime"]["path"]
+    assert driver._sha256_path(base_path) == request["base_runtime"]["sha256"]
+    worker = payload["evaluation"]["worker"]
+    quality_script = payload["evaluation"]["quality"]["script"]
+    assert worker["sha256"] == driver._sha256_path(ROOT / worker["path"])
+    assert worker["implementation_sha256"] == driver._sha256_path(
+        ROOT / worker["implementation_path"]
+    )
+    assert quality_script["sha256"] == driver._sha256_path(
+        ROOT / quality_script["path"]
+    )
+    declared_arcface = payload["evaluation"]["arcface"]
     assert set(declared_arcface) == {
         "model_name",
         "model_root",
@@ -196,49 +409,31 @@ def test_effective_evaluation_uses_exact_arcface_declaration_and_reconstructs_fu
         "assets",
         "execution_probe",
     }
-    probe = json.loads(
-        Path(declared_arcface["execution_probe"]["path"]).read_text(encoding="utf-8")
-    )
+    probe_path = ROOT / declared_arcface["execution_probe"]["path"]
+    probe = json.loads(probe_path.read_text(encoding="utf-8"))
     expected_full = _validate_arcface_contract(
         {**declared_arcface, "execution": probe["execution"]},
         repo_root=ROOT,
     )
-    expected_digest = driver._canonical_json_sha256(expected_full)
-    request_path = ROOT / declaration["resource_smokes"]["arcface"]["request"]["path"]
-    request = json.loads(request_path.read_text(encoding="utf-8"))
-    assert driver._canonical_json_sha256(request["config"]["arcface"]) == (
-        expected_digest
-    )
-
-    smoke_path = ROOT / payload["resources"]["resource_smoke"]["output_path"]
-    smoke_sha256_before = driver._sha256_path(smoke_path)
-    effective, _, _ = driver.build_effective_campaign_runtime(
-        payload,
-        campaign_id="r9-shared-smoke-reuse-test",
-        repo_root=ROOT,
-    )
-
-    assert effective["evaluation"]["arcface"] == expected_full
-    assert (
-        driver._canonical_json_sha256(effective["evaluation"]["arcface"])
-        == expected_digest
-    )
-    assert effective["resources"]["resource_smoke"]["run_id"] == (
-        "native_smoke_calibration_64_v4"
-    )
-    assert effective["resources"]["ram_slot_budget_bytes"] == 3_691_032_576
-    assert effective["campaign_runtime_sha256"] is not None
-    assert driver._sha256_path(smoke_path) == smoke_sha256_before
+    assert expected_full["execution"] == probe["execution"]
 
 
 def test_raw_arcface_execution_injection_is_rejected() -> None:
-    payload = deepcopy(runtime())
+    payload, request_path, _ = driver.load_continuation_request()
+    payload = deepcopy(payload)
     probe_path = ROOT / payload["evaluation"]["arcface"]["execution_probe"]["path"]
     probe = json.loads(probe_path.read_text(encoding="utf-8"))
     payload["evaluation"]["arcface"]["execution"] = probe["execution"]
 
     with pytest.raises(ValueError, match="ArcFace evaluation fields are not canonical"):
-        driver._build_effective_evaluation(payload, repo_root=ROOT)
+        driver._build_effective_evaluation(
+            payload,
+            repo_root=ROOT,
+            runtime_config={
+                "path": str(request_path),
+                "sha256": driver._sha256_path(ROOT / request_path),
+            },
+        )
 
 
 def test_yaml_binds_exact_r8_and_diagnose_evidence() -> None:

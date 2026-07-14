@@ -362,6 +362,90 @@ def test_quality_eval_manifest_joins_real_superset_in_manifest_order(
     assert len(payload["sample_id_sha256"]) == 64
 
 
+def test_quality_eval_manifest_publishes_ordered_per_sample_metrics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_script("eval_generation_quality")
+    real_index, generated_dir, manifest, per_sample = _write_manifest_quality_case(
+        tmp_path,
+        manifest_ids=["b", "a"],
+    )
+    niqe_values = iter((1.5, 2.5))
+    sharpness_values = iter((100.0, 200.0))
+
+    class FakeIqa:
+        def __call__(self, images):
+            import torch
+
+            assert images.shape[0] == 1
+            return torch.tensor([next(niqe_values)])
+
+    def fake_load(path: Path):
+        import torch
+
+        del path
+        return torch.zeros(1, 3, 8, 8, dtype=torch.uint8)
+
+    monkeypatch.setattr(module, "load_image_uint8", fake_load)
+    monkeypatch.setattr(module, "create_iqa_metric", lambda method: FakeIqa())
+    monkeypatch.setattr(
+        module, "laplacian_variance", lambda path: next(sharpness_values)
+    )
+
+    payload = module.evaluate_generation_quality(
+        real_index=real_index,
+        generated_dir=generated_dir,
+        output=tmp_path / "quality.json",
+        metrics=["niqe", "sharpness"],
+        sample_id_manifest=manifest,
+        per_sample_jsonl=per_sample,
+        device="cpu",
+    )
+
+    contract = payload["per_sample_metrics"]
+    assert contract["rows"] == [
+        {"sample_id": "b", "niqe": 1.5, "sharpness": 100.0},
+        {"sample_id": "a", "niqe": 2.5, "sharpness": 200.0},
+    ]
+    assert contract["sample_count"] == 2
+    assert contract["ordered_sample_id_sha256"] == payload["sample_id_sha256"]
+    assert contract["per_sample_metrics_sha256"] == module.canonical_contract_sha256(
+        contract, "per_sample_metrics_sha256"
+    )
+    assert payload["iqa"]["mean"] == pytest.approx(2.0)
+    assert payload["sharpness"]["mean"] == pytest.approx(150.0)
+
+
+def test_quality_eval_manifest_rejects_multi_value_niqe_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_script("eval_generation_quality")
+    real_index, generated_dir, manifest, per_sample = _write_manifest_quality_case(
+        tmp_path,
+        manifest_ids=["sample"],
+    )
+
+    class FakeIqa:
+        def __call__(self, images):
+            import torch
+
+            return torch.tensor([1.0, 2.0])
+
+    monkeypatch.setattr(module, "create_iqa_metric", lambda method: FakeIqa())
+    with pytest.raises(ValueError, match="one NIQE value per image"):
+        module.evaluate_generation_quality(
+            real_index=real_index,
+            generated_dir=generated_dir,
+            output=tmp_path / "quality.json",
+            metrics=["niqe", "sharpness"],
+            sample_id_manifest=manifest,
+            per_sample_jsonl=per_sample,
+            device="cpu",
+        )
+
+
 @pytest.mark.parametrize(
     ("manifest_ids", "real_ids", "per_sample_ids", "generated_file_ids", "message"),
     [

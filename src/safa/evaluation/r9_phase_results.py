@@ -64,6 +64,16 @@ _SEMANTIC_ROW_FIELDS = (
     "candidate_diagnostic_trace",
     "route_diagnostics",
 )
+_PAIRED_METRIC_FIELDS = (
+    "candidate_e0",
+    "native_e0",
+    "candidate_edev",
+    "native_edev",
+    "candidate_niqe",
+    "native_niqe",
+    "candidate_sharpness",
+    "native_sharpness",
+)
 
 
 class PhaseResultsError(ValueError):
@@ -540,6 +550,7 @@ def _load_run_evidence(
     validated: Mapping[str, Any], spec: RunEvidenceSpec
 ) -> dict[str, Any]:
     request: PhaseResultsRequest = validated["request"]
+    manifest_ids: list[str] = validated["manifest_ids"]
     repo_root: Path = validated["repo_root"]
     manifest_ids: list[str] = validated["manifest_ids"]
     shards: dict[int, dict[str, Any]] = {}
@@ -834,6 +845,7 @@ def _build_automatic_evidence(
                 )
             seed_rows = []
             privacy_rows = []
+            paired_metric_rows = []
             all_exact_one = True
             for run in arm_runs:
                 native = native_by_key[(int(run["seed"]), run["repeat_index"])]
@@ -852,6 +864,14 @@ def _build_automatic_evidence(
                     native_samples,
                     "native",
                     quality_evaluator,
+                )
+                paired_metric_rows.extend(
+                    _paired_metric_rows(
+                        run,
+                        candidate_quality=candidate_quality,
+                        native_quality=native_quality,
+                        manifest_ids=manifest_ids,
+                    )
                 )
                 arcface = _evaluate_arcface(
                     request, run, candidate_samples, arcface_evaluator
@@ -934,11 +954,17 @@ def _build_automatic_evidence(
                     expected_seeds=tuple(row["seed"] for row in seed_rows),
                     bootstrap_seed=request.bootstrap_seed,
                 )
+            paired_metrics = _build_paired_metric_rows_contract(
+                paired_metric_rows,
+                manifest_ids=manifest_ids,
+                expected_seeds=tuple(int(row["seed"]) for row in seed_rows),
+            )
             auto_arm.update(
                 {
                     "seed_results": seed_rows,
                     "privacy_rows": privacy_rows,
                     "privacy_bootstrap": privacy_bootstrap,
+                    "paired_metric_rows": paired_metrics,
                     "evaluator_evidence_sha256": _canonical_json_sha256(
                         {
                             "seeds": [
@@ -956,7 +982,10 @@ def _build_automatic_evidence(
                                     "arcface_raw": row["arcface_raw_evidence_sha256"],
                                 }
                                 for row in seed_rows
-                            ]
+                            ],
+                            "paired_metric_rows": paired_metrics[
+                                "paired_metric_rows_sha256"
+                            ],
                         }
                     ),
                 }
@@ -983,7 +1012,6 @@ def _build_automatic_evidence(
                 "heldout": heldout["heldout_raw_evidence_sha256"],
             }
         )
-    manifest_ids: list[str] = validated["manifest_ids"]
     payload = {
         "schema_version": 1,
         "contract_type": "safa_r9_automatic_phase_evidence_v1",
@@ -1140,6 +1168,14 @@ def _evaluate_quality(
         or sharpness.get("definition") != "grayscale_laplacian_variance"
     ):
         raise PhaseResultsError("quality result must contain registered Sharpness")
+    niqe_mean = _finite_float(iqa.get("mean"), "NIQE")
+    sharpness_mean = _finite_float(sharpness.get("mean"), "Sharpness")
+    per_sample_metrics = _validate_quality_per_sample_metrics(
+        raw.get("per_sample_metrics"),
+        sample_ids=[sample.sample_id for sample in samples],
+        niqe_mean=niqe_mean,
+        sharpness_mean=sharpness_mean,
+    )
     raw_contract = {
         "schema_version": 1,
         "contract_type": "safa_r9_quality_raw_evidence_v1",
@@ -1166,8 +1202,9 @@ def _evaluate_quality(
     normalized = {
         "fid": _finite_float(raw.get("fid"), "FID"),
         "kid": _finite_float(raw.get("kid_mean"), "KID"),
-        "niqe": _finite_float(iqa.get("mean"), "NIQE"),
-        "sharpness": _finite_float(sharpness.get("mean"), "Sharpness"),
+        "niqe": niqe_mean,
+        "sharpness": sharpness_mean,
+        "per_sample_metrics": per_sample_metrics,
         "raw_evidence_path": str(raw_path),
         "raw_evidence_sha256": raw_contract["quality_raw_evidence_sha256"],
     }
@@ -1175,6 +1212,201 @@ def _evaluate_quality(
         {key: value for key, value in normalized.items() if key != "raw_evidence_path"}
     )
     return normalized
+
+
+def _validate_quality_per_sample_metrics(
+    value: Any,
+    *,
+    sample_ids: Sequence[str],
+    niqe_mean: float,
+    sharpness_mean: float,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise PhaseResultsError("quality result lacks per_sample_metrics")
+    required = {
+        "schema_version",
+        "contract_type",
+        "sample_count",
+        "ordered_sample_id_sha256",
+        "metric_fields",
+        "rows",
+        "per_sample_metrics_sha256",
+    }
+    if set(value) != required:
+        raise PhaseResultsError("per_sample_metrics fields are not canonical")
+    _assert_finite_json(value, "per_sample_metrics")
+    if (
+        _strict_int(value.get("schema_version"), "per_sample_metrics schema") != 1
+        or value.get("contract_type")
+        != "safa_r9_quality_per_sample_metrics_v1"
+    ):
+        raise PhaseResultsError("per_sample_metrics contract identity mismatch")
+    digest = _require_sha256(
+        value.get("per_sample_metrics_sha256"),
+        "per_sample_metrics_sha256",
+    )
+    if digest != _canonical_utf8_digest(value, "per_sample_metrics_sha256"):
+        raise PhaseResultsError("per_sample_metrics_sha256 mismatch")
+    expected_ids = list(sample_ids)
+    if _strict_int(value.get("sample_count"), "per_sample_metrics count") != len(
+        expected_ids
+    ):
+        raise PhaseResultsError("per_sample_metrics count mismatch")
+    if value.get("ordered_sample_id_sha256") != _sample_id_digest(expected_ids):
+        raise PhaseResultsError("per_sample_metrics ordered sample digest mismatch")
+    if value.get("metric_fields") != ["niqe", "sharpness"]:
+        raise PhaseResultsError("per_sample_metrics metric fields mismatch")
+    rows = value.get("rows")
+    if not isinstance(rows, list) or len(rows) != len(expected_ids):
+        raise PhaseResultsError("per_sample_metrics rows do not cover the manifest")
+    observed_ids = []
+    observed_niqe = []
+    observed_sharpness = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping) or set(row) != {
+            "sample_id",
+            "niqe",
+            "sharpness",
+        }:
+            raise PhaseResultsError(
+                f"per_sample_metrics row {index} fields are not canonical"
+            )
+        observed_ids.append(row.get("sample_id"))
+        observed_niqe.append(
+            _finite_float(row.get("niqe"), "per-sample NIQE")
+        )
+        observed_sharpness.append(
+            _finite_float(row.get("sharpness"), "per-sample Sharpness")
+        )
+    if observed_ids != expected_ids:
+        raise PhaseResultsError("per_sample_metrics rows violate manifest order")
+    if statistics.fmean(observed_niqe) != niqe_mean:
+        raise PhaseResultsError("per-sample NIQE summary mismatch")
+    if statistics.fmean(observed_sharpness) != sharpness_mean:
+        raise PhaseResultsError("per-sample Sharpness summary mismatch")
+    return _json_roundtrip(value, "per_sample_metrics")
+
+
+def _paired_metric_rows(
+    run: Mapping[str, Any],
+    *,
+    candidate_quality: Mapping[str, Any],
+    native_quality: Mapping[str, Any],
+    manifest_ids: Sequence[str],
+) -> list[dict[str, Any]]:
+    candidate_contract = candidate_quality.get("per_sample_metrics")
+    native_contract = native_quality.get("per_sample_metrics")
+    if not isinstance(candidate_contract, Mapping) or not isinstance(
+        native_contract, Mapping
+    ):
+        raise PhaseResultsError("quality per-sample contracts are unavailable")
+    candidate_rows = candidate_contract.get("rows")
+    native_rows = native_contract.get("rows")
+    if not isinstance(candidate_rows, list) or not isinstance(native_rows, list):
+        raise PhaseResultsError("quality per-sample rows are unavailable for pairing")
+    if [row.get("sample_id") for row in candidate_rows] != list(manifest_ids):
+        raise PhaseResultsError("candidate quality rows violate manifest order")
+    if [row.get("sample_id") for row in native_rows] != list(manifest_ids):
+        raise PhaseResultsError("native quality rows violate manifest order")
+    run_rows = run.get("rows")
+    if not isinstance(run_rows, list) or [
+        row.get("sample_id") for row in run_rows
+    ] != list(manifest_ids):
+        raise PhaseResultsError("generation rows violate manifest order")
+    seed = _strict_int(run.get("seed"), "paired metric seed")
+    rows = []
+    for sample_id, generation, candidate, native in zip(
+        manifest_ids, run_rows, candidate_rows, native_rows, strict=True
+    ):
+        metrics = generation.get("metrics")
+        if not isinstance(metrics, Mapping):
+            raise PhaseResultsError("generation metrics are unavailable for pairing")
+        rows.append(
+            {
+                "sample_id": sample_id,
+                "seed": seed,
+                "candidate_e0": _cosine(
+                    metrics.get("candidate_cosine"), "candidate E0 cosine"
+                ),
+                "native_e0": _cosine(
+                    metrics.get("native_cosine"), "native E0 cosine"
+                ),
+                "candidate_edev": _cosine(
+                    metrics.get("edev_cosine"), "candidate Edev cosine"
+                ),
+                "native_edev": _cosine(
+                    metrics.get("native_edev_cosine"), "native Edev cosine"
+                ),
+                "candidate_niqe": _finite_float(
+                    candidate.get("niqe"), "candidate NIQE"
+                ),
+                "native_niqe": _finite_float(native.get("niqe"), "native NIQE"),
+                "candidate_sharpness": _finite_float(
+                    candidate.get("sharpness"), "candidate Sharpness"
+                ),
+                "native_sharpness": _finite_float(
+                    native.get("sharpness"), "native Sharpness"
+                ),
+            }
+        )
+    return rows
+
+
+def _build_paired_metric_rows_contract(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    manifest_ids: Sequence[str],
+    expected_seeds: Sequence[int],
+) -> dict[str, Any]:
+    seeds = tuple(
+        sorted(_strict_int(seed, "paired metric seed") for seed in expected_seeds)
+    )
+    if not seeds or len(set(seeds)) != len(seeds):
+        raise PhaseResultsError("paired metric seeds must be unique and non-empty")
+    expected_keys = {"sample_id", "seed", *_PAIRED_METRIC_FIELDS}
+    normalized = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping) or set(row) != expected_keys:
+            raise PhaseResultsError(
+                f"paired metric row {index} fields are not canonical"
+            )
+        sample_id = row.get("sample_id")
+        if not isinstance(sample_id, str) or not sample_id:
+            raise PhaseResultsError(f"paired metric row {index} sample_id is invalid")
+        normalized.append(
+            {
+                "sample_id": sample_id,
+                "seed": _strict_int(
+                    row.get("seed"), f"paired metric row {index} seed"
+                ),
+                **{
+                    field: _finite_float(
+                        row.get(field), f"paired metric row {index} {field}"
+                    )
+                    for field in _PAIRED_METRIC_FIELDS
+                },
+            }
+        )
+    expected_order = [
+        (sample_id, seed) for seed in seeds for sample_id in manifest_ids
+    ]
+    if [(row["sample_id"], row["seed"]) for row in normalized] != expected_order:
+        raise PhaseResultsError("paired metric rows violate seed-major manifest order")
+    payload = {
+        "schema_version": 1,
+        "contract_type": "safa_r9_paired_metric_rows_v1",
+        "direction": "candidate_minus_native",
+        "seeds": list(seeds),
+        "sample_count": len(manifest_ids),
+        "observation_count": len(normalized),
+        "ordered_sample_id_sha256": _sample_id_digest(manifest_ids),
+        "metric_fields": list(_PAIRED_METRIC_FIELDS),
+        "rows": normalized,
+    }
+    payload["paired_metric_rows_sha256"] = _canonical_digest(
+        payload, "paired_metric_rows_sha256"
+    )
+    return payload
 
 
 def _evaluate_arcface(
@@ -1923,6 +2155,7 @@ def _build_phase_results(
                     ),
                     "seed_results": seed_results,
                     "privacy_rows": arm["privacy_rows"],
+                    "paired_metric_rows": arm["paired_metric_rows"],
                 }
             )
         value_field = "arms"
@@ -1953,6 +2186,7 @@ def _build_phase_results(
         } | {
             "severe_count": visual["severe_count"],
             "severe_sample_ids": visual["severe_sample_ids"],
+            "paired_metric_rows": arm["paired_metric_rows"],
         }
         value_field = "result"
         value = {
@@ -2814,6 +3048,20 @@ def _canonical_digest(payload: Mapping[str, Any], digest_field: str) -> str:
     canonical = dict(payload)
     canonical.pop(digest_field, None)
     return _canonical_json_sha256(canonical)
+
+
+def _canonical_utf8_digest(payload: Mapping[str, Any], digest_field: str) -> str:
+    canonical = dict(payload)
+    canonical.pop(digest_field, None)
+    return hashlib.sha256(
+        json.dumps(
+            canonical,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _sha256_file(path: Path) -> str:

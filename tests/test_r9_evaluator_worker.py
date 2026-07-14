@@ -69,6 +69,42 @@ def _sample_digest(ids: list[str]) -> str:
     ).hexdigest()
 
 
+def _contract_digest(payload: dict[str, Any], digest_field: str) -> str:
+    canonical = dict(payload)
+    canonical.pop(digest_field, None)
+    return hashlib.sha256(
+        json.dumps(
+            canonical,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+    ).hexdigest()
+
+
+def _per_sample_metrics(ids: list[str]) -> dict[str, Any]:
+    niqe_values = [3.9 + 0.2 * index for index in range(len(ids))]
+    sharpness_values = [349.0 + 2.0 * index for index in range(len(ids))]
+    payload = {
+        "schema_version": 1,
+        "contract_type": "safa_r9_quality_per_sample_metrics_v1",
+        "sample_count": len(ids),
+        "ordered_sample_id_sha256": _sample_digest(ids),
+        "metric_fields": ["niqe", "sharpness"],
+        "rows": [
+            {"sample_id": sample_id, "niqe": niqe, "sharpness": sharpness}
+            for sample_id, niqe, sharpness in zip(
+                ids, niqe_values, sharpness_values, strict=True
+            )
+        ],
+    }
+    payload["per_sample_metrics_sha256"] = _contract_digest(
+        payload, "per_sample_metrics_sha256"
+    )
+    return payload
+
+
 def _asset_digest(ids: list[str], paths: list[Path]) -> str:
     return hashlib.sha256(
         "".join(
@@ -366,8 +402,9 @@ def _fixture(
 
 
 class FakeQualityBackend:
-    def __init__(self) -> None:
+    def __init__(self, mutation: str | None = None) -> None:
         self.generated_dir: Path | None = None
+        self.mutation = mutation
 
     def __call__(self, **kwargs: Any) -> dict[str, Any]:
         generated_dir = Path(kwargs["generated_dir"])
@@ -423,7 +460,25 @@ class FakeQualityBackend:
                 "p90": 351.0,
                 "p95": 351.0,
             },
+            "per_sample_metrics": _per_sample_metrics(ids),
         }
+        per_sample_metrics = payload["per_sample_metrics"]
+        if self.mutation == "digest":
+            per_sample_metrics["per_sample_metrics_sha256"] = "0" * 64
+        elif self.mutation == "order":
+            per_sample_metrics["rows"].reverse()
+            per_sample_metrics["per_sample_metrics_sha256"] = _contract_digest(
+                per_sample_metrics, "per_sample_metrics_sha256"
+            )
+        elif self.mutation == "count":
+            per_sample_metrics["sample_count"] -= 1
+            per_sample_metrics["per_sample_metrics_sha256"] = _contract_digest(
+                per_sample_metrics, "per_sample_metrics_sha256"
+            )
+        elif self.mutation == "nonfinite":
+            per_sample_metrics["rows"][0]["niqe"] = float("inf")
+        elif self.mutation == "summary":
+            payload["iqa"]["mean"] += 1.0
         Path(kwargs["output"]).write_text(
             json.dumps(payload, sort_keys=True), encoding="utf-8"
         )
@@ -530,6 +585,28 @@ def test_quality_uses_exact_hardlink_view_and_cleans_it(tmp_path: Path) -> None:
     assert backend.generated_dir is not None
     assert not backend.generated_dir.exists()
     assert all(sample.candidate.is_file() for sample in samples)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("digest", "per_sample_metrics_sha256 mismatch"),
+        ("order", "manifest order"),
+        ("count", "count mismatch"),
+        ("nonfinite", "finite JSON"),
+        ("summary", "NIQE summary mismatch"),
+    ],
+)
+def test_quality_rejects_invalid_per_sample_metrics(
+    tmp_path: Path, mutation: str, message: str
+) -> None:
+    config, samples, manifest = _fixture(tmp_path)
+    evaluator = R9ProductionEvaluators(
+        config,
+        _dependencies(FakeQualityBackend(mutation), FakeAnalyzer([1] * 6)),
+    )
+    with pytest.raises(R9EvaluatorError, match=message):
+        evaluator.quality(_quality_request(samples, manifest))
 
 
 def test_quality_rejects_manifest_order_mismatch(tmp_path: Path) -> None:

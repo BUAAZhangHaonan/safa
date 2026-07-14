@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import statistics
 import sys
 import tempfile
 from pathlib import Path
@@ -270,6 +271,21 @@ def sample_id_digest(sample_ids: Iterable[str]) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
+def canonical_contract_sha256(
+    payload: Mapping[str, Any], digest_field: str
+) -> str:
+    canonical = dict(payload)
+    canonical.pop(digest_field, None)
+    encoded = json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def laplacian_variance(path: Path) -> float:
     try:
         import cv2
@@ -294,7 +310,7 @@ def sharpness_summary(values: list[float]) -> dict[str, float | str]:
     array = np.asarray(values, dtype=np.float64)
     return {
         "definition": "grayscale_laplacian_variance",
-        "mean": float(array.mean()),
+        "mean": statistics.fmean(values),
         "median": float(np.median(array)),
         "std": float(array.std()),
         "p05": float(np.percentile(array, 5)),
@@ -435,7 +451,7 @@ def metric_values(value: Any) -> list[float]:
 def mean_std(values: list[float]) -> dict[str, float]:
     if not values:
         raise ValueError("cannot summarize empty IQA values")
-    mean = sum(values) / len(values)
+    mean = statistics.fmean(values)
     variance = sum((value - mean) ** 2 for value in values) / len(values)
     return {"mean": float(mean), "std": float(math.sqrt(variance))}
 
@@ -587,7 +603,12 @@ def evaluate_generation_quality(
                 kid.update(image_to_device(image, kid_device), real=False)
             if iqa is not None:
                 iqa_image = image_to_device(image, iqa_device)
-                iqa_values.extend(metric_values(iqa(iqa_image.float().div(255.0))))
+                observation = metric_values(iqa(iqa_image.float().div(255.0)))
+                if len(observation) != 1:
+                    raise ValueError(
+                        "manifest quality evaluation requires one NIQE value per image"
+                    )
+                iqa_values.append(observation[0])
             if "sharpness" in metric_names:
                 sharpness_values.append(laplacian_variance(path))
 
@@ -618,6 +639,37 @@ def evaluate_generation_quality(
             }
         if "sharpness" in metric_names:
             payload["sharpness"] = sharpness_summary(sharpness_values)
+        if manifest_mode and iqa is not None and "sharpness" in metric_names:
+            if (
+                len(iqa_values) != len(manifest_ids)
+                or len(sharpness_values) != len(manifest_ids)
+            ):
+                raise ValueError(
+                    "per-sample quality metrics do not cover the manifest exactly"
+                )
+            per_sample_metrics = {
+                "schema_version": 1,
+                "contract_type": "safa_r9_quality_per_sample_metrics_v1",
+                "sample_count": len(manifest_ids),
+                "ordered_sample_id_sha256": sample_id_digest(manifest_ids),
+                "metric_fields": ["niqe", "sharpness"],
+                "rows": [
+                    {
+                        "sample_id": sample_id,
+                        "niqe": niqe,
+                        "sharpness": sharpness,
+                    }
+                    for sample_id, niqe, sharpness in zip(
+                        manifest_ids, iqa_values, sharpness_values, strict=True
+                    )
+                ],
+            }
+            per_sample_metrics["per_sample_metrics_sha256"] = (
+                canonical_contract_sha256(
+                    per_sample_metrics, "per_sample_metrics_sha256"
+                )
+            )
+            payload["per_sample_metrics"] = per_sample_metrics
 
     atomic_write_json(output, payload)
     return payload

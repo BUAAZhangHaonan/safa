@@ -31,7 +31,14 @@ def materialize_evaluator_resource_profiles(
     worker_contract: Mapping[str, Any],
     arcface_contract_sha256: str,
     quality_script_sha256: str,
+    runtime_config_path: Any,
+    runtime_config_sha256: str,
 ) -> dict[str, Any]:
+    expected_runtime = _normalize_expected_runtime_config(
+        repo_root,
+        runtime_config_path,
+        runtime_config_sha256,
+    )
     raw = _mapping(value, "evaluator resource profiles")
     if set(raw) != {"arcface", "quality", "heldout"}:
         raise EvaluatorResourceContractError(
@@ -42,6 +49,7 @@ def materialize_evaluator_resource_profiles(
         "quality": "measured_exclusive_bootstrap",
     }
     normalized = {}
+    claim_runtimes = {}
     for kind, mode in expected_modes.items():
         declaration = _mapping(raw.get(kind), f"{kind} resource profile")
         if set(declaration) != {"mode", "artifact_root"}:
@@ -53,13 +61,18 @@ def materialize_evaluator_resource_profiles(
         artifact_root = _repo_dir(
             repo_root, declaration.get("artifact_root"), f"{kind} smoke root"
         )
-        normalized[kind] = _materialize_measured_profile(
+        normalized[kind], claim_runtimes[kind] = _materialize_measured_profile(
             kind,
             artifact_root=artifact_root,
             repo_root=repo_root,
             worker_contract=worker_contract,
             arcface_contract_sha256=arcface_contract_sha256,
             quality_script_sha256=quality_script_sha256,
+            expected_runtime=expected_runtime,
+        )
+    if claim_runtimes["arcface"] != claim_runtimes["quality"]:
+        raise EvaluatorResourceContractError(
+            "ArcFace and quality smoke claims bind different runtime configs"
         )
     heldout = _mapping(raw.get("heldout"), "heldout resource profile")
     expected_heldout = {
@@ -85,6 +98,8 @@ def validate_evaluator_resource_profiles(
     worker_contract: Mapping[str, Any],
     arcface_contract_sha256: str,
     quality_script_sha256: str,
+    runtime_config_path: Any,
+    runtime_config_sha256: str,
 ) -> dict[str, Any]:
     declared = _mapping(value, "evaluator resource profiles")
     if set(declared) != {
@@ -119,6 +134,8 @@ def validate_evaluator_resource_profiles(
         worker_contract=worker_contract,
         arcface_contract_sha256=arcface_contract_sha256,
         quality_script_sha256=quality_script_sha256,
+        runtime_config_path=runtime_config_path,
+        runtime_config_sha256=runtime_config_sha256,
     )
     if rematerialized != declared:
         raise EvaluatorResourceContractError(
@@ -135,7 +152,8 @@ def _materialize_measured_profile(
     worker_contract: Mapping[str, Any],
     arcface_contract_sha256: str,
     quality_script_sha256: str,
-) -> dict[str, Any]:
+    expected_runtime: Mapping[str, str],
+) -> tuple[dict[str, Any], dict[str, str]]:
     inventory = {path.name for path in artifact_root.iterdir()}
     if inventory != _SMOKE_FILES or any(
         path.is_symlink() or not path.is_file() for path in artifact_root.iterdir()
@@ -158,6 +176,11 @@ def _materialize_measured_profile(
         digest_field="smoke_request_claim_sha256",
         contract_type="safa_r9_evaluator_resource_smoke_request_v1",
     )
+    claim_runtime = _normalize_claim_runtime_config(claim, repo_root)
+    if claim_runtime != expected_runtime:
+        raise EvaluatorResourceContractError(
+            f"{kind} smoke claim runtime config binding mismatch"
+        )
     execution_type = {
         "arcface": "safa_r9_evaluator_resource_smoke_execution_v1",
         "quality": "safa_r9_quality_bootstrap_smoke_execution_v1",
@@ -298,7 +321,7 @@ def _materialize_measured_profile(
         "peak_gpu_memory_bytes": peak_gpu,
         "ram_slot_budget_bytes": budget,
         "gpu_uuid": gpu_uuid,
-    }
+    }, claim_runtime
 
 
 def _validate_arcface_result(value: Any) -> None:
@@ -373,6 +396,43 @@ def _normalize_expected_worker(
         normalized[path_field] = str(path)
         normalized[sha_field] = digest
     return normalized
+
+
+def _normalize_expected_runtime_config(
+    repo_root: Path,
+    path_value: Any,
+    sha256_value: Any,
+) -> dict[str, str]:
+    path = _repo_file(repo_root, path_value, "expected runtime config")
+    digest = _sha256(sha256_value, "expected runtime config")
+    if _file_sha256(path) != digest:
+        raise EvaluatorResourceContractError(
+            "expected runtime config bytes changed"
+        )
+    return {"path": str(path), "sha256": digest}
+
+
+def _normalize_claim_runtime_config(
+    claim: Mapping[str, Any], repo_root: Path
+) -> dict[str, str]:
+    raw_path = claim.get("runtime_config")
+    if not isinstance(raw_path, str) or not Path(raw_path).is_absolute():
+        raise EvaluatorResourceContractError(
+            "smoke claim runtime config path must be canonical and absolute"
+        )
+    path = _repo_file(repo_root, raw_path, "smoke claim runtime config")
+    if str(path) != raw_path:
+        raise EvaluatorResourceContractError(
+            "smoke claim runtime config path is not canonical"
+        )
+    digest = _sha256(
+        claim.get("runtime_config_sha256"), "smoke claim runtime config"
+    )
+    if _file_sha256(path) != digest:
+        raise EvaluatorResourceContractError(
+            "smoke claim runtime config SHA256 mismatch"
+        )
+    return {"path": str(path), "sha256": digest}
 
 
 def _digest_contract(

@@ -32,6 +32,16 @@ from safa.evaluation.r9_campaign_contracts import (
     validate_selection_contract,
     write_immutable_contract,
 )
+from safa.evaluation.r9_continuation_contracts import (
+    R9_CONTINUATION_BASE_RUNTIME_PATH,
+    R9_CONTINUATION_REQUEST_PATH,
+    build_continuation_contract,
+    continuation_contract_binding,
+    materialize_continuation_evaluator_smoke_requests as _materialize_continuation_evaluator_smoke_requests,
+    materialize_continuation_contract,
+    normalize_continuation_source,
+    validate_continuation_contract,
+)
 from safa.evaluation.meanflow_guidance_runner import (
     resolve_frozen_effective_guidance_config,
 )
@@ -71,6 +81,8 @@ from safa.evaluation.r9_semigroup_campaign_closure import (
 
 
 RUNTIME_CONFIG = Path("configs/medium_v2/experiments/r9_meanflow_campaign.yaml")
+CONTINUATION_RUNTIME_CONFIG = Path(R9_CONTINUATION_REQUEST_PATH)
+CONTINUATION_CHILD_CAMPAIGN_ID = "r9-report-only-formal-v3"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PHASES = ("preflight", "diagnose", "calibrate", "confirm512", "full")
 CAMPAIGN_ID_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
@@ -136,6 +148,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--campaign-id must be an immutable lowercase slug")
     if args.execute and not args.allow_busy_gpus:
         parser.error("R9 execution requires explicit --allow-busy-gpus")
+    if (
+        args.campaign_id == CONTINUATION_CHILD_CAMPAIGN_ID
+        and args.phase in {"preflight", "diagnose"}
+    ):
+        parser.error("continuation child rejects preflight and diagnose")
     return args
 
 
@@ -150,14 +167,140 @@ def load_runtime_config(path: Path = RUNTIME_CONFIG) -> dict[str, Any]:
     return payload
 
 
-def _formal_closure_for_runtime(
+def load_continuation_request(
+    path: Path = CONTINUATION_RUNTIME_CONFIG,
+    *,
+    repo_root: Path = REPO_ROOT,
+) -> tuple[dict[str, Any], Path, dict[str, str]]:
+    request_path = _repo_path(repo_root, path, "continuation request")
+    request = yaml.safe_load(request_path.read_text(encoding="utf-8"))
+    if not isinstance(request, Mapping) or set(request) != {
+        "schema_version",
+        "contract_type",
+        "child_campaign_id",
+        "base_runtime",
+        "source",
+        "evaluator_resources",
+    }:
+        raise ValueError("continuation request fields are not canonical")
+    if (
+        request.get("schema_version") != 1
+        or request.get("contract_type") != "safa_r9_continuation_request_v1"
+        or request.get("child_campaign_id") != CONTINUATION_CHILD_CAMPAIGN_ID
+    ):
+        raise ValueError("continuation request type or child campaign mismatch")
+    base = _mapping(request.get("base_runtime"), "continuation base runtime")
+    if set(base) != {"path", "sha256"}:
+        raise ValueError("continuation base runtime fields are not canonical")
+    base_path = _repo_path(repo_root, base.get("path"), "continuation base runtime")
+    if str(base_path.relative_to(repo_root.resolve())) != R9_CONTINUATION_BASE_RUNTIME_PATH:
+        raise ValueError("continuation request changed the base runtime path")
+    if _sha256_path(base_path) != _require_sha256(
+        base.get("sha256"), "continuation base runtime SHA256"
+    ):
+        raise ValueError("continuation base runtime SHA256 mismatch")
+    source = normalize_continuation_source(request.get("source"))
+    runtime = load_runtime_config(base_path)
+    evaluation = _mapping(runtime.get("evaluation"), "continuation evaluation")
+    worker = _mapping(evaluation.get("worker"), "continuation evaluator worker")
+    worker["sha256"] = _sha256_path(
+        _repo_path(repo_root, worker.get("path"), "continuation evaluator entrypoint")
+    )
+    worker["implementation_sha256"] = _sha256_path(
+        _repo_path(
+            repo_root,
+            worker.get("implementation_path"),
+            "continuation evaluator implementation",
+        )
+    )
+    evaluation["worker"] = worker
+    quality = _mapping(evaluation.get("quality"), "continuation quality")
+    quality_script = _mapping(quality.get("script"), "continuation quality script")
+    quality_script["sha256"] = _sha256_path(
+        _repo_path(repo_root, quality_script.get("path"), "continuation quality script")
+    )
+    quality["script"] = quality_script
+    evaluation["quality"] = quality
+    evaluator_resources = _mapping(
+        request.get("evaluator_resources"), "continuation evaluator resources"
+    )
+    if set(evaluator_resources) != {"arcface", "quality", "heldout"}:
+        raise ValueError("continuation evaluator resource fields are not canonical")
+    evaluation["resource_smokes"] = evaluator_resources
+    runtime["evaluation"] = evaluation
+    return (
+        runtime,
+        Path(str(request_path.relative_to(repo_root.resolve()))),
+        source,
+    )
+
+
+def prepare_continuation_evaluator_smoke_requests(
+    *, repo_root: Path = REPO_ROOT
+) -> dict[str, Any]:
+    runtime, request_path, source = load_continuation_request(repo_root=repo_root)
+    normalize_continuation_source(source)
+    return _materialize_continuation_evaluator_smoke_requests(
+        repo_root=repo_root,
+        child_campaign_id=CONTINUATION_CHILD_CAMPAIGN_ID,
+        runtime_config_path=request_path,
+        runtime=runtime,
+    )
+
+
+def load_campaign_configuration(
+    campaign_id: str,
+) -> tuple[dict[str, Any], Path, dict[str, str] | None]:
+    if campaign_id == CONTINUATION_CHILD_CAMPAIGN_ID:
+        return load_continuation_request()
+    return load_runtime_config(), RUNTIME_CONFIG, None
+
+
+def _continuation_for_runtime(
     campaign_runtime: Mapping[str, Any], *, repo_root: Path = REPO_ROOT
+) -> dict[str, Any] | None:
+    binding = campaign_runtime.get("continuation")
+    if binding is None:
+        return None
+    row = _mapping(binding, "continuation binding")
+    if set(row) != {"path", "file_sha256", "contract_sha256"}:
+        raise ValueError("continuation binding fields are not canonical")
+    path = _repo_path(repo_root, row.get("path"), "continuation contract")
+    if _sha256_path(path) != _require_sha256(
+        row.get("file_sha256"), "continuation file SHA256"
+    ):
+        raise ValueError("continuation file SHA256 mismatch")
+    payload = validate_continuation_contract(
+        _read_json_mapping(path, "continuation contract"), repo_root=repo_root
+    )
+    if payload["continuation_contract_sha256"] != row["contract_sha256"]:
+        raise ValueError("continuation internal contract SHA256 mismatch")
+    if payload["child_campaign_id"] != campaign_runtime.get("campaign_id"):
+        raise ValueError("continuation child campaign ID mismatch")
+    return payload
+
+
+def _formal_closure_for_runtime(
+    campaign_runtime: Mapping[str, Any],
+    *,
+    repo_root: Path = REPO_ROOT,
+    continuation_contract: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     campaign_id = str(campaign_runtime.get("campaign_id", ""))
     if CAMPAIGN_ID_PATTERN.fullmatch(campaign_id) is None:
         raise ValueError("campaign runtime has no canonical campaign ID")
+    continuation = (
+        validate_continuation_contract(continuation_contract, repo_root=repo_root)
+        if continuation_contract is not None
+        else _continuation_for_runtime(campaign_runtime, repo_root=repo_root)
+    )
+    closure_campaign_id = (
+        continuation["parent"]["campaign_id"]
+        if continuation is not None
+        else campaign_id
+    )
     closure = resolve_formal_campaign_semigroup_closure(
-        campaign_id, repo_root=repo_root
+        closure_campaign_id, repo_root=repo_root
     )
     if closure is None:
         return None
@@ -172,9 +315,20 @@ def _formal_closure_for_runtime(
 
 
 def _validate_requested_campaign_role(
-    campaign_runtime: Mapping[str, Any], *, requested_phase: str
+    campaign_runtime: Mapping[str, Any],
+    *,
+    requested_phase: str,
+    continuation_contract: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    closure = _formal_closure_for_runtime(campaign_runtime)
+    closure = _formal_closure_for_runtime(
+        campaign_runtime, continuation_contract=continuation_contract
+    )
+    if campaign_runtime.get("continuation") is not None:
+        if requested_phase in {"preflight", "diagnose"}:
+            raise ValueError("continuation child rejects preflight and diagnose")
+        if closure is None:
+            raise ValueError("continuation parent has no sealed semigroup closure")
+        return closure
     if closure is None and requested_phase != "preflight":
         raise ValueError(
             "bootstrap campaign can only execute preflight; formal phases require "
@@ -260,17 +414,40 @@ def build_phase_plan(
 
 
 def build_requested_plans(
-    runtime: Mapping[str, Any], *, phase: str, campaign_id: str
+    runtime: Mapping[str, Any],
+    *,
+    phase: str,
+    campaign_id: str,
+    continuation_selected_arm_ids: Sequence[str] | None = None,
 ) -> tuple[PhasePlan, ...]:
-    selected = PHASES if phase == "all" else (phase,)
+    continuation = continuation_selected_arm_ids is not None
+    if continuation and phase in {"preflight", "diagnose"}:
+        raise ValueError("continuation child rejects preflight and diagnose")
+    selected = (
+        ("calibrate", "confirm512", "full")
+        if continuation and phase == "all"
+        else (PHASES if phase == "all" else (phase,))
+    )
     return tuple(
-        build_phase_plan(runtime, phase=item, campaign_id=campaign_id)
+        build_phase_plan(
+            runtime,
+            phase=item,
+            campaign_id=campaign_id,
+            promoted_arm_ids=(
+                continuation_selected_arm_ids if item == "calibrate" else None
+            ),
+        )
         for item in selected
     )
 
 
 def build_effective_campaign_runtime(
-    runtime: Mapping[str, Any], *, campaign_id: str, repo_root: Path
+    runtime: Mapping[str, Any],
+    *,
+    campaign_id: str,
+    repo_root: Path,
+    runtime_config_path: Path = RUNTIME_CONFIG,
+    continuation_source: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     manifests = _mapping(runtime.get("manifests"), "manifests")
     main_manifests = {
@@ -313,8 +490,23 @@ def build_effective_campaign_runtime(
         repo_root=repo_root,
         manifests=manifest_contract["manifests"],
     )
+    continuation_contract = None
+    continuation_binding = None
+    closure_campaign_id = campaign_id
+    if continuation_source is not None:
+        continuation_contract = build_continuation_contract(
+            repo_root=repo_root,
+            child_campaign_id=campaign_id,
+            source=continuation_source,
+        )
+        _, _, continuation_binding = continuation_contract_binding(
+            continuation_contract, repo_root=repo_root
+        )
+        closure_campaign_id = str(
+            continuation_contract["parent"]["campaign_id"]
+        )
     formal_closure = resolve_formal_campaign_semigroup_closure(
-        campaign_id, repo_root=repo_root
+        closure_campaign_id, repo_root=repo_root
     )
     if formal_closure is None:
         schedule_binding = {
@@ -330,18 +522,19 @@ def build_effective_campaign_runtime(
     else:
         schedule_binding = dict(formal_closure["schedule"])
         gate_binding = dict(formal_closure["gate"])
+    campaign_template = _bound_file(
+        repo_root,
+        runtime_config_path,
+        _sha256_path(repo_root / runtime_config_path),
+        "campaign template",
+    )
     effective = {
         "schema_version": 1,
         "experiment_contract": str(runtime["campaign_contract"]),
         "generation_experiment_contract": str(runtime["experiment_contract"]),
         "campaign_id": campaign_id,
         "campaign_root": str(Path(str(runtime["campaign_root"])) / campaign_id),
-        "campaign_template": _bound_file(
-            repo_root,
-            RUNTIME_CONFIG,
-            _sha256_path(repo_root / RUNTIME_CONFIG),
-            "campaign template",
-        ),
+        "campaign_template": campaign_template,
         "base_config": _bound_file(
             repo_root,
             runtime.get("base_config"),
@@ -367,16 +560,26 @@ def build_effective_campaign_runtime(
         "manifest_construction": construction_contract,
         "resources": resources,
         "bootstrap": dict(_mapping(runtime.get("bootstrap"), "bootstrap")),
-        "evaluation": _build_effective_evaluation(runtime, repo_root=repo_root),
+        "evaluation": _build_effective_evaluation(
+            runtime,
+            repo_root=repo_root,
+            runtime_config=campaign_template,
+        ),
         "phases": dict(phases),
     }
+    if continuation_binding is not None:
+        effective["continuation"] = continuation_binding
     diagnose_contract = manifest_contract["provenance"]["diagnose_18"]
     if resources.get("resource_smoke", {}).get("result") is None:
         claim = dict(effective)
         claim["campaign_claim_sha256"] = _canonical_json_sha256(claim)
         claim["campaign_runtime_sha256"] = None
         return claim, manifest_contract, diagnose_contract
-    validated_runtime = validate_campaign_runtime(effective, repo_root)
+    validated_runtime = validate_campaign_runtime(
+        effective,
+        repo_root,
+        continuation_contract=continuation_contract,
+    )
     return validated_runtime, manifest_contract, diagnose_contract
 
 
@@ -452,7 +655,10 @@ def _build_effective_resources(
 
 
 def _build_effective_evaluation(
-    runtime: Mapping[str, Any], *, repo_root: Path
+    runtime: Mapping[str, Any],
+    *,
+    repo_root: Path,
+    runtime_config: Mapping[str, Any],
 ) -> dict[str, Any]:
     raw = _mapping(runtime.get("evaluation"), "evaluation")
     if set(raw) != {"worker", "quality", "arcface", "heldout", "resource_smokes"}:
@@ -619,6 +825,8 @@ def _build_effective_evaluation(
         worker_contract=normalized_worker,
         arcface_contract_sha256=_canonical_json_sha256(normalized_arcface),
         quality_script_sha256=normalized_quality["script"]["sha256"],
+        runtime_config_path=runtime_config["path"],
+        runtime_config_sha256=runtime_config["sha256"],
     )
     return {
         "worker": normalized_worker,
@@ -755,17 +963,42 @@ def render_dry_run(
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    runtime = load_runtime_config()
-    plans = build_requested_plans(
-        runtime, phase=str(args.phase), campaign_id=str(args.campaign_id)
+    runtime, runtime_config_path, continuation_source = load_campaign_configuration(
+        str(args.campaign_id)
     )
     effective_runtime, manifest_contract, diagnose_contract = (
         build_effective_campaign_runtime(
-            runtime, campaign_id=str(args.campaign_id), repo_root=REPO_ROOT
+            runtime,
+            campaign_id=str(args.campaign_id),
+            repo_root=REPO_ROOT,
+            runtime_config_path=runtime_config_path,
+            continuation_source=continuation_source,
         )
     )
+    continuation_contract = (
+        build_continuation_contract(
+            repo_root=REPO_ROOT,
+            child_campaign_id=str(args.campaign_id),
+            source=continuation_source,
+        )
+        if continuation_source is not None
+        else None
+    )
+    continuation_selected = (
+        [str(row["arm_id"]) for row in continuation_contract["selected_arms"]]
+        if continuation_contract is not None
+        else None
+    )
+    plans = build_requested_plans(
+        runtime,
+        phase=str(args.phase),
+        campaign_id=str(args.campaign_id),
+        continuation_selected_arm_ids=continuation_selected,
+    )
     _validate_requested_campaign_role(
-        effective_runtime, requested_phase=str(args.phase)
+        effective_runtime,
+        requested_phase=str(args.phase),
+        continuation_contract=continuation_contract,
     )
     if not args.execute:
         print(
@@ -780,6 +1013,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if "TMUX" not in os.environ:
         raise RuntimeError("R9 execution must be launched inside tmux")
+    if continuation_source is not None:
+        _, binding = materialize_continuation_contract(
+            repo_root=REPO_ROOT,
+            child_campaign_id=str(args.campaign_id),
+            source=continuation_source,
+        )
+        if effective_runtime.get("continuation") != binding:
+            raise RuntimeError("materialized continuation binding changed")
     if effective_runtime.get("campaign_runtime_sha256") is None:
         run_resource_smoke(
             runtime,
@@ -791,10 +1032,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 runtime,
                 campaign_id=str(args.campaign_id),
                 repo_root=REPO_ROOT,
+                runtime_config_path=runtime_config_path,
+                continuation_source=continuation_source,
             )
         )
         _validate_requested_campaign_role(
-            effective_runtime, requested_phase=str(args.phase)
+            effective_runtime,
+            requested_phase=str(args.phase),
+            continuation_contract=continuation_contract,
         )
     if effective_runtime.get("campaign_runtime_sha256") is None:
         raise RuntimeError("resource smoke did not produce a final campaign runtime")
@@ -855,7 +1100,14 @@ def execute_dynamic_campaign(
         _validate_requested_campaign_role(
             campaign_runtime, requested_phase=requested_phase
         )
-    selected_phases = PHASES if requested_phase == "all" else (requested_phase,)
+    is_continuation = campaign_runtime.get("continuation") is not None
+    if is_continuation and requested_phase in {"preflight", "diagnose"}:
+        raise ValueError("continuation child rejects preflight and diagnose")
+    selected_phases = (
+        ("calibrate", "confirm512", "full")
+        if is_continuation and requested_phase == "all"
+        else (PHASES if requested_phase == "all" else (requested_phase,))
+    )
     for phase in selected_phases:
         promoted, winner = resolve_phase_promotion(
             runtime,
@@ -1012,9 +1264,16 @@ def build_phase_results_request(
         "full": "confirm512",
     }.get(plan.phase)
     if upstream_phase is not None:
-        upstream_gate = _load_gate(
-            campaign_root / upstream_phase / "gate_contract.json", upstream_phase
-        )
+        continuation = _continuation_for_runtime(campaign_runtime)
+        if plan.phase == "calibrate" and continuation is not None:
+            upstream_path = REPO_ROOT / str(
+                continuation["parent"]["diagnose_gate"]["path"]
+            )
+        else:
+            upstream_path = campaign_root / upstream_phase / "gate_contract.json"
+        upstream_gate = _load_gate(upstream_path, upstream_phase)
+        if plan.phase != "calibrate" and continuation is not None:
+            _require_gate_continuation(upstream_gate, campaign_runtime)
     if plan.phase == "full":
         assert upstream_gate is not None
         selection = validate_selection_contract(
@@ -1482,20 +1741,28 @@ def resolve_phase_promotion(
     del runtime
     root = REPO_ROOT / str(campaign_runtime["campaign_root"])
     if phase in {"preflight", "diagnose"}:
+        if campaign_runtime.get("continuation") is not None:
+            raise ValueError("continuation child rejects preflight and diagnose")
         return None, None
     if phase == "calibrate":
-        gate = _load_gate(root / "diagnose" / "gate_contract.json", "diagnose")
-        selected = list(gate["selected_arm_ids"])
+        continuation = _continuation_for_runtime(campaign_runtime)
+        if continuation is not None:
+            selected = [str(row["arm_id"]) for row in continuation["selected_arms"]]
+        else:
+            gate = _load_gate(root / "diagnose" / "gate_contract.json", "diagnose")
+            selected = list(gate["selected_arm_ids"])
         if not 1 <= len(selected) <= 3:
             raise RuntimeError("calibrate requires 1..3 A-stage promotions")
         return selected, None
     if phase == "confirm512":
         gate = _load_gate(root / "calibrate" / "gate_contract.json", "calibrate")
+        _require_gate_continuation(gate, campaign_runtime)
         selected = list(gate["selected_arm_ids"])
         if not 1 <= len(selected) <= 2:
             raise RuntimeError("confirm512 requires 1..2 B-stage promotions")
         return selected, None
     confirm_gate = _load_gate(root / "confirm512" / "gate_contract.json", "confirm512")
+    _require_gate_continuation(confirm_gate, campaign_runtime)
     selection_path = root / "selection.json"
     selection = validate_selection_contract(
         _read_json_mapping(selection_path, "selection"),
@@ -1503,6 +1770,7 @@ def resolve_phase_promotion(
     )
     if selection["campaign_id"] != campaign_id:
         raise ValueError("selection campaign ID mismatch")
+    _require_selection_continuation(selection, campaign_runtime)
     return None, str(selection["winner"]["arm_id"])
 
 
@@ -1543,6 +1811,11 @@ def finalize_phase_gate(
         "run_plan_sha256": results["run_plan_sha256"],
         "evaluator_evidence_sha256": _phase_evaluator_evidence_sha256(results, phase),
     }
+    continuation = _continuation_for_runtime(campaign_runtime)
+    if continuation is not None:
+        context["continuation_contract_sha256"] = continuation[
+            "continuation_contract_sha256"
+        ]
     for field in (
         "campaign_runtime_sha256",
         "manifest_contracts_sha256",
@@ -1586,14 +1859,19 @@ def finalize_phase_gate(
             _read_json_mapping(root / "selection.json", "selection"),
             confirm_gate,
         )
+        _require_selection_continuation(selection, campaign_runtime)
         heldout = _read_json_mapping(root / "heldout_seal.json", "heldout seal")
         gate = build_d_gate_contract(
             context,
             selection=selection,
             heldout_seal=heldout,
             result=results["result"],
+            bootstrap_seed=int(
+                _mapping(campaign_runtime.get("bootstrap"), "bootstrap")["seed"]
+            ),
         )
     gate_path = root / phase / "gate_contract.json"
+    _require_gate_continuation(gate, campaign_runtime)
     write_immutable_contract(
         gate_path,
         gate,
@@ -1607,6 +1885,7 @@ def finalize_phase_gate(
             gate,
             manifest_sha256s=manifest_sha256s,
         )
+        _require_selection_continuation(selection, campaign_runtime)
         write_immutable_contract(
             root / "selection.json",
             selection,
@@ -1636,6 +1915,31 @@ def _load_gate(path: Path, expected_phase: str) -> dict[str, Any]:
     if gate["phase"] != expected_phase:
         raise ValueError(f"expected {expected_phase} gate, got {gate['phase']}")
     return gate
+
+
+def _require_gate_continuation(
+    gate: Mapping[str, Any], campaign_runtime: Mapping[str, Any]
+) -> None:
+    continuation = _continuation_for_runtime(campaign_runtime)
+    if continuation is None:
+        return
+    context = _mapping(gate.get("context"), "gate context")
+    if context.get("continuation_contract_sha256") != continuation[
+        "continuation_contract_sha256"
+    ]:
+        raise ValueError("child gate continuation SHA256 mismatch")
+
+
+def _require_selection_continuation(
+    selection: Mapping[str, Any], campaign_runtime: Mapping[str, Any]
+) -> None:
+    continuation = _continuation_for_runtime(campaign_runtime)
+    if continuation is None:
+        return
+    if selection.get("continuation_contract_sha256") != continuation[
+        "continuation_contract_sha256"
+    ]:
+        raise ValueError("child selection continuation SHA256 mismatch")
 
 
 def _load_phase_results(path: Path, phase: str) -> dict[str, Any]:
@@ -2431,6 +2735,11 @@ def build_run_runtime_config(
             "r9_phase_manifest_sha256": str(manifest["sha256"]),
         }
     )
+    continuation = _continuation_for_runtime(campaign_runtime)
+    if continuation is not None:
+        config["r9_continuation_contract_sha256"] = continuation[
+            "continuation_contract_sha256"
+        ]
     if formal_closure is not None:
         closure_binding = _mapping(formal_closure.get("closure"), "semigroup closure")
         config.update(
@@ -2469,7 +2778,18 @@ def build_run_runtime_config(
                 else False
             )
             _bind_locked_schedule(config, campaign_runtime)
-    return resolve_frozen_effective_guidance_config(config)
+    resolved = resolve_frozen_effective_guidance_config(config)
+    if continuation is not None and run.arm_ref != "native":
+        selected = {
+            str(row["arm_id"]): row for row in continuation["selected_arms"]
+        }
+        if run.arm_ref not in selected:
+            raise ValueError("child run references a candidate outside parent A selection")
+        if resolved.get("arm_config_sha256") != selected[run.arm_ref][
+            "config_sha256"
+        ]:
+            raise ValueError("child candidate arm config drifted from parent A evidence")
+    return resolved
 
 
 def materialize_phase_runtime_configs(
@@ -2512,6 +2832,9 @@ def materialize_phase_runtime_configs(
                 "semigroup_closure_contract_sha256": config.get(
                     "r9_semigroup_closure_contract_sha256"
                 ),
+                "continuation_contract_sha256": config.get(
+                    "r9_continuation_contract_sha256"
+                ),
             }
         )
     payload = {
@@ -2523,6 +2846,11 @@ def materialize_phase_runtime_configs(
         "manifest_contracts_sha256": manifest_contract["manifest_contracts_sha256"],
         "runs": records,
     }
+    continuation = _continuation_for_runtime(campaign_runtime)
+    if continuation is not None:
+        payload["continuation_contract_sha256"] = continuation[
+            "continuation_contract_sha256"
+        ]
     payload["runtime_configs_sha256"] = _canonical_json_sha256(payload)
     contract_path = REPO_ROOT / plan.campaign_root / plan.phase / "runtime_configs.json"
     _write_immutable_bytes(

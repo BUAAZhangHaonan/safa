@@ -24,14 +24,17 @@ from safa.evaluation.r9_phase_results import (
     SampleEvidence,
     _algorithm_config_digest,
     _asset_manifest_digest,
+    _build_paired_metric_rows_contract,
     _canonical_digest,
     _evaluate_arcface,
     _evaluate_quality,
     _load_run_evidence,
     _materialize_heldout,
     _normalize_heldout_raw,
+    _paired_metric_rows,
     _request_context,
     _sample_evidence,
+    _validate_quality_per_sample_metrics,
     _validate_automatic_context,
     _validate_request,
     _write_exclusive_json,
@@ -42,6 +45,34 @@ from safa.evaluation.r9_phase_results import (
 
 
 SHA = "a" * 64
+
+
+def _quality_per_sample_contract(
+    sample_ids: list[str], *, niqe: float = 4.0, sharpness: float = 350.0
+) -> dict[str, Any]:
+    contract = {
+        "schema_version": 1,
+        "contract_type": "safa_r9_quality_per_sample_metrics_v1",
+        "sample_count": len(sample_ids),
+        "ordered_sample_id_sha256": hashlib.sha256(
+            "".join(f"{sample_id}\n" for sample_id in sample_ids).encode("utf-8")
+        ).hexdigest(),
+        "metric_fields": ["niqe", "sharpness"],
+        "rows": [
+            {"sample_id": sample_id, "niqe": niqe, "sharpness": sharpness}
+            for sample_id in sample_ids
+        ],
+    }
+    contract["per_sample_metrics_sha256"] = hashlib.sha256(
+        json.dumps(
+            contract,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return contract
 
 
 def _sha256(path: Path) -> str:
@@ -936,6 +967,151 @@ def test_arcface_rejects_negative_face_count(tmp_path: Path) -> None:
                     "candidate_face_count": 1,
                 }
             ],
+        )
+
+
+def test_quality_per_sample_metrics_preserves_valid_contract() -> None:
+    contract = _quality_per_sample_contract(["sample_a", "sample_b"])
+
+    assert _validate_quality_per_sample_metrics(
+        contract,
+        sample_ids=["sample_a", "sample_b"],
+        niqe_mean=4.0,
+        sharpness_mean=350.0,
+    ) == contract
+
+
+def test_paired_metric_rows_join_and_contract_are_seed_major() -> None:
+    sample_ids = ["sample_a", "sample_b"]
+    candidate_quality = {
+        "per_sample_metrics": _quality_per_sample_contract(
+            sample_ids, niqe=3.0, sharpness=420.0
+        )
+    }
+    native_quality = {
+        "per_sample_metrics": _quality_per_sample_contract(
+            sample_ids, niqe=4.0, sharpness=360.0
+        )
+    }
+
+    def run(seed: int) -> dict[str, Any]:
+        return {
+            "seed": seed,
+            "rows": [
+                {
+                    "sample_id": sample_id,
+                    "metrics": {
+                        "candidate_cosine": 0.8 + index * 0.01,
+                        "native_cosine": 0.4 + index * 0.01,
+                        "edev_cosine": 0.7 + index * 0.01,
+                        "native_edev_cosine": 0.5 + index * 0.01,
+                    },
+                }
+                for index, sample_id in enumerate(sample_ids)
+            ],
+        }
+
+    rows = []
+    for seed in (1337, 2027):
+        rows.extend(
+            _paired_metric_rows(
+                run(seed),
+                candidate_quality=candidate_quality,
+                native_quality=native_quality,
+                manifest_ids=sample_ids,
+            )
+        )
+    contract = _build_paired_metric_rows_contract(
+        rows,
+        manifest_ids=sample_ids,
+        expected_seeds=(1337, 2027),
+    )
+
+    assert contract["direction"] == "candidate_minus_native"
+    assert contract["sample_count"] == 2
+    assert contract["observation_count"] == 4
+    assert [(row["sample_id"], row["seed"]) for row in contract["rows"]] == [
+        ("sample_a", 1337),
+        ("sample_b", 1337),
+        ("sample_a", 2027),
+        ("sample_b", 2027),
+    ]
+    assert contract["paired_metric_rows_sha256"] == _canonical_digest(
+        contract, "paired_metric_rows_sha256"
+    )
+    assert contract["rows"][0]["candidate_niqe"] == 3.0
+    assert contract["rows"][0]["native_sharpness"] == 360.0
+
+
+@pytest.mark.parametrize("mutation", ["order", "nonfinite", "duplicate_seed"])
+def test_paired_metric_rows_contract_rejects_invalid_rows(mutation: str) -> None:
+    sample_ids = ["sample_a", "sample_b"]
+    rows = [
+        {
+            "sample_id": sample_id,
+            "seed": 1337,
+            "candidate_e0": 0.8,
+            "native_e0": 0.4,
+            "candidate_edev": 0.7,
+            "native_edev": 0.5,
+            "candidate_niqe": 3.0,
+            "native_niqe": 4.0,
+            "candidate_sharpness": 420.0,
+            "native_sharpness": 360.0,
+        }
+        for sample_id in sample_ids
+    ]
+    seeds = (1337,)
+    if mutation == "order":
+        rows.reverse()
+    elif mutation == "nonfinite":
+        rows[0]["candidate_niqe"] = float("nan")
+    else:
+        seeds = (1337, 1337)
+
+    with pytest.raises(PhaseResultsError):
+        _build_paired_metric_rows_contract(
+            rows,
+            manifest_ids=sample_ids,
+            expected_seeds=seeds,
+        )
+
+
+@pytest.mark.parametrize("mutation", ["digest", "order", "count", "nonfinite", "summary"])
+def test_quality_per_sample_metrics_rejects_invalid_contract(mutation: str) -> None:
+    contract = _quality_per_sample_contract(["sample_a", "sample_b"])
+    niqe_mean = 4.0
+    if mutation == "digest":
+        contract["per_sample_metrics_sha256"] = "0" * 64
+    elif mutation == "order":
+        contract["rows"] = list(reversed(contract["rows"]))
+        contract["per_sample_metrics_sha256"] = _quality_per_sample_contract(
+            ["sample_b", "sample_a"]
+        )["per_sample_metrics_sha256"]
+    elif mutation == "count":
+        contract["sample_count"] = 1
+        canonical = dict(contract)
+        canonical.pop("per_sample_metrics_sha256")
+        contract["per_sample_metrics_sha256"] = hashlib.sha256(
+            json.dumps(
+                canonical,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+    elif mutation == "nonfinite":
+        contract["rows"][0]["niqe"] = float("nan")
+    else:
+        niqe_mean = 4.1
+
+    with pytest.raises(PhaseResultsError):
+        _validate_quality_per_sample_metrics(
+            contract,
+            sample_ids=["sample_a", "sample_b"],
+            niqe_mean=niqe_mean,
+            sharpness_mean=350.0,
         )
 
 

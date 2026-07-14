@@ -4,6 +4,7 @@ from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
+import statistics
 from typing import Any
 
 import pytest
@@ -22,6 +23,7 @@ from safa.evaluation.r9_campaign_contracts import (
     build_selection_contract,
     canonical_campaign_runtime_sha256,
     derive_visual_arm_pass,
+    paired_metric_cluster_bootstrap,
     privacy_delta_cluster_bootstrap,
     validate_campaign_runtime,
     validate_diagnose_manifest_contract,
@@ -219,12 +221,24 @@ def _write_digest_contract(
     return value
 
 
+def _rewrite_smoke_request_claim(
+    path: Path, **changes: object
+) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload.update(changes)
+    payload.pop("smoke_request_claim_sha256", None)
+    payload["smoke_request_claim_sha256"] = _canonical_sha(payload)
+    path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    return payload
+
+
 def _evaluator_resource_fixture(
     root: Path,
     *,
     worker_contract: dict[str, str],
     arcface_contract: dict[str, Any],
     quality_script: Path,
+    runtime_config: Path,
 ) -> dict[str, Any]:
     normalized_worker = {
         "path": str((root / worker_contract["path"]).resolve()),
@@ -274,6 +288,8 @@ def _evaluator_resource_fixture(
                 "arcface_contract_sha256": arcface_sha,
                 "quality_script_sha256": quality_binding["sha256"],
                 "evaluator_request_sha256": request["evaluator_request_sha256"],
+                "runtime_config": str(runtime_config.resolve()),
+                "runtime_config_sha256": _sha(runtime_config),
                 "retry_allowed": False,
             },
             "smoke_request_claim_sha256",
@@ -400,6 +416,8 @@ def _evaluator_resource_fixture(
         worker_contract=worker_contract,
         arcface_contract_sha256=arcface_sha,
         quality_script_sha256=quality_binding["sha256"],
+        runtime_config_path=runtime_config,
+        runtime_config_sha256=_sha(runtime_config),
     )
 
 
@@ -663,6 +681,7 @@ def _runtime(
         worker_contract=worker_contract,
         arcface_contract=arcface_contract,
         quality_script=quality_script,
+        runtime_config=template,
     )
     diagnose_arms = [{"arm_id": "native", "family": "native"}]
     diagnose_arms.extend(
@@ -1028,8 +1047,8 @@ def _seed_result(
         "sharpness": 350.0,
         "native_sharpness": 350.0,
         "e0": e0,
-        "delta_e0": 0.35,
-        "delta_edev": 0.08,
+        "delta_e0": e0 - 0.45,
+        "delta_edev": 0.58 - 0.5,
         "arcface_exact_one": True,
     }
 
@@ -1047,6 +1066,59 @@ def _privacy_rows(
         for sample_index in range(sample_count)
         for seed in seeds
     ]
+
+
+def _paired_metric_rows_contract(
+    sample_count: int,
+    seeds: tuple[int, ...],
+    *,
+    candidate_e0: float = 0.80,
+    native_e0: float = 0.45,
+    candidate_edev: float = 0.58,
+    native_edev: float = 0.50,
+    candidate_niqe: float = 4.0,
+    native_niqe: float = 4.0,
+    candidate_sharpness: float = 350.0,
+    native_sharpness: float = 350.0,
+) -> dict[str, object]:
+    sample_ids = [f"sample-{index}" for index in range(sample_count)]
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "contract_type": "safa_r9_paired_metric_rows_v1",
+        "direction": "candidate_minus_native",
+        "seeds": list(seeds),
+        "sample_count": sample_count,
+        "observation_count": sample_count * len(seeds),
+        "ordered_sample_id_sha256": _id_sha(sample_ids),
+        "metric_fields": [
+            "candidate_e0",
+            "native_e0",
+            "candidate_edev",
+            "native_edev",
+            "candidate_niqe",
+            "native_niqe",
+            "candidate_sharpness",
+            "native_sharpness",
+        ],
+        "rows": [
+            {
+                "sample_id": sample_id,
+                "seed": seed,
+                "candidate_e0": candidate_e0,
+                "native_e0": native_e0,
+                "candidate_edev": candidate_edev,
+                "native_edev": native_edev,
+                "candidate_niqe": candidate_niqe,
+                "native_niqe": native_niqe,
+                "candidate_sharpness": candidate_sharpness,
+                "native_sharpness": native_sharpness,
+            }
+            for seed in seeds
+            for sample_id in sample_ids
+        ],
+    }
+    payload["paired_metric_rows_sha256"] = _canonical_sha(payload)
+    return payload
 
 
 def _quality_arm(
@@ -1077,6 +1149,7 @@ def _quality_arm(
             if arcface_exact_one
             else []
         ),
+        "paired_metric_rows": _paired_metric_rows_contract(sample_count, seeds),
     }
 
 
@@ -1390,6 +1463,63 @@ def test_evaluator_resource_profile_budget_or_artifact_tamper_fails(
         validate_campaign_runtime(runtime, tmp_path)
 
 
+def test_evaluator_resource_claim_runtime_path_drift_fails(tmp_path: Path) -> None:
+    manifests, _, evidence = _manifest_fixture(tmp_path)
+    runtime = _runtime(tmp_path, manifests, evidence)
+    expected_path = tmp_path / runtime["campaign_template"]["path"]
+    drifted_path = tmp_path / "configs" / "campaign-copy.yaml"
+    drifted_path.write_bytes(expected_path.read_bytes())
+    claim_path = (
+        tmp_path
+        / runtime["evaluation"]["resource_smokes"]["arcface"]["request_claim"][
+            "path"
+        ]
+    )
+    _rewrite_smoke_request_claim(
+        claim_path,
+        runtime_config=str(drifted_path.resolve()),
+        runtime_config_sha256=_sha(drifted_path),
+    )
+
+    with pytest.raises(CampaignContractError, match="runtime config binding mismatch"):
+        validate_campaign_runtime(runtime, tmp_path)
+
+
+def test_evaluator_resource_claim_runtime_sha_drift_fails(tmp_path: Path) -> None:
+    manifests, _, evidence = _manifest_fixture(tmp_path)
+    runtime = _runtime(tmp_path, manifests, evidence)
+    claim_path = (
+        tmp_path
+        / runtime["evaluation"]["resource_smokes"]["quality"]["request_claim"][
+            "path"
+        ]
+    )
+    _rewrite_smoke_request_claim(claim_path, runtime_config_sha256=SHA_A)
+
+    with pytest.raises(CampaignContractError, match="runtime config SHA256 mismatch"):
+        validate_campaign_runtime(runtime, tmp_path)
+
+
+def test_old_arcface_runtime_claim_is_rejected(tmp_path: Path) -> None:
+    manifests, _, evidence = _manifest_fixture(tmp_path)
+    runtime = _runtime(tmp_path, manifests, evidence)
+    claim_path = (
+        tmp_path
+        / runtime["evaluation"]["resource_smokes"]["arcface"]["request_claim"][
+            "path"
+        ]
+    )
+    _rewrite_smoke_request_claim(
+        claim_path,
+        runtime_config_sha256=(
+            "4f964c86664b0d84684349febba5337b1ecd24cc887d97b42f32262b3fd636a3"
+        ),
+    )
+
+    with pytest.raises(CampaignContractError, match="runtime config SHA256 mismatch"):
+        validate_campaign_runtime(runtime, tmp_path)
+
+
 @pytest.mark.parametrize("binding", ("run_id", "arm_id", "manifest"))
 def test_resource_smoke_declaration_must_match_measured_result(
     tmp_path: Path, binding: str
@@ -1631,6 +1761,79 @@ def test_privacy_bootstrap_has_exact_10k_cluster_draws_and_fixed_direction() -> 
         )
 
 
+def test_paired_metric_bootstrap_aggregates_ids_and_keeps_candidate_direction() -> None:
+    raw = _paired_metric_rows_contract(
+        8,
+        (1, 2),
+        candidate_e0=0.8,
+        native_e0=0.4,
+        candidate_edev=0.7,
+        native_edev=0.5,
+        candidate_niqe=3.0,
+        native_niqe=4.0,
+        candidate_sharpness=420.0,
+        native_sharpness=360.0,
+    )
+    summary = paired_metric_cluster_bootstrap(
+        raw,
+        expected_seeds=(1, 2),
+        expected_sample_count=8,
+        bootstrap_seed=9,
+    )
+    repeated = paired_metric_cluster_bootstrap(
+        raw,
+        expected_seeds=(1, 2),
+        expected_sample_count=8,
+        bootstrap_seed=9,
+    )
+
+    assert summary["iterations"] == R9_BOOTSTRAP_ITERATIONS == 10_000
+    assert repeated == summary
+    assert summary["bootstrap_rng"] == "numpy_pcg64"
+    assert summary["resample_index_policy"] == "shared_across_metrics"
+    assert summary["direction"] == "candidate_minus_native"
+    assert summary["cluster_unit"] == "sample_id"
+    assert summary["metrics"]["e0"]["mean_delta"] == pytest.approx(0.4)
+    assert summary["metrics"]["edev"]["mean_delta"] == pytest.approx(0.2)
+    assert summary["metrics"]["niqe"]["mean_delta"] == pytest.approx(-1.0)
+    assert summary["metrics"]["niqe"]["favorable_direction"] == "lower"
+    assert summary["metrics"]["sharpness"]["mean_delta"] == pytest.approx(60.0)
+    assert summary["metrics"]["e0"]["lower_95_one_sided"] == pytest.approx(0.4)
+    assert summary["seed_summaries"] == [
+        {
+            "seed": seed,
+            "candidate_e0": 0.8,
+            "native_e0": 0.4,
+            "delta_e0": 0.4,
+            "candidate_edev": 0.7,
+            "native_edev": 0.5,
+            "delta_edev": pytest.approx(0.2),
+            "candidate_niqe": 3.0,
+            "native_niqe": 4.0,
+            "delta_niqe": -1.0,
+            "candidate_sharpness": 420.0,
+            "native_sharpness": 360.0,
+            "delta_sharpness": 60.0,
+        }
+        for seed in (1, 2)
+    ]
+    canonical_summary = deepcopy(summary)
+    del canonical_summary["paired_metric_bootstrap_sha256"]
+    assert summary["paired_metric_bootstrap_sha256"] == _canonical_sha(
+        canonical_summary
+    )
+
+    tampered = deepcopy(raw)
+    tampered["rows"][0]["candidate_e0"] = 0.1
+    with pytest.raises(CampaignContractError, match="digest mismatch"):
+        paired_metric_cluster_bootstrap(
+            tampered,
+            expected_seeds=(1, 2),
+            expected_sample_count=8,
+            bootstrap_seed=9,
+        )
+
+
 def test_a_gate_binds_diagnose_pairs_and_selects_at_most_one_per_family() -> None:
     arms = [
         _a_arm("flow-worse", "flow_map2", difficult=2, e0=0.80),
@@ -1689,9 +1892,7 @@ def test_a_gate_keeps_repeat_and_finite_contracts_as_hard_failures() -> None:
     ]
 
 
-def test_b_gate_allows_partial_arm_failure_limits_two_and_rejects_repeat_severe() -> (
-    None
-):
+def test_b_gate_reports_metric_misses_and_still_limits_selection_to_two() -> None:
     arms = [
         _quality_arm("best", SEEDS, 64, kid=0.009),
         _quality_arm("second", SEEDS, 64, kid=0.011),
@@ -1702,15 +1903,103 @@ def test_b_gate_allows_partial_arm_failure_limits_two_and_rejects_repeat_severe(
 
     assert gate["selected_arm_ids"] == ["best", "second"]
     assert gate["verdict"] == "continue"
-    assert gate["arms"][2]["passed"] is False
-    assert "same_sample_severe_in_multiple_seeds" in gate["arms"][2]["failures"]
-    zero = build_b_gate_contract(
+    assert gate["arms"][2]["passed"] is True
+    assert gate["arms"][2]["failures"] == []
+    assert gate["arms"][2]["observations"]["repeated_severe_sample_ids"] == [
+        "repeat-id"
+    ]
+    assert "fid_above_native_plus_3" in gate["arms"][2]["seed_results"][0][
+        "observations"
+    ]["numerical_reference_misses"]
+    report_only = build_b_gate_contract(
         _context(),
-        [_quality_arm("bad", SEEDS, 64, fid=14.0)],
+        [_quality_arm("bad", SEEDS, 64, fid=14.0, privacy_delta=0.1)],
         bootstrap_seed=13,
     )
-    assert zero["selected_arm_ids"] == []
-    assert zero["verdict"] == "stop_zero_candidates"
+    assert report_only["selected_arm_ids"] == ["bad"]
+    assert report_only["verdict"] == "continue"
+    assert report_only["failures"] == []
+    assert report_only["arms"][0]["observations"][
+        "privacy_reference_misses"
+    ] == ["privacy_delta_upper_gt_0.02"]
+
+
+@pytest.mark.parametrize("phase", ("calibrate", "confirm512"))
+@pytest.mark.parametrize("field", ("e0", "niqe"))
+def test_b_and_c_gates_reject_scalar_paired_raw_drift(
+    phase: str,
+    field: str,
+) -> None:
+    if phase == "calibrate":
+        arm = _quality_arm("drift", SEEDS, 64)
+        build = lambda: build_b_gate_contract(  # noqa: E731
+            _context(), [arm], bootstrap_seed=13
+        )
+        expected_seed = SEEDS[0]
+    else:
+        arm = _quality_arm("drift", (4409,), 512)
+        build = lambda: build_c_gate_contract(  # noqa: E731
+            _context(), [arm], confirm_seed=4409, bootstrap_seed=17
+        )
+        expected_seed = 4409
+    arm["seed_results"][0][field] = float(arm["seed_results"][0][field]) + 1.0
+
+    with pytest.raises(
+        CampaignContractError,
+        match=rf"seed {expected_seed} field {field} disagrees",
+    ):
+        build()
+
+
+def test_c_gate_locks_one_winner_despite_visual_and_numerical_reference_misses() -> (
+    None
+):
+    poor = _quality_arm("poor", (4409,), 512, fid=40.0, privacy_delta=0.1)
+    seed_result = poor["seed_results"][0]
+    severe_ids = [f"severe-{index}" for index in range(30)]
+    seed_result.update(
+        {
+            "severe_count": len(severe_ids),
+            "severe_sample_ids": severe_ids,
+            "kid": 0.5,
+            "niqe": 20.0,
+            "sharpness": 10.0,
+            "e0": 0.1,
+            "delta_e0": 0.1 - 0.3,
+            "delta_edev": 0.2 - 0.5,
+        }
+    )
+    poor["paired_metric_rows"] = _paired_metric_rows_contract(
+        512,
+        (4409,),
+        candidate_e0=0.1,
+        native_e0=0.3,
+        candidate_edev=0.2,
+        native_edev=0.5,
+        candidate_niqe=20.0,
+        native_niqe=4.0,
+        candidate_sharpness=10.0,
+        native_sharpness=350.0,
+    )
+
+    gate = build_c_gate_contract(
+        _context(), [poor], confirm_seed=4409, bootstrap_seed=17
+    )
+
+    assert gate["verdict"] == "winner_locked"
+    assert gate["selected_arm_ids"] == ["poor"]
+    assert gate["failures"] == []
+    observations = gate["arms"][0]["seed_results"][0]["observations"]
+    assert observations["visual_reference_misses"] == ["severe_count_gt_25"]
+    assert set(observations["numerical_reference_misses"]) == {
+        "fid_above_native_plus_3",
+        "kid_above_native_plus_0.005",
+        "niqe_above_native_plus_0.10",
+        "sharpness_below_gate",
+        "e0_below_0.75",
+        "delta_e0_below_0.30",
+        "delta_edev_below_0.05",
+    }
 
 
 def test_quality_gate_keeps_arcface_failure_as_failed_exploratory_arm() -> None:
@@ -1741,6 +2030,27 @@ def test_c_selection_is_winner_only_and_tamper_is_detected() -> None:
     assert gate["selected_arm_ids"] == ["winner"]
     assert selection["winner"]["arm_id"] == "winner"
     assert "arms" not in selection
+    assert validate_selection_contract(selection, gate) == selection
+
+
+def test_child_gate_and_selection_share_continuation_contract_sha256() -> None:
+    context = _context()
+    context["continuation_contract_sha256"] = "3" * 64
+    gate = build_c_gate_contract(
+        context,
+        [_quality_arm("winner", (4409,), 512)],
+        confirm_seed=4409,
+        bootstrap_seed=17,
+    )
+    selection = build_selection_contract(
+        gate,
+        manifest_sha256s={
+            name: SHA_A for name in campaign_contracts_module.R9_MANIFEST_KEYS
+        },
+    )
+
+    assert gate["context"]["continuation_contract_sha256"] == "3" * 64
+    assert selection["continuation_contract_sha256"] == "3" * 64
     assert validate_selection_contract(selection, gate) == selection
 
     tampered = deepcopy(selection)
@@ -1836,7 +2146,62 @@ def test_identity_report_strict_schema_rejects_partial_or_invented_metrics(
         validate_identity_report(report, expected_count=2048)
 
 
-def test_heldout_assets_run_once_and_full_failure_cannot_reselect() -> None:
+def test_heldout_metrics_are_report_only_but_coverage_and_run_once_stay_hard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fast_paired_metric_bootstrap(
+        value: dict[str, object],
+        *,
+        expected_seeds: tuple[int, ...],
+        expected_sample_count: int,
+        bootstrap_seed: int,
+        iterations: int = R9_BOOTSTRAP_ITERATIONS,
+    ) -> dict[str, object]:
+        assert (expected_seeds, expected_sample_count) in {
+            ((4409,), 512),
+            ((5501,), 2048),
+        }
+        assert bootstrap_seed == 17
+        assert iterations == R9_BOOTSTRAP_ITERATIONS
+        assert value["sample_count"] == expected_sample_count
+        assert value["seeds"] == list(expected_seeds)
+        rows = value["rows"]
+        seed_summaries = []
+        for seed in expected_seeds:
+            seed_rows = [row for row in rows if row["seed"] == seed]
+            summary: dict[str, object] = {"seed": seed}
+            for metric in ("e0", "edev", "niqe", "sharpness"):
+                candidate_field = f"candidate_{metric}"
+                native_field = f"native_{metric}"
+                candidate_mean = statistics.fmean(
+                    float(row[candidate_field]) for row in seed_rows
+                )
+                native_mean = statistics.fmean(
+                    float(row[native_field]) for row in seed_rows
+                )
+                summary[candidate_field] = candidate_mean
+                summary[native_field] = native_mean
+                summary[f"delta_{metric}"] = candidate_mean - native_mean
+            seed_summaries.append(summary)
+        return {
+            "schema_version": 1,
+            "contract_type": "safa_r9_paired_metric_cluster_bootstrap_set_v1",
+            "metrics": {
+                "e0": {"candidate_mean": 0.80, "mean_delta": 0.35},
+                "edev": {"candidate_mean": 0.58, "mean_delta": 0.08},
+                "niqe": {"candidate_mean": 4.0, "mean_delta": 0.0},
+                "sharpness": {"candidate_mean": 350.0, "mean_delta": 0.0},
+            },
+            "seed_summaries": seed_summaries,
+            "paired_metric_rows_sha256": value["paired_metric_rows_sha256"],
+            "paired_metric_bootstrap_sha256": SHA_C,
+        }
+
+    monkeypatch.setattr(
+        campaign_contracts_module,
+        "paired_metric_cluster_bootstrap",
+        fast_paired_metric_bootstrap,
+    )
     _, selection = _selection_fixture()
     seal = build_heldout_seal_contract(
         selection,
@@ -1868,23 +2233,101 @@ def test_heldout_assets_run_once_and_full_failure_cannot_reselect() -> None:
             }
             for name in ("arcface", "facenet", "adaface")
         },
-        "quality": _seed_result(5501),
+        "quality": {
+            **_seed_result(5501),
+            "paired_metric_rows": _paired_metric_rows_contract(2048, (5501,)),
+        },
         "identity_report": _identity_report(),
     }
 
     passed = build_d_gate_contract(
-        _context(), selection=selection, heldout_seal=seal, result=result
+        _context(),
+        selection=selection,
+        heldout_seal=seal,
+        result=result,
+        bootstrap_seed=17,
     )
-    failed_result = {**result, "full_visual_severe_count": 4}
-    failed = build_d_gate_contract(
-        _context(), selection=selection, heldout_seal=seal, result=failed_result
+    for field in ("e0", "niqe"):
+        drifted = deepcopy(result)
+        drifted["quality"][field] = float(drifted["quality"][field]) + 1.0
+        with pytest.raises(
+            CampaignContractError,
+            match=rf"seed 5501 field {field} disagrees",
+        ):
+            build_d_gate_contract(
+                _context(),
+                selection=selection,
+                heldout_seal=seal,
+                result=drifted,
+                bootstrap_seed=17,
+            )
+    report_only_result = deepcopy(result)
+    report_only_result["full_visual_severe_count"] = 64
+    report_only_result["representations"] = {
+        name: {
+            "winner_mean": 0.5,
+            "native_mean": 0.6,
+            "paired_bootstrap_lower_95": -0.02,
+        }
+        for name in ("e1", "e2")
+    }
+    for row in report_only_result["recognizers"].values():
+        row["privacy_delta_upper_95"] = 0.5
+    report_only_result["quality"].update(
+        {
+            "severe_count": 4,
+            "severe_sample_ids": [f"severe-{index}" for index in range(4)],
+            "fid": 40.0,
+            "kid": 0.5,
+            "niqe": 20.0,
+            "sharpness": 10.0,
+            "e0": 0.1,
+            "delta_e0": 0.1 - 0.3,
+            "delta_edev": 0.2 - 0.5,
+        }
+    )
+    report_only_result["quality"]["paired_metric_rows"] = (
+        _paired_metric_rows_contract(
+            2048,
+            (5501,),
+            candidate_e0=0.1,
+            native_e0=0.3,
+            candidate_edev=0.2,
+            native_edev=0.5,
+            candidate_niqe=20.0,
+            native_niqe=4.0,
+            candidate_sharpness=10.0,
+            native_sharpness=350.0,
+        )
+    )
+    report_only = build_d_gate_contract(
+        _context(),
+        selection=selection,
+        heldout_seal=seal,
+        result=report_only_result,
+        bootstrap_seed=17,
     )
 
     assert seal["execution_count"] == 0 and seal["sealed"] is True
     assert passed["verdict"] == "passed_locked_winner"
-    assert failed["verdict"] == "failed_locked_winner"
-    assert failed["selected_arm_ids"] == ["winner"]
-    assert failed["reselection_allowed"] is False
+    assert report_only["verdict"] == "passed_locked_winner"
+    assert report_only["selected_arm_ids"] == ["winner"]
+    assert report_only["reselection_allowed"] is False
+    assert report_only["failures"] == []
+    arm = report_only["arms"][0]
+    assert arm["observations"]["full_visual_reference_misses"] == [
+        "full_visual_severe_count_gt_3"
+    ]
+    assert arm["representations"]["e1"]["observations"]["reference_misses"] == [
+        "e1_winner_mean_not_above_native",
+        "e1_bootstrap_lower_not_positive",
+    ]
+    assert arm["recognizers"]["arcface"]["observations"][
+        "reference_misses"
+    ] == ["arcface_privacy_upper_gt_0.02"]
+    assert "fid_above_native_plus_3" in arm["quality"]["observations"][
+        "numerical_reference_misses"
+    ]
     incomplete_result = deepcopy(result)
     incomplete_result["recognizers"]["arcface"] = {
         "coverage": 2047,
@@ -1893,13 +2336,21 @@ def test_heldout_assets_run_once_and_full_failure_cannot_reselect() -> None:
     }
     incomplete_result["identity_report"] = _identity_report(arcface_coverage=2047)
     incomplete = build_d_gate_contract(
-        _context(), selection=selection, heldout_seal=seal, result=incomplete_result
+        _context(),
+        selection=selection,
+        heldout_seal=seal,
+        result=incomplete_result,
+        bootstrap_seed=17,
     )
     assert incomplete["verdict"] == "failed_locked_winner"
     assert incomplete["arms"][0]["recognizers"]["arcface"] == {
         "coverage": 2047,
         "privacy_delta_upper_95": None,
         "bootstrap_sha256": None,
+        "observations": {
+            "privacy_metric_role": "report_only",
+            "reference_misses": [],
+        },
     }
     assert "arcface_coverage_not_2048" in incomplete["arms"][0]["failures"]
 
@@ -1911,9 +2362,14 @@ def test_heldout_assets_run_once_and_full_failure_cannot_reselect() -> None:
             selection=selection,
             heldout_seal=seal,
             result=partial_bootstrap,
+            bootstrap_seed=17,
         )
     rerun = {**result, "execution_count": 2}
     with pytest.raises(CampaignContractError, match="exactly once"):
         build_d_gate_contract(
-            _context(), selection=selection, heldout_seal=seal, result=rerun
+            _context(),
+            selection=selection,
+            heldout_seal=seal,
+            result=rerun,
+            bootstrap_seed=17,
         )
