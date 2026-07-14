@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+import safa.evaluation.r9_campaign_contracts as campaign_contracts_module
 from safa.evaluation.r9_campaign_contracts import (
     CampaignContractError,
     R9_BOOTSTRAP_ITERATIONS,
@@ -35,6 +36,10 @@ from safa.evaluation.r9_evaluator_resources import (
     materialize_evaluator_resource_profiles,
 )
 from safa.evaluation.r9_evaluator_worker import _validate_arcface_contract
+from safa.evaluation.r9_semigroup_contracts import (
+    R9_SEMIGROUP_RECOVERY_POLICY_SHA256,
+    R9_SEMIGROUP_RECOVERY_SELECTION_RULE,
+)
 
 
 SHA_A = "a" * 64
@@ -895,6 +900,56 @@ def _runtime(
     }
 
 
+def _convert_runtime_to_recovery(
+    root: Path, runtime: dict[str, object]
+) -> dict[str, object]:
+    gate_binding = runtime["semigroup_gate"]
+    schedule_binding = runtime["schedule"]
+    assert isinstance(gate_binding, dict)
+    assert isinstance(schedule_binding, dict)
+    gate_path = root / str(gate_binding["path"])
+    schedule_path = root / str(schedule_binding["path"])
+    gate = json.loads(gate_path.read_text(encoding="utf-8"))
+    schedule = json.loads(schedule_path.read_text(encoding="utf-8"))
+    gate.update(
+        {
+            "schema_version": 2,
+            "contract_type": "safa_r9_semigroup_recovery_gate_v2",
+            "recovery_policy_sha256": R9_SEMIGROUP_RECOVERY_POLICY_SHA256,
+            "numerical_metrics_role": "report_only",
+            "selection_rule": R9_SEMIGROUP_RECOVERY_SELECTION_RULE,
+            "selected_t_cut": 0.25,
+        }
+    )
+    schedule.update(
+        {
+            "recovery_policy_sha256": R9_SEMIGROUP_RECOVERY_POLICY_SHA256,
+            "numerical_metrics_role": "report_only",
+            "selection_rule": R9_SEMIGROUP_RECOVERY_SELECTION_RULE,
+            "t_cut": 0.25,
+        }
+    )
+    gate["gate_contract_sha256"] = _canonical_sha(
+        {key: value for key, value in gate.items() if key != "gate_contract_sha256"}
+    )
+    gate_path.write_text(json.dumps(gate), encoding="utf-8")
+    gate_binding["file_sha256"] = _sha(gate_path)
+    gate_binding["contract_sha256"] = gate["gate_contract_sha256"]
+    schedule["r9_semigroup_gate_contract_sha256"] = gate_binding["file_sha256"]
+    schedule_path.write_text(json.dumps(schedule), encoding="utf-8")
+    schedule_binding["file_sha256"] = _sha(schedule_path)
+    return runtime
+
+
+def _resolved_recovery(runtime: dict[str, object]) -> dict[str, object]:
+    return {
+        "formal_campaign_id": runtime["campaign_id"],
+        "policy_sha256": R9_SEMIGROUP_RECOVERY_POLICY_SHA256,
+        "schedule": deepcopy(runtime["schedule"]),
+        "gate": deepcopy(runtime["semigroup_gate"]),
+    }
+
+
 def _context(*, manifest_sha: str = SHA_D) -> dict[str, str]:
     return {
         "campaign_id": "r9-test-campaign",
@@ -1072,6 +1127,96 @@ def test_runtime_digest_is_generated_and_seed_contract_is_strict(
     wrong_seed["seeds"]["calibrate"] = [1337, 2027, 9999]
     with pytest.raises(CampaignContractError, match="calibrate seeds"):
         validate_campaign_runtime(wrong_seed, tmp_path)
+
+
+def test_runtime_accepts_exact_resolved_recovery_schedule_and_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifests, _, evidence = _manifest_fixture(tmp_path)
+    runtime = _convert_runtime_to_recovery(
+        tmp_path, _runtime(tmp_path, manifests, evidence)
+    )
+    resolved = _resolved_recovery(runtime)
+    monkeypatch.setattr(
+        campaign_contracts_module,
+        "resolve_formal_campaign_semigroup_closure",
+        lambda *args, **kwargs: resolved,
+    )
+
+    validated = validate_campaign_runtime(runtime, tmp_path)
+
+    assert validated["schedule"] == runtime["schedule"]
+    assert validated["semigroup_gate"] == runtime["semigroup_gate"]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("policy_sha", "policy semantics"),
+        ("metrics_role", "policy semantics"),
+        ("selection_rule", "policy semantics"),
+        ("t_cut", "policy semantics"),
+        ("mixed_schema", "schema/type pairing"),
+        ("closure_binding", "exactly match the resolved closure"),
+    ),
+)
+def test_runtime_rejects_recovery_semantics_or_resolved_closure_tamper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    message: str,
+) -> None:
+    manifests, _, evidence = _manifest_fixture(tmp_path)
+    runtime = _convert_runtime_to_recovery(
+        tmp_path, _runtime(tmp_path, manifests, evidence)
+    )
+    gate_binding = runtime["semigroup_gate"]
+    schedule_binding = runtime["schedule"]
+    assert isinstance(gate_binding, dict)
+    assert isinstance(schedule_binding, dict)
+    gate_path = tmp_path / str(gate_binding["path"])
+    schedule_path = tmp_path / str(schedule_binding["path"])
+    gate = json.loads(gate_path.read_text(encoding="utf-8"))
+    schedule = json.loads(schedule_path.read_text(encoding="utf-8"))
+    if mutation == "policy_sha":
+        gate["recovery_policy_sha256"] = SHA_A
+        schedule["recovery_policy_sha256"] = SHA_A
+    elif mutation == "metrics_role":
+        gate["numerical_metrics_role"] = "hard_gate"
+        schedule["numerical_metrics_role"] = "hard_gate"
+    elif mutation == "selection_rule":
+        gate["selection_rule"] = "smallest_numeric_t_cut"
+        schedule["selection_rule"] = "smallest_numeric_t_cut"
+    elif mutation == "t_cut":
+        gate["selected_t_cut"] = 0.5
+        schedule["t_cut"] = 0.5
+    elif mutation == "mixed_schema":
+        gate["schema_version"] = 1
+    elif mutation != "closure_binding":
+        raise AssertionError(f"unregistered mutation: {mutation}")
+    if mutation != "closure_binding":
+        gate["gate_contract_sha256"] = _canonical_sha(
+            {key: value for key, value in gate.items() if key != "gate_contract_sha256"}
+        )
+        gate_path.write_text(json.dumps(gate), encoding="utf-8")
+        gate_binding["file_sha256"] = _sha(gate_path)
+        gate_binding["contract_sha256"] = gate["gate_contract_sha256"]
+        schedule["r9_semigroup_gate_contract_sha256"] = gate_binding["file_sha256"]
+        schedule_path.write_text(json.dumps(schedule), encoding="utf-8")
+        schedule_binding["file_sha256"] = _sha(schedule_path)
+    resolved = _resolved_recovery(runtime)
+    if mutation == "closure_binding":
+        resolved_gate = resolved["gate"]
+        assert isinstance(resolved_gate, dict)
+        resolved_gate["file_sha256"] = SHA_A
+    monkeypatch.setattr(
+        campaign_contracts_module,
+        "resolve_formal_campaign_semigroup_closure",
+        lambda *args, **kwargs: resolved,
+    )
+
+    with pytest.raises(CampaignContractError, match=message):
+        validate_campaign_runtime(runtime, tmp_path)
 
 
 @pytest.mark.parametrize(

@@ -14,6 +14,14 @@ from safa.evaluation.r9_evaluator_resources import (
     EvaluatorResourceContractError,
     validate_evaluator_resource_profiles,
 )
+from safa.evaluation.r9_semigroup_campaign_closure import (
+    CampaignSemigroupClosureError,
+    resolve_formal_campaign_semigroup_closure,
+)
+from safa.evaluation.r9_semigroup_contracts import (
+    R9_SEMIGROUP_RECOVERY_POLICY_SHA256,
+    R9_SEMIGROUP_RECOVERY_SELECTION_RULE,
+)
 
 
 R9_CAMPAIGN_CONTRACT = "safa_r9_campaign_v1"
@@ -254,6 +262,7 @@ def validate_campaign_runtime(
     schedule, semigroup_gate = _validate_schedule_and_gate(
         normalized.get("schedule"),
         normalized.get("semigroup_gate"),
+        campaign_id=str(normalized["campaign_id"]),
         repo_root=root,
         checkpoint_sha256=normalized["checkpoint"]["sha256"],
         calibration_manifest_sha256=normalized["manifests"]["calibration_64"]["sha256"],
@@ -1382,6 +1391,7 @@ def _validate_schedule_and_gate(
     schedule_value: Any,
     gate_value: Any,
     *,
+    campaign_id: str,
     repo_root: Path,
     checkpoint_sha256: str,
     calibration_manifest_sha256: str,
@@ -1397,11 +1407,51 @@ def _validate_schedule_and_gate(
         or schedule_payload.get("gate_passed") is not True
     ):
         raise CampaignContractError("locked schedule must be passing schema v3")
-    if (
-        gate_payload.get("contract_type") != "safa_r9_semigroup_gate_v1"
-        or gate_payload.get("gate_passed") is not True
-    ):
-        raise CampaignContractError("semigroup gate must be a passing R9 gate")
+    gate_schema = gate_payload.get("schema_version")
+    gate_type = gate_payload.get("contract_type")
+    if gate_schema == 1 and gate_type == "safa_r9_semigroup_gate_v1":
+        if gate_payload.get("gate_passed") is not True:
+            raise CampaignContractError("semigroup gate must be a passing R9 gate")
+    elif gate_schema == 2 and gate_type == "safa_r9_semigroup_recovery_gate_v2":
+        if (
+            gate_payload.get("gate_passed") is not True
+            or gate_payload.get("recovery_policy_sha256")
+            != R9_SEMIGROUP_RECOVERY_POLICY_SHA256
+            or gate_payload.get("numerical_metrics_role") != "report_only"
+            or gate_payload.get("selection_rule")
+            != R9_SEMIGROUP_RECOVERY_SELECTION_RULE
+            or gate_payload.get("selected_t_cut") != 0.25
+            or schedule_payload.get("recovery_policy_sha256")
+            != R9_SEMIGROUP_RECOVERY_POLICY_SHA256
+            or schedule_payload.get("numerical_metrics_role") != "report_only"
+            or schedule_payload.get("selection_rule")
+            != R9_SEMIGROUP_RECOVERY_SELECTION_RULE
+            or schedule_payload.get("t_cut") != 0.25
+        ):
+            raise CampaignContractError(
+                "recovery schedule/gate policy semantics mismatch"
+            )
+        try:
+            resolved_closure = resolve_formal_campaign_semigroup_closure(
+                campaign_id, repo_root=repo_root
+            )
+        except CampaignSemigroupClosureError as exc:
+            raise CampaignContractError(
+                "recovery schedule/gate closure validation failed"
+            ) from exc
+        if (
+            not isinstance(resolved_closure, Mapping)
+            or resolved_closure.get("formal_campaign_id") != campaign_id
+            or resolved_closure.get("policy_sha256")
+            != R9_SEMIGROUP_RECOVERY_POLICY_SHA256
+            or resolved_closure.get("schedule") != schedule
+            or resolved_closure.get("gate") != gate
+        ):
+            raise CampaignContractError(
+                "recovery schedule/gate must exactly match the resolved closure"
+            )
+    else:
+        raise CampaignContractError("semigroup gate schema/type pairing is invalid")
     if gate_payload.get("experiment_contract") != R9_GENERATION_EXPERIMENT_CONTRACT:
         raise CampaignContractError("semigroup gate generation contract mismatch")
     if gate_payload.get("determinism_policy_sha256") != R9_DETERMINISM_POLICY_SHA256:
