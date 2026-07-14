@@ -1765,10 +1765,11 @@ class _FourGpuSlotScheduler:
     resource_contract_sha256 = "a" * 64
     ram_slot_budget_bytes = 1_100_000_000
 
-    def __init__(self) -> None:
+    def __init__(self, capacities=None) -> None:
         self.active = {}
         self.max_active = 0
         self.admitted_slots = []
+        self.capacities = capacities or {f"GPU-{index}": 4 for index in range(4)}
 
     @property
     def active_leases(self):
@@ -1781,7 +1782,7 @@ class _FourGpuSlotScheduler:
         slot = next(
             (
                 index
-                for index in range(4)
+                for index in range(self.capacities[request.expected_gpu_uuid])
                 if (request.expected_gpu_uuid, index) not in occupied
             ),
             None,
@@ -1877,10 +1878,166 @@ def test_execute_refills_four_by_four_slots_without_exceeding_sixteen(
     )
     assert len(processes) == 20
     assert scheduler.max_active == 16
+    assert scheduler.admitted_slots[:16] == [
+        (f"GPU-{gpu}", slot) for slot in range(4) for gpu in range(4)
+    ]
     assert set(scheduler.admitted_slots[:16]) == {
         (f"GPU-{gpu}", slot) for gpu in range(4) for slot in range(4)
     }
     assert scheduler.active == {}
+
+
+def test_execute_spreads_twelve_workers_three_per_gpu(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(driver, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(driver, "validate_worker_completion", lambda run: {})
+    scheduler = _FourGpuSlotScheduler()
+    allow_complete = {"value": False}
+
+    class GateProcess(_FakeProcess):
+        def poll(self):
+            return 0 if allow_complete["value"] else None
+
+    driver.execute_campaign(
+        (_many_run_plan(tmp_path, 12),),
+        scheduler=scheduler,
+        gpu_bindings={index: f"GPU-{index}" for index in range(4)},
+        peer_status_store=_StatusStore(),
+        process_factory=lambda *args, **kwargs: GateProcess(0),
+        sleep=lambda _: allow_complete.update(value=True),
+    )
+    assert scheduler.max_active == 12
+    assert scheduler.admitted_slots == [
+        (f"GPU-{gpu}", slot) for slot in range(3) for gpu in range(4)
+    ]
+    assert scheduler.active == {}
+
+
+def test_execute_round_robin_respects_heterogeneous_gpu_capacity(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(driver, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(driver, "validate_worker_completion", lambda run: {})
+    scheduler = _FourGpuSlotScheduler(
+        {"GPU-0": 1, "GPU-1": 2, "GPU-2": 3, "GPU-3": 4}
+    )
+    allow_complete = {"value": False}
+
+    class GateProcess(_FakeProcess):
+        def poll(self):
+            return 0 if allow_complete["value"] else None
+
+    driver.execute_campaign(
+        (_many_run_plan(tmp_path, 10),),
+        scheduler=scheduler,
+        gpu_bindings={index: f"GPU-{index}" for index in range(4)},
+        peer_status_store=_StatusStore(),
+        process_factory=lambda *args, **kwargs: GateProcess(0),
+        sleep=lambda _: allow_complete.update(value=True),
+    )
+    assert scheduler.max_active == 10
+    assert scheduler.admitted_slots == [
+        ("GPU-0", 0),
+        ("GPU-1", 0),
+        ("GPU-2", 0),
+        ("GPU-3", 0),
+        ("GPU-1", 1),
+        ("GPU-2", 1),
+        ("GPU-3", 1),
+        ("GPU-2", 2),
+        ("GPU-3", 2),
+        ("GPU-3", 3),
+    ]
+
+
+def test_admission_skips_busy_and_locked_gpus_in_round_robin_order() -> None:
+    class BusyAndLockedScheduler:
+        resource_contract_sha256 = "a" * 64
+
+        def __init__(self) -> None:
+            self.requests = []
+
+        def admit_worker(self, request):
+            self.requests.append(request)
+            status = {
+                "GPU-1": driver.AdmissionStatus.LOCK_CONTENTION,
+                "GPU-2": driver.AdmissionStatus.GPU_LIMIT,
+                "GPU-3": driver.AdmissionStatus.ADMITTED,
+            }[request.expected_gpu_uuid]
+            lease = None
+            if status is driver.AdmissionStatus.ADMITTED:
+                lease = SimpleNamespace(gpu_uuid=request.expected_gpu_uuid, slot_index=0)
+            return SimpleNamespace(status=status, lease=lease, incumbent=None)
+
+    scheduler = BusyAndLockedScheduler()
+    lease = driver._admit_worker(
+        scheduler,
+        worker_id="worker-0",
+        launch_ordinal=10_000,
+        gpu_bindings={index: f"GPU-{index}" for index in range(4)},
+        ram_slot_budget_bytes=1_100_000_000,
+        start_gpu_index=1,
+    )
+    assert lease.gpu_uuid == "GPU-3"
+    assert [request.gpu_index for request in scheduler.requests] == [1, 2, 3]
+    assert driver._next_gpu_index(
+        {index: f"GPU-{index}" for index in range(4)}, lease.gpu_uuid
+    ) == 0
+
+
+@pytest.mark.parametrize(
+    "status",
+    [driver.AdmissionStatus.RESUMED, driver.AdmissionStatus.RECLAIMED],
+)
+def test_round_robin_accepts_bound_resume_and_reclaimed_leases(status) -> None:
+    class ResumeScheduler:
+        resource_contract_sha256 = "a" * 64
+
+        def admit_worker(self, request):
+            return SimpleNamespace(
+                status=status,
+                lease=SimpleNamespace(
+                    gpu_uuid=request.expected_gpu_uuid,
+                    slot_index=2,
+                ),
+                incumbent=None,
+            )
+
+    lease = driver._admit_worker(
+        ResumeScheduler(),
+        worker_id="worker-resume",
+        launch_ordinal=10_000,
+        gpu_bindings={index: f"GPU-{index}" for index in range(4)},
+        ram_slot_budget_bytes=1_100_000_000,
+        start_gpu_index=2,
+    )
+    assert lease.gpu_uuid == "GPU-2"
+    assert driver._next_gpu_index(
+        {index: f"GPU-{index}" for index in range(4)}, lease.gpu_uuid
+    ) == 3
+
+
+def test_round_robin_rejects_success_lease_with_wrong_gpu_uuid() -> None:
+    class WrongUuidScheduler:
+        resource_contract_sha256 = "a" * 64
+
+        def admit_worker(self, request):
+            return SimpleNamespace(
+                status=driver.AdmissionStatus.ADMITTED,
+                lease=SimpleNamespace(gpu_uuid="GPU-wrong", slot_index=0),
+                incumbent=None,
+            )
+
+    with pytest.raises(driver.ResourceContractError, match="outside its request"):
+        driver._admit_worker(
+            WrongUuidScheduler(),
+            worker_id="worker-wrong-uuid",
+            launch_ordinal=10_000,
+            gpu_bindings={index: f"GPU-{index}" for index in range(4)},
+            ram_slot_budget_bytes=1_100_000_000,
+            start_gpu_index=0,
+        )
 
 
 def test_peer_failure_terminates_and_releases_all_other_live_workers(
@@ -1909,6 +2066,12 @@ def test_peer_failure_terminates_and_releases_all_other_live_workers(
             sleep=lambda _: None,
         )
     assert all(process.terminated for process in processes[1:])
+    assert scheduler.admitted_slots == [
+        ("GPU-0", 0),
+        ("GPU-1", 0),
+        ("GPU-2", 0),
+        ("GPU-3", 0),
+    ]
     assert scheduler.active == {}
 
 

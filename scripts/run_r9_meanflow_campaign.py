@@ -83,7 +83,7 @@ from safa.evaluation.r9_semigroup_campaign_closure import (
 
 RUNTIME_CONFIG = Path("configs/medium_v2/experiments/r9_meanflow_campaign.yaml")
 CONTINUATION_RUNTIME_CONFIG = Path(R9_CONTINUATION_REQUEST_PATH)
-CONTINUATION_CHILD_CAMPAIGN_ID = "r9-report-only-formal-v4"
+CONTINUATION_CHILD_CAMPAIGN_ID = "r9-report-only-formal-v5"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PHASES = ("preflight", "diagnose", "calibrate", "confirm512", "full")
 CAMPAIGN_ID_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
@@ -2271,6 +2271,7 @@ def execute_campaign(
                 continue
             pending.append((run, _stable_launch_ordinal(run.phase, run_index)))
     active: dict[str, ActiveWorker] = {}
+    next_gpu_index = min(bindings)
     while pending or active:
         launched = False
         pending_index = 0
@@ -2283,10 +2284,12 @@ def execute_campaign(
                 launch_ordinal=launch_ordinal,
                 gpu_bindings=bindings,
                 ram_slot_budget_bytes=scheduler.ram_slot_budget_bytes,
+                start_gpu_index=next_gpu_index,
             )
             if lease is None:
                 pending_index += 1
                 continue
+            next_gpu_index = _next_gpu_index(bindings, lease.gpu_uuid)
             try:
                 peer_status_store.record_admitted(worker_id)
             except (OSError, ResourceContractError, ValueError):
@@ -2625,9 +2628,19 @@ def _admit_worker(
     launch_ordinal: int,
     gpu_bindings: Mapping[int, str],
     ram_slot_budget_bytes: int,
+    start_gpu_index: int | None = None,
 ) -> Any | None:
+    bindings = _validate_gpu_bindings(gpu_bindings)
+    if start_gpu_index is None:
+        start_gpu_index = min(bindings)
+    if start_gpu_index not in bindings:
+        raise ValueError("R9 round-robin start GPU is not bound")
+    indices = tuple(sorted(bindings))
+    start_offset = indices.index(start_gpu_index)
+    ordered_indices = indices[start_offset:] + indices[:start_offset]
     stale_incumbents = []
-    for gpu_index, gpu_uuid in gpu_bindings.items():
+    for gpu_index in ordered_indices:
+        gpu_uuid = bindings[gpu_index]
         decision = scheduler.admit_worker(
             WorkerRequest(
                 worker_id=worker_id,
@@ -2647,6 +2660,18 @@ def _admit_worker(
                 raise ResourceContractError(
                     "successful R9 admission omitted its slot lease"
                 )
+            if decision.lease.gpu_uuid != gpu_uuid:
+                raise ResourceContractError(
+                    "successful R9 admission returned a GPU UUID outside its request"
+                )
+            if (
+                isinstance(decision.lease.slot_index, bool)
+                or not isinstance(decision.lease.slot_index, int)
+                or not 0 <= decision.lease.slot_index < 4
+            ):
+                raise ResourceContractError(
+                    "successful R9 admission returned an invalid GPU slot"
+                )
             return decision.lease
         if decision.status is AdmissionStatus.STALE_PEER:
             stale_incumbents.append(decision.incumbent)
@@ -2663,6 +2688,18 @@ def _admit_worker(
             + ",".join(incumbent_ids)
         )
     return None
+
+
+def _next_gpu_index(bindings: Mapping[int, str], admitted_gpu_uuid: str) -> int:
+    normalized = _validate_gpu_bindings(bindings)
+    index_by_uuid = {uuid: index for index, uuid in normalized.items()}
+    if admitted_gpu_uuid not in index_by_uuid:
+        raise ResourceContractError(
+            "successful R9 admission returned an unbound GPU UUID"
+        )
+    indices = tuple(sorted(normalized))
+    admitted_offset = indices.index(index_by_uuid[admitted_gpu_uuid])
+    return indices[(admitted_offset + 1) % len(indices)]
 
 
 def build_run_runtime_config(
