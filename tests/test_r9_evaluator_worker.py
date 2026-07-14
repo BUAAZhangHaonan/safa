@@ -1351,12 +1351,22 @@ def test_worker_request_output_digests_and_o_excl(tmp_path: Path) -> None:
         )
 
 
-def test_worker_rejects_request_digest_tampering(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("seed", 8),
+        ("source_index_path", "/tmp/replaced-source-index.jsonl"),
+        ("source_index_sha256", "9" * 64),
+    ),
+)
+def test_worker_rejects_request_digest_tampering(
+    tmp_path: Path, field: str, value: object
+) -> None:
     config, samples, manifest = _fixture(tmp_path)
     request = build_worker_request(
         "quality", _quality_request(samples, manifest), config=config
     )
-    request["payload"]["seed"] = 8
+    request["payload"][field] = value
     request_path = tmp_path / "request.json"
     request_path.write_text(json.dumps(request), encoding="utf-8")
     with pytest.raises(R9EvaluatorError, match="request_sha256 mismatch"):

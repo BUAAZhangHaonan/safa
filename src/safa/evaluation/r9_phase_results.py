@@ -32,6 +32,7 @@ PHASE_SAMPLE_COUNTS = {
     "confirm512": 512,
     "full": 2048,
 }
+EVALUATION_REPAIR_FILENAME = "evaluation_repair_contract.json"
 FORBIDDEN_DERIVED_INPUT_FIELDS = frozenset(
     {"passed", "severe_count", "severe_failure_count", "failures", "verdict"}
 )
@@ -1103,7 +1104,6 @@ def _evaluate_quality(
         "generation_result_set_sha256": generation_result_set_sha256,
         "per_sample_set_sha256": per_sample_set_sha256,
         "manifest_sha256": request.manifest_sha256,
-        "source_index_path": str(request.source_index_path.resolve()),
         "source_index_sha256": request.source_index_sha256,
         "ordered_sample_id_sha256": _sample_id_digest(
             [sample.sample_id for sample in samples]
@@ -2762,7 +2762,7 @@ def canonical_r9_algorithm_config_digest(
 
 
 def _request_context(request: PhaseResultsRequest) -> dict[str, Any]:
-    return {
+    context = {
         "campaign_id": request.campaign_id,
         "campaign_runtime_sha256": request.campaign_runtime_sha256,
         "manifest_contracts_sha256": request.manifest_contracts_sha256,
@@ -2776,6 +2776,264 @@ def _request_context(request: PhaseResultsRequest) -> dict[str, Any]:
             else request.upstream_gate.get("gate_contract_sha256")
         ),
     }
+    repair = evaluation_repair_binding(request)
+    if repair is not None:
+        context["evaluation_repair"] = repair
+    return context
+
+
+def generation_evidence_inventory(request: PhaseResultsRequest) -> dict[str, Any]:
+    repo_root = request.repo_root.resolve()
+    phase_root = _contained_path(repo_root, request.phase_root, "phase root")
+    files: list[dict[str, str]] = []
+    shard_roots: set[Path] = set()
+    for spec in request.runs:
+        for value in spec.shard_output_dirs:
+            shard_root = _contained_path(repo_root, value, "generation shard output")
+            if shard_root.parent != phase_root or shard_root in shard_roots:
+                raise PhaseResultsError(
+                    "generation repair inventory requires unique direct phase children"
+                )
+            if shard_root.is_symlink() or not shard_root.is_dir():
+                raise PhaseResultsError("generation shard output is not a directory")
+            shard_roots.add(shard_root)
+            for path in sorted(shard_root.rglob("*")):
+                if path.is_symlink():
+                    raise PhaseResultsError("generation repair inventory rejects symlinks")
+                if path.is_file():
+                    files.append(
+                        {
+                            "path": str(path.relative_to(phase_root)),
+                            "sha256": _sha256_file(path),
+                        }
+                    )
+    files.sort(key=lambda row: row["path"])
+    completion_count = sum(row["path"].endswith("/completion.json") for row in files)
+    generation_result_count = sum(
+        row["path"].endswith("/generation_result.json") for row in files
+    )
+    png_count = sum(row["path"].lower().endswith(".png") for row in files)
+    payload = {
+        "phase_root": str(phase_root.relative_to(repo_root)),
+        "logical_run_count": len(request.runs),
+        "shard_count": len(shard_roots),
+        "completion_count": completion_count,
+        "generation_result_count": generation_result_count,
+        "file_count": len(files),
+        "png_count": png_count,
+        "inventory_sha256": _canonical_json_sha256({"files": files}),
+    }
+    if completion_count != len(shard_roots) or generation_result_count != len(
+        shard_roots
+    ):
+        raise PhaseResultsError("generation repair inventory is incomplete")
+    return payload
+
+
+def evaluation_repair_binding(
+    request: PhaseResultsRequest,
+) -> dict[str, str] | None:
+    repo_root = request.repo_root.resolve()
+    path = _contained_path(
+        repo_root,
+        request.phase_root / EVALUATION_REPAIR_FILENAME,
+        "evaluation repair contract",
+    )
+    if not path.exists():
+        return None
+    repair = _read_digest_contract(
+        path,
+        digest_field="repair_contract_sha256",
+        contract_type="safa_r9_evaluation_repair_contract_v1",
+    )
+    if set(repair) != {
+        "schema_version",
+        "contract_type",
+        "campaign_id",
+        "phase",
+        "campaign_runtime",
+        "generation_evidence",
+        "failed_evaluation",
+        "implementations",
+        "policy",
+        "repair_contract_sha256",
+    }:
+        raise PhaseResultsError("evaluation repair contract fields are not canonical")
+    if repair.get("campaign_id") != request.campaign_id or repair.get(
+        "phase"
+    ) != request.phase:
+        raise PhaseResultsError("evaluation repair campaign or phase mismatch")
+    runtime = repair.get("campaign_runtime")
+    if not isinstance(runtime, Mapping) or set(runtime) != {
+        "path",
+        "file_sha256",
+        "contract_sha256",
+    }:
+        raise PhaseResultsError("evaluation repair runtime binding is invalid")
+    runtime_path = _contained_file(
+        repo_root, Path(str(runtime["path"])), "evaluation repair runtime"
+    )
+    runtime_payload = _read_digest_contract(
+        runtime_path,
+        digest_field="campaign_runtime_sha256",
+        contract_type=None,
+    )
+    if (
+        _sha256_file(runtime_path) != runtime["file_sha256"]
+        or runtime["contract_sha256"] != runtime_payload["campaign_runtime_sha256"]
+        or runtime["contract_sha256"] != request.campaign_runtime_sha256
+    ):
+        raise PhaseResultsError("evaluation repair runtime binding mismatch")
+    if repair.get("generation_evidence") != generation_evidence_inventory(request):
+        raise PhaseResultsError("evaluation repair generation inventory mismatch")
+    failed = repair.get("failed_evaluation")
+    if not isinstance(failed, Mapping) or set(failed) != {
+        "evaluator",
+        "unit_id",
+        "request",
+        "result",
+        "mismatch",
+    }:
+        raise PhaseResultsError("evaluation repair failure evidence is invalid")
+    if failed.get("evaluator") != "quality" or not isinstance(
+        failed.get("unit_id"), str
+    ):
+        raise PhaseResultsError("evaluation repair failure identity is invalid")
+    request_binding = _validate_repair_file_binding(
+        failed.get("request"),
+        repo_root=repo_root,
+        digest_field="evaluator_request_sha256",
+        contract_type="safa_r9_phase_evaluator_request_v1",
+        label="failed evaluator request",
+    )
+    result_binding = _validate_repair_file_binding(
+        failed.get("result"),
+        repo_root=repo_root,
+        digest_field="evaluator_output_sha256",
+        contract_type="safa_r9_phase_evaluator_output_v1",
+        label="failed evaluator result",
+    )
+    request_payload = _read_json_mapping(
+        repo_root / request_binding["path"], "failed evaluator request"
+    )
+    result_payload = _read_json_mapping(
+        repo_root / result_binding["path"], "failed evaluator result"
+    )
+    if result_payload.get("evaluator_request_sha256") != request_binding[
+        "contract_sha256"
+    ]:
+        raise PhaseResultsError("failed evaluator result does not bind its request")
+    request_evaluation = request_payload.get("payload")
+    result_evaluation = result_payload.get("result")
+    raw_binding = (
+        result_evaluation.get("r9_evidence_binding")
+        if isinstance(result_evaluation, Mapping)
+        else None
+    )
+    if (
+        not isinstance(request_evaluation, Mapping)
+        or not isinstance(request_evaluation.get("source_index_path"), str)
+        or not isinstance(raw_binding, Mapping)
+        or "source_index_path" in raw_binding
+        or raw_binding.get("source_index_sha256")
+        != request_evaluation.get("source_index_sha256")
+    ):
+        raise PhaseResultsError("failed evaluator result is not the registered mismatch")
+    if failed.get("mismatch") != {
+        "field": "r9_evidence_binding.source_index_path",
+        "classification": "request_transport_field_in_raw_content_binding",
+        "producer_has_field": False,
+        "consumer_required_field": True,
+    }:
+        raise PhaseResultsError("evaluation repair mismatch classification changed")
+    implementations = repair.get("implementations")
+    if not isinstance(implementations, Mapping) or set(implementations) != {
+        "source_git_commit",
+        "prior_phase_results_sha256",
+        "repaired_phase_results",
+        "driver",
+        "evaluator_worker",
+        "quality",
+        "repair_runner",
+    }:
+        raise PhaseResultsError("evaluation repair implementation fields are invalid")
+    implementation_paths = {}
+    for field in (
+        "repaired_phase_results",
+        "driver",
+        "evaluator_worker",
+        "quality",
+        "repair_runner",
+    ):
+        implementation_paths[field] = _validate_repair_implementation_binding(
+            implementations.get(field), repo_root=repo_root, label=field
+        )
+    if implementation_paths["repaired_phase_results"] != Path(__file__).resolve():
+        raise PhaseResultsError("evaluation repair binds another phase implementation")
+    _require_sha256(
+        implementations.get("prior_phase_results_sha256"),
+        "prior phase-results SHA256",
+    )
+    source_commit = implementations.get("source_git_commit")
+    if (
+        not isinstance(source_commit, str)
+        or len(source_commit) != 40
+        or any(character not in "0123456789abcdef" for character in source_commit)
+    ):
+        raise PhaseResultsError("evaluation repair source commit is invalid")
+    if repair.get("policy") != {
+        "generation_execution": "forbidden",
+        "expected_generation_worker_count": 0,
+        "old_failed_result_usage": "input_evidence_only",
+        "old_attempt_retry_allowed": False,
+        "evaluation_namespace": "evaluation_repairs/{repair_contract_sha256}",
+        "request_binding": "full_repair_sha256_in_logical_run_id",
+    }:
+        raise PhaseResultsError("evaluation repair policy changed")
+    return {
+        "path": str(path.relative_to(repo_root)),
+        "file_sha256": _sha256_file(path),
+        "contract_sha256": repair["repair_contract_sha256"],
+    }
+
+
+def _validate_repair_file_binding(
+    value: Any,
+    *,
+    repo_root: Path,
+    digest_field: str,
+    contract_type: str,
+    label: str,
+) -> dict[str, str]:
+    if not isinstance(value, Mapping) or set(value) != {
+        "path",
+        "file_sha256",
+        "contract_sha256",
+    }:
+        raise PhaseResultsError(f"{label} binding fields are invalid")
+    path = _contained_file(repo_root, Path(str(value["path"])), label)
+    payload = _read_digest_contract(
+        path, digest_field=digest_field, contract_type=contract_type
+    )
+    if (
+        _sha256_file(path) != value["file_sha256"]
+        or payload[digest_field] != value["contract_sha256"]
+    ):
+        raise PhaseResultsError(f"{label} binding mismatch")
+    return dict(value)
+
+
+def _validate_repair_implementation_binding(
+    value: Any, *, repo_root: Path, label: str
+) -> Path:
+    if not isinstance(value, Mapping) or set(value) != {"path", "sha256"}:
+        raise PhaseResultsError(f"evaluation repair {label} binding is invalid")
+    path = _contained_file(
+        repo_root, Path(str(value["path"])), f"evaluation repair {label}"
+    )
+    if _sha256_file(path) != value["sha256"]:
+        raise PhaseResultsError(f"evaluation repair {label} SHA256 mismatch")
+    return path.resolve()
 
 
 def _run_plan_payload(request: PhaseResultsRequest) -> dict[str, Any]:

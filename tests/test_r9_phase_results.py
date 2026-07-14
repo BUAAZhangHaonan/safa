@@ -8,6 +8,7 @@ from typing import Any, Mapping
 
 from PIL import Image
 import pytest
+import safa.evaluation.r9_phase_results as phase_results
 
 from safa.evaluation.r8_visual_evidence import (
     build_visual_evidence_contract,
@@ -39,6 +40,8 @@ from safa.evaluation.r9_phase_results import (
     _validate_request,
     _write_exclusive_json,
     canonical_r9_algorithm_config_digest,
+    evaluation_repair_binding,
+    generation_evidence_inventory,
     submit_visual_review,
     validate_interval_diagnostics,
     validate_visual_review,
@@ -1162,9 +1165,11 @@ def test_quality_per_sample_metrics_rejects_invalid_contract(mutation: str) -> N
 
 
 @pytest.mark.parametrize(
-    "mutation", ["asset", "sample", "generation_set", "per_sample_set"]
+    "mutation", ["none", "asset", "sample", "generation_set", "per_sample_set"]
 )
-def test_quality_rejects_wrong_provenance(tmp_path: Path, mutation: str) -> None:
+def test_quality_accepts_producer_binding_and_rejects_wrong_provenance(
+    tmp_path: Path, mutation: str
+) -> None:
     run, _ = _make_run(
         tmp_path, f"quality_{mutation}", collect=False, operational_tag="worker"
     )
@@ -1181,7 +1186,6 @@ def test_quality_rejects_wrong_provenance(tmp_path: Path, mutation: str) -> None
             "generation_result_set_sha256": evaluation.generation_result_set_sha256,
             "per_sample_set_sha256": evaluation.per_sample_set_sha256,
             "manifest_sha256": request.manifest_sha256,
-            "source_index_path": str(request.source_index_path.resolve()),
             "source_index_sha256": request.source_index_sha256,
             "ordered_sample_id_sha256": hashlib.sha256(
                 "".join(f"{sample_id}\n" for sample_id in sample_ids).encode()
@@ -1218,25 +1222,227 @@ def test_quality_rejects_wrong_provenance(tmp_path: Path, mutation: str) -> None
             "fid": 10.0,
             "kid_mean": 0.01,
             "iqa": {"method": "niqe", "mean": 4.0},
-            "sharpness": {
-                "definition": "grayscale_laplacian_variance",
-                "mean": 350.0,
-            },
-        }
+                "sharpness": {
+                    "definition": "grayscale_laplacian_variance",
+                    "mean": 350.0,
+                },
+                "per_sample_metrics": _quality_per_sample_contract(sample_ids),
+            }
         if mutation == "asset":
             result["quality_contract"]["generated_asset_manifest_sha256"] = "0" * 64
         elif mutation == "sample":
             result["sample_id_count"] = 0
         return result
 
-    with pytest.raises(PhaseResultsError):
-        _evaluate_quality(
+    if mutation == "none":
+        result = _evaluate_quality(
             request,
             run,
             _sample_evidence(run),
             "candidate",
             evaluator,
         )
+        raw_contract = json.loads(Path(result["raw_evidence_path"]).read_text())
+        raw_binding = raw_contract["r9_evidence_binding"]
+        assert raw_binding["source_index_sha256"] == (
+            request.source_index_sha256
+        )
+        assert "source_index_path" not in raw_binding
+    else:
+        with pytest.raises(PhaseResultsError):
+            _evaluate_quality(
+                request,
+                run,
+                _sample_evidence(run),
+                "candidate",
+                evaluator,
+            )
+
+
+def _repair_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[PhaseResultsRequest, Path, dict[str, Any], dict[str, Path]]:
+    repo_root = tmp_path / "repo"
+    phase_root = repo_root / "phase"
+    phase_root.mkdir(parents=True)
+    _, run_spec = _make_run(
+        phase_root, "shard", collect=False, operational_tag="worker"
+    )
+    runtime = {"schema_version": 1, "campaign_id": "campaign"}
+    runtime["campaign_runtime_sha256"] = _canonical_digest(
+        runtime, "campaign_runtime_sha256"
+    )
+    runtime_path = repo_root / "campaign_runtime.json"
+    _write_json(runtime_path, runtime)
+    source_index = phase_root / "source_index.jsonl"
+    request = PhaseResultsRequest(
+        repo_root=repo_root,
+        phase_root=phase_root,
+        phase="diagnose",
+        campaign_id="campaign",
+        campaign_runtime_sha256=runtime["campaign_runtime_sha256"],
+        manifest_contracts_sha256="f" * 64,
+        manifest_path=phase_root / "unused.jsonl",
+        manifest_sha256="1" * 64,
+        source_index_path=source_index,
+        source_index_sha256=_sha256(source_index),
+        checkpoint_sha256=SHA,
+        bootstrap_seed=5,
+        runs=(run_spec,),
+        expected_candidate_arm_ids=("arm",),
+        expected_seeds=(1337,),
+    )
+    failed_root = phase_root / "evaluator_runs" / "quality" / "failed"
+    failed_request = {
+        "schema_version": 1,
+        "contract_type": "safa_r9_phase_evaluator_request_v1",
+        "payload": {
+            "source_index_path": str(source_index),
+            "source_index_sha256": request.source_index_sha256,
+        },
+    }
+    failed_request["evaluator_request_sha256"] = _canonical_digest(
+        failed_request, "evaluator_request_sha256"
+    )
+    failed_request_path = failed_root / "request.json"
+    _write_json(failed_request_path, failed_request)
+    failed_result = {
+        "schema_version": 1,
+        "contract_type": "safa_r9_phase_evaluator_output_v1",
+        "evaluator_request_sha256": failed_request["evaluator_request_sha256"],
+        "result": {
+            "r9_evidence_binding": {
+                "source_index_sha256": request.source_index_sha256
+            }
+        },
+    }
+    failed_result["evaluator_output_sha256"] = _canonical_digest(
+        failed_result, "evaluator_output_sha256"
+    )
+    failed_result_path = failed_root / "result.json"
+    _write_json(failed_result_path, failed_result)
+
+    implementations = {}
+    implementation_paths: dict[str, Path] = {}
+    for name in (
+        "repaired_phase_results",
+        "driver",
+        "evaluator_worker",
+        "quality",
+        "repair_runner",
+    ):
+        path = repo_root / "implementations" / f"{name}.py"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"# {name}\n", encoding="utf-8")
+        implementation_paths[name] = path
+        implementations[name] = {
+            "path": str(path.relative_to(repo_root)),
+            "sha256": _sha256(path),
+        }
+    monkeypatch.setattr(
+        phase_results, "__file__", str(implementation_paths["repaired_phase_results"])
+    )
+
+    def file_binding(path: Path, payload: Mapping[str, Any], digest_field: str):
+        return {
+            "path": str(path.relative_to(repo_root)),
+            "file_sha256": _sha256(path),
+            "contract_sha256": payload[digest_field],
+        }
+
+    repair = {
+        "schema_version": 1,
+        "contract_type": "safa_r9_evaluation_repair_contract_v1",
+        "campaign_id": request.campaign_id,
+        "phase": request.phase,
+        "campaign_runtime": file_binding(
+            runtime_path, runtime, "campaign_runtime_sha256"
+        ),
+        "generation_evidence": generation_evidence_inventory(request),
+        "failed_evaluation": {
+            "evaluator": "quality",
+            "unit_id": "failed",
+            "request": file_binding(
+                failed_request_path, failed_request, "evaluator_request_sha256"
+            ),
+            "result": file_binding(
+                failed_result_path, failed_result, "evaluator_output_sha256"
+            ),
+            "mismatch": {
+                "field": "r9_evidence_binding.source_index_path",
+                "classification": "request_transport_field_in_raw_content_binding",
+                "producer_has_field": False,
+                "consumer_required_field": True,
+            },
+        },
+        "implementations": {
+            "source_git_commit": "a" * 40,
+            "prior_phase_results_sha256": "b" * 64,
+            **implementations,
+        },
+        "policy": {
+            "generation_execution": "forbidden",
+            "expected_generation_worker_count": 0,
+            "old_failed_result_usage": "input_evidence_only",
+            "old_attempt_retry_allowed": False,
+            "evaluation_namespace": "evaluation_repairs/{repair_contract_sha256}",
+            "request_binding": "full_repair_sha256_in_logical_run_id",
+        },
+    }
+    repair["repair_contract_sha256"] = _canonical_digest(
+        repair, "repair_contract_sha256"
+    )
+    repair_path = phase_root / phase_results.EVALUATION_REPAIR_FILENAME
+    _write_json(repair_path, repair)
+    paths = {
+        "request": failed_request_path,
+        "result": failed_result_path,
+        "implementation": implementation_paths["repair_runner"],
+    }
+    return request, repair_path, repair, paths
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["repair_digest", "generation", "request", "result", "implementation", "policy", "raw_mismatch"],
+)
+def test_evaluation_repair_binding_rejects_tampering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    request, repair_path, repair, paths = _repair_fixture(tmp_path, monkeypatch)
+    assert evaluation_repair_binding(request)["contract_sha256"] == repair[
+        "repair_contract_sha256"
+    ]
+    if mutation == "repair_digest":
+        repair["repair_contract_sha256"] = "0" * 64
+    elif mutation == "generation":
+        repair["generation_evidence"]["png_count"] += 1
+    elif mutation in {"request", "result", "implementation"}:
+        paths[mutation].write_bytes(paths[mutation].read_bytes() + b"tamper")
+    elif mutation == "policy":
+        repair["policy"]["generation_execution"] = "allowed"
+    elif mutation == "raw_mismatch":
+        failed_result = json.loads(paths["result"].read_text(encoding="utf-8"))
+        failed_result["result"]["r9_evidence_binding"]["source_index_path"] = (
+            str(request.source_index_path)
+        )
+        failed_result["evaluator_output_sha256"] = _canonical_digest(
+            failed_result, "evaluator_output_sha256"
+        )
+        _write_json(paths["result"], failed_result)
+        repair["failed_evaluation"]["result"] = {
+            "path": str(paths["result"].relative_to(request.repo_root)),
+            "file_sha256": _sha256(paths["result"]),
+            "contract_sha256": failed_result["evaluator_output_sha256"],
+        }
+    if mutation not in {"repair_digest", "request", "result", "implementation"}:
+        repair["repair_contract_sha256"] = _canonical_digest(
+            repair, "repair_contract_sha256"
+        )
+    if mutation not in {"request", "result", "implementation"}:
+        _write_json(repair_path, repair)
+    with pytest.raises(PhaseResultsError):
+        evaluation_repair_binding(request)
 
 
 def _heldout_fixture(
