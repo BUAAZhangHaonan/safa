@@ -321,7 +321,7 @@ phases:
   confirm512:
     manifest: validate_512
     sample_count: 512
-    shards_per_logical_run: 8
+    shards_per_logical_run: 16
     seed: 4549
     candidate_slots: 2
     visual_severe_max: 25

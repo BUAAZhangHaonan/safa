@@ -271,7 +271,14 @@ def validate_campaign_runtime(
         if payload.get("child_campaign_id") != normalized["campaign_id"]:
             raise CampaignContractError("continuation child campaign ID mismatch")
         normalized["continuation"] = expected_binding
-        closure_campaign_id = str(payload["parent"]["campaign_id"])
+        if "semigroup_closure_campaign_id" in payload:
+            closure_campaign_id = str(payload["semigroup_closure_campaign_id"])
+        else:
+            closure_campaign_id = str(
+                _json_mapping(payload.get("parent"), "continuation parent").get(
+                    "campaign_id"
+                )
+            )
     normalized["campaign_template"] = _validate_bound_file(
         normalized.get("campaign_template"),
         repo_root=root,
@@ -2305,7 +2312,7 @@ def _validate_confirm_phase(value: Any, seeds: Any) -> None:
     expected = {
         "manifest": "validate_512",
         "sample_count": 512,
-        "shards_per_logical_run": 8,
+        "shards_per_logical_run": 16,
         "seed": _seed_tuple(seeds, "confirm512")[0],
         "candidate_slots": 2,
         "visual_severe_max": 25,

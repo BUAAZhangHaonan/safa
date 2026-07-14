@@ -252,6 +252,14 @@ def validate_continuation_contract(
     value: Mapping[str, Any], *, repo_root: Path
 ) -> dict[str, Any]:
     normalized = _mapping(value, "continuation contract")
+    if normalized.get("contract_type") == "safa_r9_confirm_continuation_contract_v1":
+        from safa.evaluation.r9_confirm_continuation_contracts import (
+            validate_confirm_continuation_contract,
+        )
+
+        return validate_confirm_continuation_contract(
+            normalized, repo_root=repo_root
+        )
     declared = _sha(
         normalized.get("continuation_contract_sha256"), "continuation contract SHA256"
     )
@@ -287,6 +295,14 @@ def continuation_contract_binding(
     payload: Mapping[str, Any], *, repo_root: Path
 ) -> tuple[Path, bytes, dict[str, str]]:
     normalized = _mapping(payload, "continuation contract")
+    if normalized.get("contract_type") == "safa_r9_confirm_continuation_contract_v1":
+        from safa.evaluation.r9_confirm_continuation_contracts import (
+            confirm_continuation_contract_binding,
+        )
+
+        return confirm_continuation_contract_binding(
+            normalized, repo_root=repo_root
+        )
     child_campaign_id = _nonempty(
         normalized.get("child_campaign_id"), "child campaign ID"
     )

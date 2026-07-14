@@ -5,7 +5,6 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -67,6 +66,38 @@ def test_continuation_cli_rejects_parent_phases_and_source_overrides() -> None:
                 "other",
             ]
         )
+
+
+def test_confirm_continuation_rejects_all_upstream_phases() -> None:
+    for phase in ("preflight", "diagnose", "calibrate"):
+        with pytest.raises(SystemExit):
+            driver.parse_args(
+                [
+                    "--phase",
+                    phase,
+                    "--campaign-id",
+                    driver.CONFIRM_CONTINUATION_CHILD_CAMPAIGN_ID,
+                ]
+            )
+
+
+def test_confirm_continuation_all_is_exactly_c_and_d() -> None:
+    selected = ["paper_eta_0p125", "flow_map2_normalized_eta_0p125"]
+    plans = driver.build_requested_plans(
+        runtime(),
+        phase="all",
+        campaign_id=driver.CONFIRM_CONTINUATION_CHILD_CAMPAIGN_ID,
+        continuation_selected_arm_ids=selected,
+        continuation_start_phase="confirm512",
+    )
+    assert [plan.phase for plan in plans] == ["confirm512", "full"]
+    confirm = plans[0]
+    assert confirm.logical_run_count == 3
+    assert confirm.shard_count == 48
+    assert confirm.logical_run_count * confirm.runs[0].sample_count == 1536
+    assert [
+        run.arm_ref for run in confirm.runs if run.shard_index == 0
+    ] == ["native", *selected]
 
 
 def test_continuation_request_is_source_only_and_all_starts_at_b() -> None:
@@ -327,7 +358,7 @@ def test_full_gate_forwards_runtime_bootstrap_seed(
         ("preflight", 1, 4),
         ("diagnose", 39, 39),
         ("calibrate", 12, 12),
-        ("confirm512", 3, 24),
+        ("confirm512", 3, 48),
         ("full", 2, 32),
     ),
 )
@@ -364,7 +395,7 @@ def test_confirm_and_full_sharding_contracts() -> None:
         runtime(), phase="confirm512", campaign_id="r9-test"
     )
     full = driver.build_phase_plan(runtime(), phase="full", campaign_id="r9-test")
-    assert {run.num_shards for run in confirm.runs} == {8}
+    assert {run.num_shards for run in confirm.runs} == {16}
     assert {run.sample_count for run in confirm.runs} == {512}
     assert {run.manifest_key for run in confirm.runs} == {"validate_512"}
     assert {run.num_shards for run in full.runs} == {16}

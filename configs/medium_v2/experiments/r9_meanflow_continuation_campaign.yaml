@@ -3,7 +3,7 @@ contract_type: safa_r9_continuation_request_v1
 child_campaign_id: r9-report-only-formal-v6
 base_runtime:
   path: configs/medium_v2/experiments/r9_meanflow_campaign.yaml
-  sha256: 7d84de7b33264e8ba25ed49b8e8410bd6fd3ac2cf540142b13da6a8511bb734c
+  sha256: 26a0e196adae065cbbfebe1c05f346026f5e30f1bfae1c879fea9a71bca6eeb3
 source:
   parent_campaign_id: r9-report-only-formal-v2
   diagnose_gate_contract_sha256: 748ff3a78157db3cce0c5161dc8a209d204a6f356fa19325b7e92a01e40d5cef

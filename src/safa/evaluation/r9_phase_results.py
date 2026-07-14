@@ -124,6 +124,7 @@ class PhaseResultsRequest:
     expected_candidate_arm_ids: tuple[str, ...]
     expected_seeds: tuple[int, ...]
     upstream_gate: Mapping[str, Any] | None = None
+    upstream_calibration_selection: Mapping[str, Any] | None = None
     visual_manifest_path: Path | None = None
     visual_manifest_sha256: str | None = None
     confirm_seed: int | None = None
@@ -161,10 +162,21 @@ class PhaseResultsRequest:
             raise PhaseResultsError("expected seeds must be nonempty and unique")
         for seed in self.expected_seeds:
             _require_nonnegative_int(seed, "expected seed")
-        if self.phase == "diagnose" and self.upstream_gate is not None:
-            raise PhaseResultsError("diagnose must not bind an upstream gate")
-        if self.phase != "diagnose" and self.upstream_gate is None:
-            raise PhaseResultsError(f"{self.phase} requires its upstream gate")
+        if self.phase == "diagnose" and (
+            self.upstream_gate is not None
+            or self.upstream_calibration_selection is not None
+        ):
+            raise PhaseResultsError("diagnose must not bind upstream selection")
+        if self.upstream_gate is not None and self.upstream_calibration_selection is not None:
+            raise PhaseResultsError("upstream gate and calibration selection are exclusive")
+        if self.phase == "confirm512":
+            if self.upstream_gate is None and self.upstream_calibration_selection is None:
+                raise PhaseResultsError(
+                    "confirm512 requires a gate or report-only calibration selection"
+                )
+        elif self.phase != "diagnose":
+            if self.upstream_gate is None or self.upstream_calibration_selection is not None:
+                raise PhaseResultsError(f"{self.phase} requires its upstream gate")
         if self.phase == "confirm512":
             _require_nonnegative_int(self.confirm_seed, "confirm512 seed")
         if self.phase == "full":
@@ -503,6 +515,7 @@ def _validate_request(request: PhaseResultsRequest) -> dict[str, Any]:
             "phase run plan has missing, stale, or extra candidate runs"
         )
     upstream_gate = None
+    upstream_calibration_selection = None
     if request.upstream_gate is not None:
         try:
             upstream_gate = validate_gate_contract(request.upstream_gate)
@@ -531,6 +544,34 @@ def _validate_request(request: PhaseResultsRequest) -> dict[str, Any]:
                 or winner.get("arm_id") != request.expected_candidate_arm_ids[0]
             ):
                 raise PhaseResultsError("Full run plan changed the locked winner")
+    if request.upstream_calibration_selection is not None:
+        if request.phase != "confirm512":
+            raise PhaseResultsError(
+                "report-only calibration selection is only valid for confirm512"
+            )
+        from safa.evaluation.r9_calibration_selection_contracts import (
+            validate_calibration_report_only_selection_contract,
+        )
+
+        try:
+            upstream_calibration_selection = (
+                validate_calibration_report_only_selection_contract(
+                    request.upstream_calibration_selection,
+                    repo_root=repo_root,
+                )
+            )
+        except ValueError as error:
+            raise PhaseResultsError(
+                "upstream calibration selection is invalid"
+            ) from error
+        selected_ids = [
+            str(row["arm_id"])
+            for row in upstream_calibration_selection["selected_arms"]
+        ]
+        if selected_ids != list(request.expected_candidate_arm_ids):
+            raise PhaseResultsError(
+                "confirm512 run plan disagrees with calibration selection"
+            )
     run_plan = _run_plan_payload(request)
     return {
         "request": request,
@@ -544,6 +585,7 @@ def _validate_request(request: PhaseResultsRequest) -> dict[str, Any]:
         "visual_manifest_path": visual_path,
         "visual_manifest_rows": visual_rows,
         "upstream_gate": upstream_gate,
+        "upstream_calibration_selection": upstream_calibration_selection,
         "run_plan": run_plan,
         "run_plan_sha256": _canonical_json_sha256(run_plan),
     }
@@ -2821,6 +2863,13 @@ def _request_context(request: PhaseResultsRequest) -> dict[str, Any]:
             None
             if request.upstream_gate is None
             else request.upstream_gate.get("gate_contract_sha256")
+        ),
+        "upstream_calibration_selection_sha256": (
+            None
+            if request.upstream_calibration_selection is None
+            else request.upstream_calibration_selection.get(
+                "calibration_selection_sha256"
+            )
         ),
     }
     repair = evaluation_repair_binding(request)

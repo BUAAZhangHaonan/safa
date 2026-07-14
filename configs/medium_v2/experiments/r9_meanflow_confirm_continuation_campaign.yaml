@@ -1,0 +1,31 @@
+schema_version: 1
+contract_type: safa_r9_confirm_continuation_request_v1
+child_campaign_id: r9-report-only-formal-v7
+start_phase: confirm512
+base_runtime:
+  path: configs/medium_v2/experiments/r9_meanflow_campaign.yaml
+  sha256: 26a0e196adae065cbbfebe1c05f346026f5e30f1bfae1c879fea9a71bca6eeb3
+source:
+  campaign_id: r9-report-only-formal-v6
+  calibrate_gate_contract_sha256: 84c4aa802965601bfeccc03fa0e9da2baef25d8cc98cb9dbbc536058037520b9
+  calibrate_phase_results_sha256: 2be463aaadc7b5cf9f4cfd87b452034bdcecd3bf65d13ecb3bebb4b68844a35c
+  automatic_evidence_sha256: c9840ff3a4c96b64db386e64a543e2c637b69ec0f9cd2453913070267ecaffbe
+  evaluation_repair_contract_sha256: 716355ccf9171d3b6d35f51c124139e110b99986393ed7e2b397c02d7c0fb355
+  generation_inventory_sha256: e40516b8dc852c6b6930e38b89b656b28274c91f40003884ab688d8768ab145a
+selection:
+  path: artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v7/calibration_report_only_selection.json
+  materialization: build_from_frozen_source_o_excl
+semigroup_closure_campaign_id: r9-report-only-formal-v2
+evaluator_resources:
+  arcface:
+    mode: measured_single_worker
+    artifact_root: artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v7/evaluator_smoke/arcface-confirm512-v1
+  quality:
+    mode: measured_exclusive_bootstrap
+    artifact_root: artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v7/evaluator_smoke/quality-confirm512-v1
+  heldout:
+    mode: exclusive_single_official_run
+    smoke_execution: sealed_until_winner_lock
+    global_exclusive_slots: 16
+    ram_admission_percent: 85
+    ram_hard_limit_percent: 90
