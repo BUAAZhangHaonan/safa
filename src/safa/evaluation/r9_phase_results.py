@@ -2755,6 +2755,12 @@ def _algorithm_config_digest(config: Mapping[str, Any], checkpoint_sha256: str) 
     return _canonical_json_sha256(payload)
 
 
+def canonical_r9_algorithm_config_digest(
+    config: Mapping[str, Any], checkpoint_sha256: str
+) -> str:
+    return _algorithm_config_digest(config, checkpoint_sha256)
+
+
 def _request_context(request: PhaseResultsRequest) -> dict[str, Any]:
     return {
         "campaign_id": request.campaign_id,

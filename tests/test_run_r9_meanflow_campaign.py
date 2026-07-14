@@ -154,6 +154,11 @@ def test_continuation_rejects_candidate_config_drift(monkeypatch) -> None:
         "resolve_frozen_effective_guidance_config",
         lambda config: {**config, "arm_config_sha256": "3" * 64},
     )
+    monkeypatch.setattr(
+        driver,
+        "canonical_r9_algorithm_config_digest",
+        lambda *args, **kwargs: "3" * 64,
+    )
     run = driver.RunSpec(
         phase="calibrate",
         logical_run_id=f"{arm_id}__seed_1337",
@@ -184,6 +189,74 @@ def test_continuation_rejects_candidate_config_drift(monkeypatch) -> None:
         driver.build_run_runtime_config(
             payload, campaign_runtime, manifest_contract, run
         )
+
+
+@pytest.mark.parametrize(
+    "arm_id",
+    (
+        "flow_map2_normalized_eta_0p125",
+        "paper_eta_0p125",
+        "paper_eta_0p25_disable_i2",
+    ),
+)
+def test_continuation_binds_algorithm_projection_not_runner_fields(
+    monkeypatch, arm_id: str
+) -> None:
+    payload = runtime()
+    monkeypatch.setattr(driver, "_formal_closure_for_runtime", lambda *a, **k: None)
+    monkeypatch.setattr(driver, "_bind_locked_schedule", lambda *a, **k: None)
+    monkeypatch.setattr(
+        driver,
+        "_continuation_for_runtime",
+        lambda *a, **k: {
+            "continuation_contract_sha256": "1" * 64,
+            "selected_arms": [
+                {"arm_id": arm_id, "config_sha256": "2" * 64}
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        driver,
+        "resolve_frozen_effective_guidance_config",
+        lambda config: {**config, "arm_config_sha256": "3" * 64},
+    )
+    monkeypatch.setattr(
+        driver,
+        "canonical_r9_algorithm_config_digest",
+        lambda *args, **kwargs: "2" * 64,
+    )
+    run = driver.RunSpec(
+        phase="calibrate",
+        logical_run_id=f"{arm_id}__seed_2027",
+        arm_ref=arm_id,
+        seed=2027,
+        repeat_index=None,
+        shard_index=0,
+        num_shards=1,
+        sample_count=64,
+        manifest_key="calibration_64",
+        runtime_config=Path("runtime.yaml"),
+        output_dir=Path("output"),
+        command=(),
+    )
+    calibration = payload["manifests"]["calibration_64"]
+    manifest_contract = {
+        "manifest_contracts_sha256": "4" * 64,
+        "manifests": {"calibration_64": calibration},
+    }
+    campaign_runtime = {
+        "campaign_id": driver.CONTINUATION_CHILD_CAMPAIGN_ID,
+        "campaign_runtime_sha256": "5" * 64,
+        "checkpoint": payload["checkpoint"],
+        "continuation": {"contract_sha256": "1" * 64},
+    }
+
+    resolved = driver.build_run_runtime_config(
+        payload, campaign_runtime, manifest_contract, run
+    )
+
+    assert resolved["arm_config_sha256"] == "3" * 64
+    assert resolved["sampling_seed"] == 2027
 
 
 def test_full_gate_forwards_runtime_bootstrap_seed(

@@ -56,6 +56,7 @@ from safa.evaluation.r9_phase_results import (
     QualityEvaluationRequest,
     QualityEvaluator,
     RunEvidenceSpec,
+    canonical_r9_algorithm_config_digest,
     materialize_phase_results,
     resume_phase_results,
 )
@@ -82,7 +83,7 @@ from safa.evaluation.r9_semigroup_campaign_closure import (
 
 RUNTIME_CONFIG = Path("configs/medium_v2/experiments/r9_meanflow_campaign.yaml")
 CONTINUATION_RUNTIME_CONFIG = Path(R9_CONTINUATION_REQUEST_PATH)
-CONTINUATION_CHILD_CAMPAIGN_ID = "r9-report-only-formal-v3"
+CONTINUATION_CHILD_CAMPAIGN_ID = "r9-report-only-formal-v4"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PHASES = ("preflight", "diagnose", "calibrate", "confirm512", "full")
 CAMPAIGN_ID_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
@@ -2785,7 +2786,10 @@ def build_run_runtime_config(
         }
         if run.arm_ref not in selected:
             raise ValueError("child run references a candidate outside parent A selection")
-        if resolved.get("arm_config_sha256") != selected[run.arm_ref][
+        algorithm_config_sha256 = canonical_r9_algorithm_config_digest(
+            resolved, str(checkpoint["sha256"])
+        )
+        if algorithm_config_sha256 != selected[run.arm_ref][
             "config_sha256"
         ]:
             raise ValueError("child candidate arm config drifted from parent A evidence")

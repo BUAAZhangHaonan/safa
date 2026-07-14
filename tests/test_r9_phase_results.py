@@ -38,6 +38,7 @@ from safa.evaluation.r9_phase_results import (
     _validate_automatic_context,
     _validate_request,
     _write_exclusive_json,
+    canonical_r9_algorithm_config_digest,
     submit_visual_review,
     validate_interval_diagnostics,
     validate_visual_review,
@@ -443,6 +444,51 @@ def test_algorithm_digest_excludes_seed_but_binds_fixed_asset_digests() -> None:
     assert _algorithm_config_digest(first, SHA) == _algorithm_config_digest(second, SHA)
     second["e0_sha256"] = "9" * 64
     assert _algorithm_config_digest(first, SHA) != _algorithm_config_digest(second, SHA)
+
+
+def test_public_algorithm_projection_ignores_only_operational_run_fields() -> None:
+    original = _config(collect=False, intervals=["I1", "I2", "I3"])
+    changed = {
+        **original,
+        "phase": "calibrate",
+        "sampling_seed": 2027,
+        "sample_id_manifest": "manifests/calibration_64.jsonl",
+        "sample_id_manifest_sha256": "6" * 64,
+        "max_samples": 64,
+        "out_dir": "artifacts/r9/child/calibrate/run",
+        "asset_digest_cache": "artifacts/r9/child/cache.json",
+        "collect_interval_diagnostics": True,
+        "r9_campaign_id": "r9-report-only-formal-v4",
+        "r9_campaign_runtime_sha256": "7" * 64,
+        "r9_manifest_contracts_sha256": "8" * 64,
+        "r9_phase_manifest_sha256": "9" * 64,
+        "r9_continuation_contract_sha256": "a" * 64,
+    }
+    assert canonical_r9_algorithm_config_digest(
+        original, SHA
+    ) == canonical_r9_algorithm_config_digest(changed, SHA)
+
+
+def test_public_algorithm_projection_rejects_every_algorithm_contract_tamper() -> None:
+    original = _config(collect=False, intervals=["I1", "I2", "I3"])
+    expected = canonical_r9_algorithm_config_digest(original, SHA)
+    assert expected == _algorithm_config_digest(original, SHA)
+
+    tampered_values = {
+        "mode": "official_head_current_xt",
+        "step_size": 0.125,
+        "sample_mode": "flow_map2",
+        "optimization_mode": "paper_normalized_direct_autograd",
+        "num_optim_iters": 2,
+        "active_guidance_intervals": ["I1", "I3"],
+        "locked_schedule": {"schedule_contract_sha256": "9" * 64},
+        "e0_sha256": "8" * 64,
+    }
+    for field, value in tampered_values.items():
+        changed = dict(original)
+        changed[field] = value
+        assert canonical_r9_algorithm_config_digest(changed, SHA) != expected, field
+    assert canonical_r9_algorithm_config_digest(original, "7" * 64) != expected
 
 
 def _diagnostic_fixture(
