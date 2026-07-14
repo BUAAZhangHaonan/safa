@@ -414,12 +414,14 @@ def test_algorithm_digest_excludes_seed_but_binds_fixed_asset_digests() -> None:
     assert _algorithm_config_digest(first, SHA) != _algorithm_config_digest(second, SHA)
 
 
-def _diagnostic_fixture() -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    algorithm_trace = [{"t": 1.0, "r": 0.75, "kind": "paper_algorithm_split"}]
+def _diagnostic_fixture(
+    mode: str = "paper_algorithm_split",
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    algorithm_trace = [{"t": 1.0, "r": 0.75, "kind": mode}]
     diagnostic_trace = [{"t": 1.0, "r": 0.0, "kind": "interval_diagnostic"}]
     contract = {
         "schema_version": 1,
-        "mode": "paper_algorithm_split",
+        "mode": mode,
         "active_guidance_intervals": ["I1", "I3"],
         "collect_interval_diagnostics": True,
         "expected_algorithm_nfe": 1,
@@ -455,10 +457,22 @@ def _diagnostic_fixture() -> tuple[list[dict[str, Any]], dict[str, Any]]:
         "interval_diagnostics": intervals,
         "algorithm_nfe": 1,
         "diagnostic_nfe": 1,
-        "diagnostic_flow_map_trace": diagnostic_trace,
-        "mode": "paper_algorithm_split",
-        "flow_map_trace": algorithm_trace,
+        "guided_times": [1.0, 0.75, 0.5, 0.25],
+        "unguided_times": [0.25, 0.125, 0.0],
+        "loss_history": [0.4, 0.3],
+        "mode": mode,
+        "step_size": 0.25,
     }
+    if mode == "official_head_current_xt":
+        route.update(
+            {
+                "adam_learning_rates": [],
+                "num_optim_iters": 1,
+                "optimization_mode": "paper_normalized_direct_autograd",
+                "sample_mode": "flow_map2",
+                "uses_adam": False,
+            }
+        )
     rows = [
         {
             "sample_id": "sample_0",
@@ -482,6 +496,46 @@ def test_interval_diagnostics_strict_contract_and_nonfinite_rejection() -> None:
         "gradient_norm"
     ] = float("nan")
     with pytest.raises(PhaseResultsError, match="finite"):
+        validate_interval_diagnostics(rows, contract)
+
+
+def test_interval_diagnostics_accepts_generator_owned_flow_map2_route() -> None:
+    rows, contract = _diagnostic_fixture("official_head_current_xt")
+
+    assert validate_interval_diagnostics(rows, contract)["diagnostics_contract_sha256"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("guided_times", [1.0, 0.5, 0.25], "route contract"),
+        ("unguided_times", [0.25, 0.0], "route contract"),
+        ("loss_history", [0.4], "route contract"),
+        ("step_size", 0.3, "route contract"),
+        ("adam_learning_rates", [0.1], "flow-map2 route contract"),
+        ("num_optim_iters", 2, "flow-map2 route contract"),
+        ("optimization_mode", "adam", "flow-map2 route contract"),
+        ("sample_mode", "flow_map1", "flow-map2 route contract"),
+        ("uses_adam", True, "flow-map2 route contract"),
+    ),
+)
+def test_interval_diagnostics_rejects_generator_route_tamper(
+    field: str, value: Any, message: str
+) -> None:
+    rows, contract = _diagnostic_fixture("official_head_current_xt")
+    rows[0]["metrics"]["route_diagnostics"][field] = value
+
+    with pytest.raises(PhaseResultsError, match=message):
+        validate_interval_diagnostics(rows, contract)
+
+
+def test_interval_diagnostics_rejects_unknown_route_fields_and_nested_traces() -> None:
+    rows, contract = _diagnostic_fixture()
+    rows[0]["metrics"]["route_diagnostics"]["flow_map_trace"] = rows[0]["metrics"][
+        "candidate_trace"
+    ]
+
+    with pytest.raises(PhaseResultsError, match="route fields"):
         validate_interval_diagnostics(rows, contract)
 
 

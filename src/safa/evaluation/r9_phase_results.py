@@ -2307,6 +2307,35 @@ def validate_interval_diagnostics(
         "gradient_velocity_cosine",
         "local_semigroup_residual",
     }
+    route_common_fields = {
+        "active_guidance_intervals",
+        "interval_diagnostics_enabled",
+        "interval_diagnostics",
+        "algorithm_nfe",
+        "diagnostic_nfe",
+        "guided_times",
+        "unguided_times",
+        "loss_history",
+        "mode",
+        "step_size",
+    }
+    route_mode = interval_contract.get("mode")
+    if route_mode == "paper_algorithm_split":
+        route_fields = route_common_fields
+        allowed_step_sizes = {0.125, 0.1875, 0.25, 0.3125, 0.375, 0.5}
+    elif route_mode == "official_head_current_xt":
+        route_fields = route_common_fields | {
+            "adam_learning_rates",
+            "num_optim_iters",
+            "optimization_mode",
+            "sample_mode",
+            "uses_adam",
+        }
+        allowed_step_sizes = {0.125, 0.1875, 0.25}
+    else:
+        raise PhaseResultsError("A interval contract mode is not registered")
+    expected_guided_times = [1.0, 0.75, 0.5, 0.25]
+    expected_unguided_times = [0.25, 0.125, 0.0]
     diagnostic_rows = []
     for ordinal, row in enumerate(rows):
         metrics = row.get("metrics")
@@ -2330,30 +2359,41 @@ def validate_interval_diagnostics(
                 f"A diagnostic row {ordinal} trace/NFE contract mismatch"
             )
         route = metrics.get("route_diagnostics")
-        if not isinstance(route, Mapping) or set(route) != {
-            "active_guidance_intervals",
-            "interval_diagnostics_enabled",
-            "interval_diagnostics",
-            "algorithm_nfe",
-            "diagnostic_nfe",
-            "diagnostic_flow_map_trace",
-            "mode",
-            "flow_map_trace",
-        }:
+        if not isinstance(route, Mapping) or set(route) != route_fields:
             raise PhaseResultsError(
                 f"A diagnostic row {ordinal} route fields are not canonical"
             )
+        loss_history = route["loss_history"]
+        step_size = _finite_float(route["step_size"], "diagnostic route step size")
         if (
             route["active_guidance_intervals"] != active
             or route["interval_diagnostics_enabled"] is not True
-            or route["algorithm_nfe"] != algorithm_nfe
-            or route["diagnostic_nfe"] != diagnostic_nfe
-            or route["diagnostic_flow_map_trace"] != expected_diagnostic_trace
-            or route["flow_map_trace"] != expected_algorithm_trace
-            or route["mode"] != interval_contract["mode"]
+            or _strict_int(route["algorithm_nfe"], "route algorithm NFE")
+            != algorithm_nfe
+            or _strict_int(route["diagnostic_nfe"], "route diagnostic NFE")
+            != diagnostic_nfe
+            or route["guided_times"] != expected_guided_times
+            or route["unguided_times"] != expected_unguided_times
+            or route["mode"] != route_mode
+            or step_size not in allowed_step_sizes
+            or not isinstance(loss_history, list)
+            or len(loss_history) != len(active)
         ):
             raise PhaseResultsError(
                 f"A diagnostic row {ordinal} route contract mismatch"
+            )
+        for loss_index, loss in enumerate(loss_history):
+            _finite_float(loss, f"diagnostic route loss history {loss_index}")
+        if route_mode == "official_head_current_xt" and (
+            route["adam_learning_rates"] != []
+            or _strict_int(route["num_optim_iters"], "route optimization iterations")
+            != 1
+            or route["optimization_mode"] != "paper_normalized_direct_autograd"
+            or route["sample_mode"] != "flow_map2"
+            or route["uses_adam"] is not False
+        ):
+            raise PhaseResultsError(
+                f"A diagnostic row {ordinal} flow-map2 route contract mismatch"
             )
         intervals = route["interval_diagnostics"]
         if not isinstance(intervals, Mapping) or tuple(intervals) != (
@@ -2407,6 +2447,15 @@ def validate_interval_diagnostics(
                 or values["correction_transport_ratio"] != 0.0
             ):
                 raise PhaseResultsError(f"inactive {interval_id} contains a correction")
+            if interval_id in active and not math.isclose(
+                float(values["correction_transport_ratio"]),
+                step_size,
+                rel_tol=1.0e-6,
+                abs_tol=1.0e-7,
+            ):
+                raise PhaseResultsError(
+                    f"active {interval_id} correction ratio disagrees with step size"
+                )
         _assert_finite_json(route, f"A diagnostic row {ordinal}")
         diagnostic_rows.append(
             {"sample_id": row["sample_id"], "route_diagnostics": route}

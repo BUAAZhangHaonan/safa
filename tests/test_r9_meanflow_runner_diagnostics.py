@@ -35,6 +35,9 @@ from safa.evaluation.r9_determinism import (  # noqa: E402
     R9_EXPERIMENT_CONTRACT,
     apply_r9_strict_cuda_determinism,
 )
+from safa.evaluation.r9_phase_results import (  # noqa: E402
+    validate_interval_diagnostics,
+)
 from safa.guidance.meanflow_flow_map import freeze_guidance_stack  # noqa: E402
 
 
@@ -421,6 +424,12 @@ def test_r9_generation_and_resume_bind_separate_nfe_and_diagnostic_trace(
             set(row["route_diagnostics"]["interval_diagnostics"]) == {"I1", "I2", "I3"}
             for row in rows
         )
+        diagnostics_contract = validate_interval_diagnostics(
+            [{"sample_id": row["sample_id"], "metrics": row} for row in rows],
+            config[R9_GUIDANCE_INTERVAL_CONTRACT_FIELD],
+        )
+        assert diagnostics_contract["sample_count"] == len(rows)
+        assert diagnostics_contract["diagnostics_contract_sha256"]
         assert manifest["nfe"] == {
             "candidate": 7,
             "matched_native": 1,
