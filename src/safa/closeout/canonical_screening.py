@@ -32,10 +32,116 @@ SCHEMA_VERSION = 1
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 RUN_MODES = {"smoke8": 8, "screen512": 512}
 CHECKPOINT_SELECTORS = {"raw", "ema"}
+NVIDIA_GPU_UUID_RE = re.compile(
+    r"^(?:GPU-)?([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+    r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$"
+)
 
 
 class CanonicalScreeningError(RuntimeError):
     """A fail-closed canonical screening contract violation."""
+
+
+def canonicalize_nvidia_gpu_uuid(
+    value: Any, label: str
+) -> dict[str, str]:
+    """Return strict raw evidence and the canonical NVIDIA GPU UUID."""
+    raw_type = f"{type(value).__module__}.{type(value).__qualname__}"
+    raw_repr = repr(value)
+    if isinstance(value, bytes):
+        try:
+            raw_string = value.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise CanonicalScreeningError(
+                f"{label} is not an ASCII NVIDIA GPU UUID"
+            ) from exc
+    elif isinstance(value, str):
+        raw_string = value
+    elif (
+        type(value).__module__ == "torch._C"
+        and type(value).__qualname__ == "_CUuuid"
+    ):
+        raw_string = str(value)
+    else:
+        raise CanonicalScreeningError(
+            f"{label} must be a string, ASCII bytes, or torch._C._CUuuid"
+        )
+    match = NVIDIA_GPU_UUID_RE.fullmatch(raw_string)
+    if match is None:
+        raise CanonicalScreeningError(
+            f"{label} is not a canonicalizable NVIDIA GPU UUID"
+        )
+    return {
+        "raw_type": raw_type,
+        "raw_repr": raw_repr,
+        "raw_string": raw_string,
+        "canonical": f"GPU-{match.group(1).lower()}",
+    }
+
+
+def canonical_gpu_registry(
+    registry: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    normalized = []
+    for row in registry:
+        index = row.get("physical_gpu_index")
+        if type(index) is not int:
+            raise CanonicalScreeningError("GPU registry index is invalid")
+        uuid = canonicalize_nvidia_gpu_uuid(
+            row.get("physical_gpu_uuid"), "GPU registry UUID"
+        )
+        normalized.append(
+            {
+                "physical_gpu_index": index,
+                "physical_gpu_uuid": uuid["canonical"],
+            }
+        )
+    if len(normalized) != len({row["physical_gpu_index"] for row in normalized}):
+        raise CanonicalScreeningError("GPU registry has duplicate indices")
+    return normalized
+
+
+def ram_probe_contract_digest(spec: Mapping[str, Any]) -> str:
+    payload = dict(spec)
+    for field in (
+        "authorized_gpu_registry",
+        "admission",
+        "probe_contract_sha256",
+        "probe_execution_sha256",
+    ):
+        payload.pop(field, None)
+    return hashlib.sha256(canonical_json(payload)).hexdigest()
+
+
+def ram_probe_admission_evidence_digest(
+    admission: Mapping[str, Any],
+) -> str:
+    payload = dict(admission)
+    for field in (
+        "probe_execution_sha256",
+        "admission_evidence_sha256",
+        "admission_sha256",
+    ):
+        payload.pop(field, None)
+    return hashlib.sha256(canonical_json(payload)).hexdigest()
+
+
+def ram_probe_execution_digest(
+    probe_contract_sha256: str,
+    registry: Sequence[Mapping[str, Any]],
+    admission_evidence_sha256: str,
+) -> str:
+    return hashlib.sha256(
+        canonical_json(
+            {
+                "schema_version": 1,
+                "contract_type": "safa_canonical_screening_ram_probe_execution_v1",
+                "probe_contract_sha256": probe_contract_sha256,
+                "authorized_gpu_registry": list(registry),
+                "admission_evidence_sha256": admission_evidence_sha256,
+            }
+        )
+    ).hexdigest()
 
 
 def canonical_json(value: Any) -> bytes:
@@ -1274,6 +1380,215 @@ def _validate_5d_preflight_supersession_evidence(
     }
 
 
+def _validate_6b_supersession_evidence(
+    repo_root: Path, raw_supersedes: Mapping[str, Any]
+) -> dict[str, Any]:
+    supersedes = _require_mapping(raw_supersedes, "6b supersession evidence")
+    _require_exact_keys(
+        supersedes,
+        {
+            "policy_sha256",
+            "classification",
+            "supersession_reason",
+            "scientific_result_reuse",
+            "successor_execution",
+            "preflight",
+            "failed_ram_probe",
+        },
+        "6b supersession evidence",
+    )
+    policy_sha = (
+        "6b088236579f731183e60c7fc1d7bece31089284aaaf13697a73f3fb6cd42072"
+    )
+    if {
+        "policy_sha256": supersedes["policy_sha256"],
+        "classification": supersedes["classification"],
+        "supersession_reason": supersedes["supersession_reason"],
+        "scientific_result_reuse": supersedes["scientific_result_reuse"],
+        "successor_execution": supersedes["successor_execution"],
+    } != {
+        "policy_sha256": policy_sha,
+        "classification": "completed_preflight_and_failed_ram_probe_superseded",
+        "supersession_reason": (
+            "strict_gpu_uuid_representation_and_probe_digest_contract_upgrade"
+        ),
+        "scientific_result_reuse": "forbidden",
+        "successor_execution": "fresh_full_193_preflight",
+    }:
+        raise CanonicalScreeningError("6b supersession status differs")
+
+    preflight = _require_mapping(supersedes["preflight"], "6b preflight")
+    file_fields = {
+        "controller_claim",
+        "controller_terminal",
+        "controller_summary",
+        "wrapper_claim",
+        "wrapper_exit",
+        "resource_monitor",
+        "resource_observer",
+        "runtime_resource_windows",
+        "startup_admission",
+        "final_plan",
+        "candidate_manifest",
+    }
+    count_fields = {
+        "request_count": 193,
+        "result_count": 193,
+        "valid_count": 193,
+        "invalid_count": 0,
+        "attempt_claim_count": 193,
+        "attempt_terminal_count": 193,
+        "run_request_count": 0,
+        "generated_png_count": 0,
+    }
+    _require_exact_keys(
+        preflight,
+        set(count_fields) | file_fields | {"evidence_root"},
+        "6b preflight",
+    )
+    if any(preflight[key] != value for key, value in count_fields.items()):
+        raise CanonicalScreeningError("6b preflight counts differ")
+    root_binding = _require_mapping(
+        preflight["evidence_root"], "6b preflight evidence root"
+    )
+    root = _repo_path(
+        repo_root,
+        root_binding["path"],
+        "6b preflight evidence root",
+        must_exist=False,
+    )
+    if (
+        root_binding
+        != {
+            "path": str(Path(root_binding["path"])),
+            "digest": "17ff26ccfa582367554fea3d8821aa6b0adf482078b2c72ec2bd23fcaa5b1d3f",
+            "digest_algorithm": "sha256_relative_posix_nul_content_nul_v1",
+        }
+        or root
+        != (
+            repo_root.resolve()
+            / "artifacts/closeout/historical-canonical-512-v1/by_policy"
+            / policy_sha
+        ).resolve()
+        or sha256_directory_tree(root) != root_binding["digest"]
+    ):
+        raise CanonicalScreeningError("6b preflight evidence root differs")
+    bound = {
+        name: _validate_bound_file(repo_root, preflight[name], f"6b {name}")
+        for name in file_fields
+    }
+    summary = load_json(Path(bound["controller_summary"]["path"]), "6b summary")
+    terminal = load_json(
+        Path(bound["controller_terminal"]["path"]), "6b terminal"
+    )
+    wrapper = load_json(Path(bound["wrapper_exit"]["path"]), "6b wrapper")
+    summary_preflight = _require_mapping(
+        summary.get("preflight"), "6b summary preflight"
+    )
+    if (
+        summary.get("policy_sha256") != policy_sha
+        or summary_preflight.get("completed") != 193
+        or summary_preflight.get("valid") != 193
+        or summary_preflight.get("invalid") != 0
+        or summary_preflight.get("reused") != 0
+        or terminal.get("status") != "completed"
+        or terminal.get("failure") is not None
+        or terminal.get("result_count") != 193
+        or terminal.get("pending_count") != 0
+        or wrapper.get("exit_code") != 0
+        or wrapper.get("signal") is not None
+        or wrapper.get("launch_failure") is not None
+    ):
+        raise CanonicalScreeningError("6b terminal semantics differ")
+
+    failed = _require_mapping(
+        supersedes["failed_ram_probe"], "6b failed RAM probe"
+    )
+    expected_failed_scalars = {
+        "classification": "failed_before_capability_execution",
+        "status": "failed",
+        "worker_returncode": 1,
+        "retry_count": 0,
+        "termination": None,
+        "capability_step_count": 0,
+        "work_directory_present": False,
+        "worker_result_present": False,
+        "resource_guard_clean": True,
+        "root_cause": "observed_uuid_representation_contract_mismatch",
+        "reuse": "forbidden",
+        "in_place_retry": "forbidden",
+    }
+    _require_exact_keys(
+        failed, set(expected_failed_scalars) | {"root", "files"}, "failed RAM probe"
+    )
+    if any(failed[key] != value for key, value in expected_failed_scalars.items()):
+        raise CanonicalScreeningError("failed RAM probe classification differs")
+    failed_root_binding = _require_mapping(failed["root"], "failed probe root")
+    failed_root = _repo_path(
+        repo_root,
+        failed_root_binding["path"],
+        "failed probe root",
+        must_exist=False,
+    )
+    if (
+        failed_root
+        != (
+            repo_root.resolve()
+            / "artifacts/closeout/historical-canonical-512-v1/"
+            "ram_probe__6b088236579f7311"
+        ).resolve()
+        or
+        failed_root_binding.get("digest_algorithm")
+        != "sha256_relative_posix_nul_content_nul_v1"
+        or failed_root_binding.get("digest")
+        != "33a9ff82fbb453753be6f769dfe6f474f6aa58741e1be54f903db5d408d932f4"
+        or sha256_directory_tree(failed_root) != failed_root_binding["digest"]
+    ):
+        raise CanonicalScreeningError("failed RAM probe root differs")
+    expected_files = {
+        "admission.json": "e2b9328fd349a6b3e17d4a2cc0006461554a92ae6008910e0c32b223aacdec50",
+        "input_policy.json": "93e7238c82cff73afee6e7a0c3067743bd17c7d90289f7e3863739820a0767f3",
+        "probe_result.json": "c2c2e86e01f262cfa831b45df8648b5f0a24612849821f739591d46809829d22",
+        "probe_spec.json": "4d6d5e3ddbb16e10c9fcde92e8a2e01361eb075b78b02eb80c85cd0ccac306d0",
+        "runtime_resource_windows.jsonl": "b32ea7d4b589a6140f35c3ae3ab0987a8b08252eee5ef3f9403a31197d46121f",
+        "worker.log": "02bc776e082a1759175fd74bf44f5695952d13eaea08f3ccf23f54ec6610a8b3",
+    }
+    entries = list(failed_root.iterdir())
+    if (
+        failed.get("files") != expected_files
+        or len(entries) != 6
+        or any(not item.is_file() or item.is_symlink() for item in entries)
+        or {item.name for item in entries} != set(expected_files)
+        or any(
+            sha256_file(failed_root / name) != digest
+            for name, digest in expected_files.items()
+        )
+    ):
+        raise CanonicalScreeningError("failed RAM probe files differ")
+    result = load_json(failed_root / "probe_result.json", "failed probe result")
+    guard = _require_mapping(
+        result.get("runtime_resource_guard"), "failed probe resource guard"
+    )
+    if (
+        result.get("status") != "failed"
+        or result.get("worker_returncode") != 1
+        or result.get("retry_count") != 0
+        or result.get("termination") is not None
+        or result.get("worker_result_sha256") is not None
+        or result.get("worker_vmhwm_bytes") is not None
+        or result.get("ram_budget_basis_bytes") is not None
+        or result.get("ram_slot_budget_bytes") is not None
+        or guard.get("violated") is not False
+        or guard.get("violation_reason") is not None
+        or guard.get("thread_failure") is not None
+        or "worker runtime CUDA UUID differs" not in (
+            failed_root / "worker.log"
+        ).read_text(encoding="utf-8")
+    ):
+        raise CanonicalScreeningError("failed RAM probe semantics differ")
+    return dict(supersedes)
+
+
 def validate_supersession_evidence(
     repo_root: Path, raw_supersedes: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -1299,7 +1614,17 @@ def validate_supersession_evidence(
         return _validate_5d_preflight_supersession_evidence(
             repo_root, supersedes
         )
-    return _validate_ea7_smoke_supersession_evidence(repo_root, supersedes)
+    if (
+        supersedes.get("policy_sha256")
+        == "6b088236579f731183e60c7fc1d7bece31089284aaaf13697a73f3fb6cd42072"
+    ):
+        return _validate_6b_supersession_evidence(repo_root, supersedes)
+    if (
+        supersedes.get("policy_sha256")
+        == "ea7ae71fd662526b9a45bf3cc6d283884aefc380b292c8f273169a35f42ffc28"
+    ):
+        return _validate_ea7_smoke_supersession_evidence(repo_root, supersedes)
+    raise CanonicalScreeningError("unknown supersession policy SHA")
 
 
 def _validate_output_decoder_registry(
@@ -1579,6 +1904,15 @@ def _validate_ram_slot_budget_source(
     )
     probe_path = Path(probe_binding["path"])
     result = load_json(probe_path, "RAM slot budget probe result")
+    is_v2 = (
+        result.get("contract_type")
+        == "safa_canonical_screening_ram_probe_result_v2"
+    )
+    probe_digest_fields = (
+        {"probe_contract_sha256", "probe_execution_sha256", "worker_device_binding"}
+        if is_v2
+        else {"probe_sha256"}
+    )
     _require_exact_keys(
         result,
         {
@@ -1586,7 +1920,6 @@ def _validate_ram_slot_budget_source(
             "contract_type",
             "status",
             "purpose",
-            "probe_sha256",
             "admission_sha256",
             "worker_result_sha256",
             "worker_log_sha256",
@@ -1604,7 +1937,8 @@ def _validate_ram_slot_budget_source(
             "retry_count",
             "completed_at",
             "probe_result_sha256",
-        },
+        }
+        | probe_digest_fields,
         "RAM slot budget probe result",
     )
     expected_method = (
@@ -1621,7 +1955,10 @@ def _validate_ram_slot_budget_source(
     if (
         result["schema_version"] != 1
         or result["contract_type"]
-        != "safa_canonical_screening_ram_probe_result_v1"
+        not in {
+            "safa_canonical_screening_ram_probe_result_v1",
+            "safa_canonical_screening_ram_probe_result_v2",
+        }
         or result["status"] != "succeeded"
         or result["purpose"]
         != "resource_measurement_only_scientific_reuse_forbidden"
@@ -1645,7 +1982,11 @@ def _validate_ram_slot_budget_source(
     ):
         raise CanonicalScreeningError("sealed RAM probe result semantics differ")
     for field in (
-        "probe_sha256",
+        *(
+            ("probe_contract_sha256", "probe_execution_sha256")
+            if is_v2
+            else ("probe_sha256",)
+        ),
         "admission_sha256",
         "worker_result_sha256",
         "worker_log_sha256",
@@ -1672,25 +2013,81 @@ def _validate_ram_slot_budget_source(
     worker = load_json(
         artifact_root / "worker_result.json", "RAM probe worker result"
     )
+    legacy_chain_invalid = (
+        not is_v2
+        and (
+            spec.get("contract_type") != "safa_canonical_screening_ram_probe_v1"
+            or spec.get("probe_sha256")
+            != canonical_digest(spec, "probe_sha256")
+            or spec.get("probe_sha256") != result["probe_sha256"]
+            or admission.get("contract_type")
+            != "safa_canonical_screening_ram_probe_admission_v1"
+            or admission.get("probe_sha256") != result["probe_sha256"]
+            or worker.get("contract_type")
+            != "safa_canonical_screening_ram_probe_worker_result_v1"
+            or worker.get("probe_sha256") != result["probe_sha256"]
+        )
+    )
+    v2_chain_invalid = (
+        is_v2
+        and (
+            spec.get("contract_type") != "safa_canonical_screening_ram_probe_v2"
+            or spec.get("probe_contract_sha256")
+            != ram_probe_contract_digest(spec)
+            or admission.get("contract_type")
+            != "safa_canonical_screening_ram_probe_admission_v2"
+            or admission.get("admission_evidence_sha256")
+            != ram_probe_admission_evidence_digest(admission)
+            or canonical_gpu_registry(
+                admission.get("authorized_gpu_registry", [])
+            )
+            != admission.get("authorized_gpu_registry")
+            or admission.get("authorized_gpu_registry")
+            != spec.get("authorized_gpu_registry")
+            or not isinstance(spec.get("admission"), Mapping)
+            or Path(str(spec["admission"].get("path", ""))).resolve()
+            != (artifact_root / "admission.json").resolve()
+            or spec["admission"].get("sha256")
+            != sha256_file(artifact_root / "admission.json")
+            or spec["admission"].get("canonical_sha256")
+            != admission.get("admission_sha256")
+            or admission.get("probe_contract_sha256")
+            != spec.get("probe_contract_sha256")
+            or admission.get("probe_execution_sha256")
+            != ram_probe_execution_digest(
+                spec["probe_contract_sha256"],
+                spec["authorized_gpu_registry"],
+                admission["admission_evidence_sha256"],
+            )
+            or spec.get("probe_execution_sha256")
+            != admission.get("probe_execution_sha256")
+            or result.get("probe_contract_sha256")
+            != spec.get("probe_contract_sha256")
+            or result.get("probe_execution_sha256")
+            != spec.get("probe_execution_sha256")
+            or worker.get("contract_type")
+            != "safa_canonical_screening_ram_probe_worker_result_v2"
+            or worker.get("status") != "succeeded"
+            or worker.get("failure") is not None
+            or worker.get("probe_contract_sha256")
+            != spec.get("probe_contract_sha256")
+            or worker.get("probe_execution_sha256")
+            != spec.get("probe_execution_sha256")
+            or result.get("worker_device_binding")
+            != worker.get("device_binding")
+        )
+    )
     if (
-        spec.get("contract_type") != "safa_canonical_screening_ram_probe_v1"
+        legacy_chain_invalid
+        or v2_chain_invalid
         or spec.get("purpose") != result["purpose"]
-        or spec.get("probe_sha256")
-        != canonical_digest(spec, "probe_sha256")
-        or spec.get("probe_sha256") != result["probe_sha256"]
-        or admission.get("contract_type")
-        != "safa_canonical_screening_ram_probe_admission_v1"
         or admission.get("admission_sha256")
         != canonical_digest(admission, "admission_sha256")
         or admission.get("admission_sha256") != result["admission_sha256"]
-        or admission.get("probe_sha256") != result["probe_sha256"]
-        or worker.get("contract_type")
-        != "safa_canonical_screening_ram_probe_worker_result_v1"
         or worker.get("worker_result_sha256")
         != canonical_digest(worker, "worker_result_sha256")
         or worker.get("worker_result_sha256")
         != result["worker_result_sha256"]
-        or worker.get("probe_sha256") != result["probe_sha256"]
         or worker.get("purpose") != result["purpose"]
         or type(worker.get("worker_vmhwm_bytes")) is not int
         or worker.get("worker_vmhwm_bytes") <= 0

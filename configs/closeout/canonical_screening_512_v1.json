@@ -3,73 +3,55 @@
   "contract_type": "safa_canonical_screening_policy_v1",
   "campaign_id": "historical-canonical-512-v1",
   "supersedes": {
-    "policy_sha256": "5d51185345983fbf9bc2924f43d5a4b671674398581824753c0c155c4cdda2db",
-    "previous_policy_sha256": "310f5b539315d3bc957530856c0f810bf5b32afc97469fdb9467bf3facdc9cda",
-    "classification": "completed_preflight_superseded",
-    "phase": "preflight",
-    "stage": "completed_preflight_candidate_manifest_prepared_before_gpu",
-    "request_count": 193,
-    "result_count": 193,
-    "valid_count": 193,
-    "invalid_count": 0,
-    "reused_count": 0,
-    "pending_count": 0,
-    "attempt_claim_count": 193,
-    "attempt_terminal_count": 193,
-    "candidate_count": 193,
-    "run_request_count": 0,
-    "generated_png_count": 0,
-    "supersession_reason": "implementation_and_policy_contract_upgrade",
+    "policy_sha256": "6b088236579f731183e60c7fc1d7bece31089284aaaf13697a73f3fb6cd42072",
+    "classification": "completed_preflight_and_failed_ram_probe_superseded",
+    "supersession_reason": "strict_gpu_uuid_representation_and_probe_digest_contract_upgrade",
     "scientific_result_reuse": "forbidden",
     "successor_execution": "fresh_full_193_preflight",
-    "evidence_root": {
-      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/5d51185345983fbf9bc2924f43d5a4b671674398581824753c0c155c4cdda2db",
-      "digest": "7a1c0fba3e7a50b748854d58987a0f21412c1f31849abea87c4f5ef639ecb60e",
-      "digest_algorithm": "sha256_relative_posix_nul_content_nul_v1"
+    "preflight": {
+      "request_count": 193,
+      "result_count": 193,
+      "valid_count": 193,
+      "invalid_count": 0,
+      "attempt_claim_count": 193,
+      "attempt_terminal_count": 193,
+      "run_request_count": 0,
+      "generated_png_count": 0,
+      "evidence_root": {"path": "artifacts/closeout/historical-canonical-512-v1/by_policy/6b088236579f731183e60c7fc1d7bece31089284aaaf13697a73f3fb6cd42072", "digest": "17ff26ccfa582367554fea3d8821aa6b0adf482078b2c72ec2bd23fcaa5b1d3f", "digest_algorithm": "sha256_relative_posix_nul_content_nul_v1"},
+      "controller_claim": {"path": "artifacts/closeout/historical-canonical-512-v1/by_policy/6b088236579f731183e60c7fc1d7bece31089284aaaf13697a73f3fb6cd42072/preflight_control/controller_claim.json", "sha256": "20d776b0bcd3326b5a20067aadb81486af9f6e408281f649792b8c8e5d6a4a7d"},
+      "controller_terminal": {"path": "artifacts/closeout/historical-canonical-512-v1/by_policy/6b088236579f731183e60c7fc1d7bece31089284aaaf13697a73f3fb6cd42072/preflight_control/controller_terminal.json", "sha256": "fd852896da9ef250387efcc73c49f2f4a6bed2516460d51fe327784c1b546c70"},
+      "controller_summary": {"path": "artifacts/closeout/historical-canonical-512-v1/by_policy/6b088236579f731183e60c7fc1d7bece31089284aaaf13697a73f3fb6cd42072/preflight_control/controller_summary.json", "sha256": "a49ebdcadc7cd01c0114db0d14410de2714c3453ccf583a8ce3ba8138937a2bb"},
+      "wrapper_claim": {"path": "artifacts/closeout/historical-canonical-512-v1/by_policy/6b088236579f731183e60c7fc1d7bece31089284aaaf13697a73f3fb6cd42072/preflight_control/wrapper_claim.json", "sha256": "1c33f041c0939fdab9cd772dd7b6c27e963a8ded797c3c521d83e70e36a4bf37"},
+      "wrapper_exit": {"path": "artifacts/closeout/historical-canonical-512-v1/by_policy/6b088236579f731183e60c7fc1d7bece31089284aaaf13697a73f3fb6cd42072/preflight_control/wrapper_exit.json", "sha256": "11bf9d6f905b8549500c62738782e7de80a15f7481650a782f4090195e02b05f"},
+      "resource_monitor": {"path": "artifacts/closeout/historical-canonical-512-v1/by_policy/6b088236579f731183e60c7fc1d7bece31089284aaaf13697a73f3fb6cd42072/logs/preflight__monitor.jsonl", "sha256": "099369e640aa668762e93c3895e234fe61ae1bb76116d7d8c2089a07d381ec61"},
+      "resource_observer": {"path": "artifacts/closeout/historical-canonical-512-v1/by_policy/6b088236579f731183e60c7fc1d7bece31089284aaaf13697a73f3fb6cd42072/logs/preflight__observer.jsonl", "sha256": "bab4db3be3382e7c48ad2856d8934d06dc4359e1b10846a2b818de8f0da33d0d"},
+      "runtime_resource_windows": {"path": "artifacts/closeout/historical-canonical-512-v1/by_policy/6b088236579f731183e60c7fc1d7bece31089284aaaf13697a73f3fb6cd42072/preflight_control/runtime_resource_windows.jsonl", "sha256": "54c55fa1619bf3d42af5b4cf1f67783aedf0a6ac9943b78616cae783a526514d"},
+      "startup_admission": {"path": "artifacts/closeout/historical-canonical-512-v1/by_policy/6b088236579f731183e60c7fc1d7bece31089284aaaf13697a73f3fb6cd42072/admissions/preflight_cpu_startup__a0f2b6d4eca97e576dc7547235d09c65f9f4342054a5822d58bb179af8ca0837.json", "sha256": "6d84b74a4c044e1fbb177fe672127e0a864411044bf922ff565acb8d400887aa"},
+      "final_plan": {"path": "artifacts/closeout/historical-canonical-512-v1/checkpoint_plan_final__6b088236579f7311.json", "sha256": "64f7b5f01a3a1a41f6dbfbf510b012425d464a61c0bce2a98d518a5dca2d125a"},
+      "candidate_manifest": {"path": "artifacts/closeout/historical-canonical-512-v1/candidate_manifest__6b088236579f7311.json", "sha256": "cff5c6db77a09d548a9ed438dbc6c055dce410f584c908125150a58fd6e05fea"}
     },
-    "controller_claim": {
-      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/5d51185345983fbf9bc2924f43d5a4b671674398581824753c0c155c4cdda2db/preflight_control/controller_claim.json",
-      "sha256": "88b19231e5d430c112c70cc406c01a7470967d9fde5d0e9fab9c7c1040ddee61"
-    },
-    "controller_terminal": {
-      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/5d51185345983fbf9bc2924f43d5a4b671674398581824753c0c155c4cdda2db/preflight_control/controller_terminal.json",
-      "sha256": "4a2eb20eefe7f2824d6fe8725c91d3cf5498ac9c50c5c1033fce00ce357096eb"
-    },
-    "controller_summary": {
-      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/5d51185345983fbf9bc2924f43d5a4b671674398581824753c0c155c4cdda2db/preflight_control/controller_summary.json",
-      "sha256": "9c7fbfc40f4255672daf51c11aafc6c683326745d0f4ac96d4ec4eff27efead8"
-    },
-    "wrapper_claim": {
-      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/5d51185345983fbf9bc2924f43d5a4b671674398581824753c0c155c4cdda2db/preflight_control/wrapper_claim.json",
-      "sha256": "990d0d2cfa252ff749757898be8d9fa88d38fc0caac21e0368eb10bde7199a4a"
-    },
-    "wrapper_exit": {
-      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/5d51185345983fbf9bc2924f43d5a4b671674398581824753c0c155c4cdda2db/preflight_control/wrapper_exit.json",
-      "sha256": "dddd29617cf6194074a1c0104cf26943ea5c560f78c9225435b4336bf2df1735"
-    },
-    "resource_monitor": {
-      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/5d51185345983fbf9bc2924f43d5a4b671674398581824753c0c155c4cdda2db/logs/preflight__monitor.jsonl",
-      "sha256": "0ecc2e5dc5c0746c4dfbe77736e618638eaaa8914c234617fe5f69c3e7fcdc0d"
-    },
-    "resource_observer": {
-      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/5d51185345983fbf9bc2924f43d5a4b671674398581824753c0c155c4cdda2db/logs/preflight__observer.jsonl",
-      "sha256": "ad179025f01b92c3409c619f99bc7cfc7d0b027fb586b63783b1691b0ad329e2"
-    },
-    "runtime_resource_windows": {
-      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/5d51185345983fbf9bc2924f43d5a4b671674398581824753c0c155c4cdda2db/preflight_control/runtime_resource_windows.jsonl",
-      "sha256": "6fd8f5b06187a51214192f784f5e5d2a95f31a5f4063abfee500ba7b574fe225"
-    },
-    "startup_admission": {
-      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/5d51185345983fbf9bc2924f43d5a4b671674398581824753c0c155c4cdda2db/admissions/preflight_cpu_startup__057d4a37181d2968966ba4934818888592e286baaf2f398ebd828f2471b606d9.json",
-      "sha256": "a5eef4a438540eba640b9b515b8f70ce7bd9fa9c295ceb91f9eda2d5b5045f76"
-    },
-    "final_plan": {
-      "path": "artifacts/closeout/historical-canonical-512-v1/checkpoint_plan_final__5d51185345983fbf.json",
-      "sha256": "48e4545e641c0f5eb6d5de30c69841af1cb5cc7b979ed5f3af8ffc037b1ec102"
-    },
-    "candidate_manifest": {
-      "path": "artifacts/closeout/historical-canonical-512-v1/candidate_manifest__5d51185345983fbf.json",
-      "sha256": "485f008f31a44d7a6ed946d7e9dff51344eeffa43a08214b0422efcb4d4d2957"
+    "failed_ram_probe": {
+      "classification": "failed_before_capability_execution",
+      "root": {"path": "artifacts/closeout/historical-canonical-512-v1/ram_probe__6b088236579f7311", "digest": "33a9ff82fbb453753be6f769dfe6f474f6aa58741e1be54f903db5d408d932f4", "digest_algorithm": "sha256_relative_posix_nul_content_nul_v1"},
+      "files": {
+        "admission.json": "e2b9328fd349a6b3e17d4a2cc0006461554a92ae6008910e0c32b223aacdec50",
+        "input_policy.json": "93e7238c82cff73afee6e7a0c3067743bd17c7d90289f7e3863739820a0767f3",
+        "probe_result.json": "c2c2e86e01f262cfa831b45df8648b5f0a24612849821f739591d46809829d22",
+        "probe_spec.json": "4d6d5e3ddbb16e10c9fcde92e8a2e01361eb075b78b02eb80c85cd0ccac306d0",
+        "runtime_resource_windows.jsonl": "b32ea7d4b589a6140f35c3ae3ab0987a8b08252eee5ef3f9403a31197d46121f",
+        "worker.log": "02bc776e082a1759175fd74bf44f5695952d13eaea08f3ccf23f54ec6610a8b3"
+      },
+      "status": "failed",
+      "worker_returncode": 1,
+      "retry_count": 0,
+      "termination": null,
+      "capability_step_count": 0,
+      "work_directory_present": false,
+      "worker_result_present": false,
+      "resource_guard_clean": true,
+      "root_cause": "observed_uuid_representation_contract_mismatch",
+      "reuse": "forbidden",
+      "in_place_retry": "forbidden"
     }
   },
   "python": "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
@@ -291,11 +273,11 @@
     },
     "screening_contracts": {
       "path": "src/safa/closeout/canonical_screening.py",
-      "sha256": "3569ff2a3cc1ccd371c5260a96a4cbb6d255819f1f9d4c8510eefcf30a9693d2"
+      "sha256": "e7c4b13594136216108122a9f131bc12d8ebf5b1e222ce4c91046107fd910af7"
     },
     "screening_worker": {
       "path": "src/safa/closeout/canonical_screening_worker.py",
-      "sha256": "a6ba230097f04157deb72bc2fbe184b560b92bb272d3cb2f2374fe53135c8183"
+      "sha256": "6c7b6d6b3ae377454f5da5742b982d29006b42a5a3756aa7d4a2bb9aff0161fc"
     },
     "controller": {
       "path": "scripts/run_canonical_checkpoint_screening.py",
@@ -303,7 +285,7 @@
     },
     "ram_probe_launcher": {
       "path": "scripts/run_canonical_screening_ram_probe.py",
-      "sha256": "117f5cb7036f294b0e735cdda7a8efab7691b5761983a81994e5bd829a10a502"
+      "sha256": "5594e19c51dc933890f6090e0ed117760fe43cb10b5ec37e8a2c458464f33199"
     },
     "preflight_wrapper": {
       "path": "scripts/run_canonical_preflight_wrapper.py",

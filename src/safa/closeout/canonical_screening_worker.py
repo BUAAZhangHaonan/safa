@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import hashlib
+import json
 import math
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ from safa.closeout.canonical_screening import (
     CanonicalScreeningError,
     build_run_claim,
     build_run_result,
+    canonicalize_nvidia_gpu_uuid,
     canonical_json,
     load_json,
     load_jsonl,
@@ -83,7 +85,17 @@ def _assert_runtime_cuda_binding(
         for row in request["authorized_gpu_registry"]
     }
     expected_uuid = registry.get(physical_gpu_index)
-    if expected_uuid is None or physical_gpu_uuid != expected_uuid:
+    if expected_uuid is None:
+        raise CanonicalScreeningError(
+            "worker physical GPU index differs from admission"
+        )
+    expected = canonicalize_nvidia_gpu_uuid(
+        expected_uuid, "admission GPU UUID"
+    )
+    supplied = canonicalize_nvidia_gpu_uuid(
+        physical_gpu_uuid, "worker physical GPU UUID"
+    )
+    if supplied["canonical"] != expected["canonical"]:
         raise CanonicalScreeningError(
             "worker physical GPU index/UUID differs from admission"
         )
@@ -92,7 +104,12 @@ def _assert_runtime_cuda_binding(
             "worker CUDA_DEVICE_ORDER must be PCI_BUS_ID"
         )
     visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if visible_devices != expected_uuid:
+    if visible_devices is None:
+        raise CanonicalScreeningError("worker CUDA_VISIBLE_DEVICES is missing")
+    visible = canonicalize_nvidia_gpu_uuid(
+        visible_devices, "worker CUDA_VISIBLE_DEVICES"
+    )
+    if visible["canonical"] != expected["canonical"]:
         raise CanonicalScreeningError(
             "worker CUDA_VISIBLE_DEVICES differs from the authorized GPU UUID"
         )
@@ -104,22 +121,40 @@ def _assert_runtime_cuda_binding(
             "worker CUDA visibility must contain exactly one device"
         )
     properties = torch.cuda.get_device_properties(0)
-    runtime_uuid = properties.uuid
-    if isinstance(runtime_uuid, bytes):
-        runtime_uuid = runtime_uuid.decode("ascii")
-    runtime_uuid = str(runtime_uuid)
-    if runtime_uuid != expected_uuid:
-        raise CanonicalScreeningError(
+    runtime_raw_uuid = properties.uuid
+    runtime = canonicalize_nvidia_gpu_uuid(
+        runtime_raw_uuid, "worker runtime CUDA UUID"
+    )
+    raw_evidence = {
+        "admission": expected,
+        "worker_argument": supplied,
+        "cuda_visible_devices": visible,
+        "runtime_cuda_uuid": runtime,
+    }
+    evidence = {
+        "physical_gpu_index": physical_gpu_index,
+        "physical_gpu_uuid": expected["canonical"],
+        "logical_cuda_index": 0,
+        "runtime_cuda_uuid": runtime["canonical"],
+        "cuda_visible_devices": visible["canonical"],
+        "uuid_evidence": raw_evidence,
+    }
+    print(
+        json.dumps(
+            {"event": "cuda_device_binding", **evidence},
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
+    if runtime["canonical"] != expected["canonical"]:
+        error = CanonicalScreeningError(
             "worker runtime CUDA UUID differs from the authorized GPU UUID"
         )
+        error.cuda_device_binding = evidence  # type: ignore[attr-defined]
+        raise error
     torch.cuda.set_device(0)
-    return {
-        "physical_gpu_index": physical_gpu_index,
-        "physical_gpu_uuid": expected_uuid,
-        "logical_cuda_index": 0,
-        "runtime_cuda_uuid": runtime_uuid,
-        "cuda_visible_devices": visible_devices,
-    }
+    return evidence
 
 
 def _load_arcface_contract(request: Mapping[str, Any]) -> dict[str, Any]:

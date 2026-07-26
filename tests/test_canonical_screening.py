@@ -20,8 +20,12 @@ from safa.closeout.canonical_screening import (
     build_run_request,
     build_run_result,
     canonical_digest,
+    canonicalize_nvidia_gpu_uuid,
     canonical_json,
     load_json,
+    ram_probe_admission_evidence_digest,
+    ram_probe_contract_digest,
+    ram_probe_execution_digest,
     validate_candidate_manifest,
     validate_checkpoint_plan,
     validate_preflight_result,
@@ -43,6 +47,10 @@ from safa.closeout.generator_output_contract import (
     decoder_registry_digest,
     resolve_checkpoint_output_capability,
 )
+
+
+def _gpu_uuid(index: int) -> str:
+    return f"GPU-0000000{index}-0000-0000-0000-00000000000{index}"
 
 
 def _controller_module():
@@ -297,7 +305,7 @@ def _admission_snapshot(policy: dict) -> dict:
         "authorized_gpu_registry": [
             {
                 "physical_gpu_index": index,
-                "physical_gpu_uuid": f"GPU-fixture-{index}",
+                "physical_gpu_uuid": _gpu_uuid(index),
             }
             for index in range(4)
         ],
@@ -722,7 +730,7 @@ def test_worker_cuda_binding_refuses_remap_and_runtime_uuid_mismatch(
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda _index: types.SimpleNamespace(uuid="GPU-runtime-mismatch"),
+        lambda _index: types.SimpleNamespace(uuid=_gpu_uuid(1)),
     )
     with pytest.raises(CanonicalScreeningError, match="runtime CUDA UUID"):
         _assert_runtime_cuda_binding(request, 0, expected_uuid)
@@ -734,14 +742,103 @@ def test_worker_cuda_binding_refuses_remap_and_runtime_uuid_mismatch(
     )
     selected: list[int] = []
     monkeypatch.setattr(torch.cuda, "set_device", selected.append)
-    assert _assert_runtime_cuda_binding(request, 0, expected_uuid) == {
-        "physical_gpu_index": 0,
-        "physical_gpu_uuid": expected_uuid,
-        "logical_cuda_index": 0,
-        "runtime_cuda_uuid": expected_uuid,
-        "cuda_visible_devices": expected_uuid,
-    }
+    binding = _assert_runtime_cuda_binding(request, 0, expected_uuid)
+    assert binding["physical_gpu_index"] == 0
+    assert binding["logical_cuda_index"] == 0
+    assert binding["physical_gpu_uuid"] == expected_uuid
+    assert binding["runtime_cuda_uuid"] == expected_uuid
+    assert binding["cuda_visible_devices"] == expected_uuid
+    assert {
+        binding["uuid_evidence"][name]["canonical"]
+        for name in (
+            "admission",
+            "worker_argument",
+            "cuda_visible_devices",
+            "runtime_cuda_uuid",
+        )
+    } == {expected_uuid}
     assert selected == [0]
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "GPU-7BA69FC7-12AC-3DFB-8265-3476CE2504B6",
+        "7ba69fc7-12ac-3dfb-8265-3476ce2504b6",
+        b"GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6",
+    ],
+)
+def test_gpu_uuid_canonicalizer_accepts_verified_representations(
+    raw: str | bytes,
+) -> None:
+    assert canonicalize_nvidia_gpu_uuid(raw, "fixture")["canonical"] == (
+        "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+    )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        " GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6",
+        "GPU-7ba69fc7",
+        "7ba69fc712ac3dfb82653476ce2504b6",
+        "MIG-7ba69fc7-12ac-3dfb-8265-3476ce2504b6",
+        b"\xff",
+        object(),
+    ],
+)
+def test_gpu_uuid_canonicalizer_rejects_malformed_values(raw: object) -> None:
+    with pytest.raises(CanonicalScreeningError):
+        canonicalize_nvidia_gpu_uuid(raw, "fixture")  # type: ignore[arg-type]
+
+
+def test_ram_probe_contract_and_execution_digests_are_split() -> None:
+    module = _ram_probe_module()
+    static = {
+        "schema_version": 1,
+        "contract_type": module.PROBE_CONTRACT,
+        "sample_count": 8,
+        "authorized_gpu_registry": None,
+        "admission": None,
+        "probe_contract_sha256": None,
+        "probe_execution_sha256": None,
+    }
+    contract = module._probe_contract_digest(static)
+    registry = [
+        {
+            "physical_gpu_index": 0,
+            "physical_gpu_uuid": _gpu_uuid(0),
+        }
+    ]
+    live = {
+        **static,
+        "authorized_gpu_registry": registry,
+        "admission": {"path": "/bound", "sha256": "0" * 64},
+        "probe_contract_sha256": contract,
+        "probe_execution_sha256": "1" * 64,
+    }
+    assert module._probe_contract_digest(live) == contract
+    admission = {
+        "schema_version": 1,
+        "contract_type": module.PROBE_ADMISSION_CONTRACT,
+        "probe_contract_sha256": contract,
+        "host": {"ram_used_percent": 20.0},
+        "gpu_snapshot": [{"index": 0, "uuid": _gpu_uuid(0)}],
+        "authorized_gpu_registry": registry,
+        "observed_at": "2026-07-27T00:00:00+00:00",
+    }
+    evidence = module._admission_evidence_digest(admission)
+    execution = module._probe_execution_digest(contract, registry, evidence)
+    changed_registry = [{**registry[0], "physical_gpu_uuid": _gpu_uuid(1)}]
+    assert (
+        module._probe_execution_digest(contract, changed_registry, evidence)
+        != execution
+    )
+    tampered = {
+        **admission,
+        "host": {"ram_used_percent": 21.0},
+    }
+    assert module._admission_evidence_digest(tampered) != evidence
 
 
 def test_worker_environment_overrides_inherited_cuda_remap(
@@ -853,7 +950,7 @@ def test_ram_probe_manifest_uses_current_plan_and_candidate_validators(
 
 def _sealed_ram_probe_fixture(tmp_path: Path) -> tuple[dict, int]:
     purpose = "resource_measurement_only_scientific_reuse_forbidden"
-    gpu_uuid = "GPU-fixture-0"
+    gpu_uuid = _gpu_uuid(0)
     input_file = tmp_path / "input.json"
     input_file.write_text("{}\n", encoding="utf-8")
     input_binding = _bound(input_file)
@@ -887,7 +984,7 @@ def _sealed_ram_probe_fixture(tmp_path: Path) -> tuple[dict, int]:
         {
             "physical_gpu_index": index,
             "physical_gpu_uuid": (
-                gpu_uuid if index == 0 else f"GPU-fixture-{index}"
+                gpu_uuid if index == 0 else _gpu_uuid(index)
             ),
         }
         for index in range(4)
@@ -1046,6 +1143,133 @@ def _reseal_ram_probe_fixture(
     )
     result_path.write_bytes(canonical_json(result))
     source["probe_result"] = _bound(result_path)
+
+
+def _upgrade_ram_probe_fixture_to_v2(tmp_path: Path, source: dict) -> None:
+    spec_path = tmp_path / "probe_spec.json"
+    spec = load_json(spec_path, "RAM probe spec")
+    spec.pop("probe_sha256")
+    spec["contract_type"] = "safa_canonical_screening_ram_probe_v2"
+    spec["admission"] = None
+    spec["probe_contract_sha256"] = None
+    spec["probe_execution_sha256"] = None
+    contract = ram_probe_contract_digest(spec)
+
+    admission_path = tmp_path / "admission.json"
+    admission = load_json(admission_path, "RAM probe admission")
+    admission.pop("probe_sha256")
+    admission["contract_type"] = (
+        "safa_canonical_screening_ram_probe_admission_v2"
+    )
+    admission["probe_contract_sha256"] = contract
+    admission["admission_evidence_sha256"] = (
+        ram_probe_admission_evidence_digest(admission)
+    )
+    execution = ram_probe_execution_digest(
+        contract,
+        admission["authorized_gpu_registry"],
+        admission["admission_evidence_sha256"],
+    )
+    admission["probe_execution_sha256"] = execution
+    admission["admission_sha256"] = canonical_digest(
+        admission, "admission_sha256"
+    )
+    admission_path.write_bytes(canonical_json(admission))
+
+    spec["probe_contract_sha256"] = contract
+    spec["probe_execution_sha256"] = execution
+    spec["admission"] = {
+        **_bound(admission_path),
+        "canonical_sha256": admission["admission_sha256"],
+    }
+    spec_path.write_bytes(canonical_json(spec))
+
+    worker_path = tmp_path / "worker_result.json"
+    worker = load_json(worker_path, "RAM probe worker result")
+    worker.pop("probe_sha256")
+    worker["contract_type"] = (
+        "safa_canonical_screening_ram_probe_worker_result_v2"
+    )
+    worker["status"] = "succeeded"
+    worker["failure"] = None
+    worker["probe_contract_sha256"] = contract
+    worker["probe_execution_sha256"] = execution
+    worker["worker_result_sha256"] = canonical_digest(
+        worker, "worker_result_sha256"
+    )
+    worker_path.write_bytes(canonical_json(worker))
+
+    result_path = tmp_path / "probe_result.json"
+    result = load_json(result_path, "RAM probe result")
+    result.pop("probe_sha256")
+    result["contract_type"] = "safa_canonical_screening_ram_probe_result_v2"
+    result["probe_contract_sha256"] = contract
+    result["probe_execution_sha256"] = execution
+    result["worker_device_binding"] = worker["device_binding"]
+    result["admission_sha256"] = admission["admission_sha256"]
+    result["worker_result_sha256"] = worker["worker_result_sha256"]
+    result["probe_result_sha256"] = canonical_digest(
+        result, "probe_result_sha256"
+    )
+    result_path.write_bytes(canonical_json(result))
+    source["probe_result"] = _bound(result_path)
+
+
+@pytest.mark.parametrize(
+    ("artifact", "field"),
+    [
+        ("probe_spec.json", "probe_contract_sha256"),
+        ("probe_spec.json", "probe_execution_sha256"),
+        ("admission.json", "authorized_gpu_registry"),
+        ("worker_result.json", "probe_execution_sha256"),
+        ("probe_result.json", "probe_contract_sha256"),
+    ],
+)
+def test_sealed_ram_probe_v2_rejects_digest_chain_tamper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact: str,
+    field: str,
+) -> None:
+    source, budget = _sealed_ram_probe_fixture(tmp_path)
+    _upgrade_ram_probe_fixture_to_v2(tmp_path, source)
+    monkeypatch.setattr(
+        sys.modules[_validate_ram_slot_budget_source.__module__],
+        "validate_policy",
+        lambda *_args, **_kwargs: {"policy_sha256": "1" * 64},
+    )
+    assert (
+        _validate_ram_slot_budget_source(
+            tmp_path,
+            source,
+            declared_budget_bytes=budget,
+            expected_predecessor_policy_sha256="1" * 64,
+        )["ram_slot_budget_bytes"]
+        == budget
+    )
+    path = tmp_path / artifact
+    changed = load_json(path, "tampered v2 RAM probe artifact")
+    if field == "authorized_gpu_registry":
+        changed[field][0]["physical_gpu_uuid"] = _gpu_uuid(1)
+    else:
+        changed[field] = "0" * 64
+    own_digest = {
+        "admission.json": "admission_sha256",
+        "worker_result.json": "worker_result_sha256",
+        "probe_result.json": "probe_result_sha256",
+    }.get(artifact)
+    if own_digest is not None:
+        changed[own_digest] = canonical_digest(changed, own_digest)
+    path.write_bytes(canonical_json(changed))
+    if artifact == "probe_result.json":
+        source["probe_result"] = _bound(path)
+    with pytest.raises(CanonicalScreeningError, match="evidence chain"):
+        _validate_ram_slot_budget_source(
+            tmp_path,
+            source,
+            declared_budget_bytes=budget,
+            expected_predecessor_policy_sha256="1" * 64,
+        )
 
 
 @pytest.mark.parametrize(
@@ -1954,7 +2178,7 @@ def test_monitor_is_append_only_and_audit_reconstructable(
     gpu_rows = [
         {
             "index": index,
-            "uuid": f"GPU-fixture-{index}",
+            "uuid": _gpu_uuid(index),
             "temperature_c": 40,
         }
         for index in range(4)
@@ -1979,7 +2203,7 @@ def test_monitor_is_append_only_and_audit_reconstructable(
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     assert len(rows) == 2
     assert rows[0]["terminal"] is False and rows[1]["terminal"] is True
-    assert rows[0]["gpus"][0]["uuid"] == "GPU-fixture-0"
+    assert rows[0]["gpus"][0]["uuid"] == _gpu_uuid(0)
     assert rows[0]["artifacts"]["generated_png"] == 0
 
 
@@ -2302,7 +2526,7 @@ def test_supersession_evidence_binds_ea7_failed_smoke_chain(
         validate_supersession_evidence(tmp_path, tampered)
 
 
-def test_current_policy_binds_completed_5d_preflight_and_forbids_reuse() -> None:
+def test_current_policy_binds_6b_preflight_and_failed_probe() -> None:
     root = Path(__file__).parents[1]
     policy_path = root / "configs/closeout/canonical_screening_512_v1.json"
 
@@ -2310,22 +2534,18 @@ def test_current_policy_binds_completed_5d_preflight_and_forbids_reuse() -> None
 
     supersedes = policy["supersedes"]
     assert supersedes["policy_sha256"] == (
-        "5d51185345983fbf9bc2924f43d5a4b671674398581824753c0c155c4cdda2db"
+        "6b088236579f731183e60c7fc1d7bece31089284aaaf13697a73f3fb6cd42072"
     )
-    assert supersedes["previous_policy_sha256"] == (
-        "310f5b539315d3bc957530856c0f810bf5b32afc97469fdb9467bf3facdc9cda"
+    assert supersedes["classification"] == (
+        "completed_preflight_and_failed_ram_probe_superseded"
     )
-    assert supersedes["classification"] == "completed_preflight_superseded"
-    assert supersedes["request_count"] == 193
-    assert supersedes["result_count"] == 193
-    assert supersedes["valid_count"] == 193
-    assert supersedes["invalid_count"] == 0
-    assert supersedes["attempt_claim_count"] == 193
-    assert supersedes["attempt_terminal_count"] == 193
-    assert supersedes["candidate_count"] == 193
-    assert supersedes["pending_count"] == 0
-    assert supersedes["run_request_count"] == 0
-    assert supersedes["generated_png_count"] == 0
+    assert supersedes["preflight"]["request_count"] == 193
+    assert supersedes["preflight"]["result_count"] == 193
+    assert supersedes["preflight"]["valid_count"] == 193
+    assert supersedes["preflight"]["invalid_count"] == 0
+    assert supersedes["failed_ram_probe"]["status"] == "failed"
+    assert supersedes["failed_ram_probe"]["capability_step_count"] == 0
+    assert supersedes["failed_ram_probe"]["in_place_retry"] == "forbidden"
     assert supersedes["scientific_result_reuse"] == "forbidden"
     assert supersedes["successor_execution"] == "fresh_full_193_preflight"
 
@@ -2333,14 +2553,14 @@ def test_current_policy_binds_completed_5d_preflight_and_forbids_reuse() -> None
 @pytest.mark.parametrize(
     ("mutation", "match"),
     [
-        ("request_count", "status differs"),
+        ("request_count", "counts differ"),
         ("reuse", "status differs"),
-        ("root_digest", "root binding differs"),
-        ("bound_path", "path differs"),
-        ("valid_count", "status differs"),
+        ("root_digest", "evidence root differs"),
+        ("failed_root_digest", "failed RAM probe root differs"),
+        ("failed_file_sha", "failed RAM probe files differ"),
     ],
 )
-def test_5d_supersession_tampering_fails_closed(
+def test_6b_supersession_tampering_fails_closed(
     mutation: str,
     match: str,
 ) -> None:
@@ -2351,20 +2571,28 @@ def test_5d_supersession_tampering_fails_closed(
     )
     supersedes = json.loads(json.dumps(raw["supersedes"]))
     if mutation == "request_count":
-        supersedes["request_count"] = 192
+        supersedes["preflight"]["request_count"] = 192
     elif mutation == "reuse":
         supersedes["scientific_result_reuse"] = "allowed"
     elif mutation == "root_digest":
-        supersedes["evidence_root"]["digest"] = "0" * 64
-    elif mutation == "bound_path":
-        supersedes["wrapper_claim"] = supersedes["wrapper_exit"]
-    elif mutation == "valid_count":
-        supersedes["valid_count"] = 192
+        supersedes["preflight"]["evidence_root"]["digest"] = "0" * 64
+    elif mutation == "failed_root_digest":
+        supersedes["failed_ram_probe"]["root"]["digest"] = "0" * 64
+    elif mutation == "failed_file_sha":
+        supersedes["failed_ram_probe"]["files"]["worker.log"] = "0" * 64
     else:
         raise AssertionError(mutation)
 
     with pytest.raises(CanonicalScreeningError, match=match):
         validate_supersession_evidence(root, supersedes)
+
+
+def test_unknown_supersession_policy_sha_fails_closed() -> None:
+    with pytest.raises(CanonicalScreeningError, match="unknown supersession"):
+        validate_supersession_evidence(
+            Path(__file__).parents[1],
+            {"policy_sha256": "0" * 64},
+        )
 
 
 def test_preflight_attempt_failure_writes_claim_and_terminal_without_result(

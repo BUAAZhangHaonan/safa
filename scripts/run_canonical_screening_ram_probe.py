@@ -29,8 +29,12 @@ from run_r9_meanflow_campaign import (
 )
 from safa.closeout.canonical_screening import (
     CanonicalScreeningError,
+    canonical_gpu_registry as _canonical_gpu_registry,
     canonical_digest,
     load_json,
+    ram_probe_admission_evidence_digest as _admission_evidence_digest,
+    ram_probe_contract_digest as _probe_contract_digest,
+    ram_probe_execution_digest as _probe_execution_digest,
     sha256_file,
     validate_candidate_manifest,
     validate_checkpoint_plan,
@@ -45,8 +49,12 @@ from safa.closeout.canonical_screening_worker import (
 )
 
 
-PROBE_CONTRACT = "safa_canonical_screening_ram_probe_v1"
-PROBE_RESULT_CONTRACT = "safa_canonical_screening_ram_probe_result_v1"
+PROBE_CONTRACT = "safa_canonical_screening_ram_probe_v2"
+PROBE_RESULT_CONTRACT = "safa_canonical_screening_ram_probe_result_v2"
+PROBE_ADMISSION_CONTRACT = "safa_canonical_screening_ram_probe_admission_v2"
+PROBE_WORKER_RESULT_CONTRACT = (
+    "safa_canonical_screening_ram_probe_worker_result_v2"
+)
 
 
 def _utc_now() -> str:
@@ -453,6 +461,7 @@ def _build_spec(
     manifest_path: Path,
     artifact_root: Path,
     gpu_registry: list[dict[str, Any]] | None,
+    admission: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     spec = {
         "schema_version": 1,
@@ -477,13 +486,21 @@ def _build_spec(
         "sample_count": 8,
         "seed": 4549,
         "batch_size": 2,
-        "authorized_gpu_registry": gpu_registry,
+        "authorized_gpu_registry": (
+            None if gpu_registry is None else _canonical_gpu_registry(gpu_registry)
+        ),
+        "admission": None if admission is None else dict(admission),
         "artifact_root": str(artifact_root.resolve()),
         "implementations": dict(policy["implementations"]),
         "retry_count": 0,
-        "probe_sha256": None,
+        "probe_contract_sha256": None,
+        "probe_execution_sha256": (
+            None
+            if admission is None
+            else admission["probe_execution_sha256"]
+        ),
     }
-    spec["probe_sha256"] = canonical_digest(spec, "probe_sha256")
+    spec["probe_contract_sha256"] = _probe_contract_digest(spec)
     return spec
 
 
@@ -501,8 +518,7 @@ def _validate_spec(
         or value.get("batch_size") != 2
         or value.get("retry_count") != 0
         or value.get("implementations") != policy["implementations"]
-        or value.get("probe_sha256")
-        != canonical_digest(value, "probe_sha256")
+        or value.get("probe_contract_sha256") != _probe_contract_digest(value)
     ):
         raise CanonicalScreeningError("RAM probe spec frozen fields differ")
     for label in ("policy", "candidate_manifest", "sample_manifest"):
@@ -524,6 +540,43 @@ def _validate_spec(
         raise CanonicalScreeningError("RAM probe policy snapshot binding mismatch")
     if value["policy"]["canonical_sha256"] != policy["policy_sha256"]:
         raise CanonicalScreeningError("RAM probe policy binding mismatch")
+    registry = value.get("authorized_gpu_registry")
+    admission_binding = value.get("admission")
+    execution = value.get("probe_execution_sha256")
+    if registry is None:
+        if admission_binding is not None or execution is not None:
+            raise CanonicalScreeningError("dry RAM probe has execution binding")
+    else:
+        canonical_registry = _canonical_gpu_registry(registry)
+        if canonical_registry != registry or not isinstance(admission_binding, Mapping):
+            raise CanonicalScreeningError("RAM probe execution registry differs")
+        admission_path = Path(str(admission_binding.get("path", ""))).resolve()
+        if (
+            not admission_path.is_file()
+            or sha256_file(admission_path) != admission_binding.get("sha256")
+        ):
+            raise CanonicalScreeningError("RAM probe admission binding differs")
+        admission = load_json(admission_path, "RAM probe admission")
+        if (
+            admission.get("contract_type") != PROBE_ADMISSION_CONTRACT
+            or admission.get("admission_sha256")
+            != canonical_digest(admission, "admission_sha256")
+            or admission.get("admission_sha256")
+            != admission_binding.get("canonical_sha256")
+            or admission.get("admission_evidence_sha256")
+            != _admission_evidence_digest(admission)
+            or admission.get("authorized_gpu_registry") != canonical_registry
+            or admission.get("probe_contract_sha256")
+            != value["probe_contract_sha256"]
+            or admission.get("probe_execution_sha256") != execution
+            or execution
+            != _probe_execution_digest(
+                value["probe_contract_sha256"],
+                canonical_registry,
+                admission["admission_evidence_sha256"],
+            )
+        ):
+            raise CanonicalScreeningError("RAM probe execution binding differs")
     return value
 
 
@@ -542,7 +595,7 @@ def _probe_request(
 ) -> dict[str, Any]:
     output_contract = candidate["output_contract"]
     return {
-        "run_request_sha256": spec["probe_sha256"],
+        "run_request_sha256": spec["probe_execution_sha256"],
         "screening_worker": policy["implementations"]["screening_worker"],
         "candidate": dict(candidate),
         "output_contract": dict(output_contract),
@@ -582,9 +635,31 @@ def _run_worker(
     registry = spec["authorized_gpu_registry"]
     if not isinstance(registry, list):
         raise CanonicalScreeningError("RAM probe GPU registry is missing")
-    device_binding = _assert_runtime_cuda_binding(
-        {"authorized_gpu_registry": registry}, gpu_index, gpu_uuid
-    )
+    try:
+        device_binding = _assert_runtime_cuda_binding(
+            {"authorized_gpu_registry": registry}, gpu_index, gpu_uuid
+        )
+    except CanonicalScreeningError as exc:
+        result = {
+            "schema_version": 1,
+            "contract_type": PROBE_WORKER_RESULT_CONTRACT,
+            "status": "failed",
+            "probe_contract_sha256": spec["probe_contract_sha256"],
+            "probe_execution_sha256": spec["probe_execution_sha256"],
+            "purpose": spec["purpose"],
+            "device_binding": getattr(exc, "cuda_device_binding", None),
+            "steps": [],
+            "worker_vmhwm_bytes": _vmhwm_bytes(),
+            "failure": {"type": type(exc).__name__, "message": str(exc)},
+            "completed_at": _utc_now(),
+        }
+        result["worker_result_sha256"] = canonical_digest(
+            result, "worker_result_sha256"
+        )
+        write_exclusive_json(
+            Path(spec["artifact_root"]) / "worker_result.json", result
+        )
+        raise
     manifest_path = Path(spec["candidate_manifest"]["path"])
     manifest = _validate_manifest_envelope(manifest_path, policy)
     selected = {
@@ -642,12 +717,15 @@ def _run_worker(
         )
     result = {
         "schema_version": 1,
-        "contract_type": "safa_canonical_screening_ram_probe_worker_result_v1",
-        "probe_sha256": spec["probe_sha256"],
+        "contract_type": PROBE_WORKER_RESULT_CONTRACT,
+        "status": "succeeded",
+        "probe_contract_sha256": spec["probe_contract_sha256"],
+        "probe_execution_sha256": spec["probe_execution_sha256"],
         "purpose": spec["purpose"],
         "device_binding": device_binding,
         "steps": steps,
         "worker_vmhwm_bytes": _vmhwm_bytes(),
+        "failure": None,
         "completed_at": _utc_now(),
     }
     result["worker_result_sha256"] = canonical_digest(
@@ -691,13 +769,13 @@ def _run_controller(
         for row in _gpu_snapshot()
         if row["index"] in policy["resources"]["physical_gpus"]
     ]
-    registry = [
+    registry = _canonical_gpu_registry([
         {
             "physical_gpu_index": row["index"],
             "physical_gpu_uuid": row["uuid"],
         }
         for row in gpus
-    ]
+    ])
     if [row["physical_gpu_index"] for row in registry] != [0, 1, 2, 3]:
         raise CanonicalScreeningError("RAM probe physical GPU registry differs")
     target_uuids = {row["physical_gpu_uuid"] for row in registry}
@@ -714,24 +792,51 @@ def _run_controller(
         < policy["resources"]["gpu_headroom_bytes"] // 1024**2
     ):
         raise CanonicalScreeningError("RAM probe GPU0 headroom admission failed")
-    spec = _build_spec(
-        policy, config, manifest, manifest_path, artifact_root, registry
+    contract_spec = _build_spec(
+        policy, config, manifest, manifest_path, artifact_root, None
     )
-    spec_path = artifact_root / "probe_spec.json"
-    write_exclusive_json(spec_path, spec)
     admission = {
         "schema_version": 1,
-        "contract_type": "safa_canonical_screening_ram_probe_admission_v1",
-        "probe_sha256": spec["probe_sha256"],
+        "contract_type": PROBE_ADMISSION_CONTRACT,
+        "probe_contract_sha256": contract_spec["probe_contract_sha256"],
         "host": host,
         "gpu_snapshot": gpus,
         "authorized_gpu_registry": registry,
         "observed_at": _utc_now(),
     }
+    admission["admission_evidence_sha256"] = _admission_evidence_digest(
+        admission
+    )
+    admission["probe_execution_sha256"] = _probe_execution_digest(
+        contract_spec["probe_contract_sha256"],
+        registry,
+        admission["admission_evidence_sha256"],
+    )
     admission["admission_sha256"] = canonical_digest(
         admission, "admission_sha256"
     )
-    write_exclusive_json(artifact_root / "admission.json", admission)
+    admission_path = artifact_root / "admission.json"
+    write_exclusive_json(admission_path, admission)
+    spec = _build_spec(
+        policy,
+        config,
+        manifest,
+        manifest_path,
+        artifact_root,
+        registry,
+        {
+            "path": str(admission_path.resolve()),
+            "sha256": sha256_file(admission_path),
+            "canonical_sha256": admission["admission_sha256"],
+        },
+    )
+    if (
+        spec["probe_contract_sha256"]
+        != contract_spec["probe_contract_sha256"]
+    ):
+        raise CanonicalScreeningError("RAM probe dry/live contract SHA differs")
+    spec_path = artifact_root / "probe_spec.json"
+    write_exclusive_json(spec_path, spec)
     command = [
         str(policy["python"]),
         str(Path(__file__).resolve()),
@@ -793,20 +898,27 @@ def _run_controller(
     worker_result_path = artifact_root / "worker_result.json"
     worker_result = (
         load_json(worker_result_path, "RAM probe worker result")
-        if failure is None
+        if worker_result_path.is_file()
         else None
     )
     if worker_result is not None:
         if (
-            worker_result.get("probe_sha256") != spec["probe_sha256"]
+            worker_result.get("probe_contract_sha256")
+            != spec["probe_contract_sha256"]
+            or worker_result.get("probe_execution_sha256")
+            != spec["probe_execution_sha256"]
             or worker_result.get("worker_result_sha256")
             != canonical_digest(worker_result, "worker_result_sha256")
+            or worker_result.get("status")
+            != ("succeeded" if failure is None else "failed")
         ):
             raise CanonicalScreeningError("RAM probe worker result mismatch")
     if failure is None and peak_rss <= 0:
         failure = "RAM probe measured no positive RSS/VmHWM"
     worker_vmhwm = (
-        None if worker_result is None else worker_result["worker_vmhwm_bytes"]
+        None
+        if worker_result is None or worker_result.get("status") != "succeeded"
+        else worker_result["worker_vmhwm_bytes"]
     )
     budget_basis = (
         max(peak_rss, int(worker_vmhwm))
@@ -823,10 +935,14 @@ def _run_controller(
         "contract_type": PROBE_RESULT_CONTRACT,
         "status": "succeeded" if failure is None else "failed",
         "purpose": spec["purpose"],
-        "probe_sha256": spec["probe_sha256"],
+        "probe_contract_sha256": spec["probe_contract_sha256"],
+        "probe_execution_sha256": spec["probe_execution_sha256"],
         "admission_sha256": admission["admission_sha256"],
         "worker_result_sha256": (
             None if worker_result is None else worker_result["worker_result_sha256"]
+        ),
+        "worker_device_binding": (
+            None if worker_result is None else worker_result["device_binding"]
         ),
         "worker_log_sha256": sha256_file(log_path),
         "worker_returncode": returncode,
