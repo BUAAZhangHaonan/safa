@@ -2116,10 +2116,16 @@ def _validate_heldout_contracts(
         normalized_seal, dict
     ):
         raise R9EvaluatorError("heldout contracts must be mappings")
+    selection_type = normalized_selection.get("contract_type")
+    if selection_type not in {
+        "safa_r9_selection_v1",
+        "safa_r9_full_continuation_selection_v1",
+    }:
+        raise R9EvaluatorError("heldout selection contract type is not supported")
     _validate_digest_contract(
         normalized_selection,
         digest_field="selection_sha256",
-        contract_type="safa_r9_selection_v1",
+        contract_type=str(selection_type),
     )
     _validate_digest_contract(
         normalized_seal,

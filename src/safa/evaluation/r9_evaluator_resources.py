@@ -102,6 +102,14 @@ def validate_evaluator_resource_profiles(
     runtime_config_sha256: str,
 ) -> dict[str, Any]:
     declared = _mapping(value, "evaluator resource profiles")
+    if "resource_profile_binding" in declared:
+        return _validate_full_e2e_resource_profiles(
+            declared,
+            repo_root=repo_root,
+            worker_contract=worker_contract,
+            arcface_contract_sha256=arcface_contract_sha256,
+            quality_script_sha256=quality_script_sha256,
+        )
     if set(declared) != {
         "arcface",
         "quality",
@@ -144,6 +152,80 @@ def validate_evaluator_resource_profiles(
     return rematerialized
 
 
+def _validate_full_e2e_resource_profiles(
+    declared: Mapping[str, Any],
+    *,
+    repo_root: Path,
+    worker_contract: Mapping[str, Any],
+    arcface_contract_sha256: str,
+    quality_script_sha256: str,
+) -> dict[str, Any]:
+    value = _mapping(declared, "Full E2E resource profiles")
+    if set(value) != {
+        "arcface",
+        "quality",
+        "heldout",
+        "resource_profiles_sha256",
+        "resource_profile_binding",
+    }:
+        raise EvaluatorResourceContractError(
+            "Full E2E resource profile fields are not canonical"
+        )
+    binding = _mapping(
+        value["resource_profile_binding"], "Full E2E resource profile binding"
+    )
+    path = _repo_file(
+        repo_root, binding.get("path"), "Full E2E resource profile contract"
+    )
+    profile = _read_mapping(path)
+    declared_digest = _sha256(
+        profile.get("resource_profiles_sha256"),
+        "Full E2E resource profiles",
+    )
+    canonical = dict(profile)
+    canonical.pop("resource_profiles_sha256")
+    if (
+        binding
+        != {
+            "path": str(path.relative_to(repo_root.resolve())),
+            "file_sha256": _file_sha256(path),
+            "contract_sha256": declared_digest,
+        }
+        or _canonical_sha256(canonical) != declared_digest
+        or profile.get("contract_type")
+        != "safa_r9_full_e2e_resource_profiles_v1"
+        or profile.get("worker_contract")
+        != _normalize_expected_worker(worker_contract, repo_root)
+        or profile.get("arcface_contract_sha256")
+        != _sha256(arcface_contract_sha256, "ArcFace contract")
+        or profile.get("quality_script_sha256")
+        != _sha256(quality_script_sha256, "quality script")
+        or value["resource_profiles_sha256"] != declared_digest
+        or value["arcface"] != profile.get("arcface")
+        or value["quality"] != profile.get("quality")
+        or value["heldout"] != profile.get("heldout")
+    ):
+        raise EvaluatorResourceContractError(
+            "Full runtime resource profile does not bind current evaluator bytes"
+        )
+    for kind, mode in (
+        ("arcface", "measured_single_worker"),
+        ("quality", "measured_exclusive_bootstrap"),
+    ):
+        row = _mapping(profile.get(kind), f"Full E2E {kind} profile")
+        peak = _positive_int(
+            row.get("peak_process_tree_rss_bytes"), f"{kind} peak RSS"
+        )
+        if (
+            row.get("mode") != mode
+            or row.get("ram_slot_budget_bytes") != (peak * 110 + 99) // 100
+        ):
+            raise EvaluatorResourceContractError(
+                f"Full E2E {kind} resource budget changed"
+            )
+    return dict(value)
+
+
 def _materialize_measured_profile(
     kind: str,
     *,
@@ -171,10 +253,17 @@ def _materialize_measured_profile(
         digest_field="evaluator_request_sha256",
         contract_type="safa_r9_phase_evaluator_request_v1",
     )
+    raw_claim = _read_mapping(claim_path)
+    claim_type = raw_claim.get("contract_type")
+    if claim_type not in {
+        "safa_r9_evaluator_resource_smoke_request_v1",
+        "safa_r9_evaluator_resource_smoke_request_v2",
+    }:
+        raise EvaluatorResourceContractError("smoke request claim type changed")
     claim = _digest_contract(
         claim_path,
         digest_field="smoke_request_claim_sha256",
-        contract_type="safa_r9_evaluator_resource_smoke_request_v1",
+        contract_type=str(claim_type),
     )
     claim_runtime = _normalize_claim_runtime_config(claim, repo_root)
     if claim_runtime != expected_runtime:
@@ -214,10 +303,15 @@ def _materialize_measured_profile(
     )
     request_digest = request["evaluator_request_sha256"]
     claim_digest = claim["smoke_request_claim_sha256"]
+    expected_sample_count = (
+        8
+        if claim_type == "safa_r9_evaluator_resource_smoke_request_v2"
+        else 64
+    )
     if (
         request.get("task") != kind
         or claim.get("kind") != kind
-        or claim.get("sample_count") != 64
+        or claim.get("sample_count") != expected_sample_count
         or claim.get("retry_allowed") is not False
         or claim.get("evaluator_request_sha256") != request_digest
         or claim.get("worker_contract") != normalized_worker
@@ -232,6 +326,35 @@ def _materialize_measured_profile(
         raise EvaluatorResourceContractError(
             f"{kind} smoke request does not bind the current evaluator contract"
         )
+    if claim_type == "safa_r9_evaluator_resource_smoke_request_v2":
+        request_payload = _mapping(request.get("payload"), "v2 smoke payload")
+        request_samples = request_payload.get("samples")
+        manifest = _mapping(claim.get("manifest"), "v2 smoke manifest")
+        if (
+            claim.get("campaign_id") != "r9-report-only-formal-v9"
+            or claim.get("phase") != "full"
+            or claim.get("arm_id") != "paper_eta_0p125"
+            or claim.get("batch_size") != 2
+            or set(manifest) != {
+                "path",
+                "sha256",
+                "sample_count",
+                "ordered_sample_id_sha256",
+            }
+            or manifest.get("sample_count") != 8
+            or not isinstance(claim.get("smoke_supersession_sha256"), str)
+            or len(str(claim["smoke_supersession_sha256"])) != 64
+            or request_payload.get("phase") != "full"
+            or request_payload.get("arm_id") != "paper_eta_0p125"
+            or request_payload.get("logical_run_id")
+            != f"resource_smoke_{kind}_full_8"
+            or not isinstance(request_samples, list)
+            or len(request_samples) != 8
+            or request_config.get("batch_size") != 2
+        ):
+            raise EvaluatorResourceContractError(
+                f"{kind} v2 smoke request violates the frozen Full policy"
+            )
     quality_path = Path(str(request_quality.get("path"))).resolve()
     if _contained_file(repo_root, quality_path, "quality script") is None:
         raise AssertionError("unreachable")
@@ -276,11 +399,15 @@ def _materialize_measured_profile(
     if not isinstance(gpu_uuid, str) or not gpu_uuid:
         raise EvaluatorResourceContractError(f"{kind} GPU UUID is invalid")
     if kind == "arcface":
-        _validate_arcface_result(worker.get("result"))
+        _validate_arcface_result(
+            worker.get("result"), expected_sample_count=expected_sample_count
+        )
         if execution.get("kind") != "arcface":
             raise EvaluatorResourceContractError("ArcFace smoke kind mismatch")
     else:
-        _validate_quality_result(worker.get("result"))
+        _validate_quality_result(
+            worker.get("result"), expected_sample_count=expected_sample_count
+        )
         ram = _mapping(execution.get("ram"), "quality smoke RAM policy")
         if (
             execution.get("global_exclusive_slots") != 16
@@ -324,9 +451,11 @@ def _materialize_measured_profile(
     }, claim_runtime
 
 
-def _validate_arcface_result(value: Any) -> None:
-    if not isinstance(value, list) or len(value) != 64:
-        raise EvaluatorResourceContractError("ArcFace smoke must cover 64 rows")
+def _validate_arcface_result(value: Any, *, expected_sample_count: int) -> None:
+    if not isinstance(value, list) or len(value) != expected_sample_count:
+        raise EvaluatorResourceContractError(
+            f"ArcFace smoke must cover {expected_sample_count} rows"
+        )
     ids = []
     for row in value:
         item = _mapping(row, "ArcFace smoke row")
@@ -347,18 +476,18 @@ def _validate_arcface_result(value: Any) -> None:
             )
     if (
         any(not isinstance(value, str) or not value for value in ids)
-        or len(set(ids)) != 64
+        or len(set(ids)) != expected_sample_count
     ):
         raise EvaluatorResourceContractError("ArcFace smoke IDs are not unique")
 
 
-def _validate_quality_result(value: Any) -> None:
+def _validate_quality_result(value: Any, *, expected_sample_count: int) -> None:
     result = _mapping(value, "quality smoke result")
     if (
         result.get("metrics") != ["fid", "kid", "niqe", "sharpness"]
-        or result.get("num_generated") != 64
-        or result.get("num_real") != 64
-        or result.get("sample_id_count") != 64
+        or result.get("num_generated") != expected_sample_count
+        or result.get("num_real") != expected_sample_count
+        or result.get("sample_id_count") != expected_sample_count
     ):
         raise EvaluatorResourceContractError("quality smoke coverage mismatch")
     iqa = _mapping(result.get("iqa"), "quality IQA")

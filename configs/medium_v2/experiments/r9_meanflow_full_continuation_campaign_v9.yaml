@@ -1,0 +1,40 @@
+schema_version: 1
+contract_type: safa_r9_full_continuation_request_v1
+child_campaign_id: r9-report-only-formal-v9
+start_phase: full
+base_runtime:
+  path: configs/medium_v2/experiments/r9_meanflow_campaign.yaml
+  sha256: 26a0e196adae065cbbfebe1c05f346026f5e30f1bfae1c879fea9a71bca6eeb3
+source:
+  supersession_contract_sha256: f4323db51df0c4980a3b8160bd741ec72aa45a4836bf3c1f4fde5ee0f86a83f0
+  gate_contract_sha256: faf54907384e5c975fdbf5edf5b8cde2c1b477cf3a9b37370bd82290f9e669ce
+  selection_sha256: 4bf2351852e63fbf956c529bd915ef159db274e15f5b9748ceb1f11e9bd8b716
+  supersession_result_sha256: d0e83fe6357052f9409a2b71f7d03bb6bce0b303086ecc94efd20466f335758e
+  winner_arm_id: paper_eta_0p125
+  campaign_runtime_sha256: 0b8a3c1d76c5ab9851dd7cf0b86d559690158f56716f61fa0401c26ac2bbf63a
+  generation_batch_benchmark_sha256: efb5075062473fdc25ec89e1d72a97dcc79201e791af9122679ef6c7bd2b3e0f
+generation_batch_benchmark:
+  contract_path: artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v8/generation_batch_benchmark.json
+  source_campaign_id: r9-report-only-formal-v8
+  source_continuation_contract_sha256: 2c95c4cbaa917742cf1a3694b0162ca5fb8d71ce0ca6b9952aded7adeac466ce
+  manifest: calibration_64
+  sample_count: 8
+  seed: 4549
+  required_arms: [native, paper_eta_0p125, flow_map2_normalized_eta_0p125]
+  batch_sizes: [2, 4]
+  selected_batch_size: 2
+  selected_slots_per_gpu: 2
+semigroup_closure_campaign_id: r9-report-only-formal-v2
+evaluator_resources:
+  arcface:
+    mode: measured_single_worker
+    source: full_e2e_profile_v1
+  quality:
+    mode: measured_exclusive_bootstrap
+    source: full_e2e_profile_v1
+  heldout:
+    mode: exclusive_single_official_run
+    smoke_execution: sealed_until_winner_lock
+    global_exclusive_slots: 16
+    ram_admission_percent: 85
+    ram_hard_limit_percent: 90

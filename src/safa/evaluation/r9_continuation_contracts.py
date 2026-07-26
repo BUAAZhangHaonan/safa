@@ -252,6 +252,17 @@ def validate_continuation_contract(
     value: Mapping[str, Any], *, repo_root: Path
 ) -> dict[str, Any]:
     normalized = _mapping(value, "continuation contract")
+    if normalized.get("contract_type") == "safa_r9_full_continuation_v1":
+        from safa.evaluation.r9_full_continuation_contracts import (
+            expected_source_from_full_continuation,
+            validate_full_continuation_contract,
+        )
+
+        return validate_full_continuation_contract(
+            normalized,
+            repo_root=repo_root,
+            expected_source=expected_source_from_full_continuation(normalized),
+        )
     if normalized.get("contract_type") == "safa_r9_confirm_continuation_contract_v1":
         from safa.evaluation.r9_confirm_continuation_contracts import (
             validate_confirm_continuation_contract,
@@ -295,6 +306,14 @@ def continuation_contract_binding(
     payload: Mapping[str, Any], *, repo_root: Path
 ) -> tuple[Path, bytes, dict[str, str]]:
     normalized = _mapping(payload, "continuation contract")
+    if normalized.get("contract_type") == "safa_r9_full_continuation_v1":
+        from safa.evaluation.r9_full_continuation_contracts import (
+            full_continuation_contract_binding,
+        )
+
+        return full_continuation_contract_binding(
+            normalized, repo_root=repo_root
+        )
     if normalized.get("contract_type") == "safa_r9_confirm_continuation_contract_v1":
         from safa.evaluation.r9_confirm_continuation_contracts import (
             confirm_continuation_contract_binding,

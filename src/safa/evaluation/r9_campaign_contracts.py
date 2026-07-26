@@ -302,14 +302,36 @@ def validate_campaign_runtime(
         )
         continuation_digest = continuation_payload.get(
             "continuation_contract_sha256",
-            continuation_payload.get("confirm_continuation_sha256"),
+            continuation_payload.get(
+                "confirm_continuation_sha256",
+                continuation_payload.get("full_continuation_sha256"),
+            ),
         )
+        benchmark_campaign_id = str(normalized["campaign_id"])
+        benchmark_continuation_digest = str(continuation_digest)
+        if (
+            continuation_payload.get("contract_type")
+            == "safa_r9_full_continuation_v1"
+        ):
+            batch_policy = _json_mapping(
+                _json_mapping(
+                    continuation_payload.get("bindings"),
+                    "Full continuation bindings",
+                ).get("generation_batch_policy"),
+                "Full generation batch policy",
+            )
+            benchmark_campaign_id = str(batch_policy.get("source_campaign_id"))
+            benchmark_continuation_digest = str(
+                batch_policy.get("source_continuation_contract_sha256")
+            )
         try:
             benchmark_payload = validate_generation_batch_benchmark_contract(
                 benchmark_payload,
                 repo_root=root,
-                expected_campaign_id=str(normalized["campaign_id"]),
-                expected_continuation_contract_sha256=str(continuation_digest),
+                expected_campaign_id=benchmark_campaign_id,
+                expected_continuation_contract_sha256=(
+                    benchmark_continuation_digest
+                ),
             )
         except ValueError as error:
             raise CampaignContractError(
@@ -389,6 +411,19 @@ def validate_campaign_runtime(
         decision = _json_mapping(
             benchmark_payload.get("decision"), "generation batch decision"
         )
+        expected_slots_per_gpu = decision.get("selected_slots_per_gpu")
+        if (
+            continuation_payload is not None
+            and continuation_payload.get("contract_type")
+            == "safa_r9_full_continuation_v1"
+        ):
+            expected_slots_per_gpu = _json_mapping(
+                _json_mapping(
+                    continuation_payload.get("bindings"),
+                    "Full continuation bindings",
+                ).get("generation_batch_policy"),
+                "Full generation batch policy",
+            ).get("workers_per_gpu")
         resources = normalized["resources"]
         if any(
             resources.get(field) != expected
@@ -404,7 +439,7 @@ def validate_campaign_runtime(
                 ("generation_batch_size", decision.get("selected_batch_size")),
                 (
                     "generation_slots_per_gpu",
-                    decision.get("selected_slots_per_gpu"),
+                    expected_slots_per_gpu,
                 ),
             )
         ):
@@ -1282,6 +1317,7 @@ def build_d_gate_contract(
     heldout_seal: Mapping[str, Any],
     result: Mapping[str, Any],
     bootstrap_seed: int,
+    formal_hard_requirements: bool = False,
 ) -> dict[str, Any]:
     bound_context = _validate_gate_context(context)
     _verify_contract_digest(selection, "selection_sha256")
@@ -1312,6 +1348,8 @@ def build_d_gate_contract(
     visual_reference_misses = []
     if visual_severe > 3:
         visual_reference_misses.append("full_visual_severe_count_gt_3")
+        if formal_hard_requirements:
+            failures.append("full_visual_severe_count_gt_3")
     representations = result.get("representations")
     if not isinstance(representations, Mapping) or set(representations) != {"e1", "e2"}:
         raise CampaignContractError("Full result requires E1 and E2 representations")
@@ -1330,12 +1368,18 @@ def build_d_gate_contract(
             reference_misses.append(f"{name}_winner_mean_not_above_native")
         if lower <= 0:
             reference_misses.append(f"{name}_bootstrap_lower_not_positive")
+            if formal_hard_requirements:
+                failures.append(f"{name}_bootstrap_lower_not_positive")
         normalized_representations[name] = {
             "winner_mean": winner_mean,
             "native_mean": native_mean,
             "paired_bootstrap_lower_95": lower,
             "observations": {
-                "metrics_role": "report_only",
+                "metrics_role": (
+                    "hard_requirement"
+                    if formal_hard_requirements
+                    else "report_only"
+                ),
                 "reference_misses": reference_misses,
             },
         }
@@ -1359,6 +1403,8 @@ def build_d_gate_contract(
             privacy_reference_misses = (
                 [f"{name}_privacy_upper_gt_0.02"] if upper > 0.02 else []
             )
+            if formal_hard_requirements and upper > 0.02:
+                failures.append(f"{name}_privacy_upper_gt_0.02")
         else:
             if upper_value is not None or bootstrap_value is not None:
                 raise CampaignContractError(
@@ -1373,7 +1419,11 @@ def build_d_gate_contract(
             "privacy_delta_upper_95": upper,
             "bootstrap_sha256": bootstrap_sha,
             "observations": {
-                "privacy_metric_role": "report_only",
+                "privacy_metric_role": (
+                    "hard_requirement"
+                    if formal_hard_requirements
+                    else "report_only"
+                ),
                 "reference_misses": privacy_reference_misses,
             },
         }
@@ -1391,6 +1441,21 @@ def build_d_gate_contract(
     _validate_seed_quality_against_paired_metrics(
         (quality,), paired_metric_bootstrap
     )
+    if formal_hard_requirements:
+        strict_quality_failures = [
+            *quality["observations"]["visual_reference_misses"],
+            *quality["observations"]["numerical_reference_misses"],
+        ]
+        quality = {
+            **quality,
+            "observations": {
+                **quality["observations"],
+                "numerical_metrics_role": "hard_requirement",
+                "visual_metrics_role": "hard_requirement",
+            },
+            "failures": [*quality["failures"], *strict_quality_failures],
+            "passed": not quality["failures"] and not strict_quality_failures,
+        }
     failures.extend(
         f"quality:{item}"
         for item in quality["failures"]
@@ -1419,9 +1484,21 @@ def build_d_gate_contract(
             "identity_report": metrics_report,
             "heldout_execution_count": 1,
             "observations": {
-                "numerical_metrics_role": "report_only",
-                "visual_metrics_role": "observation_only",
-                "privacy_metrics_role": "report_only",
+                "numerical_metrics_role": (
+                    "hard_requirement"
+                    if formal_hard_requirements
+                    else "report_only"
+                ),
+                "visual_metrics_role": (
+                    "hard_requirement"
+                    if formal_hard_requirements
+                    else "observation_only"
+                ),
+                "privacy_metrics_role": (
+                    "hard_requirement"
+                    if formal_hard_requirements
+                    else "report_only"
+                ),
                 "full_visual_reference_misses": visual_reference_misses,
                 "paired_metric_bootstrap_sha256": paired_metric_bootstrap[
                     "paired_metric_bootstrap_sha256"
@@ -1432,14 +1509,31 @@ def build_d_gate_contract(
         }
     ]
     passed = not failures
+    privacy_upper_values = [
+        normalized_recognizers[name]["privacy_delta_upper_95"]
+        for name in sorted(required_recognizers)
+    ]
+    privacy_improvement = (
+        all(value is not None and value < 0 for value in privacy_upper_values)
+        if formal_hard_requirements
+        else False
+    )
     return _build_gate_payload(
         phase="full",
         context=bound_context,
         seeds=[full_seed],
         thresholds={
             **_quality_thresholds(severe_limit=3),
-            "representation_metrics_role": "report_only",
-            "privacy_metrics_role": "report_only",
+            "representation_metrics_role": (
+                "hard_requirement"
+                if formal_hard_requirements
+                else "report_only"
+            ),
+            "privacy_metrics_role": (
+                "hard_requirement"
+                if formal_hard_requirements
+                else "report_only"
+            ),
             "identity_coverage_role": "hard_requirement",
             "full_visual_severe_max": 3,
             "representation_bootstrap_lower_min_exclusive": 0.0,
@@ -1454,6 +1548,15 @@ def build_d_gate_contract(
             "selection_sha256": selection["selection_sha256"],
             "heldout_seal_sha256": heldout_seal["heldout_seal_sha256"],
             "reselection_allowed": False,
+            "privacy_non_inferiority": (
+                all(
+                    value is not None and value <= 0.02
+                    for value in privacy_upper_values
+                )
+                if formal_hard_requirements
+                else None
+            ),
+            "privacy_improvement": privacy_improvement,
         },
     )
 

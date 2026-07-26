@@ -11,6 +11,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from safa.evaluation.r9_phase_results import SampleEvidence
 from safa.evaluation.r9_evaluator_worker import _validate_arcface_contract
@@ -99,6 +100,53 @@ def test_confirm_continuation_all_is_exactly_c_and_d() -> None:
     assert [
         run.arm_ref for run in confirm.runs if run.shard_index == 0
     ] == ["native", *selected]
+
+
+def test_full_continuation_cli_accepts_only_full() -> None:
+    for phase in ("preflight", "diagnose", "calibrate", "confirm512", "all"):
+        with pytest.raises(SystemExit):
+            driver.parse_args(
+                [
+                    "--phase",
+                    phase,
+                    "--campaign-id",
+                    driver.FULL_CONTINUATION_CHILD_CAMPAIGN_ID,
+                ]
+            )
+    args = driver.parse_args(
+        [
+            "--phase",
+            "full",
+            "--campaign-id",
+            driver.FULL_CONTINUATION_CHILD_CAMPAIGN_ID,
+        ]
+    )
+    assert args.phase == "full"
+
+
+def test_full_continuation_plan_is_only_locked_winner_at_batch2() -> None:
+    selected = ["paper_eta_0p125"]
+    plans = driver.build_requested_plans(
+        runtime(),
+        phase="full",
+        campaign_id=driver.FULL_CONTINUATION_CHILD_CAMPAIGN_ID,
+        continuation_selected_arm_ids=selected,
+        continuation_start_phase="full",
+    )
+    assert [plan.phase for plan in plans] == ["full"]
+    assert plans[0].logical_run_count == 2
+    assert [run.arm_ref for run in plans[0].runs if run.shard_index == 0] == [
+        "native",
+        "paper_eta_0p125",
+    ]
+    with pytest.raises(ValueError, match="rejects every upstream"):
+        driver.build_requested_plans(
+            runtime(),
+            phase="confirm512",
+            campaign_id=driver.FULL_CONTINUATION_CHILD_CAMPAIGN_ID,
+            continuation_selected_arm_ids=selected,
+            continuation_start_phase="full",
+        )
 
 
 def test_confirm_request_locks_generation_batch_benchmark() -> None:
@@ -400,6 +448,136 @@ def test_full_gate_forwards_runtime_bootstrap_seed(
 
     assert gate == {"verdict": "pass"}
     assert captured == {"bootstrap_seed": 91637}
+
+
+def test_full_finalize_gate_revalidates_frozen_selection_without_digest_cycle(
+    monkeypatch, tmp_path: Path
+) -> None:
+    full_request = yaml.safe_load(
+        (driver.REPO_ROOT / driver.FULL_CONTINUATION_RUNTIME_CONFIG).read_text(
+            encoding="utf-8"
+        )
+    )
+    source = full_request["source"]
+    runtime = driver.load_runtime_config(
+        driver.REPO_ROOT / full_request["base_runtime"]["path"]
+    )
+    continuation = driver.build_full_continuation_contract(
+        repo_root=driver.REPO_ROOT, expected_source=source
+    )
+    selection = driver.build_full_continuation_selection_contract(
+        repo_root=driver.REPO_ROOT, expected_source=source
+    )
+    assert "continuation_contract_sha256" not in selection
+    selection_path = tmp_path / "full_continuation_selection.json"
+    selection_path.write_text(
+        json.dumps(selection, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    campaign_root = tmp_path / "child"
+    campaign_root.mkdir()
+    (campaign_root / "heldout_seal.json").write_text("{}\n", encoding="utf-8")
+    manifest_sha = "1" * 64
+    runtime_sha = "2" * 64
+    manifests_sha = "3" * 64
+    results = {
+        "phase_results_sha256": "4" * 64,
+        "automatic_evidence_sha256": "5" * 64,
+        "run_plan_sha256": "6" * 64,
+        "campaign_runtime_sha256": runtime_sha,
+        "manifest_contracts_sha256": manifests_sha,
+        "manifest_sha256": manifest_sha,
+        "result": {"arm_id": "paper_eta_0p125"},
+    }
+    real_repo_path = driver._repo_path
+
+    def repo_path(root, value, label):
+        if label == "Full continuation selection":
+            assert value == continuation["selection"]["path"]
+            return selection_path
+        return real_repo_path(root, value, label)
+
+    monkeypatch.setattr(driver, "_repo_path", repo_path)
+    monkeypatch.setattr(
+        driver, "_continuation_for_runtime", lambda *a, **k: continuation
+    )
+    monkeypatch.setattr(driver, "_load_phase_results", lambda *a, **k: results)
+    monkeypatch.setattr(driver, "_validate_phase_evidence_chain", lambda *a, **k: {})
+    monkeypatch.setattr(
+        driver, "_phase_evaluator_evidence_sha256", lambda *a, **k: "7" * 64
+    )
+    monkeypatch.setattr(driver, "_require_gate_continuation", lambda *a: None)
+    monkeypatch.setattr(driver, "write_immutable_contract", lambda *a, **k: None)
+    monkeypatch.setattr(
+        driver,
+        "build_d_gate_contract",
+        lambda *a, **k: {
+            "verdict": "pass",
+            "selection": k["selection"]["selection_sha256"],
+        },
+    )
+    gate = driver.finalize_phase_gate(
+        runtime,
+        {
+            "campaign_root": str(campaign_root),
+            "campaign_runtime_sha256": runtime_sha,
+            "checkpoint": {"sha256": "8" * 64},
+            "bootstrap": {"seed": 91637},
+            "continuation": {
+                "path": "unused",
+                "file_sha256": "9" * 64,
+                "contract_sha256": continuation["full_continuation_sha256"],
+            },
+        },
+        {
+            "manifest_contracts_sha256": manifests_sha,
+            "manifests": {"full_2048": {"sha256": manifest_sha}},
+        },
+        {},
+        phase="full",
+        campaign_id=driver.FULL_CONTINUATION_CHILD_CAMPAIGN_ID,
+    )
+    assert gate["selection"] == selection["selection_sha256"]
+
+
+def test_full_execution_is_blocked_without_formal_e2e_gate(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(driver, "REPO_ROOT", tmp_path)
+    continuation = {
+        "start_phase": "full",
+        "full_continuation_sha256": "a" * 64,
+        "bindings": {
+            "current_evaluation": {
+                "classification": "canonical_current_v9_execution_authority",
+                "worker": {"sha256": "d" * 64},
+                "quality_script": {"sha256": "e" * 64},
+            }
+        },
+    }
+    monkeypatch.setattr(
+        driver, "_continuation_for_runtime", lambda *a, **k: continuation
+    )
+    monkeypatch.setattr(
+        driver,
+        "_require_full_selection_binding",
+        lambda *a, **k: {"selection_sha256": "b" * 64},
+    )
+    with pytest.raises(
+        (FileNotFoundError, ValueError), match="Full E2E gate"
+    ):
+        driver._require_full_e2e_gate(
+            {
+                "campaign_root": "child",
+                "manifests": {
+                    "full_2048": {"path": "full.jsonl", "sha256": "c" * 64}
+                },
+                "evaluation": {
+                    "worker": {"sha256": "d" * 64},
+                    "quality": {"script": {"sha256": "e" * 64}},
+                },
+            }
+        )
 
 
 @pytest.mark.parametrize(
@@ -2615,3 +2793,511 @@ def test_launch_ordinals_are_stable_across_phase_invocation_modes() -> None:
     assert driver._stable_launch_ordinal("calibrate", 0) == 20_000
     assert driver._stable_launch_ordinal("confirm512", 0) == 30_000
     assert driver._stable_launch_ordinal("full", 0) == 40_000
+
+
+def test_full_runtime_guard_hard_stops_on_sustained_host_cpu(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(driver, "REPO_ROOT", tmp_path)
+
+    class Probe:
+        @staticmethod
+        def ram_snapshot():
+            return SimpleNamespace(used_bytes=10, total_bytes=100)
+
+        @staticmethod
+        def gpu_snapshots():
+            return tuple(
+                SimpleNamespace(
+                    index=index,
+                    uuid=f"GPU-{index}",
+                    total_bytes=100,
+                    free_bytes=90,
+                )
+                for index in range(4)
+            )
+
+    cpu_values = iter(((100, 50), (200, 60), (300, 70)))
+    policy = {
+        "policy_id": "frozen_conservative_e2e_v1",
+        "gpu_indices": [0, 1, 2, 3],
+        "hard_stop": {
+            "gpu_memory_percent_at_or_above": 90,
+            "ram_percent_at_or_above": 90,
+            "disk_percent_at_or_above": 90,
+            "cpu_percent_at_or_above": 90,
+            "temperature_c_above": 85,
+            "swap_io_positive": True,
+            "sustained_sample_count": 2,
+        },
+    }
+    guard = driver.FullRuntimeGuard(
+        policy,
+        monitor_path=tmp_path / "monitor.jsonl",
+        probe=Probe(),
+        temperatures=lambda: {f"GPU-{index}": 40 for index in range(4)},
+        swap_reader=lambda: (0, 0),
+        disk_usage=lambda _: SimpleNamespace(used=10, total=100),
+        gpu_process_memory=lambda: {},
+        cpu_reader=lambda: next(cpu_values),
+    )
+    guard.enforce()
+    with pytest.raises(driver.ResourceContractError, match="host CPU"):
+        guard.enforce()
+
+
+def test_full_runtime_guard_fails_when_bound_monitor_dies(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(driver, "REPO_ROOT", tmp_path)
+    policy = {
+        "policy_id": "frozen_conservative_e2e_v1",
+        "gpu_indices": [0, 1, 2, 3],
+        "hard_stop": {
+            "gpu_memory_percent_at_or_above": 90,
+            "ram_percent_at_or_above": 90,
+            "disk_percent_at_or_above": 90,
+            "cpu_percent_at_or_above": 90,
+            "temperature_c_above": 85,
+            "swap_io_positive": True,
+            "sustained_sample_count": 2,
+        },
+    }
+    guard = driver.FullRuntimeGuard(
+        policy,
+        monitor_path=tmp_path / "guard.jsonl",
+        swap_reader=lambda: (0, 0),
+        cpu_reader=lambda: (100, 50),
+    )
+    claim = {
+        "schema_version": 1,
+        "contract_type": "safa_r9_formal_full_monitor_claim_v1",
+    }
+    claim["monitor_claim_sha256"] = driver._canonical_json_sha256(claim)
+    claim_path = tmp_path / "claim.json"
+    claim_path.write_text(json.dumps(claim), encoding="utf-8")
+    guard.bind_monitor(
+        session_name="safa-r9-v9-formal-full-monitor",
+        claim_path=claim_path,
+        claim_sha256=claim["monitor_claim_sha256"],
+    )
+    monkeypatch.setattr(
+        driver.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=1),
+    )
+    with pytest.raises(driver.ResourceContractError, match="monitor tmux session died"):
+        guard.enforce()
+
+
+def test_formal_monitor_start_requires_live_tmux_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outcomes = iter((1, 0, 1))
+    monkeypatch.setattr(
+        driver.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=next(outcomes), stderr=""
+        ),
+    )
+    with pytest.raises(RuntimeError, match="did not stay alive"):
+        driver._start_formal_full_monitor(
+            {"campaign_root": "campaign"},
+            {
+                "session_name": "safa-r9-v9-formal-full-monitor",
+                "command": ["python", "monitor.py"],
+            },
+        )
+
+
+def test_execute_campaign_runtime_guard_failure_terminates_owned_workers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(driver, "REPO_ROOT", tmp_path)
+    scheduler = _FourGpuSlotScheduler()
+    process = _FakeProcess(0, running_polls=100)
+
+    class Guard:
+        @staticmethod
+        def enforce(processes):
+            assert processes
+            raise driver.ResourceContractError("guard hard stop")
+
+    with pytest.raises(driver.ResourceContractError, match="guard hard stop"):
+        driver.execute_campaign(
+            (_many_run_plan(tmp_path, 1),),
+            scheduler=scheduler,
+            gpu_bindings={index: f"GPU-{index}" for index in range(4)},
+            peer_status_store=_StatusStore(),
+            process_factory=lambda *args, **kwargs: process,
+            runtime_guard=Guard(),
+            sleep=lambda _: None,
+        )
+    assert process.terminated is True
+    assert scheduler.active == {}
+
+
+def test_formal_report_only_resume_executes_no_worker_callbacks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(driver, "REPO_ROOT", tmp_path)
+    order = []
+    chain = {
+        "claim": {"formal_execution_claim_sha256": "1" * 64},
+        "terminal": {
+            "status": "awaiting_visual_review",
+            "formal_execution_terminal_sha256": "2" * 64,
+        },
+    }
+    monkeypatch.setattr(
+        driver,
+        "_validate_formal_full_execution_chain",
+        lambda campaign_runtime: order.append("validate") or chain,
+    )
+    monkeypatch.setattr(
+        driver,
+        "_require_full_e2e_gate",
+        lambda campaign_runtime: order.append("gate") or {},
+    )
+    monkeypatch.setattr(
+        driver,
+        "build_phase_results_request",
+        lambda *args, **kwargs: order.append("request") or {"request": True},
+    )
+    monkeypatch.setattr(
+        driver,
+        "resume_phase_results",
+        lambda request: order.append("resume")
+        or SimpleNamespace(status="complete"),
+    )
+    monkeypatch.setattr(
+        driver,
+        "finalize_phase_gate",
+        lambda *args, **kwargs: order.append("finalize")
+        or {"gate_contract_sha256": "3" * 64},
+    )
+    monkeypatch.setattr(
+        driver,
+        "execute_campaign",
+        lambda *args, **kwargs: pytest.fail("generation callback executed"),
+    )
+    monkeypatch.setattr(
+        driver,
+        "execute_dynamic_campaign",
+        lambda *args, **kwargs: pytest.fail("dynamic callback executed"),
+    )
+    writes = []
+    monkeypatch.setattr(
+        driver,
+        "_write_immutable_bytes",
+        lambda path, content: writes.append((path, content)),
+    )
+    campaign_runtime = {
+        "campaign_root": "campaign",
+        "campaign_runtime_sha256": "4" * 64,
+    }
+    plan = driver.PhasePlan(
+        phase="full",
+        campaign_id=driver.FULL_CONTINUATION_CHILD_CAMPAIGN_ID,
+        campaign_root=Path("campaign"),
+        logical_run_count=0,
+        runs=(),
+    )
+    assert (
+        driver._resume_formal_full_report_only(
+            {},
+            campaign_runtime,
+            {},
+            {},
+            plan=plan,
+            campaign_id=driver.FULL_CONTINUATION_CHILD_CAMPAIGN_ID,
+        )
+        == 0
+    )
+    assert order == ["validate", "gate", "request", "resume", "finalize"]
+    assert len(writes) == 1
+    assert writes[0][0] == tmp_path / "campaign/full/report_only_finalize.json"
+    report = json.loads(writes[0][1])
+    assert report["generation_execution_count"] == 0
+    assert report["evaluator_execution_count"] == 0
+    assert report["heldout_execution_count"] == 0
+
+
+def _minimal_evaluator_callbacks(tmp_path: Path):
+    callbacks = object.__new__(driver.R9ProductionEvaluatorCallbacks)
+    callbacks._validate_current_worker_contract = lambda: None
+    callbacks._campaign_root = tmp_path / "campaign"
+    callbacks._evaluation = {
+        "heldout": {"batch_size": 16},
+        "arcface": {},
+        "quality": {"script": {}},
+    }
+    callbacks._worker_contract = {"sha256": "1" * 64}
+    callbacks._arcface_contract_sha256 = driver._canonical_json_sha256({})
+    callbacks._quality_script_sha256 = "2" * 64
+    callbacks._evaluator_ram_slot_budgets = {
+        "quality": 1024,
+        "arcface": 1024,
+    }
+    class RecordingScheduler(_FourGpuSlotScheduler):
+        def __init__(self):
+            super().__init__()
+            self.requests = []
+
+        def admit_worker(self, request):
+            self.requests.append(request)
+            return super().admit_worker(request)
+
+    callbacks._scheduler = RecordingScheduler()
+    callbacks._gpu_bindings = {
+        index: f"GPU-{index}" for index in range(4)
+    }
+    callbacks._peer_status_store = _StatusStore()
+    callbacks._python = sys.executable
+    callbacks._worker_script = tmp_path / "worker.py"
+    callbacks._sleep = lambda _: None
+    callbacks._poll_interval_seconds = 0.01
+    callbacks._launch_counter = 0
+    callbacks._scheduler_lock = driver.threading.RLock()
+    callbacks._quality_execution_lock = driver.threading.Lock()
+    callbacks._active_evaluator_processes = {}
+    callbacks._runtime_guard = None
+    callbacks._rss_sampler = lambda _: 1
+    callbacks._gpu_process_memory = lambda: {"GPU-0": 1}
+
+    class Process:
+        pid = 1234
+        returncode = 0
+
+        @staticmethod
+        def poll():
+            return 0
+
+    def process_factory(command, **kwargs):
+        del kwargs
+        request_path = Path(command[command.index("--request") + 1])
+        output_path = Path(command[command.index("--output") + 1])
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        output = {
+            "schema_version": 1,
+            "contract_type": "safa_r9_phase_evaluator_output_v1",
+            "task": request["task"],
+            "evaluator_request_sha256": request["evaluator_request_sha256"],
+            "worker_contract": callbacks._worker_contract,
+            "arcface_contract_sha256": callbacks._arcface_contract_sha256,
+            "quality_script_sha256": callbacks._quality_script_sha256,
+            "result": {"strict": True},
+        }
+        output["evaluator_output_sha256"] = driver._canonical_json_sha256(output)
+        output_path.write_text(json.dumps(output), encoding="utf-8")
+        return Process()
+
+    callbacks._process_factory = process_factory
+    return callbacks
+
+
+def test_heldout_uses_one_lease_and_attempt_is_single_use(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(driver, "REPO_ROOT", tmp_path)
+    callbacks = _minimal_evaluator_callbacks(tmp_path)
+    payload = {"winner": "paper_eta_0p125"}
+    assert callbacks._run("heldout", "full", "winner", payload) == {
+        "strict": True
+    }
+    assert len(callbacks._scheduler.requests) == 1
+    assert (
+        callbacks._scheduler.requests[0].ram_slot_budget_bytes
+        == 16 * 1024**3
+    )
+    assert callbacks._scheduler.active_leases == ()
+    assert callbacks._run("heldout", "full", "winner", payload) == {
+        "strict": True
+    }
+    assert len(callbacks._scheduler.requests) == 1
+
+    result_path = (
+        tmp_path
+        / "campaign/full/evaluator_runs/heldout/winner/result.json"
+    )
+    result_path.unlink()
+    with pytest.raises(RuntimeError, match="automatic retry is forbidden"):
+        callbacks._run("heldout", "full", "winner", payload)
+
+
+def test_quality_callbacks_are_process_wide_mutually_exclusive(
+    tmp_path: Path,
+) -> None:
+    callbacks = _minimal_evaluator_callbacks(tmp_path)
+    active = 0
+    maximum = 0
+    active_lock = driver.threading.Lock()
+    release = driver.threading.Event()
+    entered = driver.threading.Event()
+
+    def run(*args):
+        nonlocal active, maximum
+        del args
+        with active_lock:
+            active += 1
+            maximum = max(maximum, active)
+            entered.set()
+        release.wait(timeout=2)
+        with active_lock:
+            active -= 1
+        return {"strict": True}
+
+    callbacks._run = run
+    request = SimpleNamespace(
+        phase="full",
+        logical_run_id="winner",
+        arm_id="paper_eta_0p125",
+        seed=7919,
+        image_role="candidate",
+        manifest_path=tmp_path / "manifest.jsonl",
+        source_index_path=tmp_path / "source.jsonl",
+        source_index_sha256="1" * 64,
+        samples=(),
+        algorithm_config_sha256="2" * 64,
+        runner_arm_config_sha256="3" * 64,
+        semantic_output_sha256="4" * 64,
+        evidence_binding_sha256="5" * 64,
+        generation_result_set_sha256="6" * 64,
+        per_sample_set_sha256="7" * 64,
+    )
+    threads = [
+        driver.threading.Thread(target=callbacks.quality, args=(request,))
+        for _ in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    assert entered.wait(timeout=1)
+    release.set()
+    for thread in threads:
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+    assert maximum == 1
+
+
+def test_full_e2e_measured_resource_profile_rebuild_and_tamper_fail_closed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(driver, "REPO_ROOT", tmp_path)
+    worker_contract = {
+        "path": "scripts/worker.py",
+        "sha256": "1" * 64,
+        "implementation_path": "src/worker.py",
+        "implementation_sha256": "2" * 64,
+    }
+    arcface = {"weights_sha256": "3" * 64}
+    quality_sha256 = "4" * 64
+    campaign_runtime = {
+        "campaign_root": "campaign",
+        "evaluation": {
+            "worker": worker_contract,
+            "arcface": arcface,
+            "quality": {"script": {"sha256": quality_sha256}},
+        },
+    }
+    expected_arcface_sha256 = driver._canonical_json_sha256(arcface)
+    units = {
+        "arcface": ("arcface", "formal_e2e_arcface_8", 100, 10),
+        "quality_native": (
+            "quality",
+            "formal_e2e_quality_8__native",
+            200,
+            20,
+        ),
+        "quality_candidate": (
+            "quality",
+            "formal_e2e_quality_8__candidate",
+            300,
+            30,
+        ),
+    }
+    for task, unit, peak_rss, peak_gpu in units.values():
+        unit_root = tmp_path / "campaign/full_e2e/evaluator_runs" / task / unit
+        unit_root.mkdir(parents=True)
+        request = {
+            "evaluator_request_sha256": hashlib.sha256(unit.encode()).hexdigest()
+        }
+        result = {
+            "evaluator_output_sha256": hashlib.sha256(task.encode()).hexdigest()
+        }
+        observation = {
+            "schema_version": 1,
+            "contract_type": (
+                "safa_r9_full_e2e_evaluator_resource_observation_v1"
+            ),
+            "task": task,
+            "unit_id": unit,
+            "evaluator_request_sha256": request["evaluator_request_sha256"],
+            "evaluator_output_sha256": result["evaluator_output_sha256"],
+            "worker_contract": worker_contract,
+            "arcface_contract_sha256": expected_arcface_sha256,
+            "quality_script_sha256": quality_sha256,
+            "resource_policy_id": "frozen_conservative_e2e_v1",
+            "peak_process_tree_rss_bytes": peak_rss,
+            "peak_gpu_memory_bytes": peak_gpu,
+            "gpu_uuid": "GPU-0",
+        }
+        observation["resource_observation_sha256"] = (
+            driver._canonical_json_sha256(observation)
+        )
+        for name, payload in (
+            ("request.json", request),
+            ("result.json", result),
+            ("resource_observation.json", observation),
+        ):
+            (unit_root / name).write_text(json.dumps(payload), encoding="utf-8")
+
+    profiles = driver.build_full_e2e_resource_profiles(campaign_runtime)
+    assert profiles["arcface"]["ram_slot_budget_bytes"] == 110
+    assert profiles["quality"]["peak_process_tree_rss_bytes"] == 300
+    assert profiles["quality"]["ram_slot_budget_bytes"] == 330
+    profile_path = tmp_path / "campaign/full_e2e/resource_profiles.json"
+    profile_path.write_text(json.dumps(profiles), encoding="utf-8")
+    binding = {
+        "path": str(profile_path.relative_to(tmp_path)),
+        "file_sha256": driver._sha256_path(profile_path),
+        "contract_sha256": profiles["resource_profiles_sha256"],
+    }
+    runtime_profiles = {
+        key: profiles[key] for key in ("arcface", "quality", "heldout")
+    }
+    runtime_profiles.update(
+        {
+            "resource_profiles_sha256": profiles["resource_profiles_sha256"],
+            "resource_profile_binding": binding,
+        }
+    )
+    assert (
+        driver._validate_full_e2e_runtime_resource_profiles(
+            runtime_profiles,
+            repo_root=tmp_path,
+            worker_contract=worker_contract,
+            arcface_contract_sha256=expected_arcface_sha256,
+            quality_script_sha256=quality_sha256,
+        )
+        == runtime_profiles
+    )
+
+    profile_path.write_text(json.dumps({**profiles, "source": "tampered"}))
+    with pytest.raises(ValueError, match="does not bind"):
+        driver._validate_full_e2e_runtime_resource_profiles(
+            runtime_profiles,
+            repo_root=tmp_path,
+            worker_contract=worker_contract,
+            arcface_contract_sha256=expected_arcface_sha256,
+            quality_script_sha256=quality_sha256,
+        )
+    profile_path.unlink()
+    with pytest.raises(FileNotFoundError, match="resource profile"):
+        driver._validate_full_e2e_runtime_resource_profiles(
+            runtime_profiles,
+            repo_root=tmp_path,
+            worker_contract=worker_contract,
+            arcface_contract_sha256=expected_arcface_sha256,
+            quality_script_sha256=quality_sha256,
+        )

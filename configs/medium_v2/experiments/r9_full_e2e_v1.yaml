@@ -1,0 +1,45 @@
+schema_version: 1
+contract_type: safa_r9_full_e2e_request_v1
+campaign_id: r9-report-only-formal-v9
+manifest:
+  path: configs/medium_v2/experiments/r9_manifests/full_smoke_8.jsonl
+  sha256: 04a7d89db541b065755c965505bb26b1e58aea306cc59c1717f251ec32dfc87f
+  parent_manifest: full_2048
+sample_count: 8
+phase: full
+seed: 7919
+batch_size: 2
+required_arms: [native, paper_eta_0p125]
+evaluator_tasks: [arcface, quality_native, quality_candidate]
+resource_policy:
+  policy_id: frozen_conservative_e2e_v1
+  claim_type: preregistered_exclusive_upper_bound_not_measured_profile
+  source: pre_execution_protocol_registration
+  rationale: e2e_bootstrap_must_not_depend_on_or_reuse_a_prior_campaign_evaluator_profile
+  gpu_indices: [0, 1, 2, 3]
+  generation:
+    gpu_slot_claim_bytes: 17179869184
+    ram_slot_budget_bytes: 17179869184
+    max_slots_per_gpu: 2
+    concurrent_workers: 2
+  evaluator:
+    gpu_slot_claim_bytes: 17179869184
+    ram_slot_budget_bytes: 17179869184
+    global_exclusive: true
+    concurrent_workers: 1
+  admission:
+    minimum_free_gpu_bytes: 2147483648
+    ram_percent_below: 85
+    disk_percent_below: 85
+    unknown_gpu_pid_count: 0
+    initial_swap_io_pages: 0
+  hard_stop:
+    gpu_memory_percent_at_or_above: 90
+    ram_percent_at_or_above: 90
+    disk_percent_at_or_above: 90
+    cpu_percent_at_or_above: 90
+    temperature_c_above: 85
+    swap_io_positive: true
+    sustained_sample_count: 2
+retry_count: 0
+gate_path: artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/full_e2e/gate_contract.json

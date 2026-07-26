@@ -176,7 +176,16 @@ class PhaseResultsRequest:
                     "confirm512 requires a gate or report-only calibration selection"
                 )
         elif self.phase != "diagnose":
-            if self.upstream_gate is None or self.upstream_calibration_selection is not None:
+            full_continuation = (
+                self.phase == "full"
+                and self.selection is not None
+                and self.selection.get("contract_type")
+                == "safa_r9_full_continuation_selection_v1"
+            )
+            if (
+                (self.upstream_gate is None and not full_continuation)
+                or self.upstream_calibration_selection is not None
+            ):
                 raise PhaseResultsError(f"{self.phase} requires its upstream gate")
         if self.phase == "confirm512":
             _require_nonnegative_int(self.confirm_seed, "confirm512 seed")
@@ -553,6 +562,21 @@ def _validate_request(request: PhaseResultsRequest) -> dict[str, Any]:
                 or winner.get("arm_id") != request.expected_candidate_arm_ids[0]
             ):
                 raise PhaseResultsError("Full run plan changed the locked winner")
+    elif request.phase == "full":
+        assert request.selection is not None
+        if (
+            request.selection.get("contract_type")
+            != "safa_r9_full_continuation_selection_v1"
+        ):
+            raise PhaseResultsError(
+                "Full without a local confirm gate requires a Full continuation selection"
+            )
+        winner = request.selection.get("winner")
+        if (
+            not isinstance(winner, Mapping)
+            or winner.get("arm_id") != request.expected_candidate_arm_ids[0]
+        ):
+            raise PhaseResultsError("Full run plan changed the v3 locked winner")
     if request.upstream_calibration_selection is not None:
         if request.phase != "confirm512":
             raise PhaseResultsError(

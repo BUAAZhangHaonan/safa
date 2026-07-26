@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -51,6 +52,17 @@ from safa.evaluation.r9_confirm_continuation_contracts import (
     build_confirm_continuation_contract,
     materialize_confirm_continuation_contract,
 )
+from safa.evaluation.r9_full_continuation_contracts import (
+    CHILD_CAMPAIGN_ID as FULL_CONTINUATION_CHILD_CAMPAIGN_ID,
+    build_full_continuation_contract,
+    build_full_continuation_selection_contract,
+    expected_source_from_full_continuation,
+    materialize_full_continuation_contract,
+    validate_full_continuation_selection_contract,
+)
+from safa.evaluation.r9_full_smoke_supersession import (
+    materialize_full_smoke_supersession,
+)
 from safa.evaluation.meanflow_guidance_runner import (
     resolve_frozen_effective_guidance_config,
 )
@@ -65,6 +77,7 @@ from safa.evaluation.r9_phase_results import (
     QualityEvaluationRequest,
     QualityEvaluator,
     RunEvidenceSpec,
+    SampleEvidence,
     canonical_r9_algorithm_config_digest,
     materialize_phase_results,
     resume_phase_results,
@@ -104,6 +117,9 @@ CONFIRM_CONTINUATION_RUNTIME_CONFIG = Path(
     "configs/medium_v2/experiments/r9_meanflow_confirm_continuation_campaign_v8.yaml"
 )
 CONFIRM_CONTINUATION_CHILD_CAMPAIGN_ID = "r9-report-only-formal-v8"
+FULL_CONTINUATION_RUNTIME_CONFIG = Path(
+    "configs/medium_v2/experiments/r9_meanflow_full_continuation_campaign_v9.yaml"
+)
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PHASES = ("preflight", "diagnose", "calibrate", "confirm512", "full")
 CAMPAIGN_ID_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
@@ -167,7 +183,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if CAMPAIGN_ID_PATTERN.fullmatch(args.campaign_id) is None:
         parser.error("--campaign-id must be an immutable lowercase slug")
-    if args.execute and not args.allow_busy_gpus:
+    if (
+        args.campaign_id == FULL_CONTINUATION_CHILD_CAMPAIGN_ID
+        and args.allow_busy_gpus
+    ):
+        parser.error("v9 Full forbids --allow-busy-gpus")
+    if (
+        args.campaign_id != FULL_CONTINUATION_CHILD_CAMPAIGN_ID
+        and args.execute
+        and not args.allow_busy_gpus
+    ):
         parser.error("R9 execution requires explicit --allow-busy-gpus")
     rejected = {
         CONTINUATION_CHILD_CAMPAIGN_ID: {"preflight", "diagnose"},
@@ -177,6 +202,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "calibrate",
         },
     }
+    if (
+        args.campaign_id == FULL_CONTINUATION_CHILD_CAMPAIGN_ID
+        and args.phase != "full"
+    ):
+        parser.error("Full continuation only accepts --phase full")
     if args.phase in rejected.get(args.campaign_id, set()):
         parser.error("continuation child rejects the requested upstream phase")
     return args
@@ -402,6 +432,159 @@ def load_confirm_continuation_request(
     return runtime, Path(str(request_path.relative_to(repo_root.resolve()))), source
 
 
+def load_full_continuation_request(
+    path: Path = FULL_CONTINUATION_RUNTIME_CONFIG,
+    *,
+    repo_root: Path = REPO_ROOT,
+    validate_chain: bool = True,
+    allow_pre_e2e_profiles: bool = False,
+) -> tuple[dict[str, Any], Path, dict[str, Any]]:
+    request_path = _repo_path(repo_root, path, "Full continuation request")
+    request = yaml.safe_load(request_path.read_text(encoding="utf-8"))
+    fields = {
+        "schema_version",
+        "contract_type",
+        "child_campaign_id",
+        "start_phase",
+        "base_runtime",
+        "source",
+        "generation_batch_benchmark",
+        "semigroup_closure_campaign_id",
+        "evaluator_resources",
+    }
+    if not isinstance(request, Mapping) or set(request) != fields:
+        raise ValueError("Full continuation request fields are not canonical")
+    if (
+        request.get("schema_version") != 1
+        or request.get("contract_type")
+        != "safa_r9_full_continuation_request_v1"
+        or request.get("child_campaign_id") != FULL_CONTINUATION_CHILD_CAMPAIGN_ID
+        or request.get("start_phase") != "full"
+        or request.get("semigroup_closure_campaign_id")
+        != "r9-report-only-formal-v2"
+    ):
+        raise ValueError("Full continuation request identity mismatch")
+    base = _mapping(request.get("base_runtime"), "Full base runtime")
+    if set(base) != {"path", "sha256"}:
+        raise ValueError("Full base runtime fields are not canonical")
+    base_path = _repo_path(repo_root, base.get("path"), "Full base runtime")
+    if _sha256_path(base_path) != _require_sha256(
+        base.get("sha256"), "Full base runtime SHA256"
+    ):
+        raise ValueError("Full base runtime SHA256 mismatch")
+    source = _mapping(request.get("source"), "Full source")
+    # The contract builder rehashes and cross-binds every declared source.
+    if validate_chain:
+        build_full_continuation_contract(
+            repo_root=repo_root, expected_source=source
+        )
+    runtime = load_runtime_config(base_path)
+    evaluation = _mapping(runtime.get("evaluation"), "Full evaluation")
+    worker = _mapping(evaluation.get("worker"), "Full evaluator worker")
+    worker["sha256"] = _sha256_path(
+        _repo_path(repo_root, worker.get("path"), "Full evaluator entrypoint")
+    )
+    worker["implementation_sha256"] = _sha256_path(
+        _repo_path(
+            repo_root,
+            worker.get("implementation_path"),
+            "Full evaluator implementation",
+        )
+    )
+    evaluation["worker"] = worker
+    quality = _mapping(evaluation.get("quality"), "Full quality")
+    quality_script = _mapping(quality.get("script"), "Full quality script")
+    quality_script["sha256"] = _sha256_path(
+        _repo_path(repo_root, quality_script.get("path"), "Full quality script")
+    )
+    quality["script"] = quality_script
+    evaluation["quality"] = quality
+    resources = _mapping(request.get("evaluator_resources"), "Full evaluator resources")
+    if set(resources) != {"arcface", "quality", "heldout"}:
+        raise ValueError("Full evaluator resources are not canonical")
+    for kind, mode in (
+        ("arcface", "measured_single_worker"),
+        ("quality", "measured_exclusive_bootstrap"),
+    ):
+        if _mapping(resources.get(kind), kind) != {
+            "mode": mode,
+            "source": "full_e2e_profile_v1",
+        }:
+            raise ValueError(f"Full {kind} E2E profile declaration changed")
+    profile_path = (
+        repo_root.resolve()
+        / "artifacts/r9_meanflow_flow_map_guidance/campaigns/"
+        f"{FULL_CONTINUATION_CHILD_CAMPAIGN_ID}/full_e2e/resource_profiles.json"
+    )
+    if not profile_path.is_file():
+        if not allow_pre_e2e_profiles:
+            raise FileNotFoundError(
+                f"Full E2E resource profiles are missing: {profile_path}"
+            )
+        normalized_resources = {
+            "profile_state": "pre_e2e_not_execution_authority",
+        }
+    else:
+        profile_runtime = {
+            "campaign_root": (
+                "artifacts/r9_meanflow_flow_map_guidance/campaigns/"
+                f"{FULL_CONTINUATION_CHILD_CAMPAIGN_ID}"
+            ),
+            "evaluation": evaluation,
+        }
+        profiles = build_full_e2e_resource_profiles(profile_runtime)
+        observed_profiles = _read_json_mapping(
+            profile_path, "Full E2E resource profiles"
+        )
+        if observed_profiles != profiles:
+            raise ValueError("Full E2E resource profile bytes changed")
+        normalized_resources = {
+            "arcface": dict(profiles["arcface"]),
+            "quality": dict(profiles["quality"]),
+            "heldout": dict(profiles["heldout"]),
+            "resource_profiles_sha256": profiles["resource_profiles_sha256"],
+            "resource_profile_binding": {
+                "path": str(profile_path.relative_to(repo_root.resolve())),
+                "file_sha256": _sha256_path(profile_path),
+                "contract_sha256": profiles["resource_profiles_sha256"],
+            },
+        }
+    evaluation["resource_smokes"] = normalized_resources
+    runtime["evaluation"] = evaluation
+    benchmark = _mapping(
+        request.get("generation_batch_benchmark"), "Full batch benchmark"
+    )
+    expected_benchmark_fields = {
+        "contract_path",
+        "source_campaign_id",
+        "source_continuation_contract_sha256",
+        "manifest",
+        "sample_count",
+        "seed",
+        "required_arms",
+        "batch_sizes",
+        "selected_batch_size",
+        "selected_slots_per_gpu",
+    }
+    if set(benchmark) != expected_benchmark_fields:
+        raise ValueError("Full batch benchmark declaration is not canonical")
+    if (
+        benchmark.get("source_campaign_id") != "r9-report-only-formal-v8"
+        or benchmark.get("selected_batch_size") != 2
+        or benchmark.get("selected_slots_per_gpu") != 2
+        or benchmark.get("batch_sizes") != [2, 4]
+    ):
+        raise ValueError("Full requires the frozen batch=2/two-worker decision")
+    runtime["generation_batch_benchmark"] = benchmark
+    return runtime, Path(str(request_path.relative_to(repo_root.resolve()))), source
+
+
+def prepare_full_continuation_evaluator_smoke_requests(
+    *, repo_root: Path = REPO_ROOT
+) -> dict[str, Any]:
+    return materialize_full_smoke_supersession(repo_root=repo_root)
+
+
 def load_campaign_configuration(
     campaign_id: str,
 ) -> tuple[dict[str, Any], Path, dict[str, Any] | None]:
@@ -409,6 +592,8 @@ def load_campaign_configuration(
         return load_continuation_request()
     if campaign_id == CONFIRM_CONTINUATION_CHILD_CAMPAIGN_ID:
         return load_confirm_continuation_request()
+    if campaign_id == FULL_CONTINUATION_CHILD_CAMPAIGN_ID:
+        return load_full_continuation_request()
     return load_runtime_config(), RUNTIME_CONFIG, None
 
 
@@ -495,16 +680,15 @@ def _validate_requested_campaign_role(
             else _continuation_for_runtime(campaign_runtime)
         )
         start_phase = (
-            "confirm512"
+            str(continuation.get("start_phase", "calibrate"))
             if continuation is not None
-            and continuation.get("start_phase") == "confirm512"
             else "calibrate"
         )
-        rejected = (
-            {"preflight", "diagnose", "calibrate"}
-            if start_phase == "confirm512"
-            else {"preflight", "diagnose"}
-        )
+        rejected = {
+            "calibrate": {"preflight", "diagnose"},
+            "confirm512": {"preflight", "diagnose", "calibrate"},
+            "full": {"preflight", "diagnose", "calibrate", "confirm512"},
+        }[start_phase]
         if requested_phase in rejected:
             raise ValueError("continuation child rejects preflight and diagnose")
         if closure is None:
@@ -605,7 +789,7 @@ def build_requested_plans(
     continuation = continuation_selected_arm_ids is not None
     if continuation and phase in {"preflight", "diagnose"}:
         raise ValueError("continuation child rejects preflight and diagnose")
-    if continuation_start_phase not in {None, "calibrate", "confirm512"}:
+    if continuation_start_phase not in {None, "calibrate", "confirm512", "full"}:
         raise ValueError("continuation start phase is invalid")
     if continuation_start_phase == "confirm512" and phase in {
         "preflight",
@@ -613,9 +797,13 @@ def build_requested_plans(
         "calibrate",
     }:
         raise ValueError("confirm continuation rejects upstream phases")
+    if continuation_start_phase == "full" and phase != "full":
+        raise ValueError("Full continuation rejects every upstream phase")
     if continuation and phase == "all":
         selected = (
-            ("confirm512", "full")
+            ("full",)
+            if continuation_start_phase == "full"
+            else ("confirm512", "full")
             if continuation_start_phase == "confirm512"
             else ("calibrate", "confirm512", "full")
         )
@@ -629,6 +817,14 @@ def build_requested_plans(
             promoted_arm_ids=(
                 continuation_selected_arm_ids
                 if item == (continuation_start_phase or "calibrate")
+                and item != "full"
+                else None
+            ),
+            winner_arm_id=(
+                str(continuation_selected_arm_ids[0])
+                if item == "full"
+                and continuation_start_phase == "full"
+                and continuation_selected_arm_ids is not None
                 else None
             ),
         )
@@ -835,12 +1031,20 @@ def _generation_batch_benchmark_for_runtime(
         raise ValueError("generation batch benchmark path escapes repo root") from error
     if not path.is_file():
         return None
+    source_campaign_id = str(
+        declaration.get("source_campaign_id", campaign_id)
+    )
+    source_continuation_sha256 = declaration.get(
+        "source_continuation_contract_sha256",
+        _continuation_digest(continuation_contract),
+    )
     payload = validate_generation_batch_benchmark_contract(
         _read_json_mapping(path, "generation batch benchmark"),
         repo_root=repo_root,
-        expected_campaign_id=campaign_id,
-        expected_continuation_contract_sha256=_continuation_digest(
-            continuation_contract
+        expected_campaign_id=source_campaign_id,
+        expected_continuation_contract_sha256=_require_sha256(
+            source_continuation_sha256,
+            "source continuation contract SHA256",
         ),
     )
     manifest = _mapping(payload.get("manifest"), "benchmark manifest")
@@ -859,6 +1063,25 @@ def _generation_batch_benchmark_for_runtime(
     if payload.get("status") != "ready":
         raise ResourceContractError("generation batch benchmark blocked confirm512")
     decision = _mapping(payload.get("decision"), "batch benchmark decision")
+    selected_batch_size = declaration.get("selected_batch_size")
+    selected_slots_per_gpu = declaration.get("selected_slots_per_gpu")
+    if selected_batch_size is not None:
+        if (
+            selected_batch_size != decision.get("selected_batch_size")
+            or selected_batch_size != 2
+        ):
+            raise ValueError("declared generation batch size changed")
+        slots = _positive_int(
+            selected_slots_per_gpu, "selected generation slots per GPU"
+        )
+        if slots > int(decision.get("selected_slots_per_gpu", 0)):
+            raise ValueError("declared generation workers exceed measured capacity")
+        decision = dict(decision)
+        decision["selected_slots_per_gpu"] = slots
+        decision["aggregate_batch_per_gpu"] = selected_batch_size * slots
+        decision["aggregate_batch_four_gpus"] = (
+            selected_batch_size * slots * 4
+        )
     return {
         "binding": {
             "path": str(path.relative_to(repo_root.resolve())),
@@ -1105,15 +1328,27 @@ def _build_effective_evaluation(
         "iqa_method": "niqe",
         "device": "cuda:0",
     }
-    resource_smokes = materialize_evaluator_resource_profiles(
-        raw.get("resource_smokes"),
-        repo_root=repo_root,
-        worker_contract=normalized_worker,
-        arcface_contract_sha256=_canonical_json_sha256(normalized_arcface),
-        quality_script_sha256=normalized_quality["script"]["sha256"],
-        runtime_config_path=runtime_config["path"],
-        runtime_config_sha256=runtime_config["sha256"],
+    raw_resources = _mapping(
+        raw.get("resource_smokes"), "evaluator resource profiles"
     )
+    if "resource_profile_binding" in raw_resources:
+        resource_smokes = _validate_full_e2e_runtime_resource_profiles(
+            raw_resources,
+            repo_root=repo_root,
+            worker_contract=normalized_worker,
+            arcface_contract_sha256=_canonical_json_sha256(normalized_arcface),
+            quality_script_sha256=normalized_quality["script"]["sha256"],
+        )
+    else:
+        resource_smokes = materialize_evaluator_resource_profiles(
+            raw_resources,
+            repo_root=repo_root,
+            worker_contract=normalized_worker,
+            arcface_contract_sha256=_canonical_json_sha256(normalized_arcface),
+            quality_script_sha256=normalized_quality["script"]["sha256"],
+            runtime_config_path=runtime_config["path"],
+            runtime_config_sha256=runtime_config["sha256"],
+        )
     return {
         "worker": normalized_worker,
         "quality": normalized_quality,
@@ -1125,6 +1360,77 @@ def _build_effective_evaluation(
         },
         "resource_smokes": resource_smokes,
     }
+
+
+def _validate_full_e2e_runtime_resource_profiles(
+    value: Mapping[str, Any],
+    *,
+    repo_root: Path,
+    worker_contract: Mapping[str, Any],
+    arcface_contract_sha256: str,
+    quality_script_sha256: str,
+) -> dict[str, Any]:
+    normalized = _mapping(value, "Full E2E runtime resource profiles")
+    if set(normalized) != {
+        "arcface",
+        "quality",
+        "heldout",
+        "resource_profiles_sha256",
+        "resource_profile_binding",
+    }:
+        raise ValueError("Full E2E runtime resource profile fields changed")
+    binding = _mapping(
+        normalized.get("resource_profile_binding"),
+        "Full E2E resource profile binding",
+    )
+    profile_path = _repo_path(
+        repo_root, binding.get("path"), "Full E2E resource profile"
+    )
+    profile = _read_json_mapping(
+        profile_path, "Full E2E resource profile contract"
+    )
+    declared = _require_sha256(
+        profile.get("resource_profiles_sha256"),
+        "Full E2E resource profiles SHA256",
+    )
+    canonical = dict(profile)
+    canonical.pop("resource_profiles_sha256")
+    if (
+        binding
+        != {
+            "path": str(profile_path.relative_to(repo_root.resolve())),
+            "file_sha256": _sha256_path(profile_path),
+            "contract_sha256": declared,
+        }
+        or _canonical_json_sha256(canonical) != declared
+        or profile.get("contract_type")
+        != "safa_r9_full_e2e_resource_profiles_v1"
+        or profile.get("worker_contract") != dict(worker_contract)
+        or profile.get("arcface_contract_sha256")
+        != arcface_contract_sha256
+        or profile.get("quality_script_sha256") != quality_script_sha256
+        or normalized["resource_profiles_sha256"] != declared
+        or normalized["arcface"] != profile.get("arcface")
+        or normalized["quality"] != profile.get("quality")
+        or normalized["heldout"] != profile.get("heldout")
+    ):
+        raise ValueError(
+            "Full runtime does not bind the current measured E2E resource profile"
+        )
+    for kind, mode in (
+        ("arcface", "measured_single_worker"),
+        ("quality", "measured_exclusive_bootstrap"),
+    ):
+        row = _mapping(profile.get(kind), f"Full E2E {kind} profile")
+        peak = _positive_int(
+            row.get("peak_process_tree_rss_bytes"), f"{kind} peak RSS"
+        )
+        if (
+            row.get("mode") != mode
+            or row.get("ram_slot_budget_bytes") != (peak * 110 + 99) // 100
+        ):
+            raise ValueError(f"Full E2E {kind} resource budget changed")
+    return normalized
 
 
 def validate_diagnose_manifest(
@@ -1265,6 +1571,53 @@ def render_dry_run(
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    is_full_continuation = (
+        str(args.campaign_id) == FULL_CONTINUATION_CHILD_CAMPAIGN_ID
+    )
+    if is_full_continuation and not args.execute:
+        gate_path = (
+            REPO_ROOT
+            / "artifacts/r9_meanflow_flow_map_guidance/campaigns"
+            / FULL_CONTINUATION_CHILD_CAMPAIGN_ID
+            / "full_e2e/gate_contract.json"
+        )
+        if not gate_path.is_file():
+            runtime, _, continuation_source = load_full_continuation_request(
+                allow_pre_e2e_profiles=True
+            )
+            full_continuation = build_full_continuation_contract(
+                repo_root=REPO_ROOT, expected_source=continuation_source
+            )
+            blocked_plans = build_requested_plans(
+                runtime,
+                phase="full",
+                campaign_id=FULL_CONTINUATION_CHILD_CAMPAIGN_ID,
+                continuation_selected_arm_ids=[
+                    str(row["arm_id"])
+                    for row in full_continuation["selected_arms"]
+                ],
+                continuation_start_phase="full",
+            )
+            print(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "contract_type": "safa_r9_full_dry_run_blocked_v1",
+                        "status": "blocked_missing_e2e",
+                        "campaign_id": FULL_CONTINUATION_CHILD_CAMPAIGN_ID,
+                        "phase": "full",
+                        "full_continuation_sha256": full_continuation[
+                            "full_continuation_sha256"
+                        ],
+                        "required_gate": str(gate_path.relative_to(REPO_ROOT)),
+                        "logical_run_count": blocked_plans[0].logical_run_count,
+                        "artifact_write_count": 0,
+                        "gpu_execution_count": 0,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0
     runtime, runtime_config_path, continuation_source = load_campaign_configuration(
         str(args.campaign_id)
     )
@@ -1283,9 +1636,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         if calibration_selection is not None
         else None
     )
-    legacy_continuation_source = (
-        None if is_confirm_continuation else continuation_source
+    full_selection = (
+        build_full_continuation_selection_contract(
+            repo_root=REPO_ROOT, expected_source=continuation_source
+        )
+        if is_full_continuation and continuation_source is not None
+        else None
     )
+    full_continuation = (
+        build_full_continuation_contract(
+            repo_root=REPO_ROOT, expected_source=continuation_source
+        )
+        if full_selection is not None and continuation_source is not None
+        else None
+    )
+    legacy_continuation_source = (
+        None
+        if is_confirm_continuation or is_full_continuation
+        else continuation_source
+    )
+    continuation_override = confirm_continuation or full_continuation
     effective_runtime, manifest_contract, diagnose_contract = (
         build_effective_campaign_runtime(
             runtime,
@@ -1293,12 +1663,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             repo_root=REPO_ROOT,
             runtime_config_path=runtime_config_path,
             continuation_source=legacy_continuation_source,
-            continuation_contract_override=confirm_continuation,
+            continuation_contract_override=continuation_override,
         )
     )
     continuation_contract = (
         confirm_continuation
         if confirm_continuation is not None
+        else full_continuation
+        if full_continuation is not None
         else build_continuation_contract(
             repo_root=REPO_ROOT,
             child_campaign_id=str(args.campaign_id),
@@ -1356,6 +1728,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         _, binding = materialize_confirm_continuation_contract(repo_root=REPO_ROOT)
         if effective_runtime.get("continuation") != binding:
             raise RuntimeError("materialized confirm continuation binding changed")
+    elif full_continuation is not None and continuation_source is not None:
+        _, binding, materialized_selection = materialize_full_continuation_contract(
+            repo_root=REPO_ROOT,
+            expected_source=continuation_source,
+        )
+        if effective_runtime.get("continuation") != binding:
+            raise RuntimeError("materialized Full continuation binding changed")
+        validated_selection = validate_full_continuation_selection_contract(
+            materialized_selection,
+            repo_root=REPO_ROOT,
+            expected_source=continuation_source,
+        )
+        heldout_assets = _mapping(runtime.get("heldout_assets"), "heldout assets")
+        assets = {
+            name: _bound_file(
+                REPO_ROOT,
+                _mapping(heldout_assets.get(name), name)["path"],
+                _mapping(heldout_assets.get(name), name)["sha256"],
+                f"heldout {name}",
+            )
+            for name in ("e1", "e2", "facenet", "adaface")
+        }
+        seal = build_heldout_seal_contract(validated_selection, assets)
+        write_immutable_contract(
+            REPO_ROOT
+            / str(effective_runtime["campaign_root"])
+            / "heldout_seal.json",
+            seal,
+            digest_field="heldout_seal_sha256",
+        )
     elif legacy_continuation_source is not None:
         _, binding = materialize_continuation_contract(
             repo_root=REPO_ROOT,
@@ -1365,6 +1767,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if effective_runtime.get("continuation") != binding:
             raise RuntimeError("materialized continuation binding changed")
     if effective_runtime.get("campaign_runtime_sha256") is None:
+        if is_full_continuation:
+            _full_admission_preflight()
         run_resource_smoke(
             runtime,
             effective_runtime,
@@ -1377,7 +1781,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 repo_root=REPO_ROOT,
                 runtime_config_path=runtime_config_path,
                 continuation_source=legacy_continuation_source,
-                continuation_contract_override=confirm_continuation,
+                continuation_contract_override=continuation_override,
             )
         )
         _validate_requested_campaign_role(
@@ -1424,6 +1828,110 @@ def main(argv: Sequence[str] | None = None) -> int:
             + "\n"
         ).encode("utf-8"),
     )
+    if (
+        is_full_continuation
+        and (
+            REPO_ROOT
+            / str(effective_runtime["campaign_root"])
+            / "formal_execution_claim.json"
+        ).is_file()
+    ):
+        return _resume_formal_full_report_only(
+            runtime,
+            effective_runtime,
+            manifest_contract,
+            diagnose_contract,
+            plan=plans[0],
+            campaign_id=str(args.campaign_id),
+        )
+    runtime_guard = None
+    formal_execution_claim = None
+    if is_full_continuation:
+        e2e_gate = _require_full_e2e_gate(effective_runtime)
+        admission = _full_admission_preflight()
+        if full_continuation is None:
+            raise RuntimeError("Full continuation is missing")
+        resource_policy = _mapping(
+            _mapping(
+                _mapping(full_continuation["bindings"], "Full bindings").get(
+                    "full_e2e_requirement"
+                ),
+                "Full E2E requirement",
+            ).get("policy"),
+            "Full E2E policy",
+        )["resource_policy"]
+        campaign_root = REPO_ROOT / str(effective_runtime["campaign_root"])
+        runtime_guard = FullRuntimeGuard(
+            resource_policy,
+            monitor_path=(
+                campaign_root / "formal_monitor/runtime_guard_samples.jsonl"
+            ),
+        )
+        monitor_claim = _materialize_formal_full_monitor_claim(
+            effective_runtime
+        )
+        admission_path = campaign_root / "formal_admission.json"
+        _write_exclusive_bytes(
+            admission_path,
+            (
+                json.dumps(
+                    admission,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                + "\n"
+            ).encode("utf-8"),
+        )
+        formal_execution_claim = {
+            "schema_version": 1,
+            "contract_type": "safa_r9_formal_full_execution_claim_v1",
+            "campaign_runtime_sha256": effective_runtime[
+                "campaign_runtime_sha256"
+            ],
+            "full_e2e_gate_sha256": e2e_gate["full_e2e_gate_sha256"],
+            "full_admission": {
+                "path": str(admission_path.relative_to(REPO_ROOT)),
+                "file_sha256": _sha256_path(admission_path),
+                "contract_sha256": admission["full_admission_sha256"],
+            },
+            "monitor_claim_sha256": monitor_claim["monitor_claim_sha256"],
+            "retry_allowed": False,
+        }
+        formal_execution_claim["formal_execution_claim_sha256"] = (
+            _canonical_json_sha256(formal_execution_claim)
+        )
+        _write_exclusive_bytes(
+            campaign_root / "formal_execution_claim.json",
+            (
+                json.dumps(
+                    formal_execution_claim,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                + "\n"
+            ).encode("utf-8"),
+        )
+        try:
+            _start_formal_full_monitor(effective_runtime, monitor_claim)
+            runtime_guard.bind_monitor(
+                session_name=monitor_claim["session_name"],
+                claim_path=campaign_root / "formal_monitor/claim.json",
+                claim_sha256=monitor_claim["monitor_claim_sha256"],
+            )
+        except BaseException:
+            subprocess.run(
+                ["tmux", "kill-session", "-t", monitor_claim["session_name"]],
+                check=False,
+                capture_output=True,
+            )
+            _materialize_formal_full_terminal(
+                effective_runtime,
+                formal_execution_claim,
+                status="failed_before_worker",
+            )
+            raise
     scheduler, gpu_bindings, peer_status_store = build_resource_scheduler(
         effective_runtime
     )
@@ -1433,21 +1941,461 @@ def main(argv: Sequence[str] | None = None) -> int:
         scheduler=scheduler,
         gpu_bindings=gpu_bindings,
         peer_status_store=peer_status_store,
+        runtime_guard=runtime_guard,
     )
-    return execute_dynamic_campaign(
+    try:
+        exit_code = execute_dynamic_campaign(
+            runtime,
+            effective_runtime,
+            manifest_contract,
+            diagnose_contract,
+            requested_phase=str(args.phase),
+            campaign_id=str(args.campaign_id),
+            scheduler=scheduler,
+            gpu_bindings=gpu_bindings,
+            peer_status_store=peer_status_store,
+            quality_evaluator=evaluators.quality,
+            arcface_evaluator=evaluators.arcface,
+            heldout_evaluator=evaluators.heldout,
+            runtime_guard=runtime_guard,
+        )
+    except BaseException:
+        if formal_execution_claim is not None:
+            _materialize_formal_full_terminal(
+                effective_runtime,
+                formal_execution_claim,
+                status="failed",
+            )
+            _wait_formal_full_monitor(effective_runtime)
+        raise
+    if formal_execution_claim is not None:
+        _materialize_formal_full_terminal(
+            effective_runtime,
+            formal_execution_claim,
+            status=(
+                "awaiting_visual_review"
+                if exit_code == AWAITING_VISUAL_REVIEW_EXIT_CODE
+                else "succeeded"
+            ),
+            exit_code=exit_code,
+        )
+        _wait_formal_full_monitor(effective_runtime)
+    return exit_code
+
+
+def _resume_formal_full_report_only(
+    runtime: Mapping[str, Any],
+    campaign_runtime: Mapping[str, Any],
+    manifest_contract: Mapping[str, Any],
+    diagnose_contract: Mapping[str, Any],
+    *,
+    plan: PhasePlan,
+    campaign_id: str,
+) -> int:
+    campaign_root = REPO_ROOT / str(campaign_runtime["campaign_root"])
+    chain = _validate_formal_full_execution_chain(campaign_runtime)
+    claim = chain["claim"]
+    terminal = chain["terminal"]
+    if terminal.get("status") != "awaiting_visual_review":
+        raise RuntimeError(
+            "formal Full existing execution is not report-only resumable"
+        )
+    _require_full_e2e_gate(campaign_runtime)
+    closure_request = build_phase_results_request(
         runtime,
-        effective_runtime,
+        campaign_runtime,
         manifest_contract,
         diagnose_contract,
-        requested_phase=str(args.phase),
-        campaign_id=str(args.campaign_id),
-        scheduler=scheduler,
-        gpu_bindings=gpu_bindings,
-        peer_status_store=peer_status_store,
-        quality_evaluator=evaluators.quality,
-        arcface_evaluator=evaluators.arcface,
-        heldout_evaluator=evaluators.heldout,
+        plan=plan,
+        campaign_id=campaign_id,
     )
+    closure = resume_phase_results(closure_request)
+    if closure.status == "awaiting_visual_review":
+        _print_phase_closure("full", closure)
+        return AWAITING_VISUAL_REVIEW_EXIT_CODE
+    if closure.status != "complete":
+        raise RuntimeError("formal Full report-only resume evidence changed")
+    gate = finalize_phase_gate(
+        runtime,
+        campaign_runtime,
+        manifest_contract,
+        diagnose_contract,
+        phase="full",
+        campaign_id=campaign_id,
+    )
+    report = {
+        "schema_version": 1,
+        "contract_type": "safa_r9_formal_full_report_only_finalize_v1",
+        "formal_execution_claim_sha256": claim[
+            "formal_execution_claim_sha256"
+        ],
+        "formal_execution_terminal_sha256": terminal[
+            "formal_execution_terminal_sha256"
+        ],
+        "gate_contract_sha256": gate["gate_contract_sha256"],
+        "generation_execution_count": 0,
+        "evaluator_execution_count": 0,
+        "heldout_execution_count": 0,
+    }
+    report["report_only_finalize_sha256"] = _canonical_json_sha256(report)
+    _write_immutable_bytes(
+        campaign_root / "full/report_only_finalize.json",
+        (
+            json.dumps(
+                report,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8"),
+    )
+    return 0
+
+
+def _validate_formal_full_execution_chain(
+    campaign_runtime: Mapping[str, Any],
+) -> dict[str, Any]:
+    campaign_root = REPO_ROOT / str(campaign_runtime["campaign_root"])
+    gate = _require_full_e2e_gate(campaign_runtime)
+    claim = _read_json_mapping(
+        campaign_root / "formal_execution_claim.json",
+        "formal Full execution claim",
+    )
+    claim_digest = _require_sha256(
+        claim.get("formal_execution_claim_sha256"),
+        "formal Full execution claim SHA256",
+    )
+    canonical_claim = dict(claim)
+    canonical_claim.pop("formal_execution_claim_sha256")
+    admission_binding = _mapping(
+        claim.get("full_admission"), "formal Full admission binding"
+    )
+    admission_path = _repo_path(
+        REPO_ROOT, admission_binding.get("path"), "formal Full admission"
+    )
+    admission = _read_json_mapping(admission_path, "formal Full admission")
+    admission_canonical = dict(admission)
+    admission_digest = _require_sha256(
+        admission_canonical.pop("full_admission_sha256", None),
+        "formal Full admission SHA256",
+    )
+    monitor_claim = _read_json_mapping(
+        campaign_root / "formal_monitor/claim.json",
+        "formal Full monitor claim",
+    )
+    monitor_claim_canonical = dict(monitor_claim)
+    monitor_claim_digest = _require_sha256(
+        monitor_claim_canonical.pop("monitor_claim_sha256", None),
+        "formal Full monitor claim SHA256",
+    )
+    terminal = _read_json_mapping(
+        campaign_root / "formal_execution_terminal.json",
+        "formal Full execution terminal",
+    )
+    terminal_canonical = dict(terminal)
+    terminal_digest = _require_sha256(
+        terminal_canonical.pop("formal_execution_terminal_sha256", None),
+        "formal Full execution terminal SHA256",
+    )
+    summary = _read_json_mapping(
+        campaign_root / "formal_monitor/summary.json",
+        "formal Full monitor summary",
+    )
+    summary_canonical = dict(summary)
+    summary_digest = _require_sha256(
+        summary_canonical.pop("monitor_summary_sha256", None),
+        "formal Full monitor summary SHA256",
+    )
+    admission_fields = {
+        "schema_version",
+        "contract_type",
+        "gpu_indices",
+        "gpu_uuids",
+        "free_vram_bytes",
+        "unknown_compute_pid_count",
+        "temperatures_c",
+        "ram_used_bytes",
+        "ram_total_bytes",
+        "disk_used_bytes",
+        "disk_total_bytes",
+        "swap_in_delta_pages",
+        "swap_out_delta_pages",
+        "full_admission_sha256",
+    }
+    monitor_claim_fields = {
+        "schema_version",
+        "contract_type",
+        "campaign_id",
+        "campaign_runtime_sha256",
+        "session_name",
+        "command",
+        "records",
+        "monitor_claim_sha256",
+    }
+    terminal_fields = {
+        "schema_version",
+        "contract_type",
+        "status",
+        "formal_execution_claim_sha256",
+        "exit_code",
+        "formal_execution_terminal_sha256",
+    }
+    summary_fields = {
+        "schema_version",
+        "contract_type",
+        "monitor_claim_sha256",
+        "formal_execution_terminal_sha256",
+        "tmux_session",
+        "sample_count",
+        "log_progress_count",
+        "samples",
+        "monitor_summary_sha256",
+    }
+    sample_binding = _mapping(
+        summary.get("samples"), "formal Full monitor samples"
+    )
+    samples_path = _repo_path(
+        REPO_ROOT, sample_binding.get("path"), "formal Full monitor samples"
+    )
+    if (
+        set(claim)
+        != {
+            "schema_version",
+            "contract_type",
+            "campaign_runtime_sha256",
+            "full_e2e_gate_sha256",
+            "full_admission",
+            "monitor_claim_sha256",
+            "retry_allowed",
+            "formal_execution_claim_sha256",
+        }
+        or claim.get("contract_type")
+        != "safa_r9_formal_full_execution_claim_v1"
+        or claim.get("campaign_runtime_sha256")
+        != campaign_runtime.get("campaign_runtime_sha256")
+        or claim.get("full_e2e_gate_sha256")
+        != gate["full_e2e_gate_sha256"]
+        or claim.get("monitor_claim_sha256") != monitor_claim_digest
+        or claim.get("retry_allowed") is not False
+        or _canonical_json_sha256(canonical_claim) != claim_digest
+        or admission_binding
+        != {
+            "path": str(admission_path.relative_to(REPO_ROOT)),
+            "file_sha256": _sha256_path(admission_path),
+            "contract_sha256": admission_digest,
+        }
+        or _canonical_json_sha256(admission_canonical) != admission_digest
+        or set(admission) != admission_fields
+        or admission.get("contract_type") != "safa_r9_full_admission_v1"
+        or admission.get("gpu_indices") != [0, 1, 2, 3]
+        or not isinstance(admission.get("gpu_uuids"), list)
+        or len(set(admission["gpu_uuids"])) != 4
+        or admission.get("unknown_compute_pid_count") != 0
+        or any(
+            value < 2 * 1024**3
+            for value in admission.get("free_vram_bytes", [])
+        )
+        or len(admission.get("free_vram_bytes", [])) != 4
+        or admission["ram_used_bytes"] * 100
+        >= admission["ram_total_bytes"] * 85
+        or admission["disk_used_bytes"] * 100
+        >= admission["disk_total_bytes"] * 85
+        or admission.get("swap_in_delta_pages") != 0
+        or admission.get("swap_out_delta_pages") != 0
+        or any(
+            value > 85
+            for value in _mapping(
+                admission.get("temperatures_c"),
+                "formal Full admission temperatures",
+            ).values()
+        )
+        or set(monitor_claim) != monitor_claim_fields
+        or _canonical_json_sha256(monitor_claim_canonical)
+        != monitor_claim_digest
+        or monitor_claim.get("contract_type")
+        != "safa_r9_formal_full_monitor_claim_v1"
+        or monitor_claim.get("campaign_id")
+        != FULL_CONTINUATION_CHILD_CAMPAIGN_ID
+        or monitor_claim.get("campaign_runtime_sha256")
+        != campaign_runtime.get("campaign_runtime_sha256")
+        or monitor_claim.get("session_name")
+        != "safa-r9-v9-formal-full-monitor"
+        or monitor_claim.get("records")
+        != [
+            "gpu",
+            "cpu",
+            "ram",
+            "disk",
+            "log_byte_progress",
+            "png_count",
+            "result_count",
+        ]
+        or not isinstance(monitor_claim.get("command"), list)
+        or monitor_claim["command"][-3:]
+        != ["--phase", "formal-monitor", "--execute"]
+        or set(terminal) != terminal_fields
+        or terminal.get("contract_type")
+        != "safa_r9_formal_full_execution_terminal_v1"
+        or terminal.get("status") != "awaiting_visual_review"
+        or terminal.get("formal_execution_claim_sha256") != claim_digest
+        or terminal.get("exit_code") != AWAITING_VISUAL_REVIEW_EXIT_CODE
+        or _canonical_json_sha256(terminal_canonical) != terminal_digest
+        or set(summary) != summary_fields
+        or summary.get("contract_type")
+        != "safa_r9_formal_full_monitor_summary_v1"
+        or summary.get("monitor_claim_sha256") != monitor_claim_digest
+        or summary.get("formal_execution_terminal_sha256")
+        != terminal_digest
+        or not isinstance(summary.get("tmux_session"), str)
+        or not summary["tmux_session"]
+        or not isinstance(summary.get("sample_count"), int)
+        or summary["sample_count"] <= 0
+        or not isinstance(summary.get("log_progress_count"), int)
+        or summary["log_progress_count"] < 0
+        or sample_binding
+        != {
+            "path": str(samples_path.relative_to(REPO_ROOT)),
+            "file_sha256": _sha256_path(samples_path),
+        }
+        or _canonical_json_sha256(summary_canonical) != summary_digest
+    ):
+        raise ValueError("formal Full execution/monitor chain changed")
+    return {
+        "claim": claim,
+        "admission": admission,
+        "monitor_claim": monitor_claim,
+        "terminal": terminal,
+        "monitor_summary": summary,
+    }
+
+
+def _materialize_formal_full_monitor_claim(
+    campaign_runtime: Mapping[str, Any],
+) -> dict[str, Any]:
+    campaign_root = REPO_ROOT / str(campaign_runtime["campaign_root"])
+    session = "safa-r9-v9-formal-full-monitor"
+    command = [
+        sys.executable,
+        str(REPO_ROOT / "scripts/prepare_r9_full_continuation.py"),
+        "--phase",
+        "formal-monitor",
+        "--execute",
+    ]
+    claim = {
+        "schema_version": 1,
+        "contract_type": "safa_r9_formal_full_monitor_claim_v1",
+        "campaign_id": FULL_CONTINUATION_CHILD_CAMPAIGN_ID,
+        "campaign_runtime_sha256": campaign_runtime["campaign_runtime_sha256"],
+        "session_name": session,
+        "command": command,
+        "records": [
+            "gpu",
+            "cpu",
+            "ram",
+            "disk",
+            "log_byte_progress",
+            "png_count",
+            "result_count",
+        ],
+    }
+    claim["monitor_claim_sha256"] = _canonical_json_sha256(claim)
+    path = campaign_root / "formal_monitor/claim.json"
+    _write_exclusive_bytes(
+        path,
+        (
+            json.dumps(
+                claim,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8"),
+    )
+    return claim
+
+
+def _start_formal_full_monitor(
+    campaign_runtime: Mapping[str, Any],
+    claim: Mapping[str, Any],
+) -> None:
+    session = str(claim["session_name"])
+    if subprocess.run(
+        ["tmux", "has-session", "-t", session],
+        check=False,
+        capture_output=True,
+    ).returncode == 0:
+        raise RuntimeError("formal Full monitor tmux session already exists")
+    started = subprocess.run(
+        ["tmux", "new-session", "-d", "-s", session, *claim["command"]],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if started.returncode != 0:
+        raise RuntimeError(
+            f"formal Full monitor tmux start failed: {started.stderr.strip()}"
+        )
+    if subprocess.run(
+        ["tmux", "has-session", "-t", session],
+        check=False,
+        capture_output=True,
+    ).returncode != 0:
+        raise RuntimeError("formal Full monitor tmux did not stay alive")
+
+
+def _materialize_formal_full_terminal(
+    campaign_runtime: Mapping[str, Any],
+    claim: Mapping[str, Any],
+    *,
+    status: str,
+    exit_code: int | None = None,
+) -> dict[str, Any]:
+    terminal = {
+        "schema_version": 1,
+        "contract_type": "safa_r9_formal_full_execution_terminal_v1",
+        "status": status,
+        "formal_execution_claim_sha256": claim[
+            "formal_execution_claim_sha256"
+        ],
+    }
+    if exit_code is not None:
+        terminal["exit_code"] = int(exit_code)
+    terminal["formal_execution_terminal_sha256"] = _canonical_json_sha256(
+        terminal
+    )
+    _write_exclusive_bytes(
+        REPO_ROOT
+        / str(campaign_runtime["campaign_root"])
+        / "formal_execution_terminal.json",
+        (
+            json.dumps(
+                terminal,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8"),
+    )
+    return terminal
+
+
+def _wait_formal_full_monitor(
+    campaign_runtime: Mapping[str, Any],
+) -> None:
+    summary = (
+        REPO_ROOT
+        / str(campaign_runtime["campaign_root"])
+        / "formal_monitor/summary.json"
+    )
+    deadline = time.monotonic() + 30
+    while not summary.is_file():
+        if time.monotonic() >= deadline:
+            raise RuntimeError("formal Full monitor did not finalize")
+        time.sleep(0.5)
 
 
 def _require_generation_batch_benchmark_before_confirm(
@@ -1459,6 +2407,1228 @@ def _require_generation_batch_benchmark_before_confirm(
         raise RuntimeError(
             "confirm512 is blocked until generation_batch_benchmark.json is materialized"
         )
+
+
+def _require_full_e2e_gate(
+    campaign_runtime: Mapping[str, Any],
+) -> dict[str, Any]:
+    continuation = _continuation_for_runtime(campaign_runtime)
+    if continuation is None or continuation.get("start_phase") != "full":
+        raise ValueError("Full E2E gate requires a Full continuation")
+    selection = _require_full_selection_binding(continuation, campaign_runtime)
+    current_evaluation = _mapping(
+        _mapping(continuation.get("bindings"), "Full bindings").get(
+            "current_evaluation"
+        ),
+        "current Full evaluation",
+    )
+    runtime_evaluation = _mapping(
+        campaign_runtime.get("evaluation"), "Full runtime evaluation"
+    )
+    if (
+        current_evaluation.get("classification")
+        != "canonical_current_v9_execution_authority"
+        or runtime_evaluation.get("worker")
+        != current_evaluation.get("worker")
+        or _mapping(
+            runtime_evaluation.get("quality"), "Full runtime quality"
+        ).get("script")
+        != current_evaluation.get("quality_script")
+    ):
+        raise ValueError("Full E2E runtime is not authorized by current evaluator")
+    manifests = _mapping(campaign_runtime.get("manifests"), "campaign manifests")
+    full_manifest = _mapping(manifests.get("full_2048"), "full_2048")
+    gate_path = (
+        REPO_ROOT
+        / str(campaign_runtime["campaign_root"])
+        / "full_e2e"
+        / "gate_contract.json"
+    )
+    gate = _read_json_mapping(gate_path, "Full E2E gate")
+    expected_fields = {
+        "schema_version",
+        "contract_type",
+        "campaign_id",
+        "continuation_contract_sha256",
+        "selection_sha256",
+        "manifest",
+        "generation_policy",
+        "generation_results",
+        "evaluator_results",
+        "resource_profiles",
+        "full_e2e_result_sha256",
+        "verdict",
+        "full_e2e_gate_sha256",
+    }
+    if set(gate) != expected_fields:
+        raise ValueError("Full E2E gate fields are not canonical")
+    declared = _require_sha256(
+        gate.get("full_e2e_gate_sha256"), "Full E2E gate SHA256"
+    )
+    canonical = dict(gate)
+    canonical.pop("full_e2e_gate_sha256")
+    if _canonical_json_sha256(canonical) != declared:
+        raise ValueError("Full E2E gate digest mismatch")
+    manifest = _mapping(gate.get("manifest"), "Full E2E manifest")
+    policy = _mapping(gate.get("generation_policy"), "Full E2E generation policy")
+    results = gate.get("generation_results")
+    evaluators = _mapping(gate.get("evaluator_results"), "Full E2E evaluators")
+    _require_sha256(
+        gate.get("full_e2e_result_sha256"), "Full E2E result SHA256"
+    )
+    if (
+        gate.get("schema_version") != 1
+        or gate.get("contract_type") != "safa_r9_full_e2e_gate_v1"
+        or gate.get("campaign_id") != FULL_CONTINUATION_CHILD_CAMPAIGN_ID
+        or gate.get("continuation_contract_sha256")
+        != _continuation_digest(continuation)
+        or gate.get("selection_sha256") != selection["selection_sha256"]
+        or manifest.get("path")
+        != "configs/medium_v2/experiments/r9_manifests/full_smoke_8.jsonl"
+        or manifest.get("sha256")
+        != "04a7d89db541b065755c965505bb26b1e58aea306cc59c1717f251ec32dfc87f"
+        or manifest.get("sample_count") != 8
+        or manifest.get("parent_path") != full_manifest.get("path")
+        or manifest.get("parent_sha256") != full_manifest.get("sha256")
+        or policy
+        != {
+            "phase": "full",
+            "seed": 7919,
+            "batch_size": 2,
+            "arms": ["native", "paper_eta_0p125"],
+            "retry_count": 0,
+        }
+        or not isinstance(results, list)
+        or [row.get("arm_id") for row in results if isinstance(row, Mapping)]
+        != ["native", "paper_eta_0p125"]
+        or any(
+            not isinstance(row, Mapping)
+            or set(row)
+            != {
+                "arm_id",
+                "runtime_config_sha256",
+                "generation_result_sha256",
+                "per_sample_sha256",
+            }
+            for row in results
+        )
+        or set(evaluators)
+        != {"arcface", "quality_native", "quality_candidate"}
+        or any(
+            set(_mapping(evaluators[name], name))
+            != {"request_sha256", "result_sha256"}
+            for name in ("arcface", "quality_native", "quality_candidate")
+        )
+        or gate.get("resource_profiles")
+        != _mapping(
+            runtime_evaluation.get("resource_smokes"),
+            "Full runtime resource profiles",
+        ).get("resource_profile_binding")
+        or gate.get("verdict") != "pass"
+    ):
+        raise ValueError("Full E2E gate does not authorize formal Full execution")
+    rebuilt = _rebuild_full_e2e_evidence(campaign_runtime)
+    if gate != rebuilt["gate"]:
+        raise ValueError("Full E2E gate does not match current evidence bytes")
+    return gate
+
+
+def _rebuild_full_e2e_evidence(
+    campaign_runtime: Mapping[str, Any],
+    *,
+    require_materialized_result: bool = True,
+) -> dict[str, Any]:
+    continuation = _continuation_for_runtime(campaign_runtime)
+    if continuation is None:
+        raise ValueError("Full E2E evidence has no continuation")
+    selection = _require_full_selection_binding(continuation, campaign_runtime)
+    current_evaluation = _mapping(
+        _mapping(continuation.get("bindings"), "Full bindings").get(
+            "current_evaluation"
+        ),
+        "current Full evaluation",
+    )
+    runtime_evaluation = _mapping(
+        campaign_runtime.get("evaluation"), "Full runtime evaluation"
+    )
+    if (
+        current_evaluation.get("classification")
+        != "canonical_current_v9_execution_authority"
+        or runtime_evaluation.get("worker")
+        != current_evaluation.get("worker")
+        or _mapping(
+            runtime_evaluation.get("quality"), "Full runtime quality"
+        ).get("script")
+        != current_evaluation.get("quality_script")
+    ):
+        raise ValueError("Full E2E runtime is not authorized by current evaluator")
+    root = (
+        REPO_ROOT
+        / str(campaign_runtime["campaign_root"])
+        / "full_e2e"
+    )
+    plan = _read_json_mapping(root / "plan.json", "Full E2E plan")
+    expected_plan_fields = {
+        "schema_version",
+        "contract_type",
+        "campaign_id",
+        "continuation_contract_sha256",
+        "selection_sha256",
+        "request_config",
+        "e2e_request",
+        "generation_batch_benchmark",
+        "provisional_runtime",
+        "manifest",
+        "generation_policy",
+        "runs",
+        "full_e2e_plan_sha256",
+    }
+    if (
+        set(plan) != expected_plan_fields
+        or plan.get("schema_version") != 1
+        or plan.get("contract_type") != "safa_r9_full_e2e_plan_v1"
+        or plan.get("campaign_id") != FULL_CONTINUATION_CHILD_CAMPAIGN_ID
+    ):
+        raise ValueError("Full E2E plan fields changed")
+    declared_plan = _require_sha256(
+        plan.get("full_e2e_plan_sha256"), "Full E2E plan SHA256"
+    )
+    canonical_plan = dict(plan)
+    canonical_plan.pop("full_e2e_plan_sha256")
+    if _canonical_json_sha256(canonical_plan) != declared_plan:
+        raise ValueError("Full E2E plan digest mismatch")
+    request_config = _mapping(plan.get("request_config"), "E2E request config")
+    if (
+        request_config
+        != {
+            "path": str(FULL_CONTINUATION_RUNTIME_CONFIG),
+            "sha256": _sha256_path(REPO_ROOT / FULL_CONTINUATION_RUNTIME_CONFIG),
+        }
+        or plan.get("e2e_request")
+        != continuation["bindings"]["full_e2e_requirement"]["request"]
+        or plan.get("generation_batch_benchmark")
+        != campaign_runtime["generation_batch_benchmark"]
+        or plan.get("continuation_contract_sha256")
+        != _continuation_digest(continuation)
+        or plan.get("selection_sha256") != selection["selection_sha256"]
+    ):
+        raise ValueError("Full E2E plan source binding changed")
+    provisional_binding = _mapping(
+        plan.get("provisional_runtime"), "Full E2E provisional runtime"
+    )
+    provisional_path = _repo_path(
+        REPO_ROOT,
+        provisional_binding.get("path"),
+        "Full E2E provisional runtime",
+    )
+    observed_provisional = _read_json_mapping(
+        provisional_path, "Full E2E provisional runtime"
+    )
+    if (
+        set(provisional_binding) != {"path", "contract_sha256"}
+        or provisional_binding.get("contract_sha256")
+        != observed_provisional.get("campaign_runtime_sha256")
+        or _canonical_json_sha256(
+            {
+                key: value
+                for key, value in observed_provisional.items()
+                if key != "campaign_runtime_sha256"
+            }
+        )
+        != observed_provisional.get("campaign_runtime_sha256")
+        or observed_provisional.get("continuation")
+        != campaign_runtime.get("continuation")
+        or observed_provisional.get("checkpoint")
+        != campaign_runtime.get("checkpoint")
+        or observed_provisional.get("manifests")
+        != campaign_runtime.get("manifests")
+        or observed_provisional.get("generation_batch_benchmark")
+        != campaign_runtime.get("generation_batch_benchmark")
+        or _mapping(
+            observed_provisional.get("evaluation"),
+            "Full E2E provisional evaluation",
+        ).get("worker")
+        != runtime_evaluation.get("worker")
+    ):
+        raise ValueError("Full E2E provisional runtime binding changed")
+    manifest = _mapping(plan.get("manifest"), "Full E2E manifest")
+    parent_manifest = _mapping(
+        _mapping(campaign_runtime.get("manifests"), "manifests").get("full_2048"),
+        "full_2048",
+    )
+    manifest_path = _repo_path(
+        REPO_ROOT, manifest.get("path"), "Full E2E manifest"
+    )
+    if (
+        set(manifest)
+        != {
+            "path",
+            "sha256",
+            "sample_count",
+            "parent_path",
+            "parent_sha256",
+            "sample_ids",
+        }
+        or manifest.get("sha256") != _sha256_path(manifest_path)
+        or manifest.get("sample_count") != 8
+        or manifest.get("parent_path") != parent_manifest["path"]
+        or manifest.get("parent_sha256") != parent_manifest["sha256"]
+        or plan.get("generation_policy")
+        != {
+            "phase": "full",
+            "seed": 7919,
+            "batch_size": 2,
+            "arms": ["native", "paper_eta_0p125"],
+            "retry_count": 0,
+        }
+    ):
+        raise ValueError("Full E2E plan manifest/policy changed")
+    sample_ids = [
+        _mapping(json.loads(line), "Full E2E manifest row")["sample_id"]
+        for line in manifest_path.read_text(encoding="utf-8").splitlines()
+    ]
+    if sample_ids != manifest["sample_ids"] or len(set(sample_ids)) != 8:
+        raise ValueError("Full E2E ordered sample IDs changed")
+    runs = plan.get("runs")
+    if not isinstance(runs, list) or [
+        row.get("arm_id") for row in runs if isinstance(row, Mapping)
+    ] != ["native", "paper_eta_0p125"]:
+        raise ValueError("Full E2E run order changed")
+    generation_results = []
+    per_sample_by_arm: dict[str, dict[str, dict[str, Any]]] = {}
+    for row in runs:
+        run_row = _mapping(row, "Full E2E run")
+        arm_id = str(run_row["arm_id"])
+        config_path = _repo_path(
+            REPO_ROOT, run_row.get("runtime_config"), "Full E2E runtime config"
+        )
+        if _sha256_path(config_path) != run_row.get("runtime_config_sha256"):
+            raise ValueError("Full E2E runtime config SHA256 changed")
+        config = _mapping(
+            yaml.safe_load(config_path.read_text(encoding="utf-8")),
+            "Full E2E runtime config",
+        )
+        expected_output = (
+            Path(str(campaign_runtime["campaign_root"]))
+            / "full_e2e"
+            / "generation"
+            / arm_id
+        )
+        if (
+            config.get("phase") != "full"
+            or config.get("seed") != 7919
+            or config.get("sampling_seed") != 7919
+            or config.get("batch_size") != 2
+            or config.get("max_samples") != 8
+            or config.get("sample_id_manifest") != manifest["path"]
+            or config.get("sample_id_manifest_sha256") != manifest["sha256"]
+            or config.get("r9_full_e2e_role") != "formal_gate_v1"
+            or run_row.get("output_dir") != str(expected_output)
+        ):
+            raise ValueError("Full E2E generation runtime semantics changed")
+        output = REPO_ROOT / expected_output
+        run = RunSpec(
+            phase="full",
+            logical_run_id=f"formal_e2e_{arm_id}_8",
+            arm_ref=arm_id,
+            seed=7919,
+            repeat_index=None,
+            shard_index=0,
+            num_shards=1,
+            sample_count=8,
+            manifest_key="full_2048",
+            runtime_config=Path(str(run_row["runtime_config"])),
+            output_dir=expected_output,
+            command=tuple(run_row["command"]),
+        )
+        validate_worker_completion(run)
+        rows = _read_ordered_per_sample(output / "per_sample.jsonl")
+        if list(rows) != sample_ids:
+            raise ValueError("Full E2E per-sample order changed")
+        per_sample_by_arm[arm_id] = rows
+        generation_results.append(
+            {
+                "arm_id": arm_id,
+                "runtime_config_sha256": run_row["runtime_config_sha256"],
+                "generation_result_sha256": _sha256_path(
+                    output / "generation_result.json"
+                ),
+                "per_sample_sha256": _sha256_path(output / "per_sample.jsonl"),
+            }
+        )
+    samples = []
+    for sample_id in sample_ids:
+        native_row = per_sample_by_arm["native"][sample_id]
+        winner_row = per_sample_by_arm["paper_eta_0p125"][sample_id]
+        if native_row.get("source") != winner_row.get("source"):
+            raise ValueError("Full E2E matched source changed")
+        source = Path(str(native_row["source"])).resolve()
+        native = _repo_path(
+            REPO_ROOT, native_row.get("native"), "Full E2E native image"
+        )
+        candidate = _repo_path(
+            REPO_ROOT, winner_row.get("generated"), "Full E2E winner image"
+        )
+        samples.append(
+            SampleEvidence(
+                sample_id=sample_id,
+                source=source,
+                native=native,
+                candidate=candidate,
+                source_sha256=_sha256_path(source),
+                native_sha256=_sha256_path(native),
+                candidate_sha256=_sha256_path(candidate),
+            )
+        )
+    expected_payloads = _expected_full_e2e_payloads(
+        campaign_runtime, selection, manifest_path, tuple(samples), generation_results
+    )
+    evaluator_results = {}
+    evaluator_units = {
+        "arcface": ("arcface", "formal_e2e_arcface_8"),
+        "quality_native": ("quality", "formal_e2e_quality_8__native"),
+        "quality_candidate": ("quality", "formal_e2e_quality_8__candidate"),
+    }
+    for evidence_key, (task, unit) in evaluator_units.items():
+        unit_root = root / "evaluator_runs" / task / unit
+        request = _read_json_mapping(
+            unit_root / "request.json", f"E2E {evidence_key} request"
+        )
+        output = _read_json_mapping(
+            unit_root / "result.json", f"E2E {evidence_key} result"
+        )
+        request_sha = _require_sha256(
+            request.get("evaluator_request_sha256"), f"E2E {task} request SHA256"
+        )
+        request_canonical = dict(request)
+        request_canonical.pop("evaluator_request_sha256")
+        output_sha = _require_sha256(
+            output.get("evaluator_output_sha256"), f"E2E {task} result SHA256"
+        )
+        output_canonical = dict(output)
+        output_canonical.pop("evaluator_output_sha256")
+        evaluation = _mapping(campaign_runtime.get("evaluation"), "evaluation")
+        worker = _mapping(evaluation.get("worker"), "worker")
+        expected_config = {
+            "repo_root": str(REPO_ROOT.resolve()),
+            "device": "cuda:0",
+            "work_root": str((unit_root / "work").resolve()),
+            "batch_size": int(
+                _mapping(evaluation.get("heldout"), "heldout")["batch_size"]
+            ),
+            "arcface": dict(_mapping(evaluation.get("arcface"), "arcface")),
+            "quality_script": dict(
+                _mapping(
+                    _mapping(evaluation.get("quality"), "quality").get("script"),
+                    "quality script",
+                )
+            ),
+            "worker_contract": {
+                "path": str(
+                    _repo_path(REPO_ROOT, worker["path"], "worker").resolve()
+                ),
+                "sha256": worker["sha256"],
+                "implementation_path": str(
+                    _repo_path(
+                        REPO_ROOT,
+                        worker["implementation_path"],
+                        "worker implementation",
+                    ).resolve()
+                ),
+                "implementation_sha256": worker["implementation_sha256"],
+            },
+        }
+        if (
+            request.get("contract_type") != "safa_r9_phase_evaluator_request_v1"
+            or request.get("task") != task
+            or request.get("config") != expected_config
+            or request.get("payload") != expected_payloads[evidence_key]
+            or _canonical_json_sha256(request_canonical) != request_sha
+            or output.get("contract_type") != "safa_r9_phase_evaluator_output_v1"
+            or output.get("task") != task
+            or output.get("evaluator_request_sha256") != request_sha
+            or _canonical_json_sha256(output_canonical) != output_sha
+        ):
+            raise ValueError(
+                f"Full E2E {evidence_key} request/result binding changed"
+            )
+        _validate_full_e2e_result_semantics(
+            task, output.get("result"), sample_ids
+        )
+        evaluator_results[evidence_key] = {
+            "request_sha256": request_sha,
+            "result_sha256": output_sha,
+        }
+    resource_profiles = build_full_e2e_resource_profiles(campaign_runtime)
+    observed_profiles = _read_json_mapping(
+        root / "resource_profiles.json", "Full E2E resource profiles"
+    )
+    if observed_profiles != resource_profiles:
+        raise ValueError("Full E2E resource profiles changed")
+    resource_profile_binding = {
+        "path": str(
+            (root / "resource_profiles.json").relative_to(REPO_ROOT)
+        ),
+        "file_sha256": _sha256_path(root / "resource_profiles.json"),
+        "contract_sha256": resource_profiles["resource_profiles_sha256"],
+    }
+    result = {
+        "schema_version": 1,
+        "contract_type": "safa_r9_full_e2e_result_v1",
+        "plan_sha256": declared_plan,
+        "generation_results": generation_results,
+        "evaluator_results": evaluator_results,
+        "resource_profiles": resource_profile_binding,
+    }
+    result["full_e2e_result_sha256"] = _canonical_json_sha256(result)
+    if require_materialized_result:
+        observed_result = _read_json_mapping(
+            root / "run_result.json", "Full E2E result"
+        )
+        if observed_result != result:
+            raise ValueError("Full E2E run result does not match current evidence")
+    gate = {
+        "schema_version": 1,
+        "contract_type": "safa_r9_full_e2e_gate_v1",
+        "campaign_id": FULL_CONTINUATION_CHILD_CAMPAIGN_ID,
+        "continuation_contract_sha256": _continuation_digest(continuation),
+        "selection_sha256": selection["selection_sha256"],
+        "manifest": {
+            key: manifest[key]
+            for key in (
+                "path",
+                "sha256",
+                "sample_count",
+                "parent_path",
+                "parent_sha256",
+            )
+        },
+        "generation_policy": plan["generation_policy"],
+        "generation_results": generation_results,
+        "evaluator_results": evaluator_results,
+        "resource_profiles": resource_profile_binding,
+        "full_e2e_result_sha256": result["full_e2e_result_sha256"],
+        "verdict": "pass",
+    }
+    gate["full_e2e_gate_sha256"] = _canonical_json_sha256(gate)
+    return {"plan": plan, "result": result, "gate": gate}
+
+
+def build_full_e2e_resource_profiles(
+    campaign_runtime: Mapping[str, Any],
+) -> dict[str, Any]:
+    root = (
+        REPO_ROOT
+        / str(campaign_runtime["campaign_root"])
+        / "full_e2e"
+    )
+    evaluation = _mapping(campaign_runtime.get("evaluation"), "evaluation")
+    expected_worker = _mapping(evaluation.get("worker"), "evaluation worker")
+    expected_arcface = _canonical_json_sha256(
+        _mapping(evaluation.get("arcface"), "ArcFace evaluation")
+    )
+    expected_quality = _mapping(
+        _mapping(evaluation.get("quality"), "quality evaluation").get("script"),
+        "quality script",
+    )["sha256"]
+    units = {
+        "arcface": ("arcface", "formal_e2e_arcface_8"),
+        "quality_native": ("quality", "formal_e2e_quality_8__native"),
+        "quality_candidate": ("quality", "formal_e2e_quality_8__candidate"),
+    }
+    observations = {}
+    for evidence_key, (task, unit) in units.items():
+        unit_root = root / "evaluator_runs" / task / unit
+        request_path = unit_root / "request.json"
+        result_path = unit_root / "result.json"
+        observation_path = unit_root / "resource_observation.json"
+        request = _read_json_mapping(request_path, f"{evidence_key} request")
+        result = _read_json_mapping(result_path, f"{evidence_key} result")
+        observation = _read_json_mapping(
+            observation_path, f"{evidence_key} resource observation"
+        )
+        observation_canonical = dict(observation)
+        observation_sha = _require_sha256(
+            observation_canonical.pop("resource_observation_sha256", None),
+            f"{evidence_key} resource observation SHA256",
+        )
+        if (
+            observation.get("contract_type")
+            != "safa_r9_full_e2e_evaluator_resource_observation_v1"
+            or observation.get("task") != task
+            or observation.get("unit_id") != unit
+            or observation.get("evaluator_request_sha256")
+            != request.get("evaluator_request_sha256")
+            or observation.get("evaluator_output_sha256")
+            != result.get("evaluator_output_sha256")
+            or observation.get("worker_contract") != expected_worker
+            or observation.get("arcface_contract_sha256") != expected_arcface
+            or observation.get("quality_script_sha256") != expected_quality
+            or observation.get("resource_policy_id")
+            != "frozen_conservative_e2e_v1"
+            or _canonical_json_sha256(observation_canonical) != observation_sha
+        ):
+            raise ValueError(
+                f"Full E2E {evidence_key} resource observation changed"
+            )
+        peak_rss = _positive_int(
+            observation.get("peak_process_tree_rss_bytes"),
+            f"{evidence_key} peak RSS",
+        )
+        peak_gpu = _positive_int(
+            observation.get("peak_gpu_memory_bytes"),
+            f"{evidence_key} peak GPU memory",
+        )
+        observations[evidence_key] = {
+            "request": {
+                "path": str(request_path.relative_to(REPO_ROOT)),
+                "file_sha256": _sha256_path(request_path),
+                "contract_sha256": request["evaluator_request_sha256"],
+            },
+            "result": {
+                "path": str(result_path.relative_to(REPO_ROOT)),
+                "file_sha256": _sha256_path(result_path),
+                "contract_sha256": result["evaluator_output_sha256"],
+            },
+            "observation": {
+                "path": str(observation_path.relative_to(REPO_ROOT)),
+                "file_sha256": _sha256_path(observation_path),
+                "contract_sha256": observation_sha,
+            },
+            "peak_process_tree_rss_bytes": peak_rss,
+            "peak_gpu_memory_bytes": peak_gpu,
+            "gpu_uuid": str(observation["gpu_uuid"]),
+        }
+    arcface_peak = observations["arcface"]["peak_process_tree_rss_bytes"]
+    quality_peak = max(
+        observations[key]["peak_process_tree_rss_bytes"]
+        for key in ("quality_native", "quality_candidate")
+    )
+    payload = {
+        "schema_version": 1,
+        "contract_type": "safa_r9_full_e2e_resource_profiles_v1",
+        "campaign_id": FULL_CONTINUATION_CHILD_CAMPAIGN_ID,
+        "source": "measured_from_successful_formal_e2e_workers",
+        "worker_contract": dict(expected_worker),
+        "arcface_contract_sha256": expected_arcface,
+        "quality_script_sha256": expected_quality,
+        "arcface": {
+            "mode": "measured_single_worker",
+            "evidence": [observations["arcface"]],
+            "peak_process_tree_rss_bytes": arcface_peak,
+            "peak_gpu_memory_bytes": observations["arcface"][
+                "peak_gpu_memory_bytes"
+            ],
+            "ram_slot_budget_bytes": (arcface_peak * 110 + 99) // 100,
+        },
+        "quality": {
+            "mode": "measured_exclusive_bootstrap",
+            "evidence": [
+                observations["quality_native"],
+                observations["quality_candidate"],
+            ],
+            "peak_process_tree_rss_bytes": quality_peak,
+            "peak_gpu_memory_bytes": max(
+                observations[key]["peak_gpu_memory_bytes"]
+                for key in ("quality_native", "quality_candidate")
+            ),
+            "ram_slot_budget_bytes": (quality_peak * 110 + 99) // 100,
+        },
+        "heldout": {
+            "mode": "exclusive_single_official_run",
+            "smoke_execution": "sealed_until_winner_lock",
+            "global_exclusive_slots": 16,
+            "ram_admission_percent": 85,
+            "ram_hard_limit_percent": 90,
+        },
+    }
+    payload["resource_profiles_sha256"] = _canonical_json_sha256(payload)
+    return payload
+
+
+def materialize_full_e2e_resource_profiles(
+    campaign_runtime: Mapping[str, Any],
+) -> dict[str, Any]:
+    profiles = build_full_e2e_resource_profiles(campaign_runtime)
+    destination = (
+        REPO_ROOT
+        / str(campaign_runtime["campaign_root"])
+        / "full_e2e/resource_profiles.json"
+    )
+    _write_exclusive_bytes(
+        destination,
+        (
+            json.dumps(
+                profiles,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8"),
+    )
+    return profiles
+
+
+def _read_ordered_per_sample(path: Path) -> dict[str, dict[str, Any]]:
+    rows: dict[str, dict[str, Any]] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        row = _mapping(json.loads(line), "Full E2E per-sample row")
+        sample_id = str(row["sample_id"])
+        if sample_id in rows:
+            raise ValueError("Full E2E duplicate sample ID")
+        rows[sample_id] = row
+    return rows
+
+
+def _expected_full_e2e_payloads(
+    campaign_runtime: Mapping[str, Any],
+    selection: Mapping[str, Any],
+    manifest_path: Path,
+    samples: tuple[SampleEvidence, ...],
+    generation_results: Sequence[Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    source_index = _mapping(
+        _mapping(
+            _mapping(campaign_runtime.get("evaluation"), "evaluation").get("quality"),
+            "quality",
+        ).get("real_index"),
+        "real index",
+    )
+    serialized = _serialize_evaluator_samples(samples)
+    common = {
+        "phase": "full_e2e",
+        "seed": 7919,
+        "source_index_path": str(
+            _repo_path(REPO_ROOT, source_index["path"], "source index").resolve()
+        ),
+        "source_index_sha256": source_index["sha256"],
+        "samples": serialized,
+    }
+    winner = _mapping(selection.get("winner"), "Full winner")
+    native_config_path = next(
+        _repo_path(
+            REPO_ROOT,
+            row["runtime_config"],
+            "Full E2E native runtime config",
+        )
+        for row in _read_json_mapping(
+            REPO_ROOT
+            / str(campaign_runtime["campaign_root"])
+            / "full_e2e/plan.json",
+            "Full E2E plan",
+        )["runs"]
+        if row["arm_id"] == "native"
+    )
+    native_config = _mapping(
+        yaml.safe_load(native_config_path.read_text(encoding="utf-8")),
+        "Full E2E native runtime config",
+    )
+    evidence_binding = _canonical_json_sha256(
+        [
+            {
+                "sample_id": row.sample_id,
+                "source": row.source_sha256,
+                "native": row.native_sha256,
+                "candidate": row.candidate_sha256,
+            }
+            for row in samples
+        ]
+    )
+    generation_set = _canonical_json_sha256(
+        [row["generation_result_sha256"] for row in generation_results]
+    )
+    per_sample_set = _canonical_json_sha256(
+        [row["per_sample_sha256"] for row in generation_results]
+    )
+    return {
+        "arcface": {
+            **common,
+            "arm_id": "paper_eta_0p125",
+            "logical_run_id": "formal_e2e_arcface_8",
+        },
+        "quality_native": {
+            **common,
+            "logical_run_id": "formal_e2e_quality_8",
+            "arm_id": "native",
+            "image_role": "native",
+            "manifest_path": str(manifest_path.resolve()),
+            "algorithm_config_sha256": native_config["arm_config_sha256"],
+            "runner_arm_config_sha256": native_config["arm_config_sha256"],
+            "semantic_output_sha256": _canonical_json_sha256(
+                [
+                    {
+                        "sample_id": row.sample_id,
+                        "sha256": row.native_sha256,
+                    }
+                    for row in samples
+                ]
+            ),
+            "evidence_binding_sha256": evidence_binding,
+            "generation_result_set_sha256": generation_set,
+            "per_sample_set_sha256": per_sample_set,
+        },
+        "quality_candidate": {
+            **common,
+            "logical_run_id": "formal_e2e_quality_8",
+            "arm_id": "paper_eta_0p125",
+            "image_role": "candidate",
+            "manifest_path": str(manifest_path.resolve()),
+            "algorithm_config_sha256": winner["config_sha256"],
+            "runner_arm_config_sha256": winner["config_sha256"],
+            "semantic_output_sha256": _canonical_json_sha256(
+                [
+                    {
+                        "sample_id": row.sample_id,
+                        "sha256": row.candidate_sha256,
+                    }
+                    for row in samples
+                ]
+            ),
+            "evidence_binding_sha256": evidence_binding,
+            "generation_result_set_sha256": generation_set,
+            "per_sample_set_sha256": per_sample_set,
+        },
+    }
+
+
+def _validate_full_e2e_result_semantics(
+    task: str, result: Any, sample_ids: Sequence[str]
+) -> None:
+    if task == "arcface":
+        if (
+            not isinstance(result, list)
+            or [row.get("sample_id") for row in result if isinstance(row, Mapping)]
+            != list(sample_ids)
+            or any(
+                not isinstance(row, Mapping)
+                or set(row)
+                != {
+                    "sample_id",
+                    "source_face_count",
+                    "native_face_count",
+                    "candidate_face_count",
+                    "source_native_cosine",
+                    "source_candidate_cosine",
+                }
+                for row in result
+            )
+        ):
+            raise ValueError("Full E2E ArcFace result coverage changed")
+        return
+    quality = _mapping(result, "Full E2E quality result")
+    per_sample = _mapping(
+        quality.get("per_sample_metrics"), "Full E2E quality per-sample"
+    )
+    rows = per_sample.get("rows")
+    if (
+        quality.get("num_generated") != 8
+        or quality.get("metrics") != ["fid", "kid", "niqe", "sharpness"]
+        or not isinstance(rows, list)
+        or [row.get("sample_id") for row in rows if isinstance(row, Mapping)]
+        != list(sample_ids)
+    ):
+        raise ValueError("Full E2E quality result coverage changed")
+
+
+def _full_admission_preflight(
+    *,
+    resource_probe: Any | None = None,
+    compute_apps: Sequence[tuple[str, int]] | None = None,
+    temperatures: Mapping[str, int] | None = None,
+    disk_usage: Any | None = None,
+    swap_io_delta: tuple[int, int] | None = None,
+) -> dict[str, Any]:
+    probe = SystemResourceProbe() if resource_probe is None else resource_probe
+    ram = probe.ram_snapshot()
+    if ram.used_bytes * 100 >= ram.total_bytes * 85:
+        raise ResourceContractError("Full admission requires RAM below 85%")
+    snapshots = tuple(
+        snapshot for snapshot in probe.gpu_snapshots() if snapshot.index in {0, 1, 2, 3}
+    )
+    if [snapshot.index for snapshot in snapshots] != [0, 1, 2, 3]:
+        raise ResourceContractError("Full admission requires exactly GPU0-3")
+    if any(snapshot.free_bytes < 2 * 1024**3 for snapshot in snapshots):
+        raise ResourceContractError(
+            "Full admission requires at least 2 GiB free on every GPU"
+        )
+    apps = (
+        tuple(compute_apps)
+        if compute_apps is not None
+        else _query_gpu_compute_apps()
+    )
+    selected_uuids = {snapshot.uuid for snapshot in snapshots}
+    unknown = sorted(
+        (uuid, pid) for uuid, pid in apps if uuid in selected_uuids
+    )
+    if unknown:
+        raise ResourceContractError(
+            "Full admission found unknown GPU compute PIDs: "
+            + ",".join(f"{uuid}:{pid}" for uuid, pid in unknown)
+        )
+    observed_temperatures = (
+        dict(temperatures)
+        if temperatures is not None
+        else _query_gpu_temperatures()
+    )
+    if set(observed_temperatures) != selected_uuids:
+        raise ResourceContractError("Full admission GPU temperature set changed")
+    if any(value > 85 for value in observed_temperatures.values()):
+        raise ResourceContractError("Full admission found GPU temperature above 85C")
+    usage = shutil.disk_usage(REPO_ROOT) if disk_usage is None else disk_usage
+    if usage.used * 100 >= usage.total * 85:
+        raise ResourceContractError("Full admission requires disk usage below 85%")
+    swap_delta = (
+        _sample_swap_io_delta()
+        if swap_io_delta is None
+        else tuple(swap_io_delta)
+    )
+    if swap_delta != (0, 0):
+        raise ResourceContractError("Full admission requires zero swap I/O")
+    evidence = {
+        "schema_version": 1,
+        "contract_type": "safa_r9_full_admission_v1",
+        "gpu_indices": [snapshot.index for snapshot in snapshots],
+        "gpu_uuids": [snapshot.uuid for snapshot in snapshots],
+        "free_vram_bytes": [snapshot.free_bytes for snapshot in snapshots],
+        "unknown_compute_pid_count": 0,
+        "temperatures_c": {
+            uuid: observed_temperatures[uuid] for uuid in sorted(selected_uuids)
+        },
+        "ram_used_bytes": ram.used_bytes,
+        "ram_total_bytes": ram.total_bytes,
+        "disk_used_bytes": usage.used,
+        "disk_total_bytes": usage.total,
+        "swap_in_delta_pages": 0,
+        "swap_out_delta_pages": 0,
+    }
+    evidence["full_admission_sha256"] = _canonical_json_sha256(evidence)
+    return evidence
+
+
+def _query_gpu_compute_apps() -> tuple[tuple[str, int], ...]:
+    completed = subprocess.run(
+        (
+            "nvidia-smi",
+            "--query-compute-apps=gpu_uuid,pid",
+            "--format=csv,noheader,nounits",
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    rows = []
+    for line in completed.stdout.splitlines():
+        if not line.strip():
+            continue
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) != 2 or not fields[0] or not fields[1].isdigit():
+            raise ResourceContractError("nvidia-smi compute-app output changed")
+        rows.append((fields[0], int(fields[1])))
+    return tuple(rows)
+
+
+def _query_gpu_temperatures() -> dict[str, int]:
+    completed = subprocess.run(
+        (
+            "nvidia-smi",
+            "--query-gpu=uuid,temperature.gpu",
+            "--format=csv,noheader,nounits",
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    rows = {}
+    for line in completed.stdout.splitlines():
+        fields = [field.strip() for field in line.split(",")]
+        if (
+            len(fields) != 2
+            or not fields[0]
+            or not fields[1].isdigit()
+            or fields[0] in rows
+        ):
+            raise ResourceContractError("nvidia-smi temperature output changed")
+        rows[fields[0]] = int(fields[1])
+    return rows
+
+
+def _sample_swap_io_delta() -> tuple[int, int]:
+    before = _read_swap_io()
+    time.sleep(0.25)
+    after = _read_swap_io()
+    delta = (after[0] - before[0], after[1] - before[1])
+    if any(value < 0 for value in delta):
+        raise ResourceContractError("swap I/O counters moved backwards")
+    return delta
+
+
+def _read_swap_io() -> tuple[int, int]:
+    values = {}
+    for line in Path("/proc/vmstat").read_text(encoding="utf-8").splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0] in {"pswpin", "pswpout"}:
+            if not fields[1].isdigit():
+                raise ResourceContractError("swap I/O counter is invalid")
+            values[fields[0]] = int(fields[1])
+    if set(values) != {"pswpin", "pswpout"}:
+        raise ResourceContractError("swap I/O counters are missing")
+    return values["pswpin"], values["pswpout"]
+
+
+def _read_cpu_times() -> tuple[int, int]:
+    fields = Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0].split()
+    if len(fields) < 9 or fields[0] != "cpu" or any(
+        not value.isdigit() for value in fields[1:]
+    ):
+        raise ResourceContractError("/proc/stat aggregate CPU row changed")
+    values = [int(value) for value in fields[1:]]
+    idle = values[3] + values[4]
+    return sum(values), idle
+
+
+class FullRuntimeGuard:
+    """Enforce the preregistered Full hard stops and record live evidence."""
+
+    def __init__(
+        self,
+        policy: Mapping[str, Any],
+        *,
+        monitor_path: Path,
+        probe: Any | None = None,
+        temperatures: Any = _query_gpu_temperatures,
+        swap_reader: Any = _read_swap_io,
+        disk_usage: Any = shutil.disk_usage,
+        gpu_process_memory: Any | None = None,
+        cpu_reader: Any = _read_cpu_times,
+    ) -> None:
+        self._policy = dict(_mapping(policy, "Full runtime guard policy"))
+        if self._policy.get("policy_id") != "frozen_conservative_e2e_v1":
+            raise ValueError("Full runtime guard policy ID changed")
+        self._hard_stop = _mapping(
+            self._policy.get("hard_stop"), "Full hard-stop policy"
+        )
+        self._probe = SystemResourceProbe() if probe is None else probe
+        self._temperatures = temperatures
+        self._swap_reader = swap_reader
+        self._disk_usage = disk_usage
+        self._gpu_process_memory = (
+            _query_gpu_process_memory_bytes
+            if gpu_process_memory is None
+            else gpu_process_memory
+        )
+        self._monitor_path = Path(monitor_path)
+        self._previous_swap = tuple(self._swap_reader())
+        self._cpu_reader = cpu_reader
+        self._previous_cpu = tuple(self._cpu_reader())
+        self._sustained = {"temperature": 0, "swap": 0, "cpu": 0}
+        self._monitor_binding: dict[str, Any] | None = None
+
+    def bind_monitor(
+        self,
+        *,
+        session_name: str,
+        claim_path: Path,
+        claim_sha256: str,
+    ) -> None:
+        self._monitor_binding = {
+            "session_name": session_name,
+            "claim_path": Path(claim_path),
+            "claim_sha256": _require_sha256(
+                claim_sha256, "Full monitor claim SHA256"
+            ),
+        }
+
+    def enforce(
+        self, processes: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        if self._monitor_binding is not None:
+            session = self._monitor_binding["session_name"]
+            if subprocess.run(
+                ["tmux", "has-session", "-t", session],
+                check=False,
+                capture_output=True,
+            ).returncode != 0:
+                raise ResourceContractError(
+                    "Full runtime monitor tmux session died"
+                )
+            monitor_claim = _read_json_mapping(
+                self._monitor_binding["claim_path"],
+                "Full runtime monitor claim",
+            )
+            digest_field = (
+                "monitor_claim_sha256"
+                if "monitor_claim_sha256" in monitor_claim
+                else None
+            )
+            if (
+                digest_field is None
+                or _require_sha256(
+                    monitor_claim[digest_field],
+                    "Full runtime monitor claim SHA256",
+                )
+                != self._monitor_binding["claim_sha256"]
+                or _canonical_json_sha256(
+                    {
+                        key: value
+                        for key, value in monitor_claim.items()
+                        if key != digest_field
+                    }
+                )
+                != monitor_claim[digest_field]
+            ):
+                raise ResourceContractError(
+                    "Full runtime monitor claim changed"
+                )
+        ram = self._probe.ram_snapshot()
+        snapshots = tuple(
+            row
+            for row in self._probe.gpu_snapshots()
+            if row.index in set(self._policy["gpu_indices"])
+        )
+        if [row.index for row in snapshots] != self._policy["gpu_indices"]:
+            raise ResourceContractError("Full runtime GPU set changed")
+        temperatures = dict(self._temperatures())
+        current_swap = tuple(self._swap_reader())
+        swap_delta = tuple(
+            current - previous
+            for previous, current in zip(self._previous_swap, current_swap)
+        )
+        self._previous_swap = current_swap
+        if any(value < 0 for value in swap_delta):
+            raise ResourceContractError("Full runtime swap counters moved backwards")
+        usage = self._disk_usage(REPO_ROOT)
+        current_cpu = tuple(self._cpu_reader())
+        total_delta = current_cpu[0] - self._previous_cpu[0]
+        idle_delta = current_cpu[1] - self._previous_cpu[1]
+        self._previous_cpu = current_cpu
+        if total_delta <= 0 or not 0 <= idle_delta <= total_delta:
+            raise ResourceContractError("Full runtime CPU counters changed")
+        cpu_busy_percent = 100.0 * (total_delta - idle_delta) / total_delta
+        temperature_hot = any(
+            temperatures.get(row.uuid, -1)
+            > self._hard_stop["temperature_c_above"]
+            for row in snapshots
+        )
+        swap_active = (
+            self._hard_stop.get("swap_io_positive") is True
+            and swap_delta != (0, 0)
+        )
+        self._sustained["temperature"] = (
+            self._sustained["temperature"] + 1 if temperature_hot else 0
+        )
+        self._sustained["swap"] = (
+            self._sustained["swap"] + 1 if swap_active else 0
+        )
+        self._sustained["cpu"] = (
+            self._sustained["cpu"] + 1
+            if cpu_busy_percent
+            >= self._hard_stop["cpu_percent_at_or_above"]
+            else 0
+        )
+        process_rows = {}
+        for worker_id, process in sorted((processes or {}).items()):
+            if process.poll() is None:
+                process_rows[worker_id] = {
+                    "pid": int(process.pid),
+                    "process_tree_rss_bytes": _process_tree_rss_bytes(
+                        int(process.pid)
+                    ),
+                }
+        gpu_memory = dict(self._gpu_process_memory())
+        sample = {
+            "schema_version": 1,
+            "contract_type": "safa_r9_full_runtime_monitor_sample_v1",
+            "monotonic_ns": time.monotonic_ns(),
+            "ram_used_bytes": ram.used_bytes,
+            "ram_total_bytes": ram.total_bytes,
+            "disk_used_bytes": usage.used,
+            "disk_total_bytes": usage.total,
+            "cpu_busy_percent": cpu_busy_percent,
+            "temperatures_c": temperatures,
+            "swap_in_delta_pages": swap_delta[0],
+            "swap_out_delta_pages": swap_delta[1],
+            "gpu": [
+                {
+                    "index": row.index,
+                    "uuid": row.uuid,
+                    "used_bytes": row.total_bytes - row.free_bytes,
+                    "total_bytes": row.total_bytes,
+                    "compute_process_bytes": gpu_memory.get(row.uuid, 0),
+                }
+                for row in snapshots
+            ],
+            "processes": process_rows,
+        }
+        self._monitor_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._monitor_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    sample,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                + "\n"
+            )
+        if (
+            ram.used_bytes * 100
+            >= ram.total_bytes * self._hard_stop["ram_percent_at_or_above"]
+        ):
+            raise ResourceContractError("Full runtime crossed the 90% RAM hard stop")
+        if (
+            usage.used * 100
+            >= usage.total * self._hard_stop["disk_percent_at_or_above"]
+        ):
+            raise ResourceContractError("Full runtime crossed the 90% disk hard stop")
+        if any(
+            (row.total_bytes - row.free_bytes) * 100
+            >= row.total_bytes
+            * self._hard_stop["gpu_memory_percent_at_or_above"]
+            for row in snapshots
+        ):
+            raise ResourceContractError(
+                "Full runtime crossed the 90% GPU-memory hard stop"
+            )
+        sustained = self._hard_stop["sustained_sample_count"]
+        if self._sustained["temperature"] >= sustained:
+            raise ResourceContractError(
+                "Full runtime sustained GPU temperature above 85C"
+            )
+        if self._sustained["swap"] >= sustained:
+            raise ResourceContractError("Full runtime sustained swap I/O")
+        if self._sustained["cpu"] >= sustained:
+            raise ResourceContractError(
+                "Full runtime sustained host CPU at or above 90%"
+            )
+        return sample
+
+
+def _query_gpu_process_memory_bytes() -> dict[str, int]:
+    completed = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-compute-apps=gpu_uuid,used_memory",
+            "--format=csv,noheader,nounits",
+        ],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise ResourceContractError("nvidia-smi compute-memory query failed")
+    totals: dict[str, int] = {}
+    for raw in completed.stdout.splitlines():
+        if not raw.strip():
+            continue
+        fields = [value.strip() for value in raw.split(",")]
+        if len(fields) != 2 or not fields[0] or not fields[1].isdigit():
+            raise ResourceContractError(
+                "nvidia-smi compute-memory output changed"
+            )
+        totals[fields[0]] = totals.get(fields[0], 0) + int(fields[1]) * 1024**2
+    return totals
 
 
 def execute_dynamic_campaign(
@@ -1475,6 +3645,7 @@ def execute_dynamic_campaign(
     quality_evaluator: QualityEvaluator | None = None,
     arcface_evaluator: ArcFaceEvaluator | None = None,
     heldout_evaluator: HeldoutEvaluator | None = None,
+    runtime_guard: FullRuntimeGuard | None = None,
 ) -> int:
     if campaign_runtime:
         _validate_requested_campaign_role(
@@ -1555,6 +3726,7 @@ def execute_dynamic_campaign(
             scheduler=scheduler,
             gpu_bindings=gpu_bindings,
             peer_status_store=peer_status_store,
+            runtime_guard=runtime_guard,
         )
         if closure_request is not None:
             closure = materialize_phase_results(
@@ -1692,18 +3864,27 @@ def build_phase_results_request(
                     repo_root=REPO_ROOT,
                 )
             )
+        elif (
+            plan.phase == "full"
+            and continuation is not None
+            and continuation.get("start_phase") == "full"
+        ):
+            selection = _require_full_selection_binding(
+                continuation, campaign_runtime
+            )
         else:
             upstream_path = campaign_root / upstream_phase / "gate_contract.json"
-        if upstream_calibration_selection is None:
+        if upstream_calibration_selection is None and selection is None:
             upstream_gate = _load_gate(upstream_path, upstream_phase)
             if plan.phase != "calibrate" and continuation is not None:
                 _require_gate_continuation(upstream_gate, campaign_runtime)
     if plan.phase == "full":
-        assert upstream_gate is not None
-        selection = validate_selection_contract(
-            _read_json_mapping(campaign_root / "selection.json", "selection"),
-            upstream_gate,
-        )
+        if selection is None:
+            assert upstream_gate is not None
+            selection = validate_selection_contract(
+                _read_json_mapping(campaign_root / "selection.json", "selection"),
+                upstream_gate,
+            )
         heldout_seal = _read_json_mapping(
             campaign_root / "heldout_seal.json", "heldout seal"
         )
@@ -1779,6 +3960,9 @@ class R9ProductionEvaluatorCallbacks:
         process_factory: Any = subprocess.Popen,
         sleep: Any = time.sleep,
         poll_interval_seconds: float = 1.0,
+        runtime_guard: FullRuntimeGuard | None = None,
+        rss_sampler: Any | None = None,
+        gpu_process_memory: Any | None = None,
     ) -> None:
         self._python = str(runtime["python"])
         evaluation = _mapping(campaign_runtime.get("evaluation"), "evaluation")
@@ -1842,6 +4026,16 @@ class R9ProductionEvaluatorCallbacks:
         self._launch_counter = 0
         self._scheduler_lock = threading.RLock()
         self._active_evaluator_processes: dict[str, Any] = {}
+        self._quality_execution_lock = threading.Lock()
+        self._runtime_guard = runtime_guard
+        self._rss_sampler = (
+            _process_tree_rss_bytes if rss_sampler is None else rss_sampler
+        )
+        self._gpu_process_memory = (
+            _query_gpu_process_memory_bytes
+            if gpu_process_memory is None
+            else gpu_process_memory
+        )
 
     def quality(self, request: QualityEvaluationRequest) -> Mapping[str, Any]:
         payload = {
@@ -1861,12 +4055,13 @@ class R9ProductionEvaluatorCallbacks:
             "generation_result_set_sha256": request.generation_result_set_sha256,
             "per_sample_set_sha256": request.per_sample_set_sha256,
         }
-        return self._run(
-            "quality",
-            request.phase,
-            f"{request.logical_run_id}__{request.image_role}",
-            payload,
-        )
+        with self._quality_execution_lock:
+            return self._run(
+                "quality",
+                request.phase,
+                f"{request.logical_run_id}__{request.image_role}",
+                payload,
+            )
 
     def arcface(self, request: ArcFaceEvaluationRequest) -> Sequence[Mapping[str, Any]]:
         payload = {
@@ -1884,6 +4079,8 @@ class R9ProductionEvaluatorCallbacks:
         return result
 
     def heldout(self, request: HeldoutEvaluationRequest) -> Mapping[str, Any]:
+        if request.phase != "full":
+            raise RuntimeError("heldout evaluator is only authorized for formal Full")
         payload = {
             "phase": request.phase,
             "arm_id": request.arm_id,
@@ -1902,10 +4099,6 @@ class R9ProductionEvaluatorCallbacks:
         self._validate_current_worker_contract()
         if evaluator not in {"quality", "arcface", "heldout"}:
             raise ValueError("unknown R9 evaluator")
-        if evaluator == "heldout":
-            raise RuntimeError(
-                "heldout evaluator remains sealed until the winner-locked exclusive runner"
-            )
         if CAMPAIGN_ID_PATTERN.fullmatch(unit_id.replace("_", "-")) is None:
             if re.fullmatch(r"[A-Za-z0-9_.-]+", unit_id) is None:
                 raise ValueError("evaluator unit ID is not filesystem-safe")
@@ -1977,21 +4170,67 @@ class R9ProductionEvaluatorCallbacks:
             launch_counter = self._launch_counter
         worker_id = f"evaluator:{evaluator}:{phase}:{unit_id}"
         lease = None
-        while lease is None:
+        exclusive_lock_fd: int | None = None
+        reserved_worker_ids: list[str] = []
+        if evaluator == "heldout":
             with self._scheduler_lock:
-                lease = _admit_worker(
-                    self._scheduler,
-                    worker_id=worker_id,
-                    launch_ordinal=50_000 + launch_counter,
-                    gpu_bindings=self._gpu_bindings,
-                    ram_slot_budget_bytes=self._evaluator_ram_slot_budgets[evaluator],
-                    start_gpu_index=(launch_counter - 1) % 4,
+                if self._scheduler.active_leases:
+                    raise ResourceContractError(
+                        "heldout requires an empty globally exclusive scheduler"
+                    )
+            exclusive_lock_path = Path(
+                "/tmp/safa-r9-heldout-global-exclusive-v1.lock"
+            )
+            exclusive_lock_fd = os.open(
+                exclusive_lock_path,
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                0o600,
+            )
+            try:
+                fcntl.flock(
+                    exclusive_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB
                 )
-            if lease is None:
+            except BlockingIOError as error:
+                os.close(exclusive_lock_fd)
+                raise ResourceContractError(
+                    "heldout global exclusive lock is contended"
+                ) from error
+        reservation_count = 1
+        for reservation_index in range(reservation_count):
+            reservation_id = (
+                worker_id
+                if reservation_index == 0
+                else f"{worker_id}:exclusive-slot-{reservation_index}"
+            )
+            reserved = None
+            while reserved is None:
                 with self._scheduler_lock:
-                    self._scheduler.enforce_actual_ram_limit()
-                self._sleep(self._poll_interval_seconds)
-        self._peer_status_store.record_admitted(worker_id)
+                    reserved = _admit_worker(
+                        self._scheduler,
+                        worker_id=reservation_id,
+                        launch_ordinal=(
+                            50_000 + launch_counter + reservation_index
+                        ),
+                        gpu_bindings=self._gpu_bindings,
+                        ram_slot_budget_bytes=(
+                            16 * 1024**3
+                            if evaluator == "heldout"
+                            else self._evaluator_ram_slot_budgets[evaluator]
+                        ),
+                        start_gpu_index=(
+                            (launch_counter - 1 + reservation_index) % 4
+                        ),
+                    )
+                if reserved is None:
+                    with self._scheduler_lock:
+                        self._scheduler.enforce_actual_ram_limit()
+                    self._sleep(self._poll_interval_seconds)
+            reserved_worker_ids.append(reservation_id)
+            self._peer_status_store.record_admitted(reservation_id)
+            if reservation_index == 0:
+                lease = reserved
+        if lease is None:
+            raise AssertionError("evaluator primary lease is missing")
         environment = dict(os.environ)
         environment["CUDA_VISIBLE_DEVICES"] = lease.gpu_uuid
         environment["SAFA_R9_WORKER_ID"] = worker_id
@@ -2000,6 +4239,8 @@ class R9ProductionEvaluatorCallbacks:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         process = None
         worker_terminal = False
+        peak_rss_bytes = 0
+        peak_gpu_memory_bytes = 0
         try:
             try:
                 _write_exclusive_bytes(
@@ -2042,7 +4283,23 @@ class R9ProductionEvaluatorCallbacks:
                     try:
                         with self._scheduler_lock:
                             self._scheduler.enforce_actual_ram_limit()
-                    except CampaignFailedError:
+                        peak_rss_bytes = max(
+                            peak_rss_bytes,
+                            int(self._rss_sampler(int(process.pid))),
+                        )
+                        peak_gpu_memory_bytes = max(
+                            peak_gpu_memory_bytes,
+                            int(
+                                dict(self._gpu_process_memory()).get(
+                                    lease.gpu_uuid, 0
+                                )
+                            ),
+                        )
+                        if self._runtime_guard is not None:
+                            self._runtime_guard.enforce(
+                                {worker_id: process}
+                            )
+                    except (CampaignFailedError, ResourceContractError):
                         _terminate_process(process)
                         self._peer_status_store.record_terminal(
                             worker_id, state="terminated"
@@ -2065,18 +4322,74 @@ class R9ProductionEvaluatorCallbacks:
                 arcface_contract_sha256=self._arcface_contract_sha256,
                 quality_script_sha256=self._quality_script_sha256,
             )
+            if phase == "full_e2e":
+                if peak_rss_bytes <= 0 or peak_gpu_memory_bytes <= 0:
+                    raise ResourceContractError(
+                        "Full E2E evaluator recorded no positive resource peak"
+                    )
+                observation = {
+                    "schema_version": 1,
+                    "contract_type": (
+                        "safa_r9_full_e2e_evaluator_resource_observation_v1"
+                    ),
+                    "task": evaluator,
+                    "unit_id": unit_id,
+                    "worker_id": worker_id,
+                    "gpu_uuid": lease.gpu_uuid,
+                    "peak_process_tree_rss_bytes": peak_rss_bytes,
+                    "peak_gpu_memory_bytes": peak_gpu_memory_bytes,
+                    "evaluator_request_sha256": contract[
+                        "evaluator_request_sha256"
+                    ],
+                    "evaluator_output_sha256": _require_sha256(
+                        _read_json_mapping(
+                            output_path, "Full E2E evaluator output"
+                        ).get("evaluator_output_sha256"),
+                        "Full E2E evaluator output SHA256",
+                    ),
+                    "worker_contract": dict(self._worker_contract),
+                    "arcface_contract_sha256": self._arcface_contract_sha256,
+                    "quality_script_sha256": self._quality_script_sha256,
+                    "resource_policy_id": "frozen_conservative_e2e_v1",
+                }
+                observation["resource_observation_sha256"] = (
+                    _canonical_json_sha256(observation)
+                )
+                _write_exclusive_bytes(
+                    root / "resource_observation.json",
+                    (
+                        json.dumps(
+                            observation,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            allow_nan=False,
+                        )
+                        + "\n"
+                    ).encode("utf-8"),
+                )
         except BaseException:
             self._terminate_evaluator_peers(
                 current_worker_id=worker_id,
                 current_worker_terminal=worker_terminal,
             )
             _cleanup_evaluator_work_root(root / "work", evaluator_root=root)
+            if exclusive_lock_fd is not None:
+                fcntl.flock(exclusive_lock_fd, fcntl.LOCK_UN)
+                os.close(exclusive_lock_fd)
             raise
         _cleanup_evaluator_work_root(root / "work", evaluator_root=root)
         self._peer_status_store.record_terminal(worker_id, state="succeeded")
         with self._scheduler_lock:
             self._active_evaluator_processes.pop(worker_id, None)
-            self._scheduler.release_worker(worker_id)
+            for reservation_id in reversed(reserved_worker_ids):
+                if reservation_id != worker_id:
+                    self._peer_status_store.record_terminal(
+                        reservation_id, state="succeeded"
+                    )
+                self._scheduler.release_worker(reservation_id)
+        if exclusive_lock_fd is not None:
+            fcntl.flock(exclusive_lock_fd, fcntl.LOCK_UN)
+            os.close(exclusive_lock_fd)
         return result
 
     def _terminate_evaluator_peers(
@@ -2087,7 +4400,7 @@ class R9ProductionEvaluatorCallbacks:
             active_worker_ids = {
                 lease.worker_id for lease in self._scheduler.active_leases
             }
-        for worker_id, process in processes:
+        for worker_id, process in processes.items():
             if process.poll() is None:
                 _terminate_process(process)
         terminal_worker_ids = active_worker_ids | set(processes)
@@ -2227,6 +4540,12 @@ def resolve_phase_promotion(
         if not 1 <= len(selected) <= 2:
             raise RuntimeError("confirm512 requires 1..2 B-stage promotions")
         return selected, None
+    continuation = _continuation_for_runtime(campaign_runtime)
+    if continuation is not None and continuation.get("start_phase") == "full":
+        selection = _require_full_selection_binding(
+            continuation, campaign_runtime
+        )
+        return None, str(_mapping(selection["winner"], "winner")["arm_id"])
     confirm_gate = _load_gate(root / "confirm512" / "gate_contract.json", "confirm512")
     _require_gate_continuation(confirm_gate, campaign_runtime)
     selection_path = root / "selection.json"
@@ -2318,14 +4637,24 @@ def finalize_phase_gate(
             ),
         )
     else:
-        confirm_gate = _load_gate(
-            root / "confirm512" / "gate_contract.json", "confirm512"
-        )
-        selection = validate_selection_contract(
-            _read_json_mapping(root / "selection.json", "selection"),
-            confirm_gate,
-        )
-        _require_selection_continuation(selection, campaign_runtime)
+        continuation = _continuation_for_runtime(campaign_runtime)
+        if continuation is not None and continuation.get("start_phase") == "full":
+            selection = _require_full_selection_binding(
+                continuation, campaign_runtime
+            )
+        else:
+            confirm_gate = _load_gate(
+                root / "confirm512" / "gate_contract.json", "confirm512"
+            )
+            selection = validate_selection_contract(
+                _read_json_mapping(root / "selection.json", "selection"),
+                confirm_gate,
+            )
+        if not (
+            continuation is not None
+            and continuation.get("start_phase") == "full"
+        ):
+            _require_selection_continuation(selection, campaign_runtime)
         heldout = _read_json_mapping(root / "heldout_seal.json", "heldout seal")
         gate = build_d_gate_contract(
             context,
@@ -2334,6 +4663,9 @@ def finalize_phase_gate(
             result=results["result"],
             bootstrap_seed=int(
                 _mapping(campaign_runtime.get("bootstrap"), "bootstrap")["seed"]
+            ),
+            formal_hard_requirements=(
+                campaign_id == FULL_CONTINUATION_CHILD_CAMPAIGN_ID
             ),
         )
     gate_path = root / phase / "gate_contract.json"
@@ -2408,10 +4740,62 @@ def _require_selection_continuation(
         raise ValueError("child selection continuation SHA256 mismatch")
 
 
+def _require_full_selection_binding(
+    continuation: Mapping[str, Any],
+    campaign_runtime: Mapping[str, Any],
+) -> dict[str, Any]:
+    if continuation.get("start_phase") != "full":
+        raise ValueError("Full selection validator requires a Full continuation")
+    runtime_binding = _mapping(
+        campaign_runtime.get("continuation"), "runtime continuation binding"
+    )
+    if runtime_binding.get("contract_sha256") != _continuation_digest(continuation):
+        raise ValueError("runtime Full continuation digest changed")
+    binding = _mapping(
+        continuation.get("selection"), "Full continuation selection binding"
+    )
+    if set(binding) != {
+        "path",
+        "file_sha256",
+        "contract_sha256",
+        "prospective_file_sha256",
+    }:
+        raise ValueError("Full continuation selection binding fields changed")
+    selection_path = _repo_path(
+        REPO_ROOT, binding.get("path"), "Full continuation selection"
+    )
+    file_sha256 = _sha256_path(selection_path)
+    if (
+        file_sha256
+        != _require_sha256(binding.get("file_sha256"), "Full selection file SHA256")
+        or file_sha256
+        != _require_sha256(
+            binding.get("prospective_file_sha256"),
+            "Full selection prospective SHA256",
+        )
+    ):
+        raise ValueError("Full continuation selection file binding changed")
+    selection = validate_full_continuation_selection_contract(
+        _read_json_mapping(selection_path, "Full continuation selection"),
+        repo_root=REPO_ROOT,
+        expected_source=expected_source_from_full_continuation(continuation),
+    )
+    if selection["selection_sha256"] != _require_sha256(
+        binding.get("contract_sha256"), "Full selection contract SHA256"
+    ):
+        raise ValueError("Full continuation selection internal digest changed")
+    if "continuation_contract_sha256" in selection:
+        raise ValueError("Full selection must not contain a cyclic continuation digest")
+    return selection
+
+
 def _continuation_digest(continuation: Mapping[str, Any]) -> str:
     value = continuation.get(
         "continuation_contract_sha256",
-        continuation.get("confirm_continuation_sha256"),
+        continuation.get(
+            "confirm_continuation_sha256",
+            continuation.get("full_continuation_sha256"),
+        ),
     )
     return _require_sha256(value, "continuation contract SHA256")
 
@@ -2964,6 +5348,7 @@ def execute_campaign(
     process_factory: Any = subprocess.Popen,
     poll_interval_seconds: float = 1.0,
     sleep: Any = time.sleep,
+    runtime_guard: FullRuntimeGuard | None = None,
 ) -> int:
     """Refill all admitted GPU slots and fail the campaign on any peer error."""
     bindings = _validate_gpu_bindings(gpu_bindings)
@@ -3052,7 +5437,14 @@ def execute_campaign(
             continue
         try:
             scheduler.enforce_actual_ram_limit()
-        except CampaignFailedError:
+            if runtime_guard is not None:
+                runtime_guard.enforce(
+                    {
+                        worker_id: worker.process
+                        for worker_id, worker in active.items()
+                    }
+                )
+        except (CampaignFailedError, ResourceContractError):
             _cleanup_active_workers(active, scheduler, peer_status_store)
             raise
         completed_any = False
@@ -3489,6 +5881,8 @@ def build_run_runtime_config(
     campaign_runtime: Mapping[str, Any],
     manifest_contract: Mapping[str, Any],
     run: RunSpec,
+    *,
+    continuation_contract: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Resolve one immutable generator config from campaign-owned YAML values."""
     base_path = _repo_path(REPO_ROOT, runtime.get("base_config"), "base config")
@@ -3513,7 +5907,9 @@ def build_run_runtime_config(
     checkpoint = _mapping(campaign_runtime.get("checkpoint"), "checkpoint")
     if base.get("checkpoint_sha256") != checkpoint.get("sha256"):
         raise ValueError("base config checkpoint disagrees with campaign runtime")
-    formal_closure = _formal_closure_for_runtime(campaign_runtime)
+    formal_closure = _formal_closure_for_runtime(
+        campaign_runtime, continuation_contract=continuation_contract
+    )
     config = dict(base)
     for field in (
         "sample_mode",
@@ -3555,7 +5951,11 @@ def build_run_runtime_config(
             "r9_phase_manifest_sha256": str(manifest["sha256"]),
         }
     )
-    continuation = _continuation_for_runtime(campaign_runtime)
+    continuation = (
+        validate_continuation_contract(continuation_contract, repo_root=REPO_ROOT)
+        if continuation_contract is not None
+        else _continuation_for_runtime(campaign_runtime)
+    )
     if continuation is not None:
         config["r9_continuation_contract_sha256"] = _continuation_digest(
             continuation

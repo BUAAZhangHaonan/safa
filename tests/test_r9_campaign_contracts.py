@@ -2328,6 +2328,89 @@ def test_heldout_metrics_are_report_only_but_coverage_and_run_once_stay_hard(
     assert "fid_above_native_plus_3" in arm["quality"]["observations"][
         "numerical_reference_misses"
     ]
+    strict_passed = build_d_gate_contract(
+        _context(),
+        selection=selection,
+        heldout_seal=seal,
+        result=result,
+        bootstrap_seed=17,
+        formal_hard_requirements=True,
+    )
+    assert strict_passed["verdict"] == "passed_locked_winner"
+    assert strict_passed["privacy_non_inferiority"] is True
+    assert strict_passed["privacy_improvement"] is False
+    strict_failed = build_d_gate_contract(
+        _context(),
+        selection=selection,
+        heldout_seal=seal,
+        result=report_only_result,
+        bootstrap_seed=17,
+        formal_hard_requirements=True,
+    )
+    assert strict_failed["verdict"] == "failed_locked_winner"
+    assert strict_failed["selected_arm_ids"] == ["winner"]
+    strict_failures = strict_failed["arms"][0]["failures"]
+    for expected_failure in (
+        "full_visual_severe_count_gt_3",
+        "e1_bootstrap_lower_not_positive",
+        "e2_bootstrap_lower_not_positive",
+        "arcface_privacy_upper_gt_0.02",
+        "facenet_privacy_upper_gt_0.02",
+        "adaface_privacy_upper_gt_0.02",
+        "quality:severe_count_gt_3",
+        "quality:fid_above_native_plus_3",
+        "quality:kid_above_native_plus_0.005",
+        "quality:niqe_above_native_plus_0.10",
+        "quality:sharpness_below_gate",
+        "quality:e0_below_0.75",
+        "quality:delta_e0_below_0.30",
+        "quality:delta_edev_below_0.05",
+    ):
+        assert expected_failure in strict_failures
+    privacy_boundary = deepcopy(result)
+    for row in privacy_boundary["recognizers"].values():
+        row["privacy_delta_upper_95"] = 0.02
+    boundary_gate = build_d_gate_contract(
+        _context(),
+        selection=selection,
+        heldout_seal=seal,
+        result=privacy_boundary,
+        bootstrap_seed=17,
+        formal_hard_requirements=True,
+    )
+    assert boundary_gate["verdict"] == "passed_locked_winner"
+    assert boundary_gate["privacy_non_inferiority"] is True
+    assert boundary_gate["privacy_improvement"] is False
+    privacy_improved = deepcopy(result)
+    for row in privacy_improved["recognizers"].values():
+        row["privacy_delta_upper_95"] = -0.001
+    improved_gate = build_d_gate_contract(
+        _context(),
+        selection=selection,
+        heldout_seal=seal,
+        result=privacy_improved,
+        bootstrap_seed=17,
+        formal_hard_requirements=True,
+    )
+    assert improved_gate["privacy_non_inferiority"] is True
+    assert improved_gate["privacy_improvement"] is True
+    representation_boundary = deepcopy(result)
+    representation_boundary["representations"]["e1"][
+        "paired_bootstrap_lower_95"
+    ] = 0.0
+    representation_gate = build_d_gate_contract(
+        _context(),
+        selection=selection,
+        heldout_seal=seal,
+        result=representation_boundary,
+        bootstrap_seed=17,
+        formal_hard_requirements=True,
+    )
+    assert representation_gate["verdict"] == "failed_locked_winner"
+    assert (
+        "e1_bootstrap_lower_not_positive"
+        in representation_gate["arms"][0]["failures"]
+    )
     incomplete_result = deepcopy(result)
     incomplete_result["recognizers"]["arcface"] = {
         "coverage": 2047,
