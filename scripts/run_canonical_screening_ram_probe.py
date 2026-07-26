@@ -37,6 +37,7 @@ from safa.closeout.canonical_screening import (
     ram_probe_contract_digest as _probe_contract_digest,
     ram_probe_execution_digest as _probe_execution_digest,
     sha256_file,
+    validate_arcface_execution_probe_binding,
     validate_candidate_manifest,
     validate_checkpoint_plan,
     validate_policy,
@@ -761,6 +762,11 @@ def _run_controller_once(
 ) -> dict[str, Any]:
     if "TMUX" not in os.environ:
         raise CanonicalScreeningError("RAM probe must run inside tmux")
+    validate_arcface_execution_probe_binding(
+        REPO_ROOT,
+        policy["arcface"]["execution_probe"],
+        arcface_contract=policy["arcface"],
+    )
     if policy["resources"]["ram_budget_status"] != "probe_required":
         raise CanonicalScreeningError("RAM probe requires probe_required policy")
     artifact_root.mkdir(parents=True, exist_ok=False)

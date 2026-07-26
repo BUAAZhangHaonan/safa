@@ -12,6 +12,8 @@ import pytest
 
 from safa.closeout.canonical_screening import (
     CanonicalScreeningError,
+    _require_no_repo_path_component_symlinks,
+    _require_tree_without_symlinks,
     _validate_6b_failed_probe_root_identity,
     _validate_ram_slot_budget_source,
     build_candidate_manifest,
@@ -28,6 +30,7 @@ from safa.closeout.canonical_screening import (
     ram_probe_admission_evidence_digest,
     ram_probe_contract_digest,
     ram_probe_execution_digest,
+    validate_arcface_execution_probe_binding,
     validate_candidate_manifest,
     validate_checkpoint_plan,
     validate_preflight_result,
@@ -39,6 +42,7 @@ from safa.closeout.canonical_screening import (
 )
 from safa.closeout.canonical_screening_worker import (
     _assert_runtime_cuda_binding,
+    _load_arcface_contract,
     _load_source_pixel_batch,
     _representation_cosines,
     _write_validated_run_result,
@@ -1005,23 +1009,12 @@ def test_ram_probe_controller_positive_mock_chain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module = _ram_probe_module()
-    config = tmp_path / "policy.json"
+    root = Path(__file__).parents[1]
+    config = root / "configs/closeout/canonical_screening_512_v1.json"
     manifest_path = tmp_path / "manifest.json"
-    smoke = tmp_path / "smoke.jsonl"
-    for path in (config, manifest_path, smoke):
-        path.write_text("{}\n", encoding="utf-8")
+    manifest_path.write_text("{}\n", encoding="utf-8")
     artifact_root = tmp_path / "probe"
-    policy = {
-        "policy_sha256": "1" * 64,
-        "python": sys.executable,
-        "resources": {
-            "ram_budget_status": "probe_required",
-            "physical_gpus": [0, 1, 2, 3],
-            "gpu_headroom_bytes": 2 * 1024**3,
-        },
-        "protocol": {"manifests": {"smoke8": _bound(smoke)}},
-        "implementations": {"worker": _bound(smoke)},
-    }
+    policy = validate_policy(root, config)
     manifest = {"candidate_manifest_sha256": "2" * 64}
     monkeypatch.setenv("TMUX", "fixture")
     monkeypatch.setattr(module, "_select_probe_candidates", lambda _value: [])
@@ -2796,7 +2789,189 @@ def test_supersession_evidence_binds_ea7_failed_smoke_chain(
         validate_supersession_evidence(tmp_path, tampered)
 
 
-def test_current_policy_binds_fe9_preflight_and_incomplete_probe() -> None:
+def test_current_arcface_binding_reaches_official_validator_and_probe_request() -> None:
+    root = Path(__file__).parents[1]
+    policy_path = root / "configs/closeout/canonical_screening_512_v1.json"
+    policy = validate_policy(root, policy_path)
+    expected_fields = {
+        "path",
+        "sha256",
+        "bootstrap_claim_path",
+        "bootstrap_claim_sha256",
+        "bootstrap_claim_file_sha256",
+        "bootstrap_result_path",
+        "bootstrap_result_sha256",
+        "bootstrap_result_file_sha256",
+    }
+    assert set(policy["arcface"]["execution_probe"]) == expected_fields
+    contract = _load_arcface_contract(
+        {
+            "arcface": policy["arcface"],
+            "source_index": policy["protocol"]["source_index"],
+        }
+    )
+    assert set(contract["execution_probe"]) == expected_fields
+
+    module = _ram_probe_module()
+    manifest_path = (
+        root
+        / "artifacts/closeout/historical-canonical-512-v1/"
+        "candidate_manifest__4c5ecb55501fa6b0.json"
+    )
+    manifest = load_json(manifest_path, "4c5 candidate manifest")
+    request = module._probe_request(
+        policy,
+        manifest,
+        manifest["candidates"][0],
+        {"probe_execution_sha256": "e" * 64},
+    )
+    assert set(request["arcface"]["execution_probe"]) == expected_fields
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing",
+        "extra",
+        "probe_file_sha",
+        "claim_canonical_sha",
+        "claim_file_sha",
+        "result_canonical_sha",
+        "result_file_sha",
+        "path_escape",
+    ],
+)
+def test_arcface_execution_probe_binding_tamper_fails_closed(
+    mutation: str,
+) -> None:
+    root = Path(__file__).parents[1]
+    raw = load_json(
+        root / "configs/closeout/canonical_screening_512_v1.json",
+        "current policy",
+    )
+    arcface = json.loads(json.dumps(raw["arcface"]))
+    binding = arcface["execution_probe"]
+    if mutation == "missing":
+        binding.pop("bootstrap_claim_sha256")
+    elif mutation == "extra":
+        binding["unexpected"] = "x"
+    elif mutation == "probe_file_sha":
+        binding["sha256"] = "0" * 64
+    elif mutation == "claim_canonical_sha":
+        binding["bootstrap_claim_sha256"] = "0" * 64
+    elif mutation == "claim_file_sha":
+        binding["bootstrap_claim_file_sha256"] = "0" * 64
+    elif mutation == "result_canonical_sha":
+        binding["bootstrap_result_sha256"] = "0" * 64
+    elif mutation == "result_file_sha":
+        binding["bootstrap_result_file_sha256"] = "0" * 64
+    elif mutation == "path_escape":
+        binding["bootstrap_claim_path"] = "../outside.json"
+    else:
+        raise AssertionError(mutation)
+    with pytest.raises(CanonicalScreeningError):
+        validate_arcface_execution_probe_binding(
+            root, binding, arcface_contract=arcface
+        )
+
+
+def test_arcface_binding_rejects_ancestor_symlink(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "probe.json").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "alias").symlink_to(real, target_is_directory=True)
+    with pytest.raises(CanonicalScreeningError, match="must not be symlinks"):
+        _require_no_repo_path_component_symlinks(
+            tmp_path, "alias/probe.json", "ArcFace probe"
+        )
+
+
+def test_arcface_binding_delegates_coherent_semantic_tamper(
+    tmp_path: Path,
+) -> None:
+    from safa.evaluation.r9_evaluator_worker import _canonical_digest
+
+    root = Path(__file__).parents[1]
+    raw = load_json(
+        root / "configs/closeout/canonical_screening_512_v1.json",
+        "current policy",
+    )
+    arcface = json.loads(json.dumps(raw["arcface"]))
+    original = arcface["execution_probe"]
+    probe = tmp_path / "probe.json"
+    claim_path = tmp_path / "claim.json"
+    result_path = tmp_path / "result.json"
+    probe.write_bytes((root / original["path"]).read_bytes())
+    claim = load_json(root / original["bootstrap_claim_path"], "claim")
+    claim["kind"] = "not_arcface_profile"
+    claim["probe_output"] = str(probe.resolve())
+    claim["bootstrap_claim_sha256"] = _canonical_digest(
+        claim, "bootstrap_claim_sha256"
+    )
+    write_exclusive_json(claim_path, claim)
+    result = load_json(root / original["bootstrap_result_path"], "result")
+    result["bootstrap_claim_sha256"] = claim["bootstrap_claim_sha256"]
+    result["bootstrap_result_sha256"] = _canonical_digest(
+        result, "bootstrap_result_sha256"
+    )
+    write_exclusive_json(result_path, result)
+    arcface["execution_probe"] = {
+        "path": str(probe.resolve()),
+        "sha256": hashlib.sha256(probe.read_bytes()).hexdigest(),
+        "bootstrap_claim_path": str(claim_path.resolve()),
+        "bootstrap_claim_sha256": claim["bootstrap_claim_sha256"],
+        "bootstrap_claim_file_sha256": hashlib.sha256(
+            claim_path.read_bytes()
+        ).hexdigest(),
+        "bootstrap_result_path": str(result_path.resolve()),
+        "bootstrap_result_sha256": result["bootstrap_result_sha256"],
+        "bootstrap_result_file_sha256": hashlib.sha256(
+            result_path.read_bytes()
+        ).hexdigest(),
+    }
+    with pytest.raises(CanonicalScreeningError, match="claim policy mismatch"):
+        validate_arcface_execution_probe_binding(
+            tmp_path,
+            arcface["execution_probe"],
+            arcface_contract=arcface,
+        )
+
+
+def test_supersession_tree_rejects_recursive_symlink(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "root/nested").mkdir(parents=True)
+    target = tmp_path / "target"
+    target.write_text("x", encoding="utf-8")
+    (tmp_path / "root/nested/alias").symlink_to(target)
+    with pytest.raises(CanonicalScreeningError, match="must not contain symlinks"):
+        _require_tree_without_symlinks(
+            tmp_path / "root", "4c5 failed root"
+        )
+
+
+def test_worker_rejects_truncated_arcface_probe_request() -> None:
+    from safa.evaluation.r9_evaluator_worker import R9EvaluatorError
+
+    root = Path(__file__).parents[1]
+    policy = validate_policy(
+        root, root / "configs/closeout/canonical_screening_512_v1.json"
+    )
+    arcface = json.loads(json.dumps(policy["arcface"]))
+    arcface["execution_probe"].pop("bootstrap_result_file_sha256")
+    with pytest.raises(
+        R9EvaluatorError,
+        match="provenance fields are not canonical",
+    ):
+        _load_arcface_contract(
+            {
+                "arcface": arcface,
+                "source_index": policy["protocol"]["source_index"],
+            }
+        )
+
+
+def test_current_policy_binds_4c5_preflight_failed_probe_and_arcface() -> None:
     root = Path(__file__).parents[1]
     policy_path = root / "configs/closeout/canonical_screening_512_v1.json"
 
@@ -2804,19 +2979,24 @@ def test_current_policy_binds_fe9_preflight_and_incomplete_probe() -> None:
 
     supersedes = policy["supersedes"]
     assert supersedes["policy_sha256"] == (
-        "fe9b41136f0b9fa31ce210dfaa5500c3f46f071838ed91288878f57073502060"
+        "4c5ecb55501fa6b09b63377e892f1cee3e0140abd2a02859d33b9b33375a1576"
     )
     assert supersedes["classification"] == (
-        "completed_preflight_and_incomplete_ram_probe_superseded"
+        "completed_preflight_and_failed_ram_probe_superseded"
     )
     assert supersedes["preflight"]["request_count"] == 193
     assert supersedes["preflight"]["result_count"] == 193
     assert supersedes["preflight"]["valid_count"] == 193
     assert supersedes["preflight"]["invalid_count"] == 0
     assert supersedes["preflight"]["reused_count"] == 0
-    assert supersedes["failed_ram_probe"]["worker_started"] is False
-    assert supersedes["failed_ram_probe"]["gpu_execution_count"] == 0
-    assert supersedes["failed_ram_probe"]["capability_step_count"] == 0
+    assert supersedes["failed_ram_probe"]["generation_candidate_count"] == 1
+    assert supersedes["failed_ram_probe"]["generation_sample_count"] == 8
+    assert supersedes["failed_ram_probe"]["e0_edev_sample_count"] == 8
+    assert supersedes["failed_ram_probe"]["arcface_inference_count"] == 0
+    assert supersedes["failed_ram_probe"]["quality_evaluation_count"] == 0
+    assert supersedes["failed_ram_probe"]["pixel_candidate_count"] == 0
+    assert supersedes["failed_ram_probe"]["worker_result_present"] is False
+    assert supersedes["failed_ram_probe"]["png_reuse"] == "forbidden"
     assert supersedes["failed_ram_probe"]["in_place_retry"] == "forbidden"
     assert supersedes["scientific_result_reuse"] == "forbidden"
     assert supersedes["successor_execution"] == "fresh_full_193_preflight"
@@ -2828,13 +3008,14 @@ def test_current_policy_binds_fe9_preflight_and_incomplete_probe() -> None:
         ("request_count", "counts differ"),
         ("reuse", "status differs"),
         ("root_digest", "evidence root differs"),
+        ("preflight_path_alias", "file identity differs"),
         ("failed_root_digest", "failed root differs"),
         ("failed_file_sha", "failed root files differ"),
-        ("admission_digest", "status differs"),
-        ("forbidden_entry", "forbidden probe artifacts"),
+        ("png_sha", "failed root files differ"),
+        ("generation_count", "classification differs"),
     ],
 )
-def test_fe9_supersession_tampering_fails_closed(
+def test_4c5_supersession_tampering_fails_closed(
     mutation: str,
     match: str,
 ) -> None:
@@ -2850,14 +3031,18 @@ def test_fe9_supersession_tampering_fails_closed(
         supersedes["scientific_result_reuse"] = "allowed"
     elif mutation == "root_digest":
         supersedes["preflight"]["evidence_root"]["digest"] = "0" * 64
+    elif mutation == "preflight_path_alias":
+        supersedes["preflight"]["final_plan"]["path"] = supersedes[
+            "preflight"
+        ]["candidate_manifest"]["path"]
     elif mutation == "failed_root_digest":
         supersedes["failed_ram_probe"]["root"]["digest"] = "0" * 64
     elif mutation == "failed_file_sha":
         supersedes["failed_ram_probe"]["files"]["admission.json"] = "0" * 64
-    elif mutation == "admission_digest":
-        supersedes["failed_ram_probe"]["admission_evidence_sha256"] = "0" * 64
-    elif mutation == "forbidden_entry":
-        supersedes["failed_ram_probe"]["forbidden_entries"] = []
+    elif mutation == "png_sha":
+        supersedes["failed_ram_probe"]["png_files"]["000000.png"] = "0" * 64
+    elif mutation == "generation_count":
+        supersedes["failed_ram_probe"]["generation_sample_count"] = 7
     else:
         raise AssertionError(mutation)
 

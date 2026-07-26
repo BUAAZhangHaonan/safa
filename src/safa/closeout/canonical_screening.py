@@ -316,6 +316,129 @@ def _validate_bound_file(
     )}
 
 
+def _require_no_repo_path_component_symlinks(
+    repo_root: Path, raw_path: Any, label: str
+) -> None:
+    root = repo_root.resolve()
+    unresolved = Path(str(raw_path))
+    candidate = unresolved if unresolved.is_absolute() else root / unresolved
+    lexical = Path(os.path.abspath(candidate))
+    try:
+        relative = lexical.relative_to(root)
+    except ValueError as exc:
+        raise CanonicalScreeningError(
+            f"{label} escapes repository root"
+        ) from exc
+    component = root
+    for part in relative.parts:
+        component = component / part
+        if component.is_symlink():
+            raise CanonicalScreeningError(
+                f"{label} path components must not be symlinks"
+            )
+
+
+def _require_tree_without_symlinks(root: Path, label: str) -> None:
+    if root.is_symlink() or any(path.is_symlink() for path in root.rglob("*")):
+        raise CanonicalScreeningError(
+            f"{label} must not contain symlinks"
+        )
+
+
+def validate_arcface_execution_probe_binding(
+    repo_root: Path,
+    value: Any,
+    *,
+    arcface_contract: Mapping[str, Any],
+) -> dict[str, str]:
+    """Validate the complete frozen ArcFace bootstrap provenance chain."""
+    binding = _require_mapping(value, "ArcFace execution probe")
+    expected_fields = {
+        "path",
+        "sha256",
+        "bootstrap_claim_path",
+        "bootstrap_claim_sha256",
+        "bootstrap_claim_file_sha256",
+        "bootstrap_result_path",
+        "bootstrap_result_sha256",
+        "bootstrap_result_file_sha256",
+    }
+    _require_exact_keys(
+        binding, expected_fields, "ArcFace execution probe"
+    )
+
+    def bound_path(
+        path_field: str, file_sha_field: str, label: str
+    ) -> Path:
+        path = _repo_path(repo_root, binding[path_field], label)
+        _require_no_repo_path_component_symlinks(
+            repo_root, binding[path_field], label
+        )
+        expected_file_sha = _require_sha256(
+            binding[file_sha_field], f"{label} file SHA256"
+        )
+        if sha256_file(path) != expected_file_sha:
+            raise CanonicalScreeningError(f"{label} file SHA256 mismatch")
+        return path
+
+    probe_path = bound_path("path", "sha256", "ArcFace execution probe")
+    claim_path = bound_path(
+        "bootstrap_claim_path",
+        "bootstrap_claim_file_sha256",
+        "ArcFace bootstrap claim",
+    )
+    result_path = bound_path(
+        "bootstrap_result_path",
+        "bootstrap_result_file_sha256",
+        "ArcFace bootstrap result",
+    )
+    normalized = {
+        "path": str(probe_path),
+        "sha256": _require_sha256(
+            binding["sha256"], "ArcFace execution probe SHA256"
+        ),
+        "bootstrap_claim_path": str(claim_path),
+        "bootstrap_claim_sha256": _require_sha256(
+            binding["bootstrap_claim_sha256"],
+            "ArcFace bootstrap claim canonical SHA256",
+        ),
+        "bootstrap_claim_file_sha256": _require_sha256(
+            binding["bootstrap_claim_file_sha256"],
+            "ArcFace bootstrap claim file SHA256",
+        ),
+        "bootstrap_result_path": str(result_path),
+        "bootstrap_result_sha256": _require_sha256(
+            binding["bootstrap_result_sha256"],
+            "ArcFace bootstrap result canonical SHA256",
+        ),
+        "bootstrap_result_file_sha256": _require_sha256(
+            binding["bootstrap_result_file_sha256"],
+            "ArcFace bootstrap result file SHA256",
+        ),
+    }
+    probe = load_json(probe_path, "ArcFace execution probe")
+    execution = probe.get("execution")
+    if not isinstance(execution, Mapping):
+        raise CanonicalScreeningError(
+            "ArcFace execution probe omits execution"
+        )
+    declared = dict(arcface_contract)
+    declared["execution"] = dict(execution)
+    declared["execution_probe"] = normalized
+    try:
+        from safa.evaluation.r9_evaluator_worker import (
+            R9EvaluatorError,
+            _validate_arcface_contract,
+        )
+
+        validated = _validate_arcface_contract(
+            declared, repo_root=repo_root.resolve()
+        )
+    except (FileNotFoundError, R9EvaluatorError) as exc:
+        raise CanonicalScreeningError(str(exc)) from exc
+    return dict(validated["execution_probe"])
+
+
 def _validate_ea7_smoke_supersession_evidence(
     repo_root: Path, raw_supersedes: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -1856,6 +1979,435 @@ def _validate_fe9_supersession_evidence(
     return dict(supersedes)
 
 
+def _validate_4c5_supersession_evidence(
+    repo_root: Path, raw_supersedes: Mapping[str, Any]
+) -> dict[str, Any]:
+    supersedes = _require_mapping(raw_supersedes, "4c5 supersession evidence")
+    _require_exact_keys(
+        supersedes,
+        {
+            "policy_sha256",
+            "classification",
+            "supersession_reason",
+            "scientific_result_reuse",
+            "successor_execution",
+            "preflight",
+            "failed_ram_probe",
+        },
+        "4c5 supersession evidence",
+    )
+    policy_sha = (
+        "4c5ecb55501fa6b09b63377e892f1cee3e0140abd2a02859d33b9b33375a1576"
+    )
+    expected_status = {
+        "policy_sha256": policy_sha,
+        "classification": "completed_preflight_and_failed_ram_probe_superseded",
+        "supersession_reason": (
+            "arcface_execution_probe_provenance_binding_upgrade"
+        ),
+        "scientific_result_reuse": "forbidden",
+        "successor_execution": "fresh_full_193_preflight",
+    }
+    if {
+        key: supersedes[key] for key in expected_status
+    } != expected_status:
+        raise CanonicalScreeningError("4c5 supersession status differs")
+
+    preflight = _require_mapping(supersedes["preflight"], "4c5 preflight")
+    preflight_files = {
+        "controller_claim",
+        "controller_terminal",
+        "controller_summary",
+        "wrapper_claim",
+        "wrapper_exit",
+        "resource_monitor",
+        "resource_observer",
+        "runtime_resource_windows",
+        "startup_admission",
+        "final_plan",
+        "candidate_manifest",
+    }
+    preflight_counts = {
+        "request_count": 193,
+        "result_count": 193,
+        "valid_count": 193,
+        "invalid_count": 0,
+        "reused_count": 0,
+        "attempt_claim_count": 193,
+        "attempt_terminal_count": 193,
+        "run_request_count": 0,
+        "generated_png_count": 0,
+    }
+    _require_exact_keys(
+        preflight,
+        set(preflight_counts) | preflight_files | {"evidence_root"},
+        "4c5 preflight",
+    )
+    if any(
+        preflight[key] != value
+        for key, value in preflight_counts.items()
+    ):
+        raise CanonicalScreeningError("4c5 preflight counts differ")
+    evidence = _require_mapping(
+        preflight["evidence_root"], "4c5 preflight evidence root"
+    )
+    expected_preflight_path = (
+        "artifacts/closeout/historical-canonical-512-v1/by_policy/" + policy_sha
+    )
+    unresolved_preflight = repo_root.resolve() / expected_preflight_path
+    _require_tree_without_symlinks(
+        unresolved_preflight, "4c5 preflight evidence root"
+    )
+    if (
+        evidence
+        != {
+            "path": expected_preflight_path,
+            "digest": (
+                "abdc04bcc7d706e66a523121f9dcd77db8a1841403796a92009cb7c37431baff"
+            ),
+            "digest_algorithm": (
+                "sha256_relative_posix_nul_content_nul_v1"
+            ),
+        }
+        or not unresolved_preflight.is_dir()
+        or sha256_directory_tree(unresolved_preflight) != evidence["digest"]
+    ):
+        raise CanonicalScreeningError("4c5 preflight evidence root differs")
+    expected_preflight_files = {
+        "controller_claim": (
+            expected_preflight_path
+            + "/preflight_control/controller_claim.json"
+        ),
+        "controller_terminal": (
+            expected_preflight_path
+            + "/preflight_control/controller_terminal.json"
+        ),
+        "controller_summary": (
+            expected_preflight_path
+            + "/preflight_control/controller_summary.json"
+        ),
+        "wrapper_claim": (
+            expected_preflight_path
+            + "/preflight_control/wrapper_claim.json"
+        ),
+        "wrapper_exit": (
+            expected_preflight_path
+            + "/preflight_control/wrapper_exit.json"
+        ),
+        "resource_monitor": (
+            expected_preflight_path + "/logs/preflight__monitor.jsonl"
+        ),
+        "resource_observer": (
+            expected_preflight_path + "/logs/preflight__observer.jsonl"
+        ),
+        "runtime_resource_windows": (
+            expected_preflight_path
+            + "/preflight_control/runtime_resource_windows.jsonl"
+        ),
+        "startup_admission": (
+            expected_preflight_path
+            + "/admissions/"
+            "preflight_cpu_startup__fb2850630e589e017d27195c1ca9828b1"
+            "b20f273618f7ad296ec633059526464.json"
+        ),
+        "final_plan": (
+            "artifacts/closeout/historical-canonical-512-v1/"
+            "checkpoint_plan_final__4c5ecb55501fa6b0.json"
+        ),
+        "candidate_manifest": (
+            "artifacts/closeout/historical-canonical-512-v1/"
+            "candidate_manifest__4c5ecb55501fa6b0.json"
+        ),
+    }
+    if any(
+        preflight[name].get("path") != expected_preflight_files[name]
+        for name in preflight_files
+    ):
+        raise CanonicalScreeningError(
+            "4c5 preflight file identity differs"
+        )
+    bound = {
+        name: _validate_bound_file(
+            repo_root, preflight[name], f"4c5 {name}"
+        )
+        for name in preflight_files
+    }
+    summary = load_json(Path(bound["controller_summary"]["path"]), "4c5 summary")
+    terminal = load_json(
+        Path(bound["controller_terminal"]["path"]), "4c5 terminal"
+    )
+    wrapper = load_json(Path(bound["wrapper_exit"]["path"]), "4c5 wrapper")
+    plan = load_json(Path(bound["final_plan"]["path"]), "4c5 final plan")
+    manifest = load_json(
+        Path(bound["candidate_manifest"]["path"]), "4c5 candidate manifest"
+    )
+    if (
+        summary.get("policy_sha256") != policy_sha
+        or summary.get("preflight")
+        != {
+            "completed": 193,
+            "invalid": 0,
+            "request_count": 193,
+            "reused": 0,
+            "valid": 193,
+        }
+        or terminal.get("status") != "completed"
+        or terminal.get("failure") is not None
+        or terminal.get("result_count") != 193
+        or terminal.get("pending_count") != 0
+        or terminal.get("attempt_claim_count") != 193
+        or terminal.get("attempt_terminal_count") != 193
+        or wrapper.get("exit_code") != 0
+        or wrapper.get("signal") is not None
+        or wrapper.get("launch_failure") is not None
+        or plan.get("checkpoint_plan_sha256")
+        != "c7a9329e58b4a31a8e3094e3a60c4e33451dedad36fcc8c9606a70e70439c1ab"
+        or manifest.get("candidate_manifest_sha256")
+        != "2cd6ba6beeaafe1e6daba605f38668595cb755b826e4a653e474265710751d4e"
+        or manifest.get("candidate_count") != 193
+    ):
+        raise CanonicalScreeningError("4c5 preflight terminal semantics differ")
+
+    failed = _require_mapping(
+        supersedes["failed_ram_probe"], "4c5 failed RAM probe"
+    )
+    expected_failed = {
+        "classification": (
+            "failed_after_latent_generation_before_arcface_inference"
+        ),
+        "generation_candidate_count": 1,
+        "generation_sample_count": 8,
+        "e0_edev_sample_count": 8,
+        "arcface_inference_count": 0,
+        "quality_evaluation_count": 0,
+        "pixel_candidate_count": 0,
+        "completed_step_count": 0,
+        "worker_result_present": False,
+        "ram_budget_sealed": False,
+        "resource_guard_clean": True,
+        "retry_count": 0,
+        "root_cause": (
+            "arcface_execution_probe_provenance_fields_truncated"
+        ),
+        "png_reuse": "forbidden",
+        "reuse": "forbidden",
+        "in_place_retry": "forbidden",
+    }
+    _require_exact_keys(
+        failed,
+        set(expected_failed) | {"root", "files", "png_files"},
+        "4c5 failed RAM probe",
+    )
+    if any(failed[key] != value for key, value in expected_failed.items()):
+        raise CanonicalScreeningError("4c5 failed probe classification differs")
+    root_binding = _require_mapping(failed["root"], "4c5 failed root")
+    expected_failed_path = (
+        "artifacts/closeout/historical-canonical-512-v1/"
+        "ram_probe__4c5ecb55501fa6b0"
+    )
+    failed_root = repo_root.resolve() / expected_failed_path
+    _require_tree_without_symlinks(failed_root, "4c5 failed root")
+    if (
+        root_binding
+        != {
+            "path": expected_failed_path,
+            "digest": (
+                "931962816bb7ec702b4985cee40b447517caf8c402bb09d717d674b676bed2b5"
+            ),
+            "digest_algorithm": (
+                "sha256_relative_posix_nul_content_nul_v1"
+            ),
+        }
+        or not failed_root.is_dir()
+        or sha256_directory_tree(failed_root) != root_binding["digest"]
+    ):
+        raise CanonicalScreeningError("4c5 failed root differs")
+    expected_files = {
+        "controller_claim.json": (
+            "1490c328f70620542e408094fdf5b3126fe633b9d7a434efbd39d1e700410409"
+        ),
+        "input_policy.json": (
+            "31adbbe436b4d5546a6a5c7a1f7bb110ded7601445389991915a46f3c8e36963"
+        ),
+        "admission.json": (
+            "d2f1ecf48bccba9c1616511fe7859549571f041b7ea532fe42ec2449f019f524"
+        ),
+        "probe_spec.json": (
+            "8e824f09317baddf27ef2d4c0a2e5d4a9a76cfbcfa408cf8a88dc6aba879e822"
+        ),
+        "worker.log": (
+            "8123b892d91c79276abcb39866fd25bc6fe3bc864377085ef2c00778f88cdb08"
+        ),
+        "runtime_resource_windows.jsonl": (
+            "13ebd01a8c321274ea8178f009e35893a0ca1f2c996a644f50b3a23ed43d7ea0"
+        ),
+        "probe_result.json": (
+            "8d2401461648ab5f5143978e1f527c32524ef85fbd4f413b3dbed03bc3ac1486"
+        ),
+        "controller_terminal.json": (
+            "75bc421ec34ac0463542e4dc0ee13b9d2b2c7b865cb4d4a6d0d0970f2836a082"
+        ),
+    }
+    expected_pngs = {
+        "000000.png": (
+            "1bc2c6aad34f49afe77d654982bc49cd6105e5726b26a3ba306177df07a1d27b"
+        ),
+        "000001.png": (
+            "b0d5a019429d9c54f2377c7f7bdb48e7fb09fbaeca48b08567d0b2945b996006"
+        ),
+        "000002.png": (
+            "185f7fba318c2828ae3d4895221ee81bf20de0f9fc692606fa0f8245acfb2e8d"
+        ),
+        "000003.png": (
+            "c089a5ea492221896a8e75dd244fb20129786efcd45572398833ecf36697d3a0"
+        ),
+        "000004.png": (
+            "00a790fdc0b23d6637dae29c706c01637b951c08d1e63020c57a33e09dcb4146"
+        ),
+        "000005.png": (
+            "2fa8bc05083d43bea1ddc3a86b1e64da224e21324f1bb28d1492bcbe773f6b68"
+        ),
+        "000006.png": (
+            "e42fa5e6450d5bc9b6662502e3c5d1272046870a7c6edf98a0a952020b9c309e"
+        ),
+        "000007.png": (
+            "a9535e8876f8635ebbbf05bd65c4708c89d993a269008ffd8988452b031cd191"
+        ),
+    }
+    generated = failed_root / "work/latent/generated"
+    top_entries = {path.name for path in failed_root.iterdir()}
+    work_dirs = {
+        str(path.relative_to(failed_root).as_posix())
+        for path in failed_root.rglob("*")
+        if path.is_dir()
+    }
+    if (
+        failed["files"] != expected_files
+        or failed["png_files"] != expected_pngs
+        or top_entries != set(expected_files) | {"work"}
+        or work_dirs != {"work", "work/latent", "work/latent/generated"}
+        or not generated.is_dir()
+        or {path.name for path in generated.iterdir()} != set(expected_pngs)
+        or any(
+            not (failed_root / name).is_file()
+            or sha256_file(failed_root / name) != digest
+            for name, digest in expected_files.items()
+        )
+        or any(
+            not (generated / name).is_file()
+            or sha256_file(generated / name) != digest
+            for name, digest in expected_pngs.items()
+        )
+        or len(list(failed_root.rglob("*"))) != 19
+        or (failed_root / "worker_result.json").exists()
+        or (failed_root / "work/pixel").exists()
+    ):
+        raise CanonicalScreeningError("4c5 failed root files differ")
+
+    claim = load_json(failed_root / "controller_claim.json", "4c5 claim")
+    admission = load_json(failed_root / "admission.json", "4c5 admission")
+    spec = load_json(failed_root / "probe_spec.json", "4c5 spec")
+    result = load_json(failed_root / "probe_result.json", "4c5 result")
+    failed_terminal = load_json(
+        failed_root / "controller_terminal.json", "4c5 failed terminal"
+    )
+    guard = _require_mapping(
+        result.get("runtime_resource_guard"), "4c5 resource guard"
+    )
+    registry = canonical_gpu_registry(admission["authorized_gpu_registry"])
+    if (
+        claim.get("controller_claim_sha256")
+        != canonical_digest(claim, "controller_claim_sha256")
+        or claim.get("controller_claim_sha256")
+        != "5f4c1d9875dfaa5a79cbf3ecf2518c3909cb5e8c1d4b4c63c00adddc81accda5"
+        or admission.get("admission_sha256")
+        != canonical_digest(admission, "admission_sha256")
+        or admission.get("admission_sha256")
+        != "54f05e25ff9dcf43ddbaf6dd6b9c6317b70974f60fbbce4adf8fe46cab7d08c7"
+        or admission.get("admission_evidence_sha256")
+        != ram_probe_admission_evidence_digest(admission)
+        or admission.get("admission_evidence_sha256")
+        != "9b468cb4c0f08cf4c82c67280ed4e89d11c6b60c7d2532fcc63260af408f919e"
+        or spec.get("probe_contract_sha256")
+        != ram_probe_contract_digest(spec)
+        or spec.get("probe_contract_sha256")
+        != "1dba8a3d3cafe22d35c02978828e3df3c9fe69e7cd98cf22bd238e6ffd7ffcd4"
+        or spec.get("probe_execution_sha256")
+        != ram_probe_execution_digest(
+            spec["probe_contract_sha256"],
+            registry,
+            admission["admission_evidence_sha256"],
+        )
+        or spec.get("probe_execution_sha256")
+        != "caaeabaac0877cd3c1ec9e3f0445787b7662250e54a3abde095e6a912a1d260e"
+        or admission.get("probe_execution_sha256")
+        != spec["probe_execution_sha256"]
+        or result.get("probe_result_sha256")
+        != canonical_digest(result, "probe_result_sha256")
+        or result.get("probe_result_sha256")
+        != "924a0c4205b36147818229cea7eab0b1f6189f6aee20f24d739153969a9fa5a8"
+        or result.get("status") != "failed"
+        or result.get("worker_returncode") != 1
+        or result.get("retry_count") != 0
+        or result.get("worker_result_sha256") is not None
+        or result.get("worker_vmhwm_bytes") is not None
+        or result.get("ram_budget_basis_bytes") is not None
+        or result.get("ram_slot_budget_bytes") is not None
+        or result.get("peak_sampled_process_tree_rss_bytes") != 2384474112
+        or guard.get("violated") is not False
+        or guard.get("violation_reason") is not None
+        or guard.get("thread_failure") is not None
+        or guard.get("samples", {}).get("sha256")
+        != expected_files["runtime_resource_windows.jsonl"]
+        or failed_terminal.get("controller_terminal_sha256")
+        != canonical_digest(
+            failed_terminal, "controller_terminal_sha256"
+        )
+        or failed_terminal.get("controller_terminal_sha256")
+        != "3ee51f870d5b87bb16079a56f3d41db1d32da2679d03f961d284768cd22cdfcc"
+        or failed_terminal.get("controller_claim_sha256")
+        != claim["controller_claim_sha256"]
+        or failed_terminal.get("status") != "failed"
+        or failed_terminal.get("stage") != "worker_execution"
+        or failed_terminal.get("worker_started") is not True
+        or failed_terminal.get("worker_result_present") is not False
+        or failed_terminal.get("probe_result_present") is not True
+        or failed_terminal.get("retry_count") != 0
+    ):
+        raise CanonicalScreeningError("4c5 failed probe evidence chain differs")
+    windows = [
+        json.loads(line)
+        for line in (
+            failed_root / "runtime_resource_windows.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    worker_lines = (
+        failed_root / "worker.log"
+    ).read_text(encoding="utf-8").splitlines()
+    binding = json.loads(worker_lines[0])
+    uuid = "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+    if (
+        len(windows) != 5
+        or any(
+            window.get("resource_window_sha256")
+            != canonical_digest(window, "resource_window_sha256")
+            or window.get("violated") is not False
+            or window.get("swap_consecutive_io") != 0
+            for window in windows
+        )
+        or binding.get("physical_gpu_uuid") != uuid
+        or binding.get("runtime_cuda_uuid") != uuid
+        or binding.get("cuda_visible_devices") != uuid
+        or binding.get("logical_cuda_index") != 0
+        or "ArcFace execution probe provenance fields are not canonical"
+        not in "\n".join(worker_lines[1:])
+        or "_production_face_analyzer_factory" in "\n".join(worker_lines)
+    ):
+        raise CanonicalScreeningError("4c5 failed runtime evidence differs")
+    return dict(supersedes)
+
+
 def validate_supersession_evidence(
     repo_root: Path, raw_supersedes: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -1891,6 +2443,11 @@ def validate_supersession_evidence(
         == "fe9b41136f0b9fa31ce210dfaa5500c3f46f071838ed91288878f57073502060"
     ):
         return _validate_fe9_supersession_evidence(repo_root, supersedes)
+    if (
+        supersedes.get("policy_sha256")
+        == "4c5ecb55501fa6b09b63377e892f1cee3e0140abd2a02859d33b9b33375a1576"
+    ):
+        return _validate_4c5_supersession_evidence(repo_root, supersedes)
     if (
         supersedes.get("policy_sha256")
         == "ea7ae71fd662526b9a45bf3cc6d283884aefc380b292c8f273169a35f42ffc28"
@@ -2763,8 +3320,10 @@ def validate_policy(
         path = Path(str(arcface["model_root"])) / "models" / str(arcface["model_name"]) / filename
         if not path.is_file() or sha256_file(path) != expected:
             raise CanonicalScreeningError(f"ArcFace asset mismatch: {path}")
-    arcface["execution_probe"] = _validate_bound_file(
-        root, arcface["execution_probe"], "ArcFace execution probe"
+    arcface["execution_probe"] = validate_arcface_execution_probe_binding(
+        root,
+        arcface["execution_probe"],
+        arcface_contract=arcface,
     )
     output_decoder_registry = _validate_output_decoder_registry(
         root,
