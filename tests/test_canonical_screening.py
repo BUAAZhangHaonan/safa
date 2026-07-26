@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import sys
 import types
 
@@ -11,6 +12,7 @@ import pytest
 
 from safa.closeout.canonical_screening import (
     CanonicalScreeningError,
+    _validate_ram_slot_budget_source,
     build_candidate_manifest,
     build_checkpoint_plan,
     build_preflight_result,
@@ -805,6 +807,331 @@ def test_ram_probe_selects_largest_checkpoint_per_output_space(
         (row["output_space"], row["candidate_id"], row["checkpoint_size_bytes"])
         for row in selected
     ] == [("latent", "latent-1", 7), ("pixel", "pixel-0", 5)]
+
+
+def test_ram_probe_manifest_uses_current_plan_and_candidate_validators(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _ram_probe_module()
+    plan_path = tmp_path / "plan.json"
+    plan = {"preflight_result_root": str((tmp_path / "preflight").resolve())}
+    write_exclusive_json(plan_path, plan)
+    manifest = {
+        "checkpoint_plan": _bound(plan_path),
+        "candidates": [{"candidate_id": "candidate"}],
+    }
+    manifest_path = tmp_path / "manifest.json"
+    write_exclusive_json(manifest_path, manifest)
+    policy = {"policy_sha256": "1" * 64}
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        module,
+        "validate_checkpoint_plan",
+        lambda value, **kwargs: calls.append(
+            ("plan", (value, kwargs["policy"]))
+        )
+        or value,
+    )
+    monkeypatch.setattr(
+        module,
+        "validate_candidate_manifest",
+        lambda value, **kwargs: calls.append(
+            ("manifest", (value, kwargs["policy"]))
+        )
+        or value,
+    )
+    assert module._validate_manifest_envelope(manifest_path, policy) == manifest
+    assert calls == [
+        ("plan", (plan, policy)),
+        ("manifest", (manifest, policy)),
+    ]
+    manifest["checkpoint_plan"]["sha256"] = "0" * 64
+    manifest_path.write_bytes(canonical_json(manifest))
+    with pytest.raises(CanonicalScreeningError, match="plan binding"):
+        module._validate_manifest_envelope(manifest_path, policy)
+
+
+def _sealed_ram_probe_fixture(tmp_path: Path) -> tuple[dict, int]:
+    purpose = "resource_measurement_only_scientific_reuse_forbidden"
+    gpu_uuid = "GPU-fixture-0"
+    input_file = tmp_path / "input.json"
+    input_file.write_text("{}\n", encoding="utf-8")
+    input_binding = _bound(input_file)
+    policy_snapshot = tmp_path / "input_policy.json"
+    policy_snapshot.write_text('{"policy":"probe"}\n', encoding="utf-8")
+    policy_binding = {
+        "path": str((tmp_path / "live-policy.json").resolve()),
+        "sha256": hashlib.sha256(policy_snapshot.read_bytes()).hexdigest(),
+        "canonical_sha256": "1" * 64,
+        "snapshot": _bound(policy_snapshot),
+    }
+    selected = [
+        {
+            "candidate_id": f"{space}-candidate",
+            "checkpoint_sha256": str(index + 2) * 64,
+            "checkpoint_model": "raw",
+            "checkpoint_size_bytes": 100 + index,
+            "output_space": space,
+            "output_contract_sha256": str(index + 4) * 64,
+        }
+        for index, space in enumerate(("latent", "pixel"))
+    ]
+    registry = [
+        {
+            "physical_gpu_index": index,
+            "physical_gpu_uuid": (
+                gpu_uuid if index == 0 else f"GPU-fixture-{index}"
+            ),
+        }
+        for index in range(4)
+    ]
+    spec = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_screening_ram_probe_v1",
+        "purpose": purpose,
+        "policy": policy_binding,
+        "candidate_manifest": input_binding,
+        "selected_candidates": selected,
+        "sample_manifest": input_binding,
+        "sample_count": 8,
+        "seed": 4549,
+        "batch_size": 2,
+        "authorized_gpu_registry": registry,
+        "artifact_root": str(tmp_path.resolve()),
+        "implementations": {"worker": input_binding},
+        "retry_count": 0,
+        "probe_sha256": None,
+    }
+    spec["probe_sha256"] = canonical_digest(spec, "probe_sha256")
+    write_exclusive_json(tmp_path / "probe_spec.json", spec)
+    admission = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_screening_ram_probe_admission_v1",
+        "probe_sha256": spec["probe_sha256"],
+        "host": {},
+        "gpu_snapshot": [],
+        "authorized_gpu_registry": registry,
+        "observed_at": "2026-07-26T00:00:00+00:00",
+    }
+    admission["admission_sha256"] = canonical_digest(
+        admission, "admission_sha256"
+    )
+    write_exclusive_json(tmp_path / "admission.json", admission)
+    worker = {
+        "schema_version": 1,
+        "contract_type": (
+            "safa_canonical_screening_ram_probe_worker_result_v1"
+        ),
+        "probe_sha256": spec["probe_sha256"],
+        "purpose": purpose,
+        "device_binding": {
+            "physical_gpu_index": 0,
+            "physical_gpu_uuid": gpu_uuid,
+            "logical_cuda_index": 0,
+            "runtime_cuda_uuid": gpu_uuid,
+            "cuda_visible_devices": gpu_uuid,
+        },
+        "steps": [
+            {
+                **descriptor,
+                "sample_count": 8,
+                "generated_png_manifest_sha256": "8" * 64,
+            }
+            for descriptor in selected
+        ],
+        "worker_vmhwm_bytes": 900,
+        "completed_at": "2026-07-26T00:01:00+00:00",
+    }
+    worker["worker_result_sha256"] = canonical_digest(
+        worker, "worker_result_sha256"
+    )
+    write_exclusive_json(tmp_path / "worker_result.json", worker)
+    worker_log = tmp_path / "worker.log"
+    worker_log.write_text("probe\n", encoding="utf-8")
+    peak = 1000
+    budget = 1100
+    method = (
+        "ceil(peak_sampled_process_tree_rss_bytes*11/10);"
+        "sampled_every_0.1s_not_a_mathematical_instantaneous_peak"
+    )
+    result = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_screening_ram_probe_result_v1",
+        "status": "succeeded",
+        "purpose": purpose,
+        "probe_sha256": spec["probe_sha256"],
+        "admission_sha256": admission["admission_sha256"],
+        "worker_result_sha256": worker["worker_result_sha256"],
+        "worker_log_sha256": hashlib.sha256(worker_log.read_bytes()).hexdigest(),
+        "worker_returncode": 0,
+        "termination": None,
+        "peak_sampled_process_tree_rss_bytes": peak,
+        "worker_vmhwm_bytes": 900,
+        "ram_slot_budget_bytes": budget,
+        "budget_method": method,
+        "measurement_factor_numerator": 11,
+        "measurement_factor_denominator": 10,
+        "runtime_resource_guard": {
+            "violated": False,
+            "violation_reason": None,
+            "thread_failure": None,
+        },
+        "failure": None,
+        "retry_count": 0,
+        "completed_at": "2026-07-26T00:02:00+00:00",
+    }
+    result["probe_result_sha256"] = canonical_digest(
+        result, "probe_result_sha256"
+    )
+    result_path = tmp_path / "probe_result.json"
+    write_exclusive_json(result_path, result)
+    source = {
+        "contract_type": "safa_canonical_screening_ram_budget_source_v1",
+        "method": method,
+        "measurement_factor_numerator": 11,
+        "measurement_factor_denominator": 10,
+        "peak_sampled_process_tree_rss_bytes": peak,
+        "ram_slot_budget_bytes": budget,
+        "probe_result": _bound(result_path),
+    }
+    return source, budget
+
+
+@pytest.mark.parametrize(
+    ("artifact", "field", "value", "message"),
+    (
+        ("probe_result.json", "status", "failed", "semantics"),
+        ("probe_spec.json", "purpose", "scientific", "evidence chain"),
+        ("admission.json", "probe_sha256", "0" * 64, "evidence chain"),
+        (
+            "worker_result.json",
+            "device_binding",
+            {
+                "physical_gpu_index": 0,
+                "physical_gpu_uuid": "GPU-tampered",
+                "logical_cuda_index": 0,
+                "runtime_cuda_uuid": "GPU-tampered",
+                "cuda_visible_devices": "GPU-tampered",
+            },
+            "evidence chain",
+        ),
+    ),
+)
+def test_sealed_ram_probe_chain_rejects_tamper(
+    tmp_path: Path,
+    artifact: str,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    source, budget = _sealed_ram_probe_fixture(tmp_path)
+    assert (
+        _validate_ram_slot_budget_source(
+            tmp_path, source, declared_budget_bytes=budget
+        )["ram_slot_budget_bytes"]
+        == budget
+    )
+    path = tmp_path / artifact
+    changed = load_json(path, "tampered RAM probe artifact")
+    changed[field] = value
+    digest_fields = {
+        "probe_result.json": "probe_result_sha256",
+        "probe_spec.json": "probe_sha256",
+        "admission.json": "admission_sha256",
+        "worker_result.json": "worker_result_sha256",
+    }
+    changed[digest_fields[artifact]] = canonical_digest(
+        changed, digest_fields[artifact]
+    )
+    path.write_bytes(canonical_json(changed))
+    if artifact == "probe_result.json":
+        source["probe_result"] = _bound(path)
+    with pytest.raises(CanonicalScreeningError, match=message):
+        _validate_ram_slot_budget_source(
+            tmp_path, source, declared_budget_bytes=budget
+        )
+
+
+def test_ram_probe_sampler_exception_terminates_and_reaps_worker_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _ram_probe_module()
+
+    class Process:
+        pid = 123
+
+        def poll(self):
+            return None
+
+    class Guard:
+        def raise_if_violated(self) -> None:
+            return None
+
+    cleanup_calls: list[int] = []
+    monkeypatch.setattr(
+        module,
+        "_sample_or_reap_process_tree",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("sampler injected")),
+    )
+    monkeypatch.setattr(
+        module,
+        "_terminate_process_group",
+        lambda process: (
+            cleanup_calls.append(process.pid)
+            or {
+                "term_sent": True,
+                "kill_sent": False,
+                "reaped_returncode": -15,
+            }
+        ),
+    )
+    peak, returncode, failure, termination = module._monitor_probe_process(
+        Process(), {}, Guard()
+    )
+    assert peak == 0
+    assert returncode == -15
+    assert failure == "RuntimeError: sampler injected"
+    assert termination["term_sent"] is True
+    assert cleanup_calls == [123]
+
+
+def test_ram_probe_process_group_cleanup_escalates_to_kill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _ram_probe_module()
+
+    class Process:
+        pid = 456
+        returncode = None
+        waits = 0
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout: int):
+            assert timeout == 10
+            self.waits += 1
+            if self.waits == 1:
+                raise subprocess.TimeoutExpired("probe", timeout)
+            self.returncode = -9
+            return self.returncode
+
+    process = Process()
+    signals: list[tuple[int, object]] = []
+    monkeypatch.setattr(module.os, "getpgid", lambda _pid: process.pid)
+    monkeypatch.setattr(
+        module.os, "killpg", lambda pgid, sig: signals.append((pgid, sig))
+    )
+    result = module._terminate_process_group(process)
+    assert result == {
+        "term_sent": True,
+        "kill_sent": True,
+        "reaped_returncode": -9,
+    }
+    assert signals == [
+        (process.pid, module.signal.SIGTERM),
+        (process.pid, module.signal.SIGKILL),
+    ]
 
 
 def test_screen512_gate_requires_exact_primary_repeat_smoke(

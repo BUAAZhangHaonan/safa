@@ -266,7 +266,7 @@
     },
     "screening_contracts": {
       "path": "src/safa/closeout/canonical_screening.py",
-      "sha256": "86f144963f470398c4801f9862c67dcfacd0b112ba8b3f373bffd5bb33e24fa6"
+      "sha256": "3cf1465407406884a83463bbd05c4eb5490011d7cf906ebd57d808e7aa33af4b"
     },
     "screening_worker": {
       "path": "src/safa/closeout/canonical_screening_worker.py",
@@ -278,7 +278,7 @@
     },
     "ram_probe_launcher": {
       "path": "scripts/run_canonical_screening_ram_probe.py",
-      "sha256": "08f2484aaa7348e69fb3faa9103197b7bf8f9663ed45989a90b50d728045e727"
+      "sha256": "d3792f1e19686d9d63f9b4610412a6c7548680b3abbd340a1c847330afb6d4f5"
     },
     "preflight_wrapper": {
       "path": "scripts/run_canonical_preflight_wrapper.py",

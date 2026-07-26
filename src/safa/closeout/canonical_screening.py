@@ -1274,6 +1274,244 @@ def _validate_output_decoder_registry(
     return normalized
 
 
+def _validate_ram_slot_budget_source(
+    repo_root: Path,
+    raw_source: Mapping[str, Any],
+    *,
+    declared_budget_bytes: int,
+) -> dict[str, Any]:
+    source = _require_mapping(raw_source, "RAM slot budget source")
+    _require_exact_keys(
+        source,
+        {
+            "contract_type",
+            "method",
+            "measurement_factor_numerator",
+            "measurement_factor_denominator",
+            "peak_sampled_process_tree_rss_bytes",
+            "ram_slot_budget_bytes",
+            "probe_result",
+        },
+        "RAM slot budget source",
+    )
+    probe_binding = _validate_bound_file(
+        repo_root, source["probe_result"], "RAM slot budget probe result"
+    )
+    probe_path = Path(probe_binding["path"])
+    result = load_json(probe_path, "RAM slot budget probe result")
+    _require_exact_keys(
+        result,
+        {
+            "schema_version",
+            "contract_type",
+            "status",
+            "purpose",
+            "probe_sha256",
+            "admission_sha256",
+            "worker_result_sha256",
+            "worker_log_sha256",
+            "worker_returncode",
+            "termination",
+            "peak_sampled_process_tree_rss_bytes",
+            "worker_vmhwm_bytes",
+            "ram_slot_budget_bytes",
+            "budget_method",
+            "measurement_factor_numerator",
+            "measurement_factor_denominator",
+            "runtime_resource_guard",
+            "failure",
+            "retry_count",
+            "completed_at",
+            "probe_result_sha256",
+        },
+        "RAM slot budget probe result",
+    )
+    expected_method = (
+        "ceil(peak_sampled_process_tree_rss_bytes*11/10);"
+        "sampled_every_0.1s_not_a_mathematical_instantaneous_peak"
+    )
+    peak = result["peak_sampled_process_tree_rss_bytes"]
+    budget = result["ram_slot_budget_bytes"]
+    numerator = result["measurement_factor_numerator"]
+    denominator = result["measurement_factor_denominator"]
+    if (
+        result["schema_version"] != 1
+        or result["contract_type"]
+        != "safa_canonical_screening_ram_probe_result_v1"
+        or result["status"] != "succeeded"
+        or result["purpose"]
+        != "resource_measurement_only_scientific_reuse_forbidden"
+        or result["failure"] is not None
+        or result["retry_count"] != 0
+        or result["worker_returncode"] != 0
+        or result["termination"] is not None
+        or result["budget_method"] != expected_method
+        or numerator != 11
+        or denominator != 10
+        or type(peak) is not int
+        or peak <= 0
+        or type(budget) is not int
+        or budget != (peak * numerator + denominator - 1) // denominator
+        or result["probe_result_sha256"]
+        != canonical_digest(result, "probe_result_sha256")
+    ):
+        raise CanonicalScreeningError("sealed RAM probe result semantics differ")
+    for field in (
+        "probe_sha256",
+        "admission_sha256",
+        "worker_result_sha256",
+        "worker_log_sha256",
+        "probe_result_sha256",
+    ):
+        _require_sha256(result[field], f"RAM probe result {field}")
+    guard = _require_mapping(
+        result["runtime_resource_guard"], "RAM probe runtime resource guard"
+    )
+    if (
+        guard.get("violated") is not False
+        or guard.get("violation_reason") is not None
+        or guard.get("thread_failure") is not None
+    ):
+        raise CanonicalScreeningError(
+            "sealed RAM probe runtime resource guard is not clean"
+        )
+
+    artifact_root = probe_path.parent
+    spec = load_json(artifact_root / "probe_spec.json", "RAM probe spec")
+    admission = load_json(
+        artifact_root / "admission.json", "RAM probe admission"
+    )
+    worker = load_json(
+        artifact_root / "worker_result.json", "RAM probe worker result"
+    )
+    if (
+        spec.get("contract_type") != "safa_canonical_screening_ram_probe_v1"
+        or spec.get("purpose") != result["purpose"]
+        or spec.get("probe_sha256")
+        != canonical_digest(spec, "probe_sha256")
+        or spec.get("probe_sha256") != result["probe_sha256"]
+        or admission.get("contract_type")
+        != "safa_canonical_screening_ram_probe_admission_v1"
+        or admission.get("admission_sha256")
+        != canonical_digest(admission, "admission_sha256")
+        or admission.get("admission_sha256") != result["admission_sha256"]
+        or admission.get("probe_sha256") != result["probe_sha256"]
+        or worker.get("contract_type")
+        != "safa_canonical_screening_ram_probe_worker_result_v1"
+        or worker.get("worker_result_sha256")
+        != canonical_digest(worker, "worker_result_sha256")
+        or worker.get("worker_result_sha256")
+        != result["worker_result_sha256"]
+        or worker.get("probe_sha256") != result["probe_sha256"]
+        or worker.get("purpose") != result["purpose"]
+    ):
+        raise CanonicalScreeningError("sealed RAM probe evidence chain differs")
+    log_path = artifact_root / "worker.log"
+    if not log_path.is_file() or sha256_file(log_path) != result["worker_log_sha256"]:
+        raise CanonicalScreeningError("sealed RAM probe worker log binding differs")
+
+    for label in ("candidate_manifest", "sample_manifest"):
+        binding = _require_mapping(spec.get(label), f"RAM probe {label}")
+        bound_path = Path(str(binding.get("path", ""))).resolve()
+        if (
+            not bound_path.is_file()
+            or sha256_file(bound_path) != binding.get("sha256")
+        ):
+            raise CanonicalScreeningError(
+                f"sealed RAM probe {label} input binding differs"
+            )
+    policy_binding = _require_mapping(spec.get("policy"), "RAM probe policy")
+    snapshot = _require_mapping(
+        policy_binding.get("snapshot"), "RAM probe policy snapshot"
+    )
+    snapshot_path = Path(str(snapshot.get("path", ""))).resolve()
+    if (
+        not snapshot_path.is_file()
+        or sha256_file(snapshot_path) != snapshot.get("sha256")
+        or snapshot.get("sha256") != policy_binding.get("sha256")
+    ):
+        raise CanonicalScreeningError(
+            "sealed RAM probe policy snapshot binding differs"
+        )
+    implementations = _require_mapping(
+        spec.get("implementations"), "RAM probe implementations"
+    )
+    for name, binding in implementations.items():
+        implementation_path = Path(str(binding.get("path", ""))).resolve()
+        if (
+            not implementation_path.is_file()
+            or sha256_file(implementation_path) != binding.get("sha256")
+        ):
+            raise CanonicalScreeningError(
+                f"sealed RAM probe implementation binding differs: {name}"
+            )
+
+    registry = admission.get("authorized_gpu_registry")
+    expected_indices = [0, 1, 2, 3]
+    if (
+        not isinstance(registry, list)
+        or [row.get("physical_gpu_index") for row in registry]
+        != expected_indices
+        or len({row.get("physical_gpu_uuid") for row in registry}) != 4
+        or spec.get("authorized_gpu_registry") != registry
+    ):
+        raise CanonicalScreeningError(
+            "sealed RAM probe authorized GPU registry differs"
+        )
+    device = _require_mapping(
+        worker.get("device_binding"), "RAM probe worker device"
+    )
+    if (
+        device.get("physical_gpu_index") != 0
+        or device.get("physical_gpu_uuid")
+        != registry[0]["physical_gpu_uuid"]
+        or device.get("logical_cuda_index") != 0
+        or device.get("runtime_cuda_uuid")
+        != registry[0]["physical_gpu_uuid"]
+        or device.get("cuda_visible_devices")
+        != registry[0]["physical_gpu_uuid"]
+    ):
+        raise CanonicalScreeningError(
+            "sealed RAM probe worker device binding differs"
+        )
+    selected = spec.get("selected_candidates")
+    steps = worker.get("steps")
+    if (
+        not isinstance(selected, list)
+        or not isinstance(steps, list)
+        or [row.get("output_space") for row in selected]
+        != ["latent", "pixel"]
+        or len(steps) != len(selected)
+    ):
+        raise CanonicalScreeningError(
+            "sealed RAM probe candidate coverage differs"
+        )
+    for descriptor, step in zip(selected, steps, strict=True):
+        if (
+            any(step.get(key) != value for key, value in descriptor.items())
+            or step.get("sample_count") != 8
+        ):
+            raise CanonicalScreeningError(
+                "sealed RAM probe worker step binding differs"
+            )
+
+    if (
+        source["contract_type"]
+        != "safa_canonical_screening_ram_budget_source_v1"
+        or source["method"] != expected_method
+        or source["measurement_factor_numerator"] != numerator
+        or source["measurement_factor_denominator"] != denominator
+        or source["peak_sampled_process_tree_rss_bytes"] != peak
+        or source["ram_slot_budget_bytes"] != budget
+        or declared_budget_bytes != budget
+    ):
+        raise CanonicalScreeningError("sealed RAM slot budget differs")
+    return {
+        **dict(source),
+        "probe_result": probe_binding,
+    }
+
+
 def validate_policy(
     repo_root: Path,
     policy_path: Path,
@@ -1477,49 +1715,13 @@ def validate_policy(
             raise CanonicalScreeningError(
                 "sealed resource policy omits its RAM budget contract"
             )
-        source = _require_mapping(
-            resources["ram_slot_budget_source"], "RAM slot budget source"
-        )
-        _require_exact_keys(
-            source,
-            {
-                "contract_type",
-                "method",
-                "measurement_factor_numerator",
-                "measurement_factor_denominator",
-                "peak_process_tree_rss_bytes",
-                "ram_slot_budget_bytes",
-                "probe_result",
-            },
-            "RAM slot budget source",
-        )
-        probe_result = _validate_bound_file(
-            root, source["probe_result"], "RAM slot budget probe result"
-        )
-        peak = source["peak_process_tree_rss_bytes"]
-        numerator = source["measurement_factor_numerator"]
-        denominator = source["measurement_factor_denominator"]
-        budget = source["ram_slot_budget_bytes"]
-        if (
-            source["contract_type"]
-            != "safa_canonical_screening_ram_budget_source_v1"
-            or source["method"]
-            != "ceil(single_worker_process_tree_peak_rss_bytes*11/10)"
-            or numerator != 11
-            or denominator != 10
-            or type(peak) is not int
-            or peak <= 0
-            or type(budget) is not int
-            or budget != (peak * numerator + denominator - 1) // denominator
-            or resources["ram_slot_budget_bytes"] != budget
-        ):
-            raise CanonicalScreeningError("sealed RAM slot budget differs")
         resources = {
             **dict(resources),
-            "ram_slot_budget_source": {
-                **dict(source),
-                "probe_result": probe_result,
-            },
+            "ram_slot_budget_source": _validate_ram_slot_budget_source(
+                root,
+                resources["ram_slot_budget_source"],
+                declared_budget_bytes=resources["ram_slot_budget_bytes"],
+            ),
         }
 
     arcface = _require_mapping(raw["arcface"], "ArcFace binding")
