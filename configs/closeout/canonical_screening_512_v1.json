@@ -3,49 +3,74 @@
   "contract_type": "safa_canonical_screening_policy_v1",
   "campaign_id": "historical-canonical-512-v1",
   "supersedes": {
-      "policy_sha256": "310f5b539315d3bc957530856c0f810bf5b32afc97469fdb9467bf3facdc9cda",
-      "previous_policy_sha256": "c83b95e0ca49a0cf5b5b3d67c337000a31b8d2a3299d434fc1051256f18fea50",
-    "classification": "started_incomplete",
+    "policy_sha256": "5d51185345983fbf9bc2924f43d5a4b671674398581824753c0c155c4cdda2db",
+    "previous_policy_sha256": "310f5b539315d3bc957530856c0f810bf5b32afc97469fdb9467bf3facdc9cda",
+    "classification": "completed_preflight_superseded",
     "phase": "preflight",
-    "stage": "startup_admission_before_controller_claim",
-      "request_count": 193,
-      "result_count": 0,
-      "pending_count": 193,
-      "checkpoint_attempt_claim_count": 0,
-      "checkpoint_attempt_terminal_count": 0,
-      "wrapper_claim_count": 1,
-      "generated_png_count": 0,
-      "startup_cpu_observed_percent": 89.1,
-      "superseded_cpu_admission_percent": 85,
-      "successor_cpu_admission_percent": 90,
-      "failure_message": "CPU admission failed: 89.10% >= 85%",
-      "scientific_result_reuse": "forbidden",
-      "successor_execution": "fresh_full_193_preflight",
+    "stage": "completed_preflight_candidate_manifest_prepared_before_gpu",
+    "request_count": 193,
+    "result_count": 193,
+    "valid_count": 193,
+    "invalid_count": 0,
+    "reused_count": 0,
+    "pending_count": 0,
+    "attempt_claim_count": 193,
+    "attempt_terminal_count": 193,
+    "candidate_count": 193,
+    "run_request_count": 0,
+    "generated_png_count": 0,
+    "supersession_reason": "implementation_and_policy_contract_upgrade",
+    "scientific_result_reuse": "forbidden",
+    "successor_execution": "fresh_full_193_preflight",
     "evidence_root": {
-          "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/310f5b539315d3bc957530856c0f810bf5b32afc97469fdb9467bf3facdc9cda",
-          "digest": "c7db1ea3f6f220d684f90b76528e19c7efe5b97b5ac159e56b87f292e7cb4c48",
+      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/5d51185345983fbf9bc2924f43d5a4b671674398581824753c0c155c4cdda2db",
+      "digest": "7a1c0fba3e7a50b748854d58987a0f21412c1f31849abea87c4f5ef639ecb60e",
       "digest_algorithm": "sha256_relative_posix_nul_content_nul_v1"
     },
-    "checkpoint_plan": {
-      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/310f5b539315d3bc957530856c0f810bf5b32afc97469fdb9467bf3facdc9cda/checkpoint_plan.json",
-      "sha256": "f1d55a36af075644b4a7aff2cd141c89fd8fe4891259a00d7d651e0dfd79b7c7"
+    "controller_claim": {
+      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/5d51185345983fbf9bc2924f43d5a4b671674398581824753c0c155c4cdda2db/preflight_control/controller_claim.json",
+      "sha256": "88b19231e5d430c112c70cc406c01a7470967d9fde5d0e9fab9c7c1040ddee61"
     },
-      "wrapper_claim": {
-          "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/310f5b539315d3bc957530856c0f810bf5b32afc97469fdb9467bf3facdc9cda/preflight_control/wrapper_claim.json",
-          "sha256": "a30e34bc24f2431feb239f7031398bab010041cb7bde9d3ac733778a97bbff03"
-      },
-      "wrapper_exit": {
-          "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/310f5b539315d3bc957530856c0f810bf5b32afc97469fdb9467bf3facdc9cda/preflight_control/wrapper_exit.json",
-          "sha256": "23af1f75256318584638faf9307f0e3bf8d85a96f40c97737aadb9fc29a1fb49"
-      },
-      "controller_process_log": {
-          "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/310f5b539315d3bc957530856c0f810bf5b32afc97469fdb9467bf3facdc9cda/preflight_control/controller_process.log",
-          "sha256": "0ba41522ad5a1bed1ba8bda161e6512ec5960660fef0033290e4bb69c5e05b2a"
-      },
-      "resource_observer": {
-          "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/310f5b539315d3bc957530856c0f810bf5b32afc97469fdb9467bf3facdc9cda/logs/preflight__observer.jsonl",
-          "sha256": "d98ad204e71c889c0a2cfb1a568c679ddce56fb946190e61dc75e5e111e000ba"
-      }
+    "controller_terminal": {
+      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/5d51185345983fbf9bc2924f43d5a4b671674398581824753c0c155c4cdda2db/preflight_control/controller_terminal.json",
+      "sha256": "4a2eb20eefe7f2824d6fe8725c91d3cf5498ac9c50c5c1033fce00ce357096eb"
+    },
+    "controller_summary": {
+      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/5d51185345983fbf9bc2924f43d5a4b671674398581824753c0c155c4cdda2db/preflight_control/controller_summary.json",
+      "sha256": "9c7fbfc40f4255672daf51c11aafc6c683326745d0f4ac96d4ec4eff27efead8"
+    },
+    "wrapper_claim": {
+      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/5d51185345983fbf9bc2924f43d5a4b671674398581824753c0c155c4cdda2db/preflight_control/wrapper_claim.json",
+      "sha256": "990d0d2cfa252ff749757898be8d9fa88d38fc0caac21e0368eb10bde7199a4a"
+    },
+    "wrapper_exit": {
+      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/5d51185345983fbf9bc2924f43d5a4b671674398581824753c0c155c4cdda2db/preflight_control/wrapper_exit.json",
+      "sha256": "dddd29617cf6194074a1c0104cf26943ea5c560f78c9225435b4336bf2df1735"
+    },
+    "resource_monitor": {
+      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/5d51185345983fbf9bc2924f43d5a4b671674398581824753c0c155c4cdda2db/logs/preflight__monitor.jsonl",
+      "sha256": "0ecc2e5dc5c0746c4dfbe77736e618638eaaa8914c234617fe5f69c3e7fcdc0d"
+    },
+    "resource_observer": {
+      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/5d51185345983fbf9bc2924f43d5a4b671674398581824753c0c155c4cdda2db/logs/preflight__observer.jsonl",
+      "sha256": "ad179025f01b92c3409c619f99bc7cfc7d0b027fb586b63783b1691b0ad329e2"
+    },
+    "runtime_resource_windows": {
+      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/5d51185345983fbf9bc2924f43d5a4b671674398581824753c0c155c4cdda2db/preflight_control/runtime_resource_windows.jsonl",
+      "sha256": "6fd8f5b06187a51214192f784f5e5d2a95f31a5f4063abfee500ba7b574fe225"
+    },
+    "startup_admission": {
+      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/5d51185345983fbf9bc2924f43d5a4b671674398581824753c0c155c4cdda2db/admissions/preflight_cpu_startup__057d4a37181d2968966ba4934818888592e286baaf2f398ebd828f2471b606d9.json",
+      "sha256": "a5eef4a438540eba640b9b515b8f70ce7bd9fa9c295ceb91f9eda2d5b5045f76"
+    },
+    "final_plan": {
+      "path": "artifacts/closeout/historical-canonical-512-v1/checkpoint_plan_final__5d51185345983fbf.json",
+      "sha256": "48e4545e641c0f5eb6d5de30c69841af1cb5cc7b979ed5f3af8ffc037b1ec102"
+    },
+    "candidate_manifest": {
+      "path": "artifacts/closeout/historical-canonical-512-v1/candidate_manifest__5d51185345983fbf.json",
+      "sha256": "485f008f31a44d7a6ed946d7e9dff51344eeffa43a08214b0422efcb4d4d2957"
+    }
   },
   "python": "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
   "source": {
@@ -266,7 +291,7 @@
     },
     "screening_contracts": {
       "path": "src/safa/closeout/canonical_screening.py",
-      "sha256": "3cf1465407406884a83463bbd05c4eb5490011d7cf906ebd57d808e7aa33af4b"
+      "sha256": "3569ff2a3cc1ccd371c5260a96a4cbb6d255819f1f9d4c8510eefcf30a9693d2"
     },
     "screening_worker": {
       "path": "src/safa/closeout/canonical_screening_worker.py",
@@ -278,7 +303,7 @@
     },
     "ram_probe_launcher": {
       "path": "scripts/run_canonical_screening_ram_probe.py",
-      "sha256": "d3792f1e19686d9d63f9b4610412a6c7548680b3abbd340a1c847330afb6d4f5"
+      "sha256": "117f5cb7036f294b0e735cdda7a8efab7691b5761983a81994e5bd829a10a502"
     },
     "preflight_wrapper": {
       "path": "scripts/run_canonical_preflight_wrapper.py",

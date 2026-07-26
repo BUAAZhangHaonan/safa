@@ -1004,6 +1004,276 @@ def _validate_310_preflight_supersession_evidence(
     }
 
 
+def _validate_5d_preflight_supersession_evidence(
+    repo_root: Path, raw_supersedes: Mapping[str, Any]
+) -> dict[str, Any]:
+    supersedes = _require_mapping(raw_supersedes, "5d supersession evidence")
+    file_fields = {
+        "controller_claim",
+        "controller_terminal",
+        "controller_summary",
+        "wrapper_claim",
+        "wrapper_exit",
+        "resource_monitor",
+        "resource_observer",
+        "runtime_resource_windows",
+        "startup_admission",
+        "final_plan",
+        "candidate_manifest",
+    }
+    scalar_fields = {
+        "policy_sha256",
+        "previous_policy_sha256",
+        "classification",
+        "phase",
+        "stage",
+        "request_count",
+        "result_count",
+        "valid_count",
+        "invalid_count",
+        "reused_count",
+        "pending_count",
+        "attempt_claim_count",
+        "attempt_terminal_count",
+        "candidate_count",
+        "run_request_count",
+        "generated_png_count",
+        "supersession_reason",
+        "scientific_result_reuse",
+        "successor_execution",
+    }
+    _require_exact_keys(
+        supersedes,
+        scalar_fields | file_fields | {"evidence_root"},
+        "5d supersession evidence",
+    )
+    policy_sha256 = (
+        "5d51185345983fbf9bc2924f43d5a4b671674398581824753c0c155c4cdda2db"
+    )
+    previous_policy_sha256 = (
+        "310f5b539315d3bc957530856c0f810bf5b32afc97469fdb9467bf3facdc9cda"
+    )
+    expected_scalars = {
+        "policy_sha256": policy_sha256,
+        "previous_policy_sha256": previous_policy_sha256,
+        "classification": "completed_preflight_superseded",
+        "phase": "preflight",
+        "stage": "completed_preflight_candidate_manifest_prepared_before_gpu",
+        "request_count": 193,
+        "result_count": 193,
+        "valid_count": 193,
+        "invalid_count": 0,
+        "reused_count": 0,
+        "pending_count": 0,
+        "attempt_claim_count": 193,
+        "attempt_terminal_count": 193,
+        "candidate_count": 193,
+        "run_request_count": 0,
+        "generated_png_count": 0,
+        "supersession_reason": "implementation_and_policy_contract_upgrade",
+        "scientific_result_reuse": "forbidden",
+        "successor_execution": "fresh_full_193_preflight",
+    }
+    if any(supersedes[key] != value for key, value in expected_scalars.items()):
+        raise CanonicalScreeningError("5d supersession status differs")
+
+    evidence_root = _require_mapping(
+        supersedes["evidence_root"], "5d evidence root"
+    )
+    _require_exact_keys(
+        evidence_root,
+        {"path", "digest", "digest_algorithm"},
+        "5d evidence root",
+    )
+    root = _repo_path(
+        repo_root, evidence_root["path"], "5d evidence root", must_exist=False
+    )
+    expected_root = (
+        repo_root.resolve()
+        / "artifacts/closeout/historical-canonical-512-v1/by_policy"
+        / policy_sha256
+    ).resolve()
+    if (
+        root != expected_root
+        or not root.is_dir()
+        or evidence_root["digest_algorithm"]
+        != "sha256_relative_posix_nul_content_nul_v1"
+        or evidence_root["digest"]
+        != "7a1c0fba3e7a50b748854d58987a0f21412c1f31849abea87c4f5ef639ecb60e"
+        or sha256_directory_tree(root) != evidence_root["digest"]
+    ):
+        raise CanonicalScreeningError("5d evidence root binding differs")
+    bound_files = {
+        name: _validate_bound_file(
+            repo_root, supersedes[name], f"5d {name.replace('_', ' ')}"
+        )
+        for name in file_fields
+    }
+    expected_paths = {
+        "controller_claim": root / "preflight_control/controller_claim.json",
+        "controller_terminal": root
+        / "preflight_control/controller_terminal.json",
+        "controller_summary": root
+        / "preflight_control/controller_summary.json",
+        "wrapper_claim": root / "preflight_control/wrapper_claim.json",
+        "wrapper_exit": root / "preflight_control/wrapper_exit.json",
+        "resource_monitor": root / "logs/preflight__monitor.jsonl",
+        "resource_observer": root / "logs/preflight__observer.jsonl",
+        "runtime_resource_windows": root
+        / "preflight_control/runtime_resource_windows.jsonl",
+        "startup_admission": root
+        / "admissions/preflight_cpu_startup__"
+        "057d4a37181d2968966ba4934818888592e286baaf2f398ebd828f2471b606d9.json",
+        "final_plan": repo_root.resolve()
+        / "artifacts/closeout/historical-canonical-512-v1/"
+        "checkpoint_plan_final__5d51185345983fbf.json",
+        "candidate_manifest": repo_root.resolve()
+        / "artifacts/closeout/historical-canonical-512-v1/"
+        "candidate_manifest__5d51185345983fbf.json",
+    }
+    if any(
+        Path(bound_files[name]["path"]).resolve() != path.resolve()
+        for name, path in expected_paths.items()
+    ):
+        raise CanonicalScreeningError("5d bound evidence path differs")
+    expected_file_sha256 = {
+        "controller_claim": (
+            "88b19231e5d430c112c70cc406c01a7470967d9fde5d0e9fab9c7c1040ddee61"
+        ),
+        "controller_terminal": (
+            "4a2eb20eefe7f2824d6fe8725c91d3cf5498ac9c50c5c1033fce00ce357096eb"
+        ),
+        "controller_summary": (
+            "9c7fbfc40f4255672daf51c11aafc6c683326745d0f4ac96d4ec4eff27efead8"
+        ),
+        "wrapper_claim": (
+            "990d0d2cfa252ff749757898be8d9fa88d38fc0caac21e0368eb10bde7199a4a"
+        ),
+        "wrapper_exit": (
+            "dddd29617cf6194074a1c0104cf26943ea5c560f78c9225435b4336bf2df1735"
+        ),
+        "resource_monitor": (
+            "0ecc2e5dc5c0746c4dfbe77736e618638eaaa8914c234617fe5f69c3e7fcdc0d"
+        ),
+        "resource_observer": (
+            "ad179025f01b92c3409c619f99bc7cfc7d0b027fb586b63783b1691b0ad329e2"
+        ),
+        "runtime_resource_windows": (
+            "6fd8f5b06187a51214192f784f5e5d2a95f31a5f4063abfee500ba7b574fe225"
+        ),
+        "startup_admission": (
+            "a5eef4a438540eba640b9b515b8f70ce7bd9fa9c295ceb91f9eda2d5b5045f76"
+        ),
+        "final_plan": (
+            "48e4545e641c0f5eb6d5de30c69841af1cb5cc7b979ed5f3af8ffc037b1ec102"
+        ),
+        "candidate_manifest": (
+            "485f008f31a44d7a6ed946d7e9dff51344eeffa43a08214b0422efcb4d4d2957"
+        ),
+    }
+    if any(
+        bound_files[name]["sha256"] != digest
+        for name, digest in expected_file_sha256.items()
+    ):
+        raise CanonicalScreeningError("5d bound evidence SHA256 differs")
+
+    summary = load_json(
+        Path(bound_files["controller_summary"]["path"]),
+        "5d controller summary",
+    )
+    terminal = load_json(
+        Path(bound_files["controller_terminal"]["path"]),
+        "5d controller terminal",
+    )
+    wrapper_exit = load_json(
+        Path(bound_files["wrapper_exit"]["path"]), "5d wrapper exit"
+    )
+    final_plan = load_json(
+        Path(bound_files["final_plan"]["path"]), "5d final plan"
+    )
+    manifest = load_json(
+        Path(bound_files["candidate_manifest"]["path"]),
+        "5d candidate manifest",
+    )
+    if (
+        summary.get("contract_type")
+        != "safa_canonical_preflight_controller_summary_v1"
+        or summary.get("policy_sha256") != policy_sha256
+        or summary.get("preflight")
+        != {
+            "request_count": 193,
+            "completed": 193,
+            "valid": 193,
+            "invalid": 0,
+            "reused": 0,
+        }
+        or summary.get("counts", {}).get("pending_preflight") != 0
+        or summary.get("counts", {}).get("eligible_candidates") != 193
+        or summary.get("controller_summary_sha256")
+        != canonical_digest(summary, "controller_summary_sha256")
+        or terminal.get("status") != "completed"
+        or terminal.get("failure") is not None
+        or terminal.get("runtime_resource_guard", {}).get("violated") is not False
+        or terminal.get("runtime_resource_guard", {}).get("thread_failure")
+        is not None
+        or wrapper_exit.get("exit_code") != 0
+        or wrapper_exit.get("signal") is not None
+        or wrapper_exit.get("launch_failure") is not None
+        or wrapper_exit.get("policy_sha256") != policy_sha256
+    ):
+        raise CanonicalScreeningError("5d controller completion semantics differ")
+    if (
+        final_plan.get("policy_sha256") != policy_sha256
+        or final_plan.get("checkpoint_plan_sha256")
+        != canonical_digest(final_plan, "checkpoint_plan_sha256")
+        or final_plan.get("counts", {}).get("eligible_candidates") != 193
+        or final_plan.get("counts", {}).get("pending_preflight") != 0
+        or manifest.get("policy_sha256") != policy_sha256
+        or manifest.get("candidate_count") != 193
+        or manifest.get("candidate_manifest_sha256")
+        != canonical_digest(manifest, "candidate_manifest_sha256")
+        or manifest.get("checkpoint_plan", {}).get("canonical_sha256")
+        != final_plan.get("checkpoint_plan_sha256")
+    ):
+        raise CanonicalScreeningError("5d plan/manifest semantics differ")
+
+    requests = sorted((root / "checkpoint_preflight/requests").glob("*.json"))
+    results = sorted((root / "checkpoint_preflight/results").glob("*.json"))
+    claims = sorted((root / "preflight_control/attempts").glob("*.claim.json"))
+    terminals = sorted(
+        (root / "preflight_control/attempts").glob("*.terminal.json")
+    )
+    run_requests = list((root / "run_requests").rglob("*.json"))
+    generated_png = list((root / "runs").rglob("*.png"))
+    if (
+        len(requests) != 193
+        or len(results) != 193
+        or len(claims) != 193
+        or len(terminals) != 193
+        or run_requests
+        or generated_png
+    ):
+        raise CanonicalScreeningError("5d evidence filesystem counts differ")
+    for result_path in results:
+        result = load_json(result_path, "5d preflight result")
+        if (
+            result.get("policy_sha256") != policy_sha256
+            or result.get("strict_result", {}).get("status") != "valid"
+            or result.get("preflight_result_sha256")
+            != canonical_digest(result, "preflight_result_sha256")
+        ):
+            raise CanonicalScreeningError("5d preflight result semantics differ")
+    return {
+        **expected_scalars,
+        "evidence_root": {
+            "path": str(root),
+            "digest": evidence_root["digest"],
+            "digest_algorithm": evidence_root["digest_algorithm"],
+        },
+        **bound_files,
+    }
+
+
 def validate_supersession_evidence(
     repo_root: Path, raw_supersedes: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -1020,6 +1290,13 @@ def validate_supersession_evidence(
         == "310f5b539315d3bc957530856c0f810bf5b32afc97469fdb9467bf3facdc9cda"
     ):
         return _validate_310_preflight_supersession_evidence(
+            repo_root, supersedes
+        )
+    if (
+        supersedes.get("policy_sha256")
+        == "5d51185345983fbf9bc2924f43d5a4b671674398581824753c0c155c4cdda2db"
+    ):
+        return _validate_5d_preflight_supersession_evidence(
             repo_root, supersedes
         )
     return _validate_ea7_smoke_supersession_evidence(repo_root, supersedes)
@@ -1279,6 +1556,7 @@ def _validate_ram_slot_budget_source(
     raw_source: Mapping[str, Any],
     *,
     declared_budget_bytes: int,
+    expected_predecessor_policy_sha256: str,
 ) -> dict[str, Any]:
     source = _require_mapping(raw_source, "RAM slot budget source")
     _require_exact_keys(
@@ -1289,6 +1567,8 @@ def _validate_ram_slot_budget_source(
             "measurement_factor_numerator",
             "measurement_factor_denominator",
             "peak_sampled_process_tree_rss_bytes",
+            "worker_vmhwm_bytes",
+            "ram_budget_basis_bytes",
             "ram_slot_budget_bytes",
             "probe_result",
         },
@@ -1314,6 +1594,7 @@ def _validate_ram_slot_budget_source(
             "termination",
             "peak_sampled_process_tree_rss_bytes",
             "worker_vmhwm_bytes",
+            "ram_budget_basis_bytes",
             "ram_slot_budget_bytes",
             "budget_method",
             "measurement_factor_numerator",
@@ -1327,10 +1608,13 @@ def _validate_ram_slot_budget_source(
         "RAM slot budget probe result",
     )
     expected_method = (
-        "ceil(peak_sampled_process_tree_rss_bytes*11/10);"
-        "sampled_every_0.1s_not_a_mathematical_instantaneous_peak"
+        "ceil(max(peak_sampled_process_tree_rss_bytes,"
+        "worker_vmhwm_bytes)*11/10);sampled_tree_every_0.1s_"
+        "plus_worker_vmhwm_not_a_mathematical_instantaneous_tree_peak"
     )
     peak = result["peak_sampled_process_tree_rss_bytes"]
+    worker_vmhwm = result["worker_vmhwm_bytes"]
+    budget_basis = result["ram_budget_basis_bytes"]
     budget = result["ram_slot_budget_bytes"]
     numerator = result["measurement_factor_numerator"]
     denominator = result["measurement_factor_denominator"]
@@ -1350,8 +1634,12 @@ def _validate_ram_slot_budget_source(
         or denominator != 10
         or type(peak) is not int
         or peak <= 0
+        or type(worker_vmhwm) is not int
+        or worker_vmhwm <= 0
+        or budget_basis != max(peak, worker_vmhwm)
         or type(budget) is not int
-        or budget != (peak * numerator + denominator - 1) // denominator
+        or budget
+        != (budget_basis * numerator + denominator - 1) // denominator
         or result["probe_result_sha256"]
         != canonical_digest(result, "probe_result_sha256")
     ):
@@ -1404,6 +1692,9 @@ def _validate_ram_slot_budget_source(
         != result["worker_result_sha256"]
         or worker.get("probe_sha256") != result["probe_sha256"]
         or worker.get("purpose") != result["purpose"]
+        or type(worker.get("worker_vmhwm_bytes")) is not int
+        or worker.get("worker_vmhwm_bytes") <= 0
+        or worker.get("worker_vmhwm_bytes") != worker_vmhwm
     ):
         raise CanonicalScreeningError("sealed RAM probe evidence chain differs")
     log_path = artifact_root / "worker.log"
@@ -1432,6 +1723,40 @@ def _validate_ram_slot_budget_source(
     ):
         raise CanonicalScreeningError(
             "sealed RAM probe policy snapshot binding differs"
+        )
+    policy_identity = Path(str(policy_binding.get("path", ""))).resolve()
+    expected_policy_identity = (
+        repo_root.resolve() / "configs/closeout/canonical_screening_512_v1.json"
+    ).resolve()
+    if policy_identity != expected_policy_identity:
+        raise CanonicalScreeningError(
+            "sealed RAM probe policy identity path differs"
+        )
+    snapshot_raw = load_json(
+        snapshot_path, "RAM probe predecessor policy snapshot"
+    )
+    snapshot_resources = _require_mapping(
+        snapshot_raw.get("resources"),
+        "RAM probe predecessor policy resources",
+    )
+    if snapshot_resources.get("ram_budget_status") != "probe_required":
+        raise CanonicalScreeningError(
+            "sealed RAM probe predecessor must be a probe-required policy"
+        )
+    probe_policy = validate_policy(
+        repo_root,
+        snapshot_path,
+        verify_historical_output_evidence=False,
+        policy_identity_path=policy_identity,
+    )
+    if (
+        policy_binding.get("sha256") != snapshot.get("sha256")
+        or policy_binding.get("canonical_sha256")
+        != probe_policy["policy_sha256"]
+        or expected_predecessor_policy_sha256 != probe_policy["policy_sha256"]
+    ):
+        raise CanonicalScreeningError(
+            "sealed RAM probe predecessor policy binding differs"
         )
     implementations = _require_mapping(
         spec.get("implementations"), "RAM probe implementations"
@@ -1502,6 +1827,8 @@ def _validate_ram_slot_budget_source(
         or source["measurement_factor_numerator"] != numerator
         or source["measurement_factor_denominator"] != denominator
         or source["peak_sampled_process_tree_rss_bytes"] != peak
+        or source["worker_vmhwm_bytes"] != worker_vmhwm
+        or source["ram_budget_basis_bytes"] != budget_basis
         or source["ram_slot_budget_bytes"] != budget
         or declared_budget_bytes != budget
     ):
@@ -1517,8 +1844,14 @@ def validate_policy(
     policy_path: Path,
     *,
     verify_historical_output_evidence: bool = True,
+    policy_identity_path: Path | None = None,
 ) -> dict[str, Any]:
     root = repo_root.resolve()
+    identity_path = (
+        policy_path.resolve()
+        if policy_identity_path is None
+        else policy_identity_path.resolve()
+    )
     raw = load_json(policy_path, "canonical screening policy")
     _require_exact_keys(
         raw,
@@ -1721,6 +2054,9 @@ def validate_policy(
                 root,
                 resources["ram_slot_budget_source"],
                 declared_budget_bytes=resources["ram_slot_budget_bytes"],
+                expected_predecessor_policy_sha256=bound_supersedes[
+                    "policy_sha256"
+                ],
             ),
         }
 
@@ -1800,7 +2136,7 @@ def validate_policy(
         "supersedes_policy_sha256": bound_supersedes["policy_sha256"],
         "python": raw["python"],
         "policy_file": {
-            "path": str(policy_path.resolve()),
+            "path": str(identity_path),
             "sha256": sha256_file(policy_path),
         },
         "source": source,

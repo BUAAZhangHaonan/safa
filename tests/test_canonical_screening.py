@@ -858,9 +858,16 @@ def _sealed_ram_probe_fixture(tmp_path: Path) -> tuple[dict, int]:
     input_file.write_text("{}\n", encoding="utf-8")
     input_binding = _bound(input_file)
     policy_snapshot = tmp_path / "input_policy.json"
-    policy_snapshot.write_text('{"policy":"probe"}\n', encoding="utf-8")
+    policy_snapshot.write_text(
+        '{"resources":{"ram_budget_status":"probe_required"}}\n',
+        encoding="utf-8",
+    )
     policy_binding = {
-        "path": str((tmp_path / "live-policy.json").resolve()),
+        "path": str(
+            (
+                tmp_path / "configs/closeout/canonical_screening_512_v1.json"
+            ).resolve()
+        ),
         "sha256": hashlib.sha256(policy_snapshot.read_bytes()).hexdigest(),
         "canonical_sha256": "1" * 64,
         "snapshot": _bound(policy_snapshot),
@@ -951,8 +958,9 @@ def _sealed_ram_probe_fixture(tmp_path: Path) -> tuple[dict, int]:
     peak = 1000
     budget = 1100
     method = (
-        "ceil(peak_sampled_process_tree_rss_bytes*11/10);"
-        "sampled_every_0.1s_not_a_mathematical_instantaneous_peak"
+        "ceil(max(peak_sampled_process_tree_rss_bytes,"
+        "worker_vmhwm_bytes)*11/10);sampled_tree_every_0.1s_"
+        "plus_worker_vmhwm_not_a_mathematical_instantaneous_tree_peak"
     )
     result = {
         "schema_version": 1,
@@ -967,6 +975,7 @@ def _sealed_ram_probe_fixture(tmp_path: Path) -> tuple[dict, int]:
         "termination": None,
         "peak_sampled_process_tree_rss_bytes": peak,
         "worker_vmhwm_bytes": 900,
+        "ram_budget_basis_bytes": peak,
         "ram_slot_budget_bytes": budget,
         "budget_method": method,
         "measurement_factor_numerator": 11,
@@ -991,16 +1000,59 @@ def _sealed_ram_probe_fixture(tmp_path: Path) -> tuple[dict, int]:
         "measurement_factor_numerator": 11,
         "measurement_factor_denominator": 10,
         "peak_sampled_process_tree_rss_bytes": peak,
+        "worker_vmhwm_bytes": 900,
+        "ram_budget_basis_bytes": peak,
         "ram_slot_budget_bytes": budget,
         "probe_result": _bound(result_path),
     }
     return source, budget
 
 
+def _reseal_ram_probe_fixture(
+    tmp_path: Path, source: dict
+) -> None:
+    snapshot_path = tmp_path / "input_policy.json"
+    spec_path = tmp_path / "probe_spec.json"
+    spec = load_json(spec_path, "RAM probe spec")
+    snapshot_binding = _bound(snapshot_path)
+    spec["policy"]["sha256"] = snapshot_binding["sha256"]
+    spec["policy"]["snapshot"] = snapshot_binding
+    spec["probe_sha256"] = canonical_digest(spec, "probe_sha256")
+    spec_path.write_bytes(canonical_json(spec))
+
+    admission_path = tmp_path / "admission.json"
+    admission = load_json(admission_path, "RAM probe admission")
+    admission["probe_sha256"] = spec["probe_sha256"]
+    admission["admission_sha256"] = canonical_digest(
+        admission, "admission_sha256"
+    )
+    admission_path.write_bytes(canonical_json(admission))
+
+    worker_path = tmp_path / "worker_result.json"
+    worker = load_json(worker_path, "RAM probe worker result")
+    worker["probe_sha256"] = spec["probe_sha256"]
+    worker["worker_result_sha256"] = canonical_digest(
+        worker, "worker_result_sha256"
+    )
+    worker_path.write_bytes(canonical_json(worker))
+
+    result_path = tmp_path / "probe_result.json"
+    result = load_json(result_path, "RAM probe result")
+    result["probe_sha256"] = spec["probe_sha256"]
+    result["admission_sha256"] = admission["admission_sha256"]
+    result["worker_result_sha256"] = worker["worker_result_sha256"]
+    result["probe_result_sha256"] = canonical_digest(
+        result, "probe_result_sha256"
+    )
+    result_path.write_bytes(canonical_json(result))
+    source["probe_result"] = _bound(result_path)
+
+
 @pytest.mark.parametrize(
     ("artifact", "field", "value", "message"),
     (
         ("probe_result.json", "status", "failed", "semantics"),
+        ("input_policy.json", "policy", "forged", "snapshot binding"),
         ("probe_spec.json", "purpose", "scientific", "evidence chain"),
         ("admission.json", "probe_sha256", "0" * 64, "evidence chain"),
         (
@@ -1019,15 +1071,24 @@ def _sealed_ram_probe_fixture(tmp_path: Path) -> tuple[dict, int]:
 )
 def test_sealed_ram_probe_chain_rejects_tamper(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     artifact: str,
     field: str,
     value: object,
     message: str,
 ) -> None:
     source, budget = _sealed_ram_probe_fixture(tmp_path)
+    monkeypatch.setattr(
+        sys.modules[_validate_ram_slot_budget_source.__module__],
+        "validate_policy",
+        lambda *_args, **_kwargs: {"policy_sha256": "1" * 64},
+    )
     assert (
         _validate_ram_slot_budget_source(
-            tmp_path, source, declared_budget_bytes=budget
+            tmp_path,
+            source,
+            declared_budget_bytes=budget,
+            expected_predecessor_policy_sha256="1" * 64,
         )["ram_slot_budget_bytes"]
         == budget
     )
@@ -1040,15 +1101,19 @@ def test_sealed_ram_probe_chain_rejects_tamper(
         "admission.json": "admission_sha256",
         "worker_result.json": "worker_result_sha256",
     }
-    changed[digest_fields[artifact]] = canonical_digest(
-        changed, digest_fields[artifact]
-    )
+    if artifact in digest_fields:
+        changed[digest_fields[artifact]] = canonical_digest(
+            changed, digest_fields[artifact]
+        )
     path.write_bytes(canonical_json(changed))
     if artifact == "probe_result.json":
         source["probe_result"] = _bound(path)
     with pytest.raises(CanonicalScreeningError, match=message):
         _validate_ram_slot_budget_source(
-            tmp_path, source, declared_budget_bytes=budget
+            tmp_path,
+            source,
+            declared_budget_bytes=budget,
+            expected_predecessor_policy_sha256="1" * 64,
         )
 
 
@@ -1069,6 +1134,9 @@ def test_ram_probe_sampler_exception_terminates_and_reaps_worker_group(
 
     cleanup_calls: list[int] = []
     monkeypatch.setattr(
+        module, "_process_group_members", lambda _group: ((123, 1),)
+    )
+    monkeypatch.setattr(
         module,
         "_sample_or_reap_process_tree",
         lambda *_args: (_ for _ in ()).throw(RuntimeError("sampler injected")),
@@ -1076,7 +1144,7 @@ def test_ram_probe_sampler_exception_terminates_and_reaps_worker_group(
     monkeypatch.setattr(
         module,
         "_terminate_process_group",
-        lambda process: (
+        lambda process, **_kwargs: (
             cleanup_calls.append(process.pid)
             or {
                 "term_sent": True,
@@ -1095,6 +1163,82 @@ def test_ram_probe_sampler_exception_terminates_and_reaps_worker_group(
     assert cleanup_calls == [123]
 
 
+def test_ram_probe_descendant_appearance_terminates_and_reaps_worker_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _ram_probe_module()
+
+    class Process:
+        pid = 321
+
+        def poll(self):
+            return None
+
+    class Guard:
+        def raise_if_violated(self) -> None:
+            return None
+
+    cleanup_calls: list[int] = []
+    monkeypatch.setattr(
+        module, "_process_descendants", lambda _root: ((654, 2),)
+    )
+    monkeypatch.setattr(
+        module,
+        "_terminate_process_group",
+        lambda process, **_kwargs: (
+            cleanup_calls.append(process.pid)
+            or {
+                "term_sent": True,
+                "kill_sent": False,
+                "reaped_returncode": -15,
+            }
+        ),
+    )
+    peak, returncode, failure, termination = module._monitor_probe_process(
+        Process(), {}, Guard()
+    )
+    assert peak == 0
+    assert returncode == -15
+    assert "forbidden descendant processes" in failure
+    assert termination["term_sent"] is True
+    assert cleanup_calls == [321]
+
+
+def test_ram_probe_descendant_scan_tracks_children_that_escape_process_group(
+    tmp_path: Path,
+) -> None:
+    module = _ram_probe_module()
+    proc_root = tmp_path / "proc"
+
+    def write_stat(
+        pid: int, *, parent: int, process_group: int, start_time: int
+    ) -> None:
+        directory = proc_root / str(pid)
+        directory.mkdir(parents=True)
+        fields = (
+            ["S", str(parent), str(process_group)]
+            + ["0"] * 16
+            + [str(start_time)]
+        )
+        (directory / "stat").write_text(
+            f"{pid} (fixture worker) {' '.join(fields)}\n",
+            encoding="utf-8",
+        )
+
+    write_stat(100, parent=1, process_group=100, start_time=10)
+    write_stat(101, parent=100, process_group=999, start_time=11)
+    write_stat(102, parent=101, process_group=998, start_time=12)
+    write_stat(200, parent=1, process_group=200, start_time=20)
+
+    assert module._process_group_members(100, proc_root=proc_root) == (
+        (100, 10),
+    )
+    assert module._process_descendants(100, proc_root=proc_root) == (
+        (101, 11),
+        (102, 12),
+    )
+
+
 def test_ram_probe_process_group_cleanup_escalates_to_kill(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1106,7 +1250,7 @@ def test_ram_probe_process_group_cleanup_escalates_to_kill(
         waits = 0
 
         def poll(self):
-            return None
+            return self.returncode
 
         def wait(self, timeout: int):
             assert timeout == 10
@@ -1118,9 +1262,28 @@ def test_ram_probe_process_group_cleanup_escalates_to_kill(
 
     process = Process()
     signals: list[tuple[int, object]] = []
-    monkeypatch.setattr(module.os, "getpgid", lambda _pid: process.pid)
+    monkeypatch.setattr(module, "_process_descendants", lambda _root: ())
     monkeypatch.setattr(
-        module.os, "killpg", lambda pgid, sig: signals.append((pgid, sig))
+        module,
+        "_process_group_members",
+        lambda _group: (
+            ((process.pid, 1),) if process.returncode is None else ()
+        ),
+    )
+    monotonic = iter((0.0, 11.0, 11.0, 11.0))
+    monkeypatch.setattr(module.time, "monotonic", lambda: next(monotonic))
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(module.os, "getpgid", lambda _pid: process.pid)
+    monkeypatch.setattr(module, "_live_process_identities", lambda _ids: set())
+    monkeypatch.setattr(module, "_signal_process_identities", lambda *_args: 0)
+
+    def killpg(pgid, sig):
+        signals.append((pgid, sig))
+        if sig == module.signal.SIGKILL:
+            process.returncode = -9
+
+    monkeypatch.setattr(
+        module.os, "killpg", killpg
     )
     result = module._terminate_process_group(process)
     assert result == {
@@ -1132,6 +1295,304 @@ def test_ram_probe_process_group_cleanup_escalates_to_kill(
         (process.pid, module.signal.SIGTERM),
         (process.pid, module.signal.SIGKILL),
     ]
+
+
+def test_ram_probe_cleanup_reaps_initial_zombie_before_group_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _ram_probe_module()
+
+    class Process:
+        pid = 457
+        returncode = None
+
+        def poll(self):
+            self.returncode = 0
+            return self.returncode
+
+    process = Process()
+    group_scans: list[int] = []
+    monkeypatch.setattr(module, "_process_descendants", lambda _root: ())
+    monkeypatch.setattr(
+        module,
+        "_process_group_members",
+        lambda group: group_scans.append(group) or (),
+    )
+    monkeypatch.setattr(module, "_live_process_identities", lambda _ids: set())
+    monkeypatch.setattr(
+        module.os,
+        "killpg",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("reaped zombie group must not be signalled")
+        ),
+    )
+    assert module._terminate_process_group(process) == {
+        "term_sent": False,
+        "kill_sent": False,
+        "reaped_returncode": 0,
+    }
+    assert group_scans == [process.pid]
+
+
+def test_ram_probe_cleanup_accepts_esrch_only_after_empty_recheck(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _ram_probe_module()
+
+    class Process:
+        pid = 458
+        returncode = None
+        polls = 0
+
+        def poll(self):
+            self.polls += 1
+            if self.polls > 1:
+                self.returncode = 0
+            return self.returncode
+
+    process = Process()
+    member_samples = iter((((process.pid, 1),), ()))
+    monkeypatch.setattr(module, "_process_descendants", lambda _root: ())
+    monkeypatch.setattr(
+        module, "_process_group_members", lambda _group: next(member_samples)
+    )
+    monkeypatch.setattr(module, "_live_process_identities", lambda _ids: set())
+    monkeypatch.setattr(module.os, "getpgid", lambda _pid: process.pid)
+    monkeypatch.setattr(
+        module.os,
+        "killpg",
+        lambda *_args: (_ for _ in ()).throw(ProcessLookupError()),
+    )
+    result = module._terminate_process_group(process)
+    assert result == {
+        "term_sent": False,
+        "kill_sent": False,
+        "reaped_returncode": 0,
+    }
+
+
+def test_ram_probe_cleanup_esrch_with_live_members_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _ram_probe_module()
+
+    class Process:
+        pid = 459
+        returncode = None
+
+        def poll(self):
+            return None
+
+    process = Process()
+    monkeypatch.setattr(module, "_process_descendants", lambda _root: ())
+    monkeypatch.setattr(
+        module,
+        "_process_group_members",
+        lambda _group: ((process.pid, 1),),
+    )
+    monkeypatch.setattr(module, "_live_process_identities", lambda _ids: set())
+    monkeypatch.setattr(module.os, "getpgid", lambda _pid: process.pid)
+
+    def killpg(_group, sig):
+        if sig == module.signal.SIGKILL:
+            raise ProcessLookupError()
+
+    monkeypatch.setattr(module.os, "killpg", killpg)
+    monotonic = iter((0.0, 11.0, 11.0, 22.0))
+    monkeypatch.setattr(module.time, "monotonic", lambda: next(monotonic))
+    with pytest.raises(CanonicalScreeningError, match="survived SIGKILL"):
+        module._terminate_process_group(process)
+
+
+def test_ram_probe_root_exit_cleans_residual_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _ram_probe_module()
+
+    class Process:
+        pid = 777
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+    class Guard:
+        def raise_if_violated(self) -> None:
+            return None
+
+    monkeypatch.setattr(module, "_process_descendants", lambda _root: ())
+    monkeypatch.setattr(
+        module, "_process_group_members", lambda _group: ((888, 2),)
+    )
+    monkeypatch.setattr(
+        module,
+        "_terminate_process_group",
+        lambda _process, **_kwargs: {
+            "term_sent": True,
+            "kill_sent": False,
+            "reaped_returncode": 0,
+        },
+    )
+    peak, returncode, failure, termination = module._monitor_probe_process(
+        Process(), {}, Guard()
+    )
+    assert peak == 0 and returncode == 0
+    assert "residual process-group members" in failure
+    assert termination["term_sent"] is True
+
+
+def test_ram_probe_sampling_exit_cleans_residual_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _ram_probe_module()
+
+    class Process:
+        pid = 778
+        returncode = 0
+
+        def poll(self):
+            return None
+
+    class Guard:
+        def raise_if_violated(self) -> None:
+            return None
+
+    monkeypatch.setattr(module, "_process_descendants", lambda _root: ())
+    monkeypatch.setattr(
+        module, "_process_group_members", lambda _group: ((889, 2),)
+    )
+    monkeypatch.setattr(
+        module, "_sample_or_reap_process_tree", lambda *_args: (None, 0)
+    )
+    monkeypatch.setattr(
+        module,
+        "_terminate_process_group",
+        lambda _process, **_kwargs: {
+            "term_sent": True,
+            "kill_sent": False,
+            "reaped_returncode": 0,
+        },
+    )
+    peak, returncode, failure, termination = module._monitor_probe_process(
+        Process(), {}, Guard()
+    )
+    assert peak == 0 and returncode == 0
+    assert "exited during RSS sampling" in failure
+    assert termination["term_sent"] is True
+
+
+def test_sealed_ram_budget_uses_higher_worker_vmhwm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, budget = _sealed_ram_probe_fixture(tmp_path)
+    result_path = tmp_path / "probe_result.json"
+    result = load_json(result_path, "RAM probe result")
+    result["peak_sampled_process_tree_rss_bytes"] = 500
+    result["worker_vmhwm_bytes"] = 1000
+    result["ram_budget_basis_bytes"] = 1000
+    worker_path = tmp_path / "worker_result.json"
+    worker = load_json(worker_path, "RAM probe worker result")
+    worker["worker_vmhwm_bytes"] = 1000
+    worker["worker_result_sha256"] = canonical_digest(
+        worker, "worker_result_sha256"
+    )
+    worker_path.write_bytes(canonical_json(worker))
+    result["worker_result_sha256"] = worker["worker_result_sha256"]
+    result["probe_result_sha256"] = canonical_digest(
+        result, "probe_result_sha256"
+    )
+    result_path.write_bytes(canonical_json(result))
+    source["peak_sampled_process_tree_rss_bytes"] = 500
+    source["worker_vmhwm_bytes"] = 1000
+    source["ram_budget_basis_bytes"] = 1000
+    source["probe_result"] = _bound(result_path)
+    monkeypatch.setattr(
+        sys.modules[_validate_ram_slot_budget_source.__module__],
+        "validate_policy",
+        lambda *_args, **_kwargs: {"policy_sha256": "1" * 64},
+    )
+    validated = _validate_ram_slot_budget_source(
+        tmp_path,
+        source,
+        declared_budget_bytes=budget,
+        expected_predecessor_policy_sha256="1" * 64,
+    )
+    assert validated["ram_budget_basis_bytes"] == 1000
+
+
+def test_sealed_ram_budget_rejects_vmhwm_chain_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, budget = _sealed_ram_probe_fixture(tmp_path)
+    result_path = tmp_path / "probe_result.json"
+    result = load_json(result_path, "RAM probe result")
+    result["peak_sampled_process_tree_rss_bytes"] = 500
+    result["worker_vmhwm_bytes"] = 1000
+    result["ram_budget_basis_bytes"] = 1000
+    result["probe_result_sha256"] = canonical_digest(
+        result, "probe_result_sha256"
+    )
+    result_path.write_bytes(canonical_json(result))
+    source["peak_sampled_process_tree_rss_bytes"] = 500
+    source["worker_vmhwm_bytes"] = 1000
+    source["ram_budget_basis_bytes"] = 1000
+    source["probe_result"] = _bound(result_path)
+    monkeypatch.setattr(
+        sys.modules[_validate_ram_slot_budget_source.__module__],
+        "validate_policy",
+        lambda *_args, **_kwargs: {"policy_sha256": "1" * 64},
+    )
+    with pytest.raises(CanonicalScreeningError, match="evidence chain"):
+        _validate_ram_slot_budget_source(
+            tmp_path,
+            source,
+            declared_budget_bytes=budget,
+            expected_predecessor_policy_sha256="1" * 64,
+        )
+
+
+def test_sealed_ram_budget_rejects_forged_snapshot_canonical_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, budget = _sealed_ram_probe_fixture(tmp_path)
+    monkeypatch.setattr(
+        sys.modules[_validate_ram_slot_budget_source.__module__],
+        "validate_policy",
+        lambda *_args, **_kwargs: {"policy_sha256": "2" * 64},
+    )
+    with pytest.raises(CanonicalScreeningError, match="predecessor policy"):
+        _validate_ram_slot_budget_source(
+            tmp_path,
+            source,
+            declared_budget_bytes=budget,
+            expected_predecessor_policy_sha256="1" * 64,
+        )
+
+
+def test_sealed_ram_budget_rejects_recursive_sealed_snapshot_before_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, budget = _sealed_ram_probe_fixture(tmp_path)
+    snapshot_path = tmp_path / "input_policy.json"
+    snapshot_path.write_text(
+        '{"resources":{"ram_budget_status":"sealed"}}\n',
+        encoding="utf-8",
+    )
+    _reseal_ram_probe_fixture(tmp_path, source)
+    monkeypatch.setattr(
+        sys.modules[_validate_ram_slot_budget_source.__module__],
+        "validate_policy",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("recursive policy validation must not start")
+        ),
+    )
+    with pytest.raises(CanonicalScreeningError, match="probe-required"):
+        _validate_ram_slot_budget_source(
+            tmp_path,
+            source,
+            declared_budget_bytes=budget,
+            expected_predecessor_policy_sha256="1" * 64,
+        )
 
 
 def test_screen512_gate_requires_exact_primary_repeat_smoke(
@@ -1841,7 +2302,7 @@ def test_supersession_evidence_binds_ea7_failed_smoke_chain(
         validate_supersession_evidence(tmp_path, tampered)
 
 
-def test_current_policy_binds_stopped_310_preflight_and_forbids_reuse() -> None:
+def test_current_policy_binds_completed_5d_preflight_and_forbids_reuse() -> None:
     root = Path(__file__).parents[1]
     policy_path = root / "configs/closeout/canonical_screening_512_v1.json"
 
@@ -1849,14 +2310,22 @@ def test_current_policy_binds_stopped_310_preflight_and_forbids_reuse() -> None:
 
     supersedes = policy["supersedes"]
     assert supersedes["policy_sha256"] == (
+        "5d51185345983fbf9bc2924f43d5a4b671674398581824753c0c155c4cdda2db"
+    )
+    assert supersedes["previous_policy_sha256"] == (
         "310f5b539315d3bc957530856c0f810bf5b32afc97469fdb9467bf3facdc9cda"
     )
-    assert supersedes["classification"] == "started_incomplete"
+    assert supersedes["classification"] == "completed_preflight_superseded"
     assert supersedes["request_count"] == 193
-    assert supersedes["result_count"] == 0
-    assert supersedes["checkpoint_attempt_claim_count"] == 0
-    assert supersedes["wrapper_claim_count"] == 1
-    assert supersedes["pending_count"] == 193
+    assert supersedes["result_count"] == 193
+    assert supersedes["valid_count"] == 193
+    assert supersedes["invalid_count"] == 0
+    assert supersedes["attempt_claim_count"] == 193
+    assert supersedes["attempt_terminal_count"] == 193
+    assert supersedes["candidate_count"] == 193
+    assert supersedes["pending_count"] == 0
+    assert supersedes["run_request_count"] == 0
+    assert supersedes["generated_png_count"] == 0
     assert supersedes["scientific_result_reuse"] == "forbidden"
     assert supersedes["successor_execution"] == "fresh_full_193_preflight"
 
@@ -1868,10 +2337,10 @@ def test_current_policy_binds_stopped_310_preflight_and_forbids_reuse() -> None:
         ("reuse", "status differs"),
         ("root_digest", "root binding differs"),
         ("bound_path", "path differs"),
-        ("wrapper_claim_count", "status differs"),
+        ("valid_count", "status differs"),
     ],
 )
-def test_310_supersession_tampering_fails_closed(
+def test_5d_supersession_tampering_fails_closed(
     mutation: str,
     match: str,
 ) -> None:
@@ -1889,8 +2358,8 @@ def test_310_supersession_tampering_fails_closed(
         supersedes["evidence_root"]["digest"] = "0" * 64
     elif mutation == "bound_path":
         supersedes["wrapper_claim"] = supersedes["wrapper_exit"]
-    elif mutation == "wrapper_claim_count":
-        supersedes["wrapper_claim_count"] = 0
+    elif mutation == "valid_count":
+        supersedes["valid_count"] = 192
     else:
         raise AssertionError(mutation)
 

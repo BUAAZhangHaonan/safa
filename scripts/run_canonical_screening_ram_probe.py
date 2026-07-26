@@ -53,29 +53,137 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _terminate_process_group(process: subprocess.Popen[Any]) -> dict[str, Any]:
-    if process.poll() is not None:
+def _signal_process_identities(
+    identities: set[tuple[int, int]], sig: signal.Signals
+) -> int:
+    snapshot = _proc_process_snapshot()
+    sent = 0
+    for pid, start_time in sorted(identities):
+        current = snapshot.get(pid)
+        if current is None or current[0] != start_time:
+            continue
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            continue
+        sent += 1
+    return sent
+
+
+def _signal_process_group(
+    process_group: int, sig: signal.Signals
+) -> bool:
+    try:
+        os.killpg(process_group, sig)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _live_process_identities(
+    identities: set[tuple[int, int]],
+) -> set[tuple[int, int]]:
+    snapshot = _proc_process_snapshot()
+    return {
+        identity
+        for identity in identities
+        if (
+            identity[0] in snapshot
+            and snapshot[identity[0]][0] == identity[1]
+        )
+    }
+
+
+def _terminate_process_group(
+    process: subprocess.Popen[Any],
+    *,
+    tracked_descendants: set[tuple[int, int]] | None = None,
+) -> dict[str, Any]:
+    process_group = process.pid
+    tracked = set(tracked_descendants or ())
+    if process.returncode is None:
+        tracked.update(_process_descendants(process.pid))
+    root_returncode = process.poll()
+    members = _process_group_members(process_group)
+    if (
+        root_returncode is not None
+        and not members
+        and not _live_process_identities(tracked)
+    ):
         return {
             "term_sent": False,
             "kill_sent": False,
             "reaped_returncode": process.returncode,
         }
-    process_group = os.getpgid(process.pid)
-    if process_group != process.pid:
+    if root_returncode is None and os.getpgid(process.pid) != process_group:
         raise CanonicalScreeningError(
             "RAM probe worker is not the leader of its isolated process group"
         )
-    os.killpg(process_group, signal.SIGTERM)
-    killed = False
-    try:
-        returncode = process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        os.killpg(process_group, signal.SIGKILL)
-        killed = True
-        returncode = process.wait(timeout=10)
+    group_term_sent = (
+        _signal_process_group(process_group, signal.SIGTERM)
+        if members
+        else False
+    )
+    identity_term_count = _signal_process_identities(
+        tracked, signal.SIGTERM
+    )
+    term_sent = group_term_sent or identity_term_count > 0
+    kill_sent = False
+    live_tracked = _live_process_identities(tracked)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if process.returncode is None:
+            tracked.update(_process_descendants(process.pid))
+        root_returncode = process.poll()
+        members = _process_group_members(process_group)
+        live_tracked = _live_process_identities(tracked)
+        if root_returncode is not None and not members and not live_tracked:
+            break
+        time.sleep(0.1)
+    if (
+        root_returncode is None
+        or members
+        or live_tracked
+    ):
+        group_kill_sent = (
+            _signal_process_group(process_group, signal.SIGKILL)
+            if members
+            else False
+        )
+        identity_kill_count = _signal_process_identities(
+            tracked, signal.SIGKILL
+        )
+        kill_sent = group_kill_sent or identity_kill_count > 0
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if process.returncode is None:
+                tracked.update(_process_descendants(process.pid))
+            root_returncode = process.poll()
+            members = _process_group_members(process_group)
+            live_tracked = _live_process_identities(tracked)
+            if (
+                root_returncode is not None
+                and not members
+                and not live_tracked
+            ):
+                break
+            time.sleep(0.1)
+        if (
+            root_returncode is None
+            or members
+            or live_tracked
+        ):
+            raise CanonicalScreeningError(
+                "RAM probe root or tracked descendants survived SIGKILL"
+            )
+    returncode = (
+        process.wait(timeout=10)
+        if process.returncode is None
+        else process.returncode
+    )
     return {
-        "term_sent": True,
-        "kill_sent": killed,
+        "term_sent": term_sent,
+        "kill_sent": kill_sent,
         "reaped_returncode": returncode,
     }
 
@@ -86,15 +194,50 @@ def _monitor_probe_process(
     resource_guard: RuntimeResourceGuard,
 ) -> tuple[int, int, str | None, dict[str, Any] | None]:
     peak_rss = 0
+    tracked_descendants: set[tuple[int, int]] = set()
     try:
         while True:
+            descendants = _process_descendants(process.pid)
+            tracked_descendants.update(descendants)
+            if descendants:
+                raise CanonicalScreeningError(
+                    "RAM probe worker spawned forbidden descendant processes: "
+                    f"{descendants}"
+                )
             polled = process.poll()
             if polled is not None:
+                residual = _process_group_members(process.pid)
+                if residual:
+                    termination = _terminate_process_group(
+                        process,
+                        tracked_descendants=tracked_descendants,
+                    )
+                    return (
+                        peak_rss,
+                        int(termination["reaped_returncode"]),
+                        "RAM probe root exited with forbidden residual "
+                        f"process-group members: {residual}",
+                        termination,
+                    )
                 return peak_rss, polled, None, None
             rss_bytes, reaped_returncode = _sample_or_reap_process_tree(
                 process, _process_tree_rss_bytes
             )
             if reaped_returncode is not None:
+                residual = _process_group_members(process.pid)
+                if residual:
+                    termination = _terminate_process_group(
+                        process,
+                        tracked_descendants=tracked_descendants,
+                    )
+                    return (
+                        peak_rss,
+                        int(termination["reaped_returncode"]),
+                        "RAM probe root exited during RSS sampling with "
+                        "forbidden residual process-group members: "
+                        f"{residual}",
+                        termination,
+                    )
                 return peak_rss, reaped_returncode, None, None
             if rss_bytes is None:
                 raise CanonicalScreeningError(
@@ -104,7 +247,10 @@ def _monitor_probe_process(
             resource_guard.raise_if_violated()
             violation = _gpu_hard_resource_violation(policy)
             if violation is not None:
-                termination = _terminate_process_group(process)
+                termination = _terminate_process_group(
+                    process,
+                    tracked_descendants=tracked_descendants,
+                )
                 return (
                     peak_rss,
                     int(termination["reaped_returncode"]),
@@ -115,7 +261,10 @@ def _monitor_probe_process(
     except BaseException as exc:
         failure = f"{type(exc).__name__}: {exc}"
         try:
-            termination = _terminate_process_group(process)
+            termination = _terminate_process_group(
+                process,
+                tracked_descendants=tracked_descendants,
+            )
         except BaseException as cleanup_exc:
             raise CanonicalScreeningError(
                 f"{failure}; process-group cleanup failed: "
@@ -127,6 +276,73 @@ def _monitor_probe_process(
             failure,
             termination,
         )
+
+
+def _proc_process_snapshot(
+    *, proc_root: Path = Path("/proc")
+) -> dict[int, tuple[int, int, int]]:
+    snapshot: dict[int, tuple[int, int, int]] = {}
+    for path in proc_root.iterdir():
+        if not path.name.isdecimal():
+            continue
+        try:
+            raw = (path / "stat").read_bytes().strip()
+        except FileNotFoundError:
+            continue
+        left = raw.find(b"(")
+        right = raw.rfind(b")")
+        fields = raw[right + 1 :].split()
+        if left < 0 or right <= left or len(fields) < 20:
+            raise CanonicalScreeningError(
+                f"process-group member stat is invalid: {path}"
+            )
+        if not fields[2].isdigit() or not fields[19].isdigit():
+            raise CanonicalScreeningError(
+                f"process-group member identity is invalid: {path}"
+            )
+        if not fields[1].isdigit():
+            raise CanonicalScreeningError(
+                f"process parent identity is invalid: {path}"
+            )
+        snapshot[int(path.name)] = (
+            int(fields[19]),
+            int(fields[1]),
+            int(fields[2]),
+        )
+    return snapshot
+
+
+def _process_group_members(
+    process_group: int, *, proc_root: Path = Path("/proc")
+) -> tuple[tuple[int, int], ...]:
+    return tuple(
+        sorted(
+            (pid, fields[0])
+            for pid, fields in _proc_process_snapshot(
+                proc_root=proc_root
+            ).items()
+            if fields[2] == process_group
+        )
+    )
+
+
+def _process_descendants(
+    root_pid: int, *, proc_root: Path = Path("/proc")
+) -> tuple[tuple[int, int], ...]:
+    snapshot = _proc_process_snapshot(proc_root=proc_root)
+    descendants: set[int] = set()
+    frontier = {root_pid}
+    while frontier:
+        children = {
+            pid
+            for pid, fields in snapshot.items()
+            if fields[1] in frontier and pid not in descendants
+        }
+        descendants.update(children)
+        frontier = children
+    return tuple(
+        sorted((pid, snapshot[pid][0]) for pid in descendants)
+    )
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -589,7 +805,19 @@ def _run_controller(
             raise CanonicalScreeningError("RAM probe worker result mismatch")
     if failure is None and peak_rss <= 0:
         failure = "RAM probe measured no positive RSS/VmHWM"
-    budget = (peak_rss * 11 + 9) // 10 if peak_rss > 0 else None
+    worker_vmhwm = (
+        None if worker_result is None else worker_result["worker_vmhwm_bytes"]
+    )
+    budget_basis = (
+        max(peak_rss, int(worker_vmhwm))
+        if peak_rss > 0 and worker_vmhwm is not None
+        else None
+    )
+    budget = (
+        (budget_basis * 11 + 9) // 10
+        if budget_basis is not None
+        else None
+    )
     result = {
         "schema_version": 1,
         "contract_type": PROBE_RESULT_CONTRACT,
@@ -604,13 +832,13 @@ def _run_controller(
         "worker_returncode": returncode,
         "termination": termination,
         "peak_sampled_process_tree_rss_bytes": peak_rss,
-        "worker_vmhwm_bytes": (
-            None if worker_result is None else worker_result["worker_vmhwm_bytes"]
-        ),
+        "worker_vmhwm_bytes": worker_vmhwm,
+        "ram_budget_basis_bytes": budget_basis,
         "ram_slot_budget_bytes": budget,
         "budget_method": (
-            "ceil(peak_sampled_process_tree_rss_bytes*11/10);"
-            "sampled_every_0.1s_not_a_mathematical_instantaneous_peak"
+            "ceil(max(peak_sampled_process_tree_rss_bytes,"
+            "worker_vmhwm_bytes)*11/10);sampled_tree_every_0.1s_"
+            "plus_worker_vmhwm_not_a_mathematical_instantaneous_tree_peak"
         ),
         "measurement_factor_numerator": 11,
         "measurement_factor_denominator": 10,
