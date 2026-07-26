@@ -24,6 +24,7 @@ from safa.closeout.canonical_screening import (
     build_preflight_result,
     build_candidate_manifest,
     build_checkpoint_plan,
+    canonical_digest,
     canonical_json,
     iter_run_requests,
     load_json,
@@ -71,6 +72,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--execute", action="store_true")
     parser.add_argument("--gpu-index", type=int)
+    parser.add_argument("--gpu-uuid")
     parser.add_argument("--request", type=Path)
     parser.add_argument("--monitor-target", choices=("preflight", "smoke8", "screen512"))
     return parser.parse_args(argv)
@@ -119,15 +121,71 @@ def _candidate_manifest_path(
     )
 
 
-def _memory_percent() -> float:
+def _memory_snapshot_bytes() -> dict[str, int]:
     values: dict[str, int] = {}
     with Path("/proc/meminfo").open("r", encoding="utf-8") as handle:
         for line in handle:
             name, raw = line.split(":", maxsplit=1)
             values[name] = int(raw.strip().split()[0])
-    total = values["MemTotal"]
-    available = values["MemAvailable"]
-    return 100.0 * (total - available) / total
+    total = values["MemTotal"] * 1024
+    available = values["MemAvailable"] * 1024
+    if total <= 0 or available < 0 or available > total:
+        raise CanonicalScreeningError("/proc/meminfo RAM counters are invalid")
+    return {
+        "total_bytes": total,
+        "available_bytes": available,
+        "used_bytes": total - available,
+    }
+
+
+def _memory_percent() -> float:
+    snapshot = _memory_snapshot_bytes()
+    return 100.0 * snapshot["used_bytes"] / snapshot["total_bytes"]
+
+
+def _ram_reservation_projection(
+    *,
+    total_bytes: int,
+    used_bytes: int,
+    slot_budget_bytes: int,
+    slot_count: int,
+    admission_limit_percent: float,
+    budget_source: Mapping[str, Any],
+) -> dict[str, Any]:
+    if (
+        type(total_bytes) is not int
+        or type(used_bytes) is not int
+        or type(slot_budget_bytes) is not int
+        or type(slot_count) is not int
+        or total_bytes <= 0
+        or used_bytes < 0
+        or used_bytes > total_bytes
+        or slot_budget_bytes <= 0
+        or slot_count <= 0
+        or not 0.0 < admission_limit_percent < 100.0
+    ):
+        raise CanonicalScreeningError("RAM reservation inputs are invalid")
+    reserved_bytes = slot_budget_bytes * slot_count
+    projected_used_bytes = used_bytes + reserved_bytes
+    projected_used_percent = 100.0 * projected_used_bytes / total_bytes
+    reservation = {
+        "slot_count": slot_count,
+        "slot_budget_bytes": slot_budget_bytes,
+        "reserved_bytes": reserved_bytes,
+        "memory_total_bytes": total_bytes,
+        "memory_used_bytes": used_bytes,
+        "projected_used_bytes": projected_used_bytes,
+        "projected_used_percent": projected_used_percent,
+        "admission_limit_percent": admission_limit_percent,
+        "budget_source": dict(budget_source),
+    }
+    if projected_used_percent >= admission_limit_percent:
+        raise CanonicalScreeningError(
+            "RAM reservation admission failed: projected "
+            f"{projected_used_percent:.6f}% >= {admission_limit_percent:.0f}% "
+            f"for {slot_count} slots x {slot_budget_bytes} bytes"
+        )
+    return reservation
 
 
 def _cpu_times() -> tuple[int, int]:
@@ -215,8 +273,14 @@ def assert_resource_admission(
     policy: Mapping[str, Any], campaign_root: Path, *, require_idle_gpus: bool
 ) -> dict[str, Any]:
     resources = policy["resources"]
+    if resources["ram_budget_status"] != "sealed":
+        raise CanonicalScreeningError(
+            "GPU admission is blocked until the single-worker RAM probe "
+            "and slot budget are sealed"
+        )
     cpu_percent = _cpu_load_percent()
-    memory_percent = _memory_percent()
+    memory = _memory_snapshot_bytes()
+    memory_percent = 100.0 * memory["used_bytes"] / memory["total_bytes"]
     disk_percent = _disk_percent(campaign_root.parent)
     if cpu_percent >= float(resources["cpu_admission_percent"]):
         raise CanonicalScreeningError(
@@ -238,6 +302,33 @@ def assert_resource_admission(
     ]
     if [row["index"] for row in gpus] != resources["physical_gpus"]:
         raise CanonicalScreeningError("physical GPU 0..3 registry is unavailable")
+    authorized_gpu_registry = [
+        {
+            "physical_gpu_index": row["index"],
+            "physical_gpu_uuid": row["uuid"],
+        }
+        for row in gpus
+    ]
+    if (
+        any(
+            not row["physical_gpu_uuid"].startswith("GPU-")
+            for row in authorized_gpu_registry
+        )
+        or len({row["physical_gpu_uuid"] for row in authorized_gpu_registry})
+        != len(authorized_gpu_registry)
+    ):
+        raise CanonicalScreeningError("physical GPU UUID registry is invalid")
+    slot_count = len(resources["physical_gpus"]) * int(
+        resources["workers_per_gpu"]
+    )
+    ram_reservation = _ram_reservation_projection(
+        total_bytes=memory["total_bytes"],
+        used_bytes=memory["used_bytes"],
+        slot_budget_bytes=int(resources["ram_slot_budget_bytes"]),
+        slot_count=slot_count,
+        admission_limit_percent=float(resources["ram_admission_percent"]),
+        budget_source=resources["ram_slot_budget_source"],
+    )
     required_free_mib = int(resources["gpu_headroom_bytes"]) // 1024**2
     blocked = [row for row in gpus if row["memory_free_mib"] < required_free_mib]
     if blocked:
@@ -261,6 +352,8 @@ def assert_resource_admission(
             "out": _swap_pages()[1],
         },
         "gpus": gpus,
+        "authorized_gpu_registry": authorized_gpu_registry,
+        "ram_reservation": ram_reservation,
         "compute_processes": processes,
     }
 
@@ -1239,8 +1332,62 @@ def _monitor_sample(
     phase: str,
     *,
     terminal: bool,
+    admission: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     cpu_only = phase == "preflight"
+    gpu_rows = None if cpu_only else _gpu_snapshot()
+    gpu_binding = None
+    if not cpu_only:
+        if admission is None:
+            admission_paths = sorted(paths["admissions"].glob(f"{phase}__*.json"))
+            if len(admission_paths) != 1:
+                raise CanonicalScreeningError(
+                    f"{phase} monitor requires exactly one admission artifact"
+                )
+            admission_path = admission_paths[0]
+            admission_value = load_json(admission_path, "resource admission")
+            admission = {
+                "path": str(admission_path.resolve()),
+                "sha256": sha256_file(admission_path),
+                "canonical_sha256": admission_value["admission_sha256"],
+            }
+        admission_path = Path(str(admission["path"])).resolve()
+        if (
+            not admission_path.is_file()
+            or sha256_file(admission_path) != admission["sha256"]
+        ):
+            raise CanonicalScreeningError("monitor admission file binding mismatch")
+        admission_value = load_json(admission_path, "resource admission")
+        if (
+            admission_value.get("admission_sha256")
+            != admission["canonical_sha256"]
+            or canonical_digest(admission_value, "admission_sha256")
+            != admission["canonical_sha256"]
+            or admission_value.get("policy_sha256") != policy["policy_sha256"]
+        ):
+            raise CanonicalScreeningError("monitor admission contract mismatch")
+        snapshot = admission_value.get("snapshot")
+        if not isinstance(snapshot, Mapping):
+            raise CanonicalScreeningError("monitor admission snapshot is invalid")
+        authorized_registry = snapshot.get("authorized_gpu_registry")
+        runtime_registry = [
+            {
+                "physical_gpu_index": row["index"],
+                "physical_gpu_uuid": row["uuid"],
+            }
+            for row in gpu_rows
+            if row["index"] in policy["resources"]["physical_gpus"]
+        ]
+        if runtime_registry != authorized_registry:
+            raise CanonicalScreeningError(
+                "monitor physical GPU UUID registry differs from admission"
+            )
+        gpu_binding = {
+            "admission_sha256": admission["canonical_sha256"],
+            "authorized_gpu_registry": authorized_registry,
+            "runtime_gpu_registry": runtime_registry,
+            "ram_reservation": snapshot.get("ram_reservation"),
+        }
     log_rows = []
     if paths["logs"].exists():
         for path in sorted(paths["logs"].glob(f"{phase}*__*.log")):
@@ -1264,7 +1411,8 @@ def _monitor_sample(
         "memory_percent": _memory_percent(),
         "disk_percent": _disk_percent(paths["root"].parent),
         "swap_pages": {"in": _swap_pages()[0], "out": _swap_pages()[1]},
-        "gpus": None if cpu_only else _gpu_snapshot(),
+        "gpus": gpu_rows,
+        "gpu_binding": gpu_binding,
         "compute_processes": None if cpu_only else _gpu_compute_processes(),
         "logs": log_rows,
         "artifacts": _artifact_progress(paths, phase),
@@ -1277,11 +1425,18 @@ def _append_monitor_sample(
     phase: str,
     *,
     terminal: bool = False,
+    admission: Mapping[str, Any] | None = None,
 ) -> Path:
     path = paths["logs"] / f"{phase}__monitor.jsonl"
     _append_jsonl(
         path,
-        _monitor_sample(policy, paths, phase, terminal=terminal),
+        _monitor_sample(
+            policy,
+            paths,
+            phase,
+            terminal=terminal,
+            admission=admission,
+        ),
     )
     return path
 
@@ -1350,12 +1505,25 @@ def _gpu_hard_resource_violation(
     return None
 
 
-def _claim_slot(lock_root: Path, gpu_index: int, slot_index: int, request: Path) -> Path:
+def _claim_slot(
+    lock_root: Path,
+    gpu_index: int,
+    gpu_uuid: str,
+    slot_index: int,
+    request: Path,
+    admission: Mapping[str, Any],
+    ram_slot_budget_bytes: int,
+) -> Path:
     lock_root.mkdir(parents=True, exist_ok=True)
     path = lock_root / f"gpu{gpu_index}.slot{slot_index}.json"
     payload = {
-        "gpu_index": gpu_index,
+        "physical_gpu_index": gpu_index,
+        "physical_gpu_uuid": gpu_uuid,
+        "logical_cuda_index": 0,
+        "cuda_visible_devices": gpu_uuid,
         "slot_index": slot_index,
+        "ram_slot_budget_bytes": ram_slot_budget_bytes,
+        "admission_sha256": admission["canonical_sha256"],
         "request": str(request.resolve()),
         "controller_pid": os.getpid(),
         "claimed_at": _utc_now(),
@@ -1371,6 +1539,7 @@ def _worker_command(
     phase: str,
     request: Path,
     gpu_index: int,
+    gpu_uuid: str,
 ) -> list[str]:
     return [
         str(policy["python"]),
@@ -1386,7 +1555,19 @@ def _worker_command(
         str(request.resolve()),
         "--gpu-index",
         str(gpu_index),
+        "--gpu-uuid",
+        gpu_uuid,
     ]
+
+
+def _worker_environment(gpu_uuid: str) -> dict[str, str]:
+    if not gpu_uuid.startswith("GPU-") or "," in gpu_uuid:
+        raise CanonicalScreeningError("worker physical GPU UUID is invalid")
+    return {
+        **os.environ,
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "CUDA_VISIBLE_DEVICES": gpu_uuid,
+    }
 
 
 def _run_gpu_phase(
@@ -1401,6 +1582,10 @@ def _run_gpu_phase(
         policy, paths["root"], require_idle_gpus=True
     )
     admission = _write_admission(policy, paths, phase, admission_snapshot)
+    gpu_uuid_by_index = {
+        row["physical_gpu_index"]: row["physical_gpu_uuid"]
+        for row in admission_snapshot["authorized_gpu_registry"]
+    }
     candidate_manifest = load_json(
         _candidate_manifest_path(paths, policy), "candidate manifest"
     )
@@ -1446,7 +1631,9 @@ def _run_gpu_phase(
     request_queue = deque(requests)
     stop_reason: str | None = None
     unexpected: BaseException | None = None
-    monitor_path = _append_monitor_sample(policy, paths, phase)
+    monitor_path = _append_monitor_sample(
+        policy, paths, phase, admission=admission
+    )
     resource_guard = RuntimeResourceGuard(
         policy,
         paths["logs"] / f"{phase}__runtime_resource_windows.jsonl",
@@ -1459,10 +1646,19 @@ def _run_gpu_phase(
             while request_queue and slot_pool.free_count:
                 request = request_queue.popleft()
                 gpu, slot_index = slot_pool.acquire()
+                gpu_uuid = gpu_uuid_by_index[gpu]
                 lock: Path | None = None
                 log_handle: Any | None = None
                 try:
-                    lock = _claim_slot(lock_root, gpu, slot_index, request)
+                    lock = _claim_slot(
+                        lock_root,
+                        gpu,
+                        gpu_uuid,
+                        slot_index,
+                        request,
+                        admission,
+                        int(policy["resources"]["ram_slot_budget_bytes"]),
+                    )
                     log_path = (
                         paths["logs"]
                         / f"{request.parent.name}__{request.stem}.log"
@@ -1476,10 +1672,12 @@ def _run_gpu_phase(
                             phase,
                             request,
                             gpu,
+                            gpu_uuid,
                         ),
                         stdout=log_handle,
                         stderr=subprocess.STDOUT,
                         text=True,
+                        env=_worker_environment(gpu_uuid),
                     )
                 except BaseException:
                     if log_handle is not None:
@@ -1518,7 +1716,9 @@ def _run_gpu_phase(
                 failures.append(violation)
                 stop_reason = "resource_hard_stop"
                 break
-            _append_monitor_sample(policy, paths, phase)
+            _append_monitor_sample(
+                policy, paths, phase, admission=admission
+            )
             if active:
                 time.sleep(10)
     except BaseException as exc:
@@ -1542,7 +1742,9 @@ def _run_gpu_phase(
             stop_reason = "resource_hard_stop"
         if failures or unexpected is not None:
             _cleanup_active_workers(active, slot_pool)
-        _append_monitor_sample(policy, paths, phase, terminal=True)
+        _append_monitor_sample(
+            policy, paths, phase, terminal=True, admission=admission
+        )
     if failures:
         stop = {
             "phase": phase,
@@ -1639,13 +1841,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(_run_monitor(policy, paths, args.monitor_target), sort_keys=True))
         return 0
     if args.request is not None:
-        if args.gpu_index is None or args.phase not in {"smoke8", "screen512"}:
+        if (
+            args.gpu_index is None
+            or args.gpu_uuid is None
+            or args.phase not in {"smoke8", "screen512"}
+        ):
             raise CanonicalScreeningError(
-                "--request requires --gpu-index and a GPU screening phase"
+                "--request requires --gpu-index, --gpu-uuid, and a GPU "
+                "screening phase"
             )
         if args.dry_run:
             raise CanonicalScreeningError("worker requests cannot use --dry-run")
-        execute_screening_request(_root(args.request), args.gpu_index, policy)
+        execute_screening_request(
+            _root(args.request), args.gpu_index, args.gpu_uuid, policy
+        )
         return 0
     plan = build_checkpoint_plan(REPO_ROOT, policy, paths["preflight_results"])
 

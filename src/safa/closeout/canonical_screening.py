@@ -1405,31 +1405,14 @@ def validate_policy(
         raise CanonicalScreeningError("canonical metric registry differs")
 
     resources = _require_mapping(raw["resources"], "screening resources")
-    _require_exact_keys(
-        resources,
-        {
-            "physical_gpus",
-            "workers_per_gpu",
-            "gpu_headroom_bytes",
-            "cpu_admission_percent",
-            "cpu_hard_limit_percent",
-            "cpu_window_seconds",
-            "cpu_consecutive_hard_windows",
-            "resource_poll_seconds",
-            "swap_consecutive_hard_intervals",
-            "ram_admission_percent",
-            "ram_hard_limit_percent",
-            "disk_admission_percent",
-            "disk_hard_limit_percent",
-            "retry_count",
-            "require_tmux",
-            "global_lock_root",
-        },
-        "screening resources",
-    )
+    if "ram_budget_status" not in resources:
+        raise CanonicalScreeningError(
+            "screening resources omit RAM budget status"
+        )
     if (
         resources["physical_gpus"] != [0, 1, 2, 3]
         or resources["workers_per_gpu"] != 2
+        or resources["ram_budget_status"] not in {"probe_required", "sealed"}
         or resources["retry_count"] != 0
         or resources["require_tmux"] is not True
         or resources["cpu_admission_percent"] != 90
@@ -1445,6 +1428,99 @@ def validate_policy(
         or resources["gpu_headroom_bytes"] != 2 * 1024**3
     ):
         raise CanonicalScreeningError("canonical resource policy differs")
+    if resources["ram_budget_status"] == "probe_required":
+        if set(resources) != {
+            "physical_gpus",
+            "workers_per_gpu",
+            "ram_budget_status",
+            "gpu_headroom_bytes",
+            "cpu_admission_percent",
+            "cpu_hard_limit_percent",
+            "cpu_window_seconds",
+            "cpu_consecutive_hard_windows",
+            "resource_poll_seconds",
+            "swap_consecutive_hard_intervals",
+            "ram_admission_percent",
+            "ram_hard_limit_percent",
+            "disk_admission_percent",
+            "disk_hard_limit_percent",
+            "retry_count",
+            "require_tmux",
+            "global_lock_root",
+        }:
+            raise CanonicalScreeningError(
+                "probe-required resource policy must not preregister a RAM budget"
+            )
+    else:
+        expected_keys = {
+            "physical_gpus",
+            "workers_per_gpu",
+            "ram_budget_status",
+            "ram_slot_budget_bytes",
+            "ram_slot_budget_source",
+            "gpu_headroom_bytes",
+            "cpu_admission_percent",
+            "cpu_hard_limit_percent",
+            "cpu_window_seconds",
+            "cpu_consecutive_hard_windows",
+            "resource_poll_seconds",
+            "swap_consecutive_hard_intervals",
+            "ram_admission_percent",
+            "ram_hard_limit_percent",
+            "disk_admission_percent",
+            "disk_hard_limit_percent",
+            "retry_count",
+            "require_tmux",
+            "global_lock_root",
+        }
+        if set(resources) != expected_keys:
+            raise CanonicalScreeningError(
+                "sealed resource policy omits its RAM budget contract"
+            )
+        source = _require_mapping(
+            resources["ram_slot_budget_source"], "RAM slot budget source"
+        )
+        _require_exact_keys(
+            source,
+            {
+                "contract_type",
+                "method",
+                "measurement_factor_numerator",
+                "measurement_factor_denominator",
+                "peak_process_tree_rss_bytes",
+                "ram_slot_budget_bytes",
+                "probe_result",
+            },
+            "RAM slot budget source",
+        )
+        probe_result = _validate_bound_file(
+            root, source["probe_result"], "RAM slot budget probe result"
+        )
+        peak = source["peak_process_tree_rss_bytes"]
+        numerator = source["measurement_factor_numerator"]
+        denominator = source["measurement_factor_denominator"]
+        budget = source["ram_slot_budget_bytes"]
+        if (
+            source["contract_type"]
+            != "safa_canonical_screening_ram_budget_source_v1"
+            or source["method"]
+            != "ceil(single_worker_process_tree_peak_rss_bytes*11/10)"
+            or numerator != 11
+            or denominator != 10
+            or type(peak) is not int
+            or peak <= 0
+            or type(budget) is not int
+            or budget != (peak * numerator + denominator - 1) // denominator
+            or resources["ram_slot_budget_bytes"] != budget
+        ):
+            raise CanonicalScreeningError("sealed RAM slot budget differs")
+        resources = {
+            **dict(resources),
+            "ram_slot_budget_source": {
+                **dict(source),
+                "probe_result": probe_result,
+            },
+        }
 
     arcface = _require_mapping(raw["arcface"], "ArcFace binding")
     required_arcface = {
@@ -1500,6 +1576,7 @@ def validate_policy(
             "screening_contracts",
             "screening_worker",
             "controller",
+            "ram_probe_launcher",
             "preflight_wrapper",
             "generator_sampling",
             "meanflow_sampling",
@@ -2187,6 +2264,11 @@ def build_run_request(
             "candidate manifest file disagrees with the in-memory contract"
         )
     manifest_binding = policy["protocol"]["manifests"][mode]
+    admission_path = Path(str(admission["path"])).resolve()
+    admission_value = load_json(admission_path, "resource admission")
+    admission_snapshot = _require_mapping(
+        admission_value.get("snapshot"), "resource admission snapshot"
+    )
     output = (
         output_root / f"{mode}_{replicate}" / str(candidate["candidate_id"])
     ).resolve()
@@ -2206,6 +2288,10 @@ def build_run_request(
         },
         "implementations": dict(policy["implementations"]),
         "admission": dict(admission),
+        "authorized_gpu_registry": list(
+            admission_snapshot["authorized_gpu_registry"]
+        ),
+        "ram_reservation": dict(admission_snapshot["ram_reservation"]),
         "candidate_manifest": {
             "path": str(candidate_manifest_path.resolve()),
             "sha256": sha256_file(candidate_manifest_path),
@@ -2258,6 +2344,8 @@ def validate_run_request(
         "policy",
         "implementations",
         "admission",
+        "authorized_gpu_registry",
+        "ram_reservation",
         "candidate_manifest",
         "candidate",
         "output_decoder_registry",
@@ -2343,6 +2431,72 @@ def validate_run_request(
         or admission_value.get("policy_sha256") != policy["policy_sha256"]
     ):
         raise CanonicalScreeningError("run request admission contract mismatch")
+    snapshot = _require_mapping(
+        admission_value.get("snapshot"), "resource admission snapshot"
+    )
+    authorized_registry = value["authorized_gpu_registry"]
+    if (
+        not isinstance(authorized_registry, list)
+        or authorized_registry != snapshot.get("authorized_gpu_registry")
+        or [row.get("physical_gpu_index") for row in authorized_registry]
+        != policy["resources"]["physical_gpus"]
+        or any(
+            set(row) != {"physical_gpu_index", "physical_gpu_uuid"}
+            or not isinstance(row["physical_gpu_uuid"], str)
+            or not row["physical_gpu_uuid"].startswith("GPU-")
+            for row in authorized_registry
+        )
+        or len({row["physical_gpu_uuid"] for row in authorized_registry})
+        != len(authorized_registry)
+    ):
+        raise CanonicalScreeningError(
+            "run request authorized GPU UUID registry mismatch"
+        )
+    reservation = _require_mapping(
+        value["ram_reservation"], "run request RAM reservation"
+    )
+    if reservation != snapshot.get("ram_reservation"):
+        raise CanonicalScreeningError(
+            "run request RAM reservation differs from admission"
+        )
+    required_reservation_fields = {
+        "slot_count",
+        "slot_budget_bytes",
+        "reserved_bytes",
+        "memory_total_bytes",
+        "memory_used_bytes",
+        "projected_used_bytes",
+        "projected_used_percent",
+        "admission_limit_percent",
+        "budget_source",
+    }
+    _require_exact_keys(
+        reservation, required_reservation_fields, "run request RAM reservation"
+    )
+    expected_slot_count = len(policy["resources"]["physical_gpus"]) * int(
+        policy["resources"]["workers_per_gpu"]
+    )
+    if (
+        policy["resources"]["ram_budget_status"] != "sealed"
+        or reservation["slot_count"] != expected_slot_count
+        or reservation["slot_budget_bytes"]
+        != policy["resources"]["ram_slot_budget_bytes"]
+        or reservation["reserved_bytes"]
+        != reservation["slot_count"] * reservation["slot_budget_bytes"]
+        or reservation["projected_used_bytes"]
+        != reservation["memory_used_bytes"] + reservation["reserved_bytes"]
+        or reservation["projected_used_percent"]
+        != 100.0
+        * reservation["projected_used_bytes"]
+        / reservation["memory_total_bytes"]
+        or reservation["admission_limit_percent"]
+        != policy["resources"]["ram_admission_percent"]
+        or reservation["projected_used_percent"]
+        >= reservation["admission_limit_percent"]
+        or reservation["budget_source"]
+        != policy["resources"]["ram_slot_budget_source"]
+    ):
+        raise CanonicalScreeningError("run request RAM reservation mismatch")
     candidate_manifest = _require_mapping(
         value["candidate_manifest"], "candidate manifest binding"
     )
@@ -2365,6 +2519,9 @@ def build_run_claim(
     request: Mapping[str, Any],
     policy: Mapping[str, Any],
     gpu_index: int,
+    gpu_uuid: str,
+    runtime_cuda_uuid: str,
+    cuda_visible_devices: str,
     worker_pid: int,
     started_at: str,
 ) -> dict[str, Any]:
@@ -2378,7 +2535,14 @@ def build_run_claim(
         "contract_type": RUN_CLAIM_CONTRACT,
         "run_request_sha256": request["run_request_sha256"],
         "admission_sha256": request["admission"]["canonical_sha256"],
-        "gpu_index": gpu_index,
+        "physical_gpu_index": gpu_index,
+        "physical_gpu_uuid": gpu_uuid,
+        "logical_cuda_index": 0,
+        "runtime_cuda_uuid": runtime_cuda_uuid,
+        "cuda_visible_devices": cuda_visible_devices,
+        "ram_slot_budget_bytes": request["ram_reservation"][
+            "slot_budget_bytes"
+        ],
         "worker_pid": worker_pid,
         "started_at": started_at,
     }
@@ -2400,7 +2564,12 @@ def validate_run_claim(
             "contract_type",
             "run_request_sha256",
             "admission_sha256",
-            "gpu_index",
+            "physical_gpu_index",
+            "physical_gpu_uuid",
+            "logical_cuda_index",
+            "runtime_cuda_uuid",
+            "cuda_visible_devices",
+            "ram_slot_budget_bytes",
             "worker_pid",
             "started_at",
             "run_claim_sha256",
@@ -2413,11 +2582,26 @@ def validate_run_claim(
         or value["run_request_sha256"] != validated_request["run_request_sha256"]
         or value["admission_sha256"]
         != validated_request["admission"]["canonical_sha256"]
-        or value["gpu_index"] not in policy["resources"]["physical_gpus"]
+        or value["physical_gpu_index"]
+        not in policy["resources"]["physical_gpus"]
         or type(value["worker_pid"]) is not int
         or value["worker_pid"] <= 0
     ):
         raise CanonicalScreeningError("run claim binding mismatch")
+    registry = {
+        row["physical_gpu_index"]: row["physical_gpu_uuid"]
+        for row in validated_request["authorized_gpu_registry"]
+    }
+    expected_uuid = registry[value["physical_gpu_index"]]
+    if (
+        value["physical_gpu_uuid"] != expected_uuid
+        or value["runtime_cuda_uuid"] != expected_uuid
+        or value["cuda_visible_devices"] != expected_uuid
+        or value["logical_cuda_index"] != 0
+        or value["ram_slot_budget_bytes"]
+        != validated_request["ram_reservation"]["slot_budget_bytes"]
+    ):
+        raise CanonicalScreeningError("run claim CUDA/RAM binding mismatch")
     _require_sha256(value["run_claim_sha256"], "run claim SHA256")
     if value["run_claim_sha256"] != canonical_digest(value, "run_claim_sha256"):
         raise CanonicalScreeningError("run claim digest mismatch")
@@ -2449,6 +2633,14 @@ def build_run_result(
         "contract_type": RUN_RESULT_CONTRACT,
         "run_request_sha256": request["run_request_sha256"],
         "run_claim_sha256": claim["run_claim_sha256"],
+        "device_binding": {
+            "physical_gpu_index": claim["physical_gpu_index"],
+            "physical_gpu_uuid": claim["physical_gpu_uuid"],
+            "logical_cuda_index": claim["logical_cuda_index"],
+            "runtime_cuda_uuid": claim["runtime_cuda_uuid"],
+            "cuda_visible_devices": claim["cuda_visible_devices"],
+        },
+        "ram_slot_budget_bytes": claim["ram_slot_budget_bytes"],
         "status": status,
         "completed_at": completed_at,
         "evidence": None if evidence is None else dict(evidence),
@@ -2474,6 +2666,8 @@ def validate_run_result(
             "contract_type",
             "run_request_sha256",
             "run_claim_sha256",
+            "device_binding",
+            "ram_slot_budget_bytes",
             "status",
             "completed_at",
             "evidence",
@@ -2487,6 +2681,16 @@ def validate_run_result(
         or value["contract_type"] != RUN_RESULT_CONTRACT
         or value["run_request_sha256"] != validated_request["run_request_sha256"]
         or value["run_claim_sha256"] != validated_claim["run_claim_sha256"]
+        or value["device_binding"]
+        != {
+            "physical_gpu_index": validated_claim["physical_gpu_index"],
+            "physical_gpu_uuid": validated_claim["physical_gpu_uuid"],
+            "logical_cuda_index": validated_claim["logical_cuda_index"],
+            "runtime_cuda_uuid": validated_claim["runtime_cuda_uuid"],
+            "cuda_visible_devices": validated_claim["cuda_visible_devices"],
+        }
+        or value["ram_slot_budget_bytes"]
+        != validated_claim["ram_slot_budget_bytes"]
         or value["status"] not in {"completed", "failed"}
     ):
         raise CanonicalScreeningError("run result binding mismatch")

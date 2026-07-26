@@ -30,6 +30,7 @@ from safa.closeout.canonical_screening import (
     write_exclusive_json,
 )
 from safa.closeout.canonical_screening_worker import (
+    _assert_runtime_cuda_binding,
     _load_source_pixel_batch,
     _representation_cosines,
     _write_validated_run_result,
@@ -54,6 +55,23 @@ def _controller_module():
 def _wrapper_module():
     path = Path(__file__).parents[1] / "scripts" / "run_canonical_preflight_wrapper.py"
     spec = importlib.util.spec_from_file_location("canonical_wrapper_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _ram_probe_module():
+    path = (
+        Path(__file__).parents[1]
+        / "scripts"
+        / "run_canonical_screening_ram_probe.py"
+    )
+    if str(path.parent) not in sys.path:
+        sys.path.insert(0, str(path.parent))
+    spec = importlib.util.spec_from_file_location(
+        "canonical_ram_probe_test", path
+    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -177,6 +195,7 @@ def _policy(tmp_path: Path, ledger: Path) -> tuple[dict, Path, dict]:
             "screening_contracts",
             "screening_worker",
             "controller",
+            "ram_probe_launcher",
             "preflight_wrapper",
             "generator_sampling",
             "meanflow_sampling",
@@ -218,6 +237,19 @@ def _policy(tmp_path: Path, ledger: Path) -> tuple[dict, Path, dict]:
         "resources": {
             "physical_gpus": [0, 1, 2, 3],
             "workers_per_gpu": 2,
+            "ram_budget_status": "sealed",
+            "ram_slot_budget_bytes": 1100,
+            "ram_slot_budget_source": {
+                "contract_type": "safa_canonical_screening_ram_budget_source_v1",
+                "method": (
+                    "ceil(single_worker_process_tree_peak_rss_bytes*11/10)"
+                ),
+                "measurement_factor_numerator": 11,
+                "measurement_factor_denominator": 10,
+                "peak_process_tree_rss_bytes": 1000,
+                "ram_slot_budget_bytes": 1100,
+                "probe_result": bound,
+            },
             "gpu_headroom_bytes": 2 * 1024**3,
             "cpu_admission_percent": 90,
             "cpu_hard_limit_percent": 90,
@@ -242,7 +274,7 @@ def _policy(tmp_path: Path, ledger: Path) -> tuple[dict, Path, dict]:
     admission_value = {
         "contract_type": "safa_canonical_resource_admission_v1",
         "policy_sha256": policy["policy_sha256"],
-        "snapshot": {"gpus": []},
+        "snapshot": _admission_snapshot(policy),
     }
     admission_value["admission_sha256"] = canonical_digest(
         admission_value, "admission_sha256"
@@ -255,6 +287,30 @@ def _policy(tmp_path: Path, ledger: Path) -> tuple[dict, Path, dict]:
         "canonical_sha256": admission_value["admission_sha256"],
     }
     return policy, policy_path, admission
+
+
+def _admission_snapshot(policy: dict) -> dict:
+    return {
+        "gpus": [],
+        "authorized_gpu_registry": [
+            {
+                "physical_gpu_index": index,
+                "physical_gpu_uuid": f"GPU-fixture-{index}",
+            }
+            for index in range(4)
+        ],
+        "ram_reservation": {
+            "slot_count": 8,
+            "slot_budget_bytes": 1100,
+            "reserved_bytes": 8800,
+            "memory_total_bytes": 100000,
+            "memory_used_bytes": 10000,
+            "projected_used_bytes": 18800,
+            "projected_used_percent": 18.8,
+            "admission_limit_percent": 85,
+            "budget_source": policy["resources"]["ram_slot_budget_source"],
+        },
+    }
 
 
 def _row(run_id: str, sha: str | None, selector: str = "raw", path: str | None = None) -> dict:
@@ -367,7 +423,7 @@ def _manifest_fixture(tmp_path: Path) -> tuple[dict, dict, Path, Path, dict, dic
     admission_value = {
         "contract_type": "safa_canonical_resource_admission_v1",
         "policy_sha256": policy["policy_sha256"],
-        "snapshot": {"gpus": []},
+        "snapshot": _admission_snapshot(policy),
     }
     admission_value["admission_sha256"] = canonical_digest(
         admission_value, "admission_sha256"
@@ -559,6 +615,24 @@ def _evidence(policy: dict, request: dict) -> dict:
     }
 
 
+def _run_claim(
+    policy: dict, request: dict, gpu_index: int = 0, worker_pid: int = 123
+) -> dict:
+    gpu_uuid = request["authorized_gpu_registry"][gpu_index][
+        "physical_gpu_uuid"
+    ]
+    return build_run_claim(
+        request,
+        policy,
+        gpu_index,
+        gpu_uuid,
+        gpu_uuid,
+        gpu_uuid,
+        worker_pid,
+        "2026-07-26T00:00:00+00:00",
+    )
+
+
 def test_run_request_rejects_stale_policy_and_wrong_kid_subset(tmp_path: Path) -> None:
     policy, request = _run_fixture(tmp_path)
     assert request["kid_subset_size"] == 8
@@ -583,7 +657,7 @@ def test_screen512_locks_kid_subset_50(tmp_path: Path) -> None:
 
 def test_run_result_binds_smoke_manifest_policy_tool_and_admission(tmp_path: Path) -> None:
     policy, request = _run_fixture(tmp_path)
-    claim = build_run_claim(request, policy, 3, 123, "2026-07-26T00:00:00+00:00")
+    claim = _run_claim(policy, request, gpu_index=3)
     result = build_run_result(
         request,
         claim,
@@ -598,6 +672,139 @@ def test_run_result_binds_smoke_manifest_policy_tool_and_admission(tmp_path: Pat
     changed["run_result_sha256"] = canonical_digest(changed, "run_result_sha256")
     with pytest.raises(CanonicalScreeningError, match="candidate_manifest"):
         validate_run_result(changed, request, claim, policy)
+
+
+def test_run_request_and_claim_reject_gpu_uuid_tampering(tmp_path: Path) -> None:
+    policy, request = _run_fixture(tmp_path)
+    changed_request = json.loads(json.dumps(request))
+    changed_request["authorized_gpu_registry"][0]["physical_gpu_uuid"] = (
+        "GPU-tampered"
+    )
+    changed_request["run_request_sha256"] = canonical_digest(
+        changed_request, "run_request_sha256"
+    )
+    with pytest.raises(CanonicalScreeningError, match="GPU UUID registry"):
+        validate_run_request(changed_request, policy)
+
+    claim = _run_claim(policy, request)
+    changed_claim = json.loads(json.dumps(claim))
+    changed_claim["runtime_cuda_uuid"] = "GPU-tampered"
+    changed_claim["run_claim_sha256"] = canonical_digest(
+        changed_claim, "run_claim_sha256"
+    )
+    with pytest.raises(CanonicalScreeningError, match="CUDA/RAM"):
+        build_run_result(
+            request,
+            changed_claim,
+            policy,
+            status="failed",
+            completed_at="2026-07-26T00:01:00+00:00",
+            failure={"type": "probe", "message": "probe"},
+        )
+
+
+def test_worker_cuda_binding_refuses_remap_and_runtime_uuid_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import torch
+
+    policy, request = _run_fixture(tmp_path)
+    expected_uuid = request["authorized_gpu_registry"][0]["physical_gpu_uuid"]
+    monkeypatch.setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    with pytest.raises(CanonicalScreeningError, match="CUDA_VISIBLE_DEVICES"):
+        _assert_runtime_cuda_binding(request, 0, expected_uuid)
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", expected_uuid)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _index: types.SimpleNamespace(uuid="GPU-runtime-mismatch"),
+    )
+    with pytest.raises(CanonicalScreeningError, match="runtime CUDA UUID"):
+        _assert_runtime_cuda_binding(request, 0, expected_uuid)
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _index: types.SimpleNamespace(uuid=expected_uuid),
+    )
+    selected: list[int] = []
+    monkeypatch.setattr(torch.cuda, "set_device", selected.append)
+    assert _assert_runtime_cuda_binding(request, 0, expected_uuid) == {
+        "physical_gpu_index": 0,
+        "physical_gpu_uuid": expected_uuid,
+        "logical_cuda_index": 0,
+        "runtime_cuda_uuid": expected_uuid,
+        "cuda_visible_devices": expected_uuid,
+    }
+    assert selected == [0]
+
+
+def test_worker_environment_overrides_inherited_cuda_remap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _controller_module()
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3,2,1,0")
+    env = module._worker_environment("GPU-authorized")
+    assert env["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
+    assert env["CUDA_VISIBLE_DEVICES"] == "GPU-authorized"
+    with pytest.raises(CanonicalScreeningError, match="UUID"):
+        module._worker_environment("0")
+
+
+def test_ram_projection_accepts_84_99_and_rejects_exact_85() -> None:
+    module = _controller_module()
+    source = {"contract_type": "fixture"}
+    accepted = module._ram_reservation_projection(
+        total_bytes=1_000_000,
+        used_bytes=0,
+        slot_budget_bytes=849_900,
+        slot_count=1,
+        admission_limit_percent=85,
+        budget_source=source,
+    )
+    assert accepted["projected_used_percent"] == 84.99
+    with pytest.raises(CanonicalScreeningError, match="RAM reservation"):
+        module._ram_reservation_projection(
+            total_bytes=1_000_000,
+            used_bytes=0,
+            slot_budget_bytes=850_000,
+            slot_count=1,
+            admission_limit_percent=85,
+            budget_source=source,
+        )
+
+
+def test_ram_probe_selects_largest_checkpoint_per_output_space(
+    tmp_path: Path,
+) -> None:
+    module = _ram_probe_module()
+    candidates = []
+    for output_space, sizes in (("latent", (3, 7)), ("pixel", (5, 2))):
+        for index, size in enumerate(sizes):
+            checkpoint = tmp_path / f"{output_space}-{index}.pt"
+            checkpoint.write_bytes(bytes([index + 1]) * size)
+            candidates.append(
+                {
+                    "candidate_id": f"{output_space}-{index}",
+                    "checkpoint_path": str(checkpoint),
+                    "checkpoint_sha256": hashlib.sha256(
+                        checkpoint.read_bytes()
+                    ).hexdigest(),
+                    "checkpoint_model": "raw",
+                    "output_contract": {
+                        "output_contract_sha256": str(index) * 64,
+                        "capability": {"output_space": output_space},
+                    },
+                }
+            )
+    selected = module._select_probe_candidates({"candidates": candidates})
+    assert [
+        (row["output_space"], row["candidate_id"], row["checkpoint_size_bytes"])
+        for row in selected
+    ] == [("latent", "latent-1", 7), ("pixel", "pixel-0", 5)]
 
 
 def test_screen512_gate_requires_exact_primary_repeat_smoke(
@@ -689,12 +896,10 @@ def test_screen512_gate_requires_exact_primary_repeat_smoke(
             )
         per_sample = output / "per_sample.jsonl"
         _write_jsonl(per_sample, rows)
-        claim = build_run_claim(
-            request,
+        claim = _run_claim(
             policy,
-            0,
-            100 + (replicate == "repeat"),
-            "2026-07-26T00:00:00+00:00",
+            request,
+            worker_pid=100 + (replicate == "repeat"),
         )
         write_exclusive_json(output / "claim.json", claim)
         evidence = _evidence(policy, request)
@@ -868,7 +1073,7 @@ def test_kid_subset_8_accepts_eight_real_and_fake_samples(
 
 def test_invalid_result_validation_leaves_no_immutable_result(tmp_path: Path) -> None:
     policy, request = _run_fixture(tmp_path)
-    claim = build_run_claim(request, policy, 0, 123, "2026-07-26T00:00:00+00:00")
+    claim = _run_claim(policy, request)
     result = build_run_result(
         request,
         claim,
@@ -958,18 +1163,35 @@ def test_monitor_is_append_only_and_audit_reconstructable(
     monkeypatch.setattr(module, "_memory_percent", lambda: 20.0)
     monkeypatch.setattr(module, "_disk_percent", lambda _path: 30.0)
     monkeypatch.setattr(module, "_swap_pages", lambda: (1, 2))
-    monkeypatch.setattr(
-        module,
-        "_gpu_snapshot",
-        lambda: [{"index": 0, "uuid": "GPU-a", "temperature_c": 40}],
-    )
+    gpu_rows = [
+        {
+            "index": index,
+            "uuid": f"GPU-fixture-{index}",
+            "temperature_c": 40,
+        }
+        for index in range(4)
+    ]
+    monkeypatch.setattr(module, "_gpu_snapshot", lambda: gpu_rows)
     monkeypatch.setattr(module, "_gpu_compute_processes", lambda: [])
-    path = module._append_monitor_sample(policy, paths, "smoke8")
-    module._append_monitor_sample(policy, paths, "smoke8", terminal=True)
+    admission = module._write_admission(
+        policy,
+        paths,
+        "smoke8",
+        {
+            **_admission_snapshot(policy),
+            "gpus": gpu_rows,
+        },
+    )
+    path = module._append_monitor_sample(
+        policy, paths, "smoke8", admission=admission
+    )
+    module._append_monitor_sample(
+        policy, paths, "smoke8", terminal=True, admission=admission
+    )
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     assert len(rows) == 2
     assert rows[0]["terminal"] is False and rows[1]["terminal"] is True
-    assert rows[0]["gpus"][0]["uuid"] == "GPU-a"
+    assert rows[0]["gpus"][0]["uuid"] == "GPU-fixture-0"
     assert rows[0]["artifacts"]["generated_png"] == 0
 
 

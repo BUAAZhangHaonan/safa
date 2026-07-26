@@ -126,6 +126,7 @@
   "resources": {
     "physical_gpus": [0, 1, 2, 3],
     "workers_per_gpu": 2,
+    "ram_budget_status": "probe_required",
     "gpu_headroom_bytes": 2147483648,
     "cpu_admission_percent": 90,
     "cpu_hard_limit_percent": 90,
@@ -265,15 +266,19 @@
     },
     "screening_contracts": {
       "path": "src/safa/closeout/canonical_screening.py",
-      "sha256": "60d114d888a8554a899b2696e9e028485654ca3c98a68265755ba96281563b50"
+      "sha256": "86f144963f470398c4801f9862c67dcfacd0b112ba8b3f373bffd5bb33e24fa6"
     },
     "screening_worker": {
       "path": "src/safa/closeout/canonical_screening_worker.py",
-      "sha256": "f0d0c6428146417b87e6fbca3bf247decf07b1bd966b0d4c91f0a862e4fd68e3"
+      "sha256": "a6ba230097f04157deb72bc2fbe184b560b92bb272d3cb2f2374fe53135c8183"
     },
     "controller": {
       "path": "scripts/run_canonical_checkpoint_screening.py",
-      "sha256": "59694c8361ce7a9e5143e28380d3e13f5304fb320ec63eaf7e3b734b66e916a9"
+      "sha256": "f4c5728834c3f4be60477d8e016fc261b833ea0c448d3928aca368926af5860f"
+    },
+    "ram_probe_launcher": {
+      "path": "scripts/run_canonical_screening_ram_probe.py",
+      "sha256": "b4341a38eda1584d7e688a79d749437196675e7f4ef474babb80f794db89964f"
     },
     "preflight_wrapper": {
       "path": "scripts/run_canonical_preflight_wrapper.py",

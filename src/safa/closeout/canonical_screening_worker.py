@@ -73,6 +73,55 @@ def _mean(values: Sequence[float], label: str) -> float:
     return float(statistics.fmean(values))
 
 
+def _assert_runtime_cuda_binding(
+    request: Mapping[str, Any],
+    physical_gpu_index: int,
+    physical_gpu_uuid: str,
+) -> dict[str, Any]:
+    registry = {
+        row["physical_gpu_index"]: row["physical_gpu_uuid"]
+        for row in request["authorized_gpu_registry"]
+    }
+    expected_uuid = registry.get(physical_gpu_index)
+    if expected_uuid is None or physical_gpu_uuid != expected_uuid:
+        raise CanonicalScreeningError(
+            "worker physical GPU index/UUID differs from admission"
+        )
+    if os.environ.get("CUDA_DEVICE_ORDER") != "PCI_BUS_ID":
+        raise CanonicalScreeningError(
+            "worker CUDA_DEVICE_ORDER must be PCI_BUS_ID"
+        )
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible_devices != expected_uuid:
+        raise CanonicalScreeningError(
+            "worker CUDA_VISIBLE_DEVICES differs from the authorized GPU UUID"
+        )
+
+    import torch
+
+    if torch.cuda.device_count() != 1:
+        raise CanonicalScreeningError(
+            "worker CUDA visibility must contain exactly one device"
+        )
+    properties = torch.cuda.get_device_properties(0)
+    runtime_uuid = properties.uuid
+    if isinstance(runtime_uuid, bytes):
+        runtime_uuid = runtime_uuid.decode("ascii")
+    runtime_uuid = str(runtime_uuid)
+    if runtime_uuid != expected_uuid:
+        raise CanonicalScreeningError(
+            "worker runtime CUDA UUID differs from the authorized GPU UUID"
+        )
+    torch.cuda.set_device(0)
+    return {
+        "physical_gpu_index": physical_gpu_index,
+        "physical_gpu_uuid": expected_uuid,
+        "logical_cuda_index": 0,
+        "runtime_cuda_uuid": runtime_uuid,
+        "cuda_visible_devices": visible_devices,
+    }
+
+
 def _load_arcface_contract(request: Mapping[str, Any]) -> dict[str, Any]:
     from safa.evaluation.r9_evaluator_worker import _validate_arcface_contract
 
@@ -186,7 +235,7 @@ def _run_generation(
     from safa.utils.sampling import make_x_init_for_sample_ids
     from safa.utils.seed import set_seed
 
-    device = f"cuda:{gpu_index}"
+    device = "cuda:0"
     if not torch.cuda.is_available():
         raise CanonicalScreeningError("CUDA is required for canonical screening")
     set_seed(4549)
@@ -381,7 +430,7 @@ def _run_arcface(
     )
 
     contract = _load_arcface_contract(request)
-    analyzer = _production_face_analyzer_factory(contract, f"cuda:{gpu_index}")
+    analyzer = _production_face_analyzer_factory(contract, "cuda:0")
     complete = 0
     values: list[float] = []
     for row, source, candidate in zip(
@@ -467,7 +516,7 @@ def _run_quality(
             max_generated=None,
             max_real=None,
             subset_seed=4549,
-            device=f"cuda:{gpu_index}",
+            device="cuda:0",
             sample_id_manifest=Path(str(request["sample_manifest"]["path"])),
             per_sample_jsonl=per_sample,
             generation_result=None,
@@ -482,7 +531,7 @@ def _run_quality(
         per_sample_jsonl=per_sample,
         subset_seed=4549,
         subset_size=request["kid_subset_size"],
-        device=f"cuda:{gpu_index}",
+        device="cuda:0",
     )
     for field in ("kid_mean", "kid_std", "kid_subset_size"):
         quality[field] = kid[field]
@@ -491,7 +540,10 @@ def _run_quality(
 
 
 def execute_screening_request(
-    request_path: Path, gpu_index: int, policy: Mapping[str, Any]
+    request_path: Path,
+    gpu_index: int,
+    gpu_uuid: str,
+    policy: Mapping[str, Any],
 ) -> dict[str, Any]:
     request = validate_run_request(
         load_json(request_path, "screening run request"), policy
@@ -535,9 +587,19 @@ def execute_screening_request(
         verify_historical_output_evidence=False,
     ) != dict(policy):
         raise CanonicalScreeningError("worker policy differs from current validated policy")
+    cuda_binding = _assert_runtime_cuda_binding(request, gpu_index, gpu_uuid)
     output_dir = Path(str(request["output_dir"])).resolve()
     output_dir.mkdir(parents=True, exist_ok=False)
-    claim = build_run_claim(request, policy, gpu_index, os.getpid(), _utc_now())
+    claim = build_run_claim(
+        request,
+        policy,
+        cuda_binding["physical_gpu_index"],
+        cuda_binding["physical_gpu_uuid"],
+        cuda_binding["runtime_cuda_uuid"],
+        cuda_binding["cuda_visible_devices"],
+        os.getpid(),
+        _utc_now(),
+    )
     write_exclusive_json(output_dir / "claim.json", claim)
     try:
         rows, source_paths, candidate_paths = _run_generation(
