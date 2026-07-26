@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "contract_type": "safa_historical_evidence_policy_v1",
+  "legacy_invalid_series": {
+    "logical_experiment_ids": ["R1", "R2", "R3", "R4", "R5"],
+    "evidence_level": "legacy_untrusted_candidate_discovery",
+    "status_when_execution_evidence_exists": "invalid_evaluation",
+    "reason": "The approved closeout protocol invalidates R1-R5 formal comparisons because the historical LoRA loader was defective and narrative/JSON claims conflict. These runs remain candidate-discovery evidence only.",
+    "sources": [
+      "safa-round1-results-2026-07-07.md",
+      "safa-autonomous-exploration-final-2026-07-08.md",
+      "docs/results/safa-lora-target-sweep-results-2026-07-07.md",
+      "docs/results/safa-r5-eval-results-2026-07-08.md"
+    ]
+  },
+  "trusted_historical_baselines": {
+    "logical_experiment_ids": ["R6", "R7", "R9"],
+    "evidence_level": "strong_provenance_historical_baseline"
+  },
+  "protocol_families": {
+    "R1-R5": "legacy_lora_loader_bug",
+    "R6-R7": "lora_pu_historical",
+    "R8": "meanflow_guidance_r8",
+    "R9": "meanflow_guidance_r9",
+    "E1-E15": "medium_v2_training_historical",
+    "E16-E23": "medium_v2_generator_matrix"
+  }
+}
