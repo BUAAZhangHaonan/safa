@@ -14,6 +14,11 @@ from io import StringIO
 from pathlib import Path
 from typing import Any
 
+from safa.closeout.generator_output_contract import (
+    bind_output_contract,
+    resolve_checkpoint_output_capability,
+    validate_loaded_generator_capability,
+)
 from safa.models.generator import (
     build_generator,
     generator_sample_channels,
@@ -73,6 +78,8 @@ def _base_result(
             "mounted_key_count": 0,
             "mounted": False,
         },
+        "output_capability": None,
+        "output_contract": None,
         "smoke": {
             "requested_sample_count": 0,
             "executed_sample_count": 0,
@@ -422,6 +429,7 @@ def strict_load_generator_checkpoint(
     expected_checkpoint_sha256: str | None = None,
     compute_sha256: bool = False,
     smoke_samples: int = 0,
+    output_decoder_registry: Mapping[str, Any] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Reconstruct, validate, and strictly load one generator checkpoint."""
     import torch
@@ -469,6 +477,27 @@ def strict_load_generator_checkpoint(
             "model_config_invalid",
             f"invalid generator model_config: {type(exc).__name__}: {exc}",
         )
+    try:
+        output_capability = resolve_checkpoint_output_capability(
+            payload,
+            result["checkpoint_sha256"],
+        )
+        output_contract = (
+            None
+            if output_decoder_registry is None
+            else bind_output_contract(
+                output_capability,
+                output_decoder_registry,
+            )
+        )
+    except Exception as exc:
+        _fail(
+            result,
+            "output_contract_invalid",
+            f"invalid generator output contract: {type(exc).__name__}: {exc}",
+        )
+    result["output_capability"] = output_capability
+    result["output_contract"] = output_contract
     if selector not in {"raw", "ema"}:
         message = (
             "checkpoint_model is required for eval and must be 'raw' or 'ema'"
@@ -666,6 +695,15 @@ def strict_load_generator_checkpoint(
             "state_dict_load_failed",
             f"strict state_dict load failed: {type(exc).__name__}: {exc}",
         )
+    try:
+        validate_loaded_generator_capability(generator, output_capability)
+    except Exception as exc:
+        _fail(
+            result,
+            "loaded_output_capability_mismatch",
+            f"strict-loaded generator output capability mismatch: "
+            f"{type(exc).__name__}: {exc}",
+        )
     generator = generator.to(device).eval()
     result["smoke"] = _smoke_generator(generator, int(smoke_samples), result)
     result["status"] = "valid"
@@ -683,6 +721,7 @@ def preflight_generator_checkpoint(
     expected_checkpoint_sha256: str | None = None,
     compute_sha256: bool = True,
     smoke_samples: int = 0,
+    output_decoder_registry: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return a machine-readable result instead of raising on validation failure."""
     try:
@@ -693,6 +732,7 @@ def preflight_generator_checkpoint(
             expected_checkpoint_sha256=expected_checkpoint_sha256,
             compute_sha256=compute_sha256,
             smoke_samples=smoke_samples,
+            output_decoder_registry=output_decoder_registry,
         )
         return result
     except CheckpointPreflightError as exc:

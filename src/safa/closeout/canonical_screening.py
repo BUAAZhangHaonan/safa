@@ -10,6 +10,15 @@ from pathlib import Path
 import re
 from typing import Any, Iterable, Mapping, Sequence
 
+from safa.closeout.generator_output_contract import (
+    DECODER_REGISTRY_CONTRACT,
+    GeneratorOutputContractError,
+    LATENT_DECODER_TYPE,
+    PIXEL_DECODER_TYPE,
+    decoder_registry_digest,
+    validate_decoder_registry,
+    validate_output_contract,
+)
 
 POLICY_CONTRACT = "safa_canonical_screening_policy_v1"
 PLAN_CONTRACT = "safa_canonical_checkpoint_plan_v1"
@@ -186,75 +195,481 @@ def validate_supersession_evidence(
         {
             "policy_sha256",
             "classification",
-            "result_count",
-            "pending_count",
-            "controller_terminal",
-            "wrapper_exit",
-            "controller_log",
-            "controller_process_log",
+            "phase",
+            "request_count",
+            "primary_failed_count",
+            "repeat_result_count",
+            "screen512_result_count",
+            "generated_png_count",
+            "failed_summary",
+            "run_requests",
+            "run_claims",
+            "failed_results",
+            "worker_logs",
+            "resource_monitor",
+            "runtime_resource_windows",
         },
         "supersession evidence",
     )
     if (
         supersedes["policy_sha256"]
-        != "8ce4855b042161ff5698ce400f8b80122add90d6025ffd08f31fe49d8ef84a7f"
+        != "ea7ae71fd662526b9a45bf3cc6d283884aefc380b292c8f273169a35f42ffc28"
         or supersedes["classification"] != "started_incomplete"
-        or supersedes["result_count"] != 1
-        or supersedes["pending_count"] != 192
+        or supersedes["phase"] != "smoke8"
+        or supersedes["request_count"] != 386
+        or supersedes["primary_failed_count"] != 8
+        or supersedes["repeat_result_count"] != 0
+        or supersedes["screen512_result_count"] != 0
+        or supersedes["generated_png_count"] != 0
     ):
         raise CanonicalScreeningError("canonical supersession status differs")
     root = repo_root.resolve()
+    failed_results = supersedes["failed_results"]
+    run_requests = supersedes["run_requests"]
+    run_claims = supersedes["run_claims"]
+    worker_logs = supersedes["worker_logs"]
+    if (
+        not isinstance(run_requests, list)
+        or len(run_requests) != 8
+        or not isinstance(run_claims, list)
+        or len(run_claims) != 8
+        or not isinstance(failed_results, list)
+        or len(failed_results) != 8
+        or not isinstance(worker_logs, list)
+        or len(worker_logs) != 8
+    ):
+        raise CanonicalScreeningError(
+            "smoke supersession must bind eight results and eight logs"
+        )
     bound = {
         "policy_sha256": supersedes["policy_sha256"],
         "classification": "started_incomplete",
-        "result_count": 1,
-        "pending_count": 192,
-        **{
-            name: _validate_bound_file(
-                root, supersedes[name], f"supersession {name}"
-            )
-            for name in (
-                "controller_terminal",
-                "wrapper_exit",
-                "controller_log",
-                "controller_process_log",
-            )
-        },
+        "phase": "smoke8",
+        "request_count": 386,
+        "primary_failed_count": 8,
+        "repeat_result_count": 0,
+        "screen512_result_count": 0,
+        "generated_png_count": 0,
+        "failed_summary": _validate_bound_file(
+            root, supersedes["failed_summary"], "supersession failed summary"
+        ),
+        "run_requests": [
+            _validate_bound_file(root, value, "supersession run request")
+            for value in run_requests
+        ],
+        "run_claims": [
+            _validate_bound_file(root, value, "supersession run claim")
+            for value in run_claims
+        ],
+        "failed_results": [
+            _validate_bound_file(root, value, "supersession failed result")
+            for value in failed_results
+        ],
+        "worker_logs": [
+            _validate_bound_file(root, value, "supersession worker log")
+            for value in worker_logs
+        ],
+        "resource_monitor": _validate_bound_file(
+            root, supersedes["resource_monitor"], "supersession resource monitor"
+        ),
+        "runtime_resource_windows": _validate_bound_file(
+            root,
+            supersedes["runtime_resource_windows"],
+            "supersession runtime resource windows",
+        ),
     }
-    terminal = load_json(
-        Path(bound["controller_terminal"]["path"]),
-        "superseded controller terminal",
+    summary = load_json(
+        Path(bound["failed_summary"]["path"]),
+        "superseded smoke failed summary",
     )
     if (
-        terminal.get("contract_type")
-        != "safa_canonical_preflight_controller_terminal_v1"
-        or terminal.get("policy_sha256") != bound["policy_sha256"]
-        or terminal.get("status") != "failed"
-        or terminal.get("result_count") != 1
-        or terminal.get("pending_count") != 192
+        summary.get("phase") != "smoke8"
+        or summary.get("reason") != "worker_nonzero_exit"
+        or summary.get("failures")
+        != [
+            f"{binding['path']}: exit_code=1"
+            for binding in bound["run_requests"]
+        ]
+        or summary.get("monitor_log") != bound["resource_monitor"]
+        or _require_mapping(
+            summary.get("runtime_resource_guard"),
+            "superseded runtime resource guard",
+        ).get("samples")
+        != bound["runtime_resource_windows"]
+    ):
+        raise CanonicalScreeningError("superseded smoke summary semantics differ")
+    failure_message = (
+        "The size of tensor a (4) must match the size of tensor b (3) "
+        "at non-singleton dimension 1"
+    )
+    candidate_ids: list[str] = []
+    for request_binding, claim_binding, result_binding in zip(
+        bound["run_requests"],
+        bound["run_claims"],
+        bound["failed_results"],
+        strict=True,
+    ):
+        request = load_json(
+            Path(request_binding["path"]), "superseded smoke run request"
+        )
+        claim = load_json(
+            Path(claim_binding["path"]), "superseded smoke run claim"
+        )
+        result = load_json(
+            Path(result_binding["path"]), "superseded smoke failed result"
+        )
+        failure = _require_mapping(result.get("failure"), "smoke result failure")
+        candidate = _require_mapping(
+            request.get("candidate"), "superseded request candidate"
+        )
+        candidate_id = candidate.get("candidate_id")
+        if (
+            request.get("contract_type") != RUN_REQUEST_CONTRACT
+            or request.get("mode") != "smoke8"
+            or request.get("replicate") != "primary"
+            or request.get("sample_count") != 8
+            or request.get("batch_size") != 2
+            or request.get("seed") != 4549
+            or _require_mapping(
+                request.get("policy"), "superseded request policy"
+            ).get("canonical_sha256")
+            != supersedes["policy_sha256"]
+            or request.get("run_request_sha256")
+            != canonical_digest(request, "run_request_sha256")
+            or not isinstance(candidate_id, str)
+            or not candidate_id
+            or claim.get("contract_type") != RUN_CLAIM_CONTRACT
+            or claim.get("run_request_sha256")
+            != request.get("run_request_sha256")
+            or claim.get("run_claim_sha256")
+            != canonical_digest(claim, "run_claim_sha256")
+            or result.get("run_request_sha256")
+            != request.get("run_request_sha256")
+            or result.get("run_claim_sha256") != claim.get("run_claim_sha256")
+            or result.get("run_result_sha256")
+            != canonical_digest(result, "run_result_sha256")
+            or result.get("status") != "failed"
+            or failure.get("type") != "RuntimeError"
+            or failure.get("message") != failure_message
+        ):
+            raise CanonicalScreeningError(
+                "superseded smoke result semantics differ"
+            )
+        candidate_ids.append(candidate_id)
+    if len(candidate_ids) != len(set(candidate_ids)):
+        raise CanonicalScreeningError(
+            "superseded smoke candidate IDs are not unique"
+        )
+    campaign_policy_root = (
+        Path(bound["run_requests"][0]["path"]).resolve().parents[2]
+    )
+    primary_requests = list(
+        (campaign_policy_root / "run_requests" / "smoke8_primary").glob("*.json")
+    )
+    repeat_requests = list(
+        (campaign_policy_root / "run_requests" / "smoke8_repeat").glob("*.json")
+    )
+    repeat_results = list(
+        (campaign_policy_root / "runs" / "smoke8_repeat").glob("*/result.json")
+    )
+    primary_results = list(
+        (campaign_policy_root / "runs" / "smoke8_primary").glob("*/result.json")
+    )
+    screen512_results = list(
+        (campaign_policy_root / "runs" / "screen512_primary").glob("*/result.json")
+    )
+    generated_pngs = list((campaign_policy_root / "runs").glob("**/*.png"))
+    if (
+        len(primary_requests) + len(repeat_requests) != 386
+        or len(primary_requests) != 193
+        or len(repeat_requests) != 193
+        or len(primary_results) != 8
+        or len(repeat_results) != 0
+        or len(screen512_results) != 0
+        or len(generated_pngs) != 0
     ):
         raise CanonicalScreeningError(
-            "superseded controller terminal semantics differ"
+            "superseded smoke filesystem counts differ"
         )
-    wrapper_exit = load_json(
-        Path(bound["wrapper_exit"]["path"]),
-        "superseded wrapper exit",
+    resource_guard = _require_mapping(
+        summary.get("runtime_resource_guard"),
+        "superseded runtime resource guard",
     )
     if (
-        wrapper_exit.get("contract_type")
-        != "safa_canonical_preflight_wrapper_exit_v2"
-        or wrapper_exit.get("policy_sha256") != bound["policy_sha256"]
-        or wrapper_exit.get("exit_code") != 2
-        or wrapper_exit.get("signal") is not None
-        or wrapper_exit.get("controller_terminal") != bound["controller_terminal"]
-        or wrapper_exit.get("controller_process_log")
-        != bound["controller_process_log"]
+        resource_guard.get("violated") is not False
+        or resource_guard.get("violation_reason") is not None
+        or resource_guard.get("thread_failure") is not None
+        or resource_guard.get("final_cpu_consecutive_high") != 0
+        or resource_guard.get("final_swap_consecutive_io") != 0
     ):
-        raise CanonicalScreeningError("superseded wrapper exit semantics differ")
+        raise CanonicalScreeningError(
+            "superseded smoke resource guard semantics differ"
+        )
+    for log_binding in bound["worker_logs"]:
+        if failure_message not in Path(log_binding["path"]).read_text(
+            encoding="utf-8"
+        ):
+            raise CanonicalScreeningError(
+                "superseded smoke worker log semantics differ"
+            )
     return bound
 
 
-def validate_policy(repo_root: Path, policy_path: Path) -> dict[str, Any]:
+def _validate_output_decoder_registry(
+    repo_root: Path,
+    raw_registry: Mapping[str, Any],
+    *,
+    verify_historical_evidence: bool,
+) -> dict[str, Any]:
+    try:
+        registry = validate_decoder_registry(raw_registry)
+    except GeneratorOutputContractError as exc:
+        raise CanonicalScreeningError(str(exc)) from exc
+
+    def known_binding(
+        raw_binding: Mapping[str, Any],
+        relative_path: str,
+        expected_sha256: str,
+        label: str,
+        *,
+        verify_content: bool,
+    ) -> dict[str, Any]:
+        binding = _require_mapping(raw_binding, label)
+        path = (
+            repo_root / str(binding["path"])
+            if not Path(str(binding["path"])).is_absolute()
+            else Path(str(binding["path"]))
+        ).resolve()
+        expected_path = (repo_root / relative_path).resolve()
+        if (
+            path != expected_path
+            or binding.get("sha256") != expected_sha256
+            or (
+                verify_content
+                and (
+                    not path.is_file()
+                    or sha256_file(path) != expected_sha256
+                )
+            )
+        ):
+            raise CanonicalScreeningError(f"{label} frozen binding differs")
+        return {"path": str(path), "sha256": expected_sha256}
+
+    pixel = _require_mapping(registry["pixel"], "pixel output registry")
+    if (
+        pixel["decoder_type"] != PIXEL_DECODER_TYPE
+        or pixel["channels"] != 3
+        or pixel["height"] != 224
+        or pixel["width"] != 224
+        or pixel["output_range"] != [0.0, 1.0]
+        or pixel["model_type"] != "conditional_flow_matching"
+        or pixel["sampler"] != "heun"
+        or pixel["sample_steps"] != 32
+        or pixel["model_space"] != "rgb_neg1_pos1"
+        or pixel["sample_api"] != "clamp_output=true"
+        or pixel["clamp_output"] is not True
+        or pixel["postprocess"]
+        != "in_generator_clamp_minus1_1_then_affine_then_clamp_unit_interval"
+        or pixel["decoder_forbidden"] is not True
+    ):
+        raise CanonicalScreeningError("pixel output registry semantics differ")
+    bound_pixel = {
+        **dict(pixel),
+        "sampling_implementation": known_binding(
+            pixel["sampling_implementation"],
+            "src/safa/models/generator.py",
+            "b3d8a699aa4a236c3998681510f7bc1e01ada5415a04342182c91f2f7ae74219",
+            "pixel sampling implementation",
+            verify_content=True,
+        ),
+    }
+    latent = _require_mapping(registry["latent"], "latent decoder registry")
+    if (
+        latent["decoder_type"] != LATENT_DECODER_TYPE
+        or latent["vae_source_path"]
+        != "artifacts/checkpoints/external/sd-vae-ft-ema"
+        or latent["scaling_factor"] != 0.18215
+        or latent["directory_digest_algorithm"]
+        != "sha256_relative_posix_nul_content_nul_v1"
+        or latent["latent_shape"] != ["B", 4, 32, 32]
+        or latent["decoded_rgb_shape"] != ["B", 3, 256, 256]
+        or latent["output_range"] != [0.0, 1.0]
+    ):
+        raise CanonicalScreeningError("latent decoder registry semantics differ")
+    directory = _require_mapping(latent["directory"], "latent decoder directory")
+    _require_exact_keys(directory, {"path", "digest"}, "latent decoder directory")
+    directory_path = (
+        repo_root / str(directory["path"])
+        if not Path(str(directory["path"])).is_absolute()
+        else Path(str(directory["path"]))
+    ).resolve()
+    expected_directory = (
+        repo_root / "artifacts/checkpoints/external/sd-vae-ft-ema"
+    ).resolve()
+    if (
+        directory_path != expected_directory
+        or directory["digest"]
+        != "ac188e7f6ff31ff1a3bbde37fea3c345ec72f9e10589cf8aa8a3ec7e86afb188"
+    ):
+        raise CanonicalScreeningError("latent decoder directory binding differs")
+    known_files = {
+        "config": (
+            "artifacts/checkpoints/external/sd-vae-ft-ema/config.json",
+            "92d3dfb746fca211a2c9e019e285f8597412211728dce3c5bcf4eda0f2d62e7e",
+        ),
+        "weights": (
+            "artifacts/checkpoints/external/sd-vae-ft-ema/"
+            "diffusion_pytorch_model.safetensors",
+            "32db726da04f06c1b6b14c0043ce115cc87a501482945c5add89a40d838fcb46",
+        ),
+        "implementation": (
+            "src/safa/training/latent_codec.py",
+            "b57aded8d27da9ec209c1ec0f04e5d08f9ac53fd92a67f069f32d2259b6c39cb",
+        ),
+        "trusted_runtime_config": (
+            "configs/medium_v2/experiments/r9_meanflow_semigroup_preflight.yaml",
+            "0a9536583af4d3b6234e425bca8ad01d6e52110b81827ad97b71dfa08a40b24d",
+        ),
+        "trusted_runner": (
+            "src/safa/evaluation/meanflow_guidance_runner.py",
+            "c5c619af8df3edb8c92491350e078064821a8a7e12b9c317aa7e91bca12645ce",
+        ),
+        "trusted_reference_checkpoint": (
+            "artifacts/checkpoints/"
+            "e15_meanflow_sit_b_face_mixed_h100_resume_2400ep/last_nopretrained.pt",
+            "4690717781db58a6021d57d124300a9b212f0a5043cf3028fb5de4d9c835cc4d",
+        ),
+        "trusted_resolved_config": (
+            "artifacts/r9_meanflow_flow_map_guidance/campaigns/"
+            "r9-report-only-formal-v8/runtime_configs/confirm512/"
+            "paper_eta_0p125.yaml",
+            "5adb05787baa1130ead3f20c8483603d3696fd65ac04d1c75623f42678fa7819",
+        ),
+        "trusted_generation_result": (
+            "artifacts/r9_meanflow_flow_map_guidance/campaigns/"
+            "r9-report-only-formal-v8/confirm512/paper_eta_0p125/"
+            "shards/shard_0/generation_result.json",
+            "f96e3afcf618abd93ae1e4fc2196f19ff55cbbf63f8ea6119b939e68d995f149",
+        ),
+        "asset_digest_cache_algorithm": (
+            "src/safa/evaluation/meanflow_guidance_runner.py",
+            "c5c619af8df3edb8c92491350e078064821a8a7e12b9c317aa7e91bca12645ce",
+        ),
+    }
+    bound_latent = {
+        **dict(latent),
+        "directory": {
+            "path": str(directory_path),
+            "digest": directory["digest"],
+        },
+        **{
+            name: known_binding(
+                latent[name],
+                relative_path,
+                expected_sha256,
+                f"latent decoder {name}",
+                verify_content=(
+                    name == "implementation"
+                    or verify_historical_evidence
+                ),
+            )
+            for name, (relative_path, expected_sha256) in known_files.items()
+        },
+    }
+    cache = _require_mapping(
+        latent["asset_digest_cache"], "latent asset digest cache"
+    )
+    cache_path = Path(str(cache["path"]))
+    if not cache_path.is_absolute():
+        cache_path = repo_root / cache_path
+    cache_path = cache_path.resolve()
+    expected_cache_path = (
+        repo_root
+        / "artifacts/closeout/historical-canonical-512-v1/shared/"
+        "vae_asset_digests_v1.json"
+    ).resolve()
+    if cache_path != expected_cache_path:
+        raise CanonicalScreeningError("latent asset digest cache binding differs")
+    if verify_historical_evidence:
+        from safa.closeout.generator_output_contract import digest_asset_directory
+
+        if digest_asset_directory(directory_path) != directory["digest"]:
+            raise CanonicalScreeningError("latent decoder directory digest differs")
+    else:
+        from safa.evaluation.meanflow_guidance_runner import cached_asset_digest
+
+        if (
+            cached_asset_digest(
+                directory_path,
+                directory["digest"],
+                cache_path,
+            )
+            != directory["digest"]
+        ):
+            raise CanonicalScreeningError("latent cached asset digest differs")
+    bound_latent["asset_digest_cache"] = {"path": str(cache_path)}
+    environment = _require_mapping(latent["environment"], "decoder environment")
+    _require_exact_keys(
+        environment,
+        {
+            "provenance_snapshot",
+            "packages_sha256",
+            "python_version",
+            "torch_version",
+            "diffusers_version",
+        },
+        "decoder environment",
+    )
+    if (
+        environment["packages_sha256"]
+        != "35196c0c7f5a8a2db3dcb31a67c0102fbd713db6d67af72eacfffe8f8b82be7b"
+        or environment["python_version"] != "3.12.13"
+        or environment["torch_version"] != "2.11.0+cu128"
+        or environment["diffusers_version"] != "0.38.0"
+    ):
+        raise CanonicalScreeningError("decoder environment binding differs")
+    bound_latent["environment"] = {
+        **dict(environment),
+        "provenance_snapshot": known_binding(
+            environment["provenance_snapshot"],
+            "artifacts/closeout/"
+            "historical-ledger-v1-precommit-5e5ec305-20260726/"
+            "provenance_snapshot.json",
+            "94507bbd5b2361b29cc3f4a68ade43b9cf3597fecdd20a93835548360c717b68",
+            "decoder environment provenance",
+            verify_content=verify_historical_evidence,
+        ),
+    }
+    if verify_historical_evidence:
+        generation_result = load_json(
+            Path(bound_latent["trusted_generation_result"]["path"]),
+            "trusted R9 generation result",
+        )
+        runtime = _require_mapping(
+            generation_result.get("config"), "trusted R9 generation config"
+        )
+        if runtime.get("batch_size") != 2:
+            raise CanonicalScreeningError(
+                "trusted R9 generation evidence is not batch=2"
+            )
+    normalized = {
+        "schema_version": SCHEMA_VERSION,
+        "contract_type": DECODER_REGISTRY_CONTRACT,
+        "pixel": bound_pixel,
+        "latent": bound_latent,
+        "decoder_registry_sha256": None,
+    }
+    normalized["decoder_registry_sha256"] = decoder_registry_digest(normalized)
+    validate_decoder_registry(normalized)
+    return normalized
+
+
+def validate_policy(
+    repo_root: Path,
+    policy_path: Path,
+    *,
+    verify_historical_output_evidence: bool = True,
+) -> dict[str, Any]:
     root = repo_root.resolve()
     raw = load_json(policy_path, "canonical screening policy")
     _require_exact_keys(
@@ -269,6 +684,7 @@ def validate_policy(repo_root: Path, policy_path: Path) -> dict[str, Any]:
             "protocol",
             "resources",
             "arcface",
+            "output_decoder_registry",
             "implementations",
         },
         "canonical screening policy",
@@ -457,6 +873,11 @@ def validate_policy(repo_root: Path, policy_path: Path) -> dict[str, Any]:
     arcface["execution_probe"] = _validate_bound_file(
         root, arcface["execution_probe"], "ArcFace execution probe"
     )
+    output_decoder_registry = _validate_output_decoder_registry(
+        root,
+        raw["output_decoder_registry"],
+        verify_historical_evidence=verify_historical_output_evidence,
+    )
 
     implementations = _require_mapping(raw["implementations"], "implementations")
     _require_exact_keys(
@@ -470,6 +891,10 @@ def validate_policy(repo_root: Path, policy_path: Path) -> dict[str, Any]:
             "screening_worker",
             "controller",
             "preflight_wrapper",
+            "generator_sampling",
+            "meanflow_sampling",
+            "latent_codec",
+            "output_contract",
         },
         "implementations",
     )
@@ -493,6 +918,7 @@ def validate_policy(repo_root: Path, policy_path: Path) -> dict[str, Any]:
         "protocol": bound_protocol,
         "resources": resources,
         "arcface": arcface,
+        "output_decoder_registry": output_decoder_registry,
         "implementations": implementations,
     }
     normalized["policy_sha256"] = canonical_digest(normalized, "policy_sha256")
@@ -582,6 +1008,7 @@ def build_preflight_request(
         "preflight_implementation": dict(
             policy["implementations"]["checkpoint_preflight"]
         ),
+        "output_decoder_registry": dict(policy["output_decoder_registry"]),
     }
     request["preflight_request_sha256"] = canonical_digest(
         request, "preflight_request_sha256"
@@ -606,6 +1033,7 @@ def validate_preflight_request(
             "policy_sha256",
             "ledger_sha256",
             "preflight_implementation",
+            "output_decoder_registry",
             "preflight_request_sha256",
         },
         "checkpoint preflight request",
@@ -618,6 +1046,7 @@ def validate_preflight_request(
         or value["ledger_sha256"] != policy["source"]["ledger"]["sha256"]
         or value["preflight_implementation"]
         != policy["implementations"]["checkpoint_preflight"]
+        or value["output_decoder_registry"] != policy["output_decoder_registry"]
     ):
         raise CanonicalScreeningError("checkpoint preflight request binding mismatch")
     _require_sha256(value["checkpoint_sha256"], "preflight checkpoint SHA256")
@@ -752,6 +1181,8 @@ def validate_preflight_result(
         "shape_mismatches",
         "reconstruction_messages",
         "adapter",
+        "output_capability",
+        "output_contract",
         "smoke",
         "failure_code",
         "failure_message",
@@ -775,6 +1206,25 @@ def validate_preflight_result(
         raise CanonicalScreeningError(
             f"valid preflight lacks exact SHA binding for {expected_sha256}/{selector}"
         )
+    if strict_result["status"] == "valid":
+        output_contract = validate_output_contract(
+            _require_mapping(
+                strict_result["output_contract"],
+                "strict checkpoint output contract",
+            ),
+            policy["output_decoder_registry"],
+        )
+        capability = _require_mapping(
+            strict_result["output_capability"],
+            "strict checkpoint output capability",
+        )
+        if (
+            output_contract["capability"] != capability
+            or capability["checkpoint_sha256"] != expected_sha256
+        ):
+            raise CanonicalScreeningError(
+                "valid preflight output contract lacks exact checkpoint binding"
+            )
     if strict_result["status"] == "invalid" and (
         strict_result["checkpoint_sha256"] not in {None, expected_sha256}
         or strict_result["sha256_binding"] not in {None, "expected_exact"}
@@ -895,6 +1345,7 @@ def build_checkpoint_plan(
                 "candidate_id": f"g_{sha256[:16]}_{selector}",
                 "preflight_result_path": str(result_path.resolve()),
                 "preflight_result_sha256": result_sha256,
+                "output_contract": dict(result["output_contract"]),
             }
         )
 
@@ -1043,6 +1494,7 @@ def build_candidate_manifest(
         "protocol": policy["protocol"],
         "implementations": policy["implementations"],
         "arcface": policy["arcface"],
+        "output_decoder_registry": policy["output_decoder_registry"],
     }
     manifest["candidate_manifest_sha256"] = canonical_digest(
         manifest, "candidate_manifest_sha256"
@@ -1074,6 +1526,7 @@ def validate_candidate_manifest(
             "protocol",
             "implementations",
             "arcface",
+            "output_decoder_registry",
             "candidate_manifest_sha256",
         },
         "candidate manifest",
@@ -1149,6 +1602,8 @@ def build_run_request(
             "canonical_sha256": candidate_manifest["candidate_manifest_sha256"],
         },
         "candidate": dict(candidate),
+        "output_decoder_registry": dict(policy["output_decoder_registry"]),
+        "output_contract": dict(candidate["output_contract"]),
         "sample_manifest": dict(manifest_binding),
         "source_index": dict(policy["protocol"]["source_index"]),
         "features": dict(policy["protocol"]["features"]),
@@ -1162,6 +1617,14 @@ def build_run_request(
         "kid_subset_size": policy["protocol"]["kid_subset_sizes"][mode],
         "arcface": dict(policy["arcface"]),
         "screening_worker": dict(policy["implementations"]["screening_worker"]),
+        "quality_protocol_family": candidate["output_contract"][
+            "quality_protocol_family"
+        ],
+        "native_rgb_size": [
+            candidate["output_contract"]["rgb_contract"]["height"],
+            candidate["output_contract"]["rgb_contract"]["width"],
+        ],
+        "nfe": candidate["output_contract"]["capability"]["nfe"],
         "output_dir": str(output),
         "retry_count": 0,
     }
@@ -1187,6 +1650,8 @@ def validate_run_request(
         "admission",
         "candidate_manifest",
         "candidate",
+        "output_decoder_registry",
+        "output_contract",
         "sample_manifest",
         "source_index",
         "features",
@@ -1198,6 +1663,9 @@ def validate_run_request(
         "kid_subset_size",
         "arcface",
         "screening_worker",
+        "quality_protocol_family",
+        "native_rgb_size",
+        "nfe",
         "output_dir",
         "retry_count",
         "run_request_sha256",
@@ -1215,13 +1683,27 @@ def validate_run_request(
         or value["retry_count"] != 0
         or value["campaign_id"] != policy["campaign_id"]
         or value["implementations"] != policy["implementations"]
+        or value["output_decoder_registry"] != policy["output_decoder_registry"]
+        or value["output_contract"] != value["candidate"].get("output_contract")
         or value["pixel_image_size"] != policy["protocol"]["pixel_image_size"]
         or value["pixel_protocol_config"]
         != policy["protocol"]["pixel_protocol_config"]
         or value["kid_subset_size"]
         != policy["protocol"]["kid_subset_sizes"][value["mode"]]
+        or value["native_rgb_size"]
+        != [
+            value["output_contract"]["rgb_contract"]["height"],
+            value["output_contract"]["rgb_contract"]["width"],
+        ]
+        or value["nfe"] != value["output_contract"]["capability"]["nfe"]
+        or value["quality_protocol_family"]
+        != value["output_contract"]["quality_protocol_family"]
     ):
         raise CanonicalScreeningError("run request frozen fields differ")
+    validate_output_contract(
+        _require_mapping(value["output_contract"], "run output contract"),
+        policy["output_decoder_registry"],
+    )
     policy_binding = _require_mapping(value["policy"], "policy binding")
     _require_exact_keys(
         policy_binding, {"path", "sha256", "canonical_sha256"}, "policy binding"
@@ -1419,6 +1901,13 @@ def validate_run_result(
                 "implementations",
                 "checkpoint_sha256",
                 "checkpoint_model",
+                "output_contract_sha256",
+                "output_contract_type",
+                "decoder_registry_sha256",
+                "output_space",
+                "native_rgb_size",
+                "quality_protocol_family",
+                "nfe",
                 "pixel_image_size",
                 "pixel_protocol_config_sha256",
                 "kid_subset_size",
@@ -1444,6 +1933,23 @@ def validate_run_result(
             "implementations": policy["implementations"],
             "checkpoint_sha256": validated_request["candidate"]["checkpoint_sha256"],
             "checkpoint_model": validated_request["candidate"]["checkpoint_model"],
+            "output_contract_sha256": validated_request["output_contract"][
+                "output_contract_sha256"
+            ],
+            "output_contract_type": validated_request["output_contract"][
+                "contract_type"
+            ],
+            "decoder_registry_sha256": validated_request[
+                "output_decoder_registry"
+            ]["decoder_registry_sha256"],
+            "output_space": validated_request["output_contract"]["capability"][
+                "output_space"
+            ],
+            "native_rgb_size": validated_request["native_rgb_size"],
+            "quality_protocol_family": validated_request[
+                "quality_protocol_family"
+            ],
+            "nfe": validated_request["nfe"],
             "pixel_image_size": policy["protocol"]["pixel_image_size"],
             "pixel_protocol_config_sha256": policy["protocol"][
                 "pixel_protocol_config"

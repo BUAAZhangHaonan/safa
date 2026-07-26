@@ -9,6 +9,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -600,6 +601,7 @@ def materialize_preflights(
                 expected_checkpoint_sha256=str(request["checkpoint_sha256"]),
                 compute_sha256=True,
                 smoke_samples=0,
+                output_decoder_registry=request["output_decoder_registry"],
             )
             resource_guard.raise_if_violated()
             result = build_preflight_result(request, policy, strict_result)
@@ -856,13 +858,180 @@ def _write_run_requests(
     return written
 
 
+def _validate_smoke_per_sample_rows(
+    request: Mapping[str, Any],
+    per_sample_path: Path,
+    expected_manifest_ids: Sequence[str],
+) -> list[tuple[str, str, str, str, tuple[int, ...]]]:
+    rows = load_jsonl(per_sample_path, "smoke8 per-sample evidence")
+    required = {
+        "sample_id",
+        "run_request_sha256",
+        "checkpoint_sha256",
+        "checkpoint_model",
+        "source_path",
+        "source_sha256",
+        "candidate_path",
+        "candidate_sha256",
+        "output_contract_sha256",
+        "output_contract_type",
+        "decoder_registry_sha256",
+        "output_space",
+        "native_output_sha256",
+        "native_output_shape",
+        "native_rgb_shape",
+        "native_rgb_size",
+        "quality_protocol_family",
+        "nfe",
+        "e0_cosine",
+        "edev_cosine",
+        "arcface_source_face_count",
+        "arcface_candidate_face_count",
+        "arcface_source_candidate_cosine",
+    }
+    sample_ids = [str(row.get("sample_id")) for row in rows]
+    if (
+        sample_ids != list(expected_manifest_ids)
+        or len(sample_ids) != 8
+        or len(sample_ids) != len(set(sample_ids))
+    ):
+        raise CanonicalScreeningError(
+            "smoke8 per-sample IDs differ from the frozen ordered manifest"
+        )
+    contract = request["output_contract"]
+    capability = contract["capability"]
+    native_tensor = capability["generator_output_tensor"]
+    native_shape = [
+        native_tensor["channels"],
+        native_tensor["height"],
+        native_tensor["width"],
+    ]
+    rgb_contract = contract["rgb_contract"]
+    rgb_shape = [
+        rgb_contract["channels"],
+        rgb_contract["height"],
+        rgb_contract["width"],
+    ]
+    expected_bindings = {
+        "run_request_sha256": request["run_request_sha256"],
+        "checkpoint_sha256": request["candidate"]["checkpoint_sha256"],
+        "checkpoint_model": request["candidate"]["checkpoint_model"],
+        "output_contract_sha256": contract["output_contract_sha256"],
+        "output_contract_type": contract["contract_type"],
+        "decoder_registry_sha256": request["output_decoder_registry"][
+            "decoder_registry_sha256"
+        ],
+        "output_space": capability["output_space"],
+        "native_output_shape": native_shape,
+        "native_rgb_shape": rgb_shape,
+        "native_rgb_size": request["native_rgb_size"],
+        "quality_protocol_family": request["quality_protocol_family"],
+        "nfe": request["nfe"],
+    }
+    deterministic = []
+    for index, row in enumerate(rows):
+        if set(row) != required:
+            raise CanonicalScreeningError(
+                "smoke8 per-sample evidence fields differ"
+            )
+        for field, expected in expected_bindings.items():
+            if row[field] != expected:
+                raise CanonicalScreeningError(
+                    f"smoke8 per-sample {field} binding differs"
+                )
+        for field in (
+            "source_sha256",
+            "candidate_sha256",
+            "native_output_sha256",
+        ):
+            digest = row[field]
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise CanonicalScreeningError(
+                    f"smoke8 per-sample {field} is invalid"
+                )
+        source_path = Path(str(row["source_path"])).resolve()
+        candidate_path = Path(str(row["candidate_path"])).resolve()
+        expected_candidate = (
+            Path(str(request["output_dir"])).resolve()
+            / "generated"
+            / f"{index:06d}.png"
+        )
+        if (
+            not source_path.is_file()
+            or sha256_file(source_path) != row["source_sha256"]
+            or candidate_path != expected_candidate
+            or not candidate_path.is_file()
+            or sha256_file(candidate_path) != row["candidate_sha256"]
+        ):
+            raise CanonicalScreeningError(
+                "smoke8 per-sample image binding differs"
+            )
+        for field in ("e0_cosine", "edev_cosine"):
+            value = row[field]
+            if not isinstance(value, (int, float)) or not math.isfinite(
+                float(value)
+            ):
+                raise CanonicalScreeningError(
+                    f"smoke8 per-sample {field} is non-finite"
+                )
+        source_faces = row["arcface_source_face_count"]
+        candidate_faces = row["arcface_candidate_face_count"]
+        if (
+            type(source_faces) is not int
+            or source_faces < 0
+            or type(candidate_faces) is not int
+            or candidate_faces < 0
+        ):
+            raise CanonicalScreeningError(
+                "smoke8 per-sample ArcFace counts are invalid"
+            )
+        arcface_cosine = row["arcface_source_candidate_cosine"]
+        if source_faces == candidate_faces == 1:
+            if not isinstance(arcface_cosine, (int, float)) or not math.isfinite(
+                float(arcface_cosine)
+            ):
+                raise CanonicalScreeningError(
+                    "smoke8 per-sample ArcFace cosine is invalid"
+                )
+        elif arcface_cosine is not None:
+            raise CanonicalScreeningError(
+                "smoke8 per-sample ArcFace coverage/cosine differs"
+            )
+        deterministic.append(
+            (
+                row["sample_id"],
+                row["candidate_sha256"],
+                row["native_output_sha256"],
+                row["output_contract_sha256"],
+                tuple(int(item) for item in row["native_rgb_shape"]),
+            )
+        )
+    return deterministic
+
+
 def _require_smoke_success(
     policy: Mapping[str, Any],
     candidate_manifest: Mapping[str, Any],
     paths: Mapping[str, Path],
 ) -> None:
+    expected_manifest_ids = [
+        str(row["sample_id"])
+        for row in load_jsonl(
+            Path(str(policy["protocol"]["manifests"]["smoke8"]["path"])),
+            "frozen smoke8 manifest",
+        )
+    ]
+    if (
+        len(expected_manifest_ids) != 8
+        or len(expected_manifest_ids) != len(set(expected_manifest_ids))
+    ):
+        raise CanonicalScreeningError("frozen smoke8 manifest IDs are invalid")
     for candidate in candidate_manifest["candidates"]:
-        determinism_rows: list[list[tuple[str, str]]] = []
+        determinism_rows: list[list[tuple[str, str, str, str, tuple[int, ...]]]] = []
         for replicate in ("primary", "repeat"):
             request_path = (
                 paths["run_requests"]
@@ -904,12 +1073,11 @@ def _require_smoke_success(
             per_sample_path = output_dir / "per_sample.jsonl"
             if sha256_file(per_sample_path) != result["evidence"]["per_sample_sha256"]:
                 raise CanonicalScreeningError("smoke8 per-sample digest mismatch")
-            rows = [
-                (str(row["sample_id"]), str(row["candidate_sha256"]))
-                for row in load_jsonl(per_sample_path, f"smoke8 {replicate} per-sample")
-            ]
-            if len(rows) != 8:
-                raise CanonicalScreeningError("smoke8 per-sample coverage must be 8")
+            rows = _validate_smoke_per_sample_rows(
+                request,
+                per_sample_path,
+                expected_manifest_ids,
+            )
             determinism_rows.append(rows)
         if determinism_rows[0] != determinism_rows[1]:
             raise CanonicalScreeningError(
@@ -1408,7 +1576,46 @@ def _run_gpu_phase(
             "sha256": sha256_file(monitor_path),
         },
         "runtime_resource_guard": resource_guard_summary,
+        "capability_completion": {
+            output_space: {
+                "request_count": sum(
+                    1
+                    for request_path in requests
+                    if load_json(
+                        request_path, "completed run request"
+                    )["output_contract"]["capability"]["output_space"]
+                    == output_space
+                ),
+                "completed_count": sum(
+                    1
+                    for request_path in requests
+                    if load_json(
+                        Path(
+                            load_json(
+                                request_path, "completed run request"
+                            )["output_dir"]
+                        )
+                        / "result.json",
+                        "completed run result",
+                    )["status"]
+                    == "completed"
+                    and load_json(
+                        request_path, "completed run request"
+                    )["output_contract"]["capability"]["output_space"]
+                    == output_space
+                ),
+            }
+            for output_space in ("latent", "pixel")
+        },
     }
+    for output_space, completion in summary["capability_completion"].items():
+        if completion["request_count"] == 0 or (
+            completion["completed_count"] != completion["request_count"]
+        ):
+            raise CanonicalScreeningError(
+                f"{phase} capability completion differs for {output_space}: "
+                f"{completion}"
+            )
     summary["controller_summary_sha256"] = hashlib.sha256(
         canonical_json(summary)
     ).hexdigest()

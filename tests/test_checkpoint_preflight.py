@@ -39,7 +39,7 @@ def _config() -> dict:
     return {
         "model_type": "meanflow_sit",
         "embedding_dim": 16,
-        "image_size": 16,
+        "image_size": 32,
         "base_channels": 4,
         "channel_multipliers": [1],
         "time_embedding_dim": 8,
@@ -54,7 +54,8 @@ def _config() -> dict:
         "meanflow_norm_p": 1.0,
         "meanflow_norm_eps": 0.001,
         "meanflow_jvp_mode": "torch_func",
-        "sit_input_channels": 3,
+        "sit_input_channels": 4,
+        "sit_data_space": "latent",
         "sit_patch_size": 4,
         "sit_hidden_size": 32,
         "sit_depth": 2,
@@ -145,7 +146,7 @@ def test_plain_checkpoint_strict_load_and_cpu_smoke_8(tmp_path: Path) -> None:
     assert result["missing_keys"] == []
     assert result["unexpected_keys"] == []
     assert result["smoke"]["executed_sample_count"] == 8
-    assert result["smoke"]["output_shape"] == [8, 3, 16, 16]
+    assert result["smoke"]["output_shape"] == [8, 4, 32, 32]
     assert generator._safa_checkpoint_preflight["status"] == "valid"
 
 

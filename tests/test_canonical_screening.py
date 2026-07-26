@@ -34,6 +34,11 @@ from safa.closeout.canonical_screening_worker import (
     _write_validated_run_result,
 )
 from safa.closeout.canonical_quality import evaluate_locked_kid
+from safa.closeout.generator_output_contract import (
+    bind_output_contract,
+    decoder_registry_digest,
+    resolve_checkpoint_output_capability,
+)
 
 
 def _controller_module():
@@ -66,8 +71,101 @@ def _bound(path: Path) -> dict:
     return {"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
+def _decoder_registry(tmp_path: Path) -> dict:
+    bound = _bound(tmp_path / "decoder-bound.bin")
+    registry = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_output_decoder_registry_v1",
+        "pixel": {
+            "decoder_type": "native_rgb_unit_interval",
+            "output_range": [0.0, 1.0],
+            "channels": 3,
+            "height": 224,
+            "width": 224,
+            "model_type": "conditional_flow_matching",
+            "sampler": "heun",
+            "sample_steps": 32,
+            "model_space": "rgb_neg1_pos1",
+            "sample_api": "clamp_output=true",
+            "clamp_output": True,
+            "postprocess": (
+                "in_generator_clamp_minus1_1_then_affine_then_"
+                "clamp_unit_interval"
+            ),
+            "decoder_forbidden": True,
+            "sampling_implementation": dict(bound),
+        },
+        "latent": {
+            "decoder_type": "r9_frozen_sd_vae_ft_ema",
+            "vae_source_path": "artifacts/checkpoints/external/sd-vae-ft-ema",
+            "directory": {"path": str(tmp_path), "digest": "a" * 64},
+            "config": dict(bound),
+            "weights": dict(bound),
+            "scaling_factor": 0.18215,
+            "implementation": dict(bound),
+            "trusted_runtime_config": dict(bound),
+            "trusted_runner": dict(bound),
+            "trusted_reference_checkpoint": dict(bound),
+            "trusted_resolved_config": dict(bound),
+            "trusted_generation_result": dict(bound),
+            "environment": {
+                "provenance_snapshot": dict(bound),
+                "packages_sha256": (
+                    "35196c0c7f5a8a2db3dcb31a67c0102"
+                    "fbd713db6d67af72eacfffe8f8b82be7b"
+                ),
+                "python_version": "3.12.13",
+                "torch_version": "2.11.0+cu128",
+                "diffusers_version": "0.38.0",
+            },
+            "directory_digest_algorithm": (
+                "sha256_relative_posix_nul_content_nul_v1"
+            ),
+            "asset_digest_cache": {"path": str(tmp_path / "cache.json")},
+            "asset_digest_cache_algorithm": dict(bound),
+            "latent_shape": ["B", 4, 32, 32],
+            "decoded_rgb_shape": ["B", 3, 256, 256],
+            "output_range": [0.0, 1.0],
+        },
+        "decoder_registry_sha256": "",
+    }
+    registry["decoder_registry_sha256"] = decoder_registry_digest(registry)
+    return registry
+
+
+def _pixel_output_contract(checkpoint_sha256: str, registry: dict) -> dict:
+    capability = resolve_checkpoint_output_capability(
+        {
+            "model_config": {
+                "model_type": "conditional_flow_matching",
+                "embedding_dim": 512,
+                "image_size": 224,
+                "base_channels": 32,
+                "channel_multipliers": [1, 2, 4, 4],
+                "condition_dim": 512,
+                "sample_steps": 32,
+                "train_cycle_steps": 8,
+                "sampler": "heun",
+            },
+            "training_config": {},
+        },
+        checkpoint_sha256,
+    )
+    return bind_output_contract(capability, registry)
+
+
 def _policy(tmp_path: Path, ledger: Path) -> tuple[dict, Path, dict]:
     bound = _bound(tmp_path / "bound.bin")
+    smoke_manifest = tmp_path / "smoke8.jsonl"
+    screen_manifest = tmp_path / "screen512.jsonl"
+    _write_jsonl(
+        smoke_manifest,
+        [{"sample_id": f"s{index}"} for index in range(8)],
+    )
+    _write_jsonl(
+        screen_manifest,
+        [{"sample_id": f"s{index}"} for index in range(512)],
+    )
     implementations = {
         name: dict(bound)
         for name in (
@@ -79,6 +177,10 @@ def _policy(tmp_path: Path, ledger: Path) -> tuple[dict, Path, dict]:
             "screening_worker",
             "controller",
             "preflight_wrapper",
+            "generator_sampling",
+            "meanflow_sampling",
+            "latent_codec",
+            "output_contract",
         )
     }
     policy = {
@@ -96,8 +198,11 @@ def _policy(tmp_path: Path, ledger: Path) -> tuple[dict, Path, dict]:
             "seed": 4549,
             "batch_size": 2,
             "manifests": {
-                "smoke8": {**bound, "sample_count": 8},
-                "screen512": {**bound, "sample_count": 512},
+                "smoke8": {**_bound(smoke_manifest), "sample_count": 8},
+                "screen512": {
+                    **_bound(screen_manifest),
+                    "sample_count": 512,
+                },
             },
             "source_index": bound,
             "features": {"directory": str(tmp_path), "manifest": bound, "shard": bound},
@@ -129,6 +234,7 @@ def _policy(tmp_path: Path, ledger: Path) -> tuple[dict, Path, dict]:
         },
         "implementations": implementations,
         "arcface": {"model_name": "buffalo_l"},
+        "output_decoder_registry": _decoder_registry(tmp_path),
     }
     policy_path = tmp_path / "policy.json"
     policy_path.write_text('{"policy":"fixture"}\n', encoding="utf-8")
@@ -169,7 +275,12 @@ def _row(run_id: str, sha: str | None, selector: str = "raw", path: str | None =
     }
 
 
-def _strict_preflight(sha: str, selector: str, status: str = "valid") -> dict:
+def _strict_preflight(
+    sha: str,
+    selector: str,
+    registry: dict,
+    status: str = "valid",
+) -> dict:
     valid = status == "valid"
     return {
         "schema_version": 1,
@@ -199,6 +310,16 @@ def _strict_preflight(sha: str, selector: str, status: str = "valid") -> dict:
             "mounted_key_count": 0,
             "mounted": False,
         },
+        "output_capability": (
+            _pixel_output_contract(sha, registry)["capability"]
+            if valid
+            else None
+        ),
+        "output_contract": (
+            _pixel_output_contract(sha, registry)
+            if valid
+            else None
+        ),
         "smoke": {"requested_sample_count": 0, "executed_sample_count": 0, "output_shape": None},
         "failure_code": None if valid else "strict_load_failed",
         "failure_message": None if valid else "cannot reconstruct",
@@ -213,7 +334,9 @@ def _complete_plan(tmp_path: Path, rows: list[dict]) -> tuple[dict, dict, Path]:
     pending = build_checkpoint_plan(tmp_path, policy, result_root)
     for request in pending["preflight_requests"]:
         strict = _strict_preflight(
-            request["checkpoint_sha256"], request["checkpoint_model"]
+            request["checkpoint_sha256"],
+            request["checkpoint_model"],
+            policy["output_decoder_registry"],
         )
         envelope = build_preflight_result(request, policy, strict)
         write_exclusive_json(
@@ -288,7 +411,10 @@ def test_old_unbound_preflight_result_is_rejected(tmp_path: Path) -> None:
     _write_jsonl(ledger, [_row("candidate", sha)])
     policy, _, _ = _policy(tmp_path, ledger)
     results = tmp_path / "results"
-    write_exclusive_json(results / f"{sha}__raw.json", _strict_preflight(sha, "raw"))
+    write_exclusive_json(
+        results / f"{sha}__raw.json",
+        _strict_preflight(sha, "raw", policy["output_decoder_registry"]),
+    )
     with pytest.raises(CanonicalScreeningError, match="fields differ"):
         build_checkpoint_plan(tmp_path, policy, results)
 
@@ -300,7 +426,15 @@ def test_preflight_result_binds_request_policy_ledger_and_tool(tmp_path: Path) -
     policy, _, _ = _policy(tmp_path, ledger)
     pending = build_checkpoint_plan(tmp_path, policy, tmp_path / "results")
     request = pending["preflight_requests"][0]
-    envelope = build_preflight_result(request, policy, _strict_preflight(sha, "raw"))
+    envelope = build_preflight_result(
+        request,
+        policy,
+        _strict_preflight(
+            sha,
+            "raw",
+            policy["output_decoder_registry"],
+        ),
+    )
     assert validate_preflight_result(envelope, request, policy)[0] is True
     tampered = json.loads(json.dumps(envelope))
     tampered["policy_sha256"] = "7" * 64
@@ -402,6 +536,17 @@ def _evidence(policy: dict, request: dict) -> dict:
         "implementations": policy["implementations"],
         "checkpoint_sha256": request["candidate"]["checkpoint_sha256"],
         "checkpoint_model": request["candidate"]["checkpoint_model"],
+        "output_contract_sha256": request["output_contract"][
+            "output_contract_sha256"
+        ],
+        "output_contract_type": request["output_contract"]["contract_type"],
+        "decoder_registry_sha256": request["output_decoder_registry"][
+            "decoder_registry_sha256"
+        ],
+        "output_space": request["output_contract"]["capability"]["output_space"],
+        "native_rgb_size": request["native_rgb_size"],
+        "quality_protocol_family": request["quality_protocol_family"],
+        "nfe": request["nfe"],
         "pixel_image_size": 256,
         "pixel_protocol_config_sha256": policy["protocol"]["pixel_protocol_config"]["sha256"],
         "kid_subset_size": policy["protocol"]["kid_subset_sizes"][request["mode"]],
@@ -463,6 +608,8 @@ def test_screen512_gate_requires_exact_primary_repeat_smoke(
     )
     paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
     candidate = manifest["candidates"][0]
+    baseline_rows = {}
+    baseline_results = {}
     for replicate in ("primary", "repeat"):
         request = build_run_request(
             policy,
@@ -483,13 +630,62 @@ def test_screen512_gate_requires_exact_primary_repeat_smoke(
         write_exclusive_json(request_path, request)
         output = Path(request["output_dir"])
         output.mkdir(parents=True)
-        rows = [
-            {
-                "sample_id": f"s{index}",
-                "candidate_sha256": hashlib.sha256(f"png{index}".encode()).hexdigest(),
-            }
-            for index in range(8)
-        ]
+        generated = output / "generated"
+        generated.mkdir()
+        rows = []
+        for index in range(8):
+            source_path = tmp_path / "sources" / f"{index:06d}.png"
+            source_path.parent.mkdir(parents=True, exist_ok=True)
+            source_path.write_bytes(f"source{index}".encode())
+            candidate_path = generated / f"{index:06d}.png"
+            candidate_path.write_bytes(f"png{index}".encode())
+            rows.append(
+                {
+                    "sample_id": f"s{index}",
+                    "run_request_sha256": request["run_request_sha256"],
+                    "checkpoint_sha256": request["candidate"][
+                        "checkpoint_sha256"
+                    ],
+                    "checkpoint_model": request["candidate"][
+                        "checkpoint_model"
+                    ],
+                    "source_path": str(source_path.resolve()),
+                    "source_sha256": hashlib.sha256(
+                        source_path.read_bytes()
+                    ).hexdigest(),
+                    "candidate_path": str(candidate_path.resolve()),
+                    "candidate_sha256": hashlib.sha256(
+                        candidate_path.read_bytes()
+                    ).hexdigest(),
+                    "native_output_sha256": hashlib.sha256(
+                        f"native{index}".encode()
+                    ).hexdigest(),
+                    "output_contract_sha256": request["output_contract"][
+                        "output_contract_sha256"
+                    ],
+                    "output_contract_type": request["output_contract"][
+                        "contract_type"
+                    ],
+                    "decoder_registry_sha256": request[
+                        "output_decoder_registry"
+                    ]["decoder_registry_sha256"],
+                    "output_space": request["output_contract"]["capability"][
+                        "output_space"
+                    ],
+                    "native_output_shape": [3, 224, 224],
+                    "native_rgb_shape": [3, 224, 224],
+                    "native_rgb_size": [224, 224],
+                    "quality_protocol_family": request[
+                        "quality_protocol_family"
+                    ],
+                    "nfe": request["nfe"],
+                    "e0_cosine": 0.8,
+                    "edev_cosine": 0.7,
+                    "arcface_source_face_count": 1,
+                    "arcface_candidate_face_count": 1,
+                    "arcface_source_candidate_cosine": 0.1,
+                }
+            )
         per_sample = output / "per_sample.jsonl"
         _write_jsonl(per_sample, rows)
         claim = build_run_claim(
@@ -513,13 +709,62 @@ def test_screen512_gate_requires_exact_primary_repeat_smoke(
             evidence=evidence,
         )
         write_exclusive_json(output / "result.json", result)
+        baseline_rows[replicate] = json.loads(json.dumps(rows))
+        baseline_results[replicate] = json.loads(json.dumps(result))
     module._require_smoke_success(policy, manifest, paths)
-    repeat_rows = paths["runs"] / "smoke8_repeat" / candidate["candidate_id"] / "per_sample.jsonl"
-    rows = [json.loads(line) for line in repeat_rows.read_text(encoding="utf-8").splitlines()]
-    rows[0]["candidate_sha256"] = "f" * 64
-    _write_jsonl(repeat_rows, rows)
-    with pytest.raises(CanonicalScreeningError, match="per-sample digest mismatch"):
-        module._require_smoke_success(policy, manifest, paths)
+    mutations = (
+        lambda rows: rows[0].__setitem__("sample_id", "tampered"),
+        lambda rows: rows[1].__setitem__("sample_id", rows[0]["sample_id"]),
+        lambda rows: (
+            rows[0].__setitem__("sample_id", "s1"),
+            rows[1].__setitem__("sample_id", "s0"),
+        ),
+        lambda rows: rows[0].__setitem__(
+            "native_rgb_shape", [3, 256, 256]
+        ),
+        lambda rows: rows[0].__setitem__(
+            "output_contract_sha256", "f" * 64
+        ),
+    )
+    for mutate in mutations:
+        for replicate in ("primary", "repeat"):
+            output = (
+                paths["runs"]
+                / f"smoke8_{replicate}"
+                / candidate["candidate_id"]
+            )
+            changed_rows = json.loads(json.dumps(baseline_rows[replicate]))
+            mutate(changed_rows)
+            per_sample = output / "per_sample.jsonl"
+            per_sample.unlink()
+            _write_jsonl(per_sample, changed_rows)
+            changed_result = json.loads(
+                json.dumps(baseline_results[replicate])
+            )
+            changed_result["evidence"]["per_sample_sha256"] = hashlib.sha256(
+                per_sample.read_bytes()
+            ).hexdigest()
+            changed_result["run_result_sha256"] = canonical_digest(
+                changed_result,
+                "run_result_sha256",
+            )
+            (output / "result.json").write_bytes(
+                canonical_json(changed_result)
+            )
+        with pytest.raises(CanonicalScreeningError, match="smoke8 per-sample"):
+            module._require_smoke_success(policy, manifest, paths)
+        for replicate in ("primary", "repeat"):
+            output = (
+                paths["runs"]
+                / f"smoke8_{replicate}"
+                / candidate["candidate_id"]
+            )
+            per_sample = output / "per_sample.jsonl"
+            per_sample.unlink()
+            _write_jsonl(per_sample, baseline_rows[replicate])
+            (output / "result.json").write_bytes(
+                canonical_json(baseline_results[replicate])
+            )
 
 
 def test_e0_cosine_uses_locked_target_z_not_source_embedding() -> None:
@@ -880,57 +1125,134 @@ def test_preflight_monitor_never_queries_gpu(
     assert sample["compute_processes"] is None
 
 
-def test_supersession_evidence_binds_failed_8ce_terminal_and_exit(
+def test_supersession_evidence_binds_ea7_failed_smoke_chain(
     tmp_path: Path,
 ) -> None:
     old_policy = (
-        "8ce4855b042161ff5698ce400f8b80122"
-        "add90d6025ffd08f31fe49d8ef84a7f"
+        "ea7ae71fd662526b9a45bf3cc6d283884"
+        "aefc380b292c8f273169a35f42ffc28"
     )
-    terminal_path = tmp_path / "controller_terminal.json"
-    terminal_path.write_bytes(
-        canonical_json(
-            {
-                "contract_type": "safa_canonical_preflight_controller_terminal_v1",
-                "policy_sha256": old_policy,
-                "status": "failed",
-                "result_count": 1,
-                "pending_count": 192,
+    policy_root = (
+        tmp_path
+        / "artifacts/closeout/historical-canonical-512-v1/by_policy"
+        / old_policy
+    )
+    primary_requests = policy_root / "run_requests/smoke8_primary"
+    repeat_requests = policy_root / "run_requests/smoke8_repeat"
+    run_requests = []
+    run_claims = []
+    failed_results = []
+    worker_logs = []
+    failure_message = (
+        "The size of tensor a (4) must match the size of tensor b (3) "
+        "at non-singleton dimension 1"
+    )
+    for index in range(193):
+        candidate_id = f"g_{index:016x}_raw"
+        request_path = primary_requests / f"{candidate_id}.json"
+        if index < 8:
+            request = {
+                "contract_type": "safa_canonical_screening_run_request_v1",
+                "mode": "smoke8",
+                "replicate": "primary",
+                "sample_count": 8,
+                "batch_size": 2,
+                "seed": 4549,
+                "policy": {"canonical_sha256": old_policy},
+                "candidate": {"candidate_id": candidate_id},
             }
-        )
-    )
-    controller_log = _bound(tmp_path / "controller.log")
-    process_log = _bound(tmp_path / "controller_process.log")
-    terminal = _bound(terminal_path)
-    wrapper_path = tmp_path / "wrapper_exit.json"
-    wrapper_path.write_bytes(
+            request["run_request_sha256"] = canonical_digest(
+                request, "run_request_sha256"
+            )
+            request_path.parent.mkdir(parents=True, exist_ok=True)
+            request_path.write_bytes(canonical_json(request))
+            run_dir = policy_root / "runs/smoke8_primary" / candidate_id
+            claim = {
+                "contract_type": "safa_canonical_screening_run_claim_v1",
+                "run_request_sha256": request["run_request_sha256"],
+            }
+            claim["run_claim_sha256"] = canonical_digest(
+                claim, "run_claim_sha256"
+            )
+            claim_path = run_dir / "claim.json"
+            claim_path.parent.mkdir(parents=True, exist_ok=True)
+            claim_path.write_bytes(canonical_json(claim))
+            result = {
+                "contract_type": "safa_canonical_screening_run_result_v1",
+                "run_request_sha256": request["run_request_sha256"],
+                "run_claim_sha256": claim["run_claim_sha256"],
+                "status": "failed",
+                "failure": {
+                    "type": "RuntimeError",
+                    "message": failure_message,
+                },
+            }
+            result["run_result_sha256"] = canonical_digest(
+                result, "run_result_sha256"
+            )
+            result_path = run_dir / "result.json"
+            result_path.write_bytes(canonical_json(result))
+            log_path = policy_root / "logs" / f"smoke8_primary__{candidate_id}.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(failure_message, encoding="utf-8")
+            run_requests.append(_bound(request_path))
+            run_claims.append(_bound(claim_path))
+            failed_results.append(_bound(result_path))
+            worker_logs.append(_bound(log_path))
+        else:
+            request_path.parent.mkdir(parents=True, exist_ok=True)
+            request_path.write_text("{}\n", encoding="utf-8")
+        repeat_path = repeat_requests / f"{candidate_id}.json"
+        repeat_path.parent.mkdir(parents=True, exist_ok=True)
+        repeat_path.write_text("{}\n", encoding="utf-8")
+    monitor = _bound(policy_root / "logs/smoke8__monitor.jsonl")
+    runtime = _bound(policy_root / "logs/smoke8__runtime_resource_windows.jsonl")
+    summary_path = policy_root / "summaries/smoke8__failed.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_bytes(
         canonical_json(
             {
-                "contract_type": "safa_canonical_preflight_wrapper_exit_v2",
-                "policy_sha256": old_policy,
-                "exit_code": 2,
-                "signal": None,
-                "controller_terminal": terminal,
-                "controller_process_log": process_log,
+                "phase": "smoke8",
+                "reason": "worker_nonzero_exit",
+                "failures": [
+                    f"{binding['path']}: exit_code=1"
+                    for binding in run_requests
+                ],
+                "monitor_log": monitor,
+                "runtime_resource_guard": {
+                    "samples": runtime,
+                    "violated": False,
+                    "violation_reason": None,
+                    "thread_failure": None,
+                    "final_cpu_consecutive_high": 0,
+                    "final_swap_consecutive_io": 0,
+                },
             }
         )
     )
     supersedes = {
         "policy_sha256": old_policy,
         "classification": "started_incomplete",
-        "result_count": 1,
-        "pending_count": 192,
-        "controller_terminal": terminal,
-        "wrapper_exit": _bound(wrapper_path),
-        "controller_log": controller_log,
-        "controller_process_log": process_log,
+        "phase": "smoke8",
+        "request_count": 386,
+        "primary_failed_count": 8,
+        "repeat_result_count": 0,
+        "screen512_result_count": 0,
+        "generated_png_count": 0,
+        "failed_summary": _bound(summary_path),
+        "run_requests": run_requests,
+        "run_claims": run_claims,
+        "failed_results": failed_results,
+        "worker_logs": worker_logs,
+        "resource_monitor": monitor,
+        "runtime_resource_windows": runtime,
     }
     assert (
         validate_supersession_evidence(tmp_path, supersedes)["classification"]
         == "started_incomplete"
     )
     tampered = json.loads(json.dumps(supersedes))
-    tampered["controller_log"]["sha256"] = "f" * 64
+    tampered["run_claims"][0]["sha256"] = "f" * 64
     with pytest.raises(CanonicalScreeningError, match="SHA256 mismatch"):
         validate_supersession_evidence(tmp_path, tampered)
 

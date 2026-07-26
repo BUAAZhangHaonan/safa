@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -112,25 +113,17 @@ def _embedding_cosine(left: Any, right: Any) -> float:
     return value
 
 
-def _build_latent_codec(checkpoint_path: Path, device: str):
+def _tensor_sample_sha256(value: Any) -> str:
     import torch
 
-    from safa.training.latent_codec import build_latent_codec_from_train_config
-
-    try:
-        payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    except TypeError:
-        payload = torch.load(checkpoint_path, map_location="cpu")
-    if not isinstance(payload, Mapping):
-        raise CanonicalScreeningError("checkpoint payload is not a mapping")
-    training_config = payload.get("training_config")
-    if not isinstance(training_config, Mapping):
-        raise CanonicalScreeningError("checkpoint omits recorded training_config")
-    codec = build_latent_codec_from_train_config(dict(training_config), device)
-    del payload
-    if codec is not None:
-        codec.vae.eval()
-    return codec
+    tensor = value.detach().contiguous().cpu()
+    digest = hashlib.sha256()
+    digest.update(str(tensor.dtype).encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(str(tuple(tensor.shape)).encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(tensor.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
 
 
 def _load_source_pixel_batch(
@@ -180,6 +173,11 @@ def _run_generation(
 
     from safa.data.feature_dataset import FeatureAlignedAffectNet
     from safa.evaluation.checkpoint_preflight import strict_load_generator_checkpoint
+    from safa.closeout.generator_output_contract import (
+        build_bound_decoder,
+        validate_native_generator_output,
+        validate_rgb_unit_interval,
+    )
     from safa.models.e0 import freeze_e0, load_e0_checkpoint
     from safa.models.generator import generator_sample_channels
     from safa.training.losses import normalize_for_e0
@@ -206,11 +204,20 @@ def _run_generation(
         expected_checkpoint_sha256=str(checkpoint["checkpoint_sha256"]),
         compute_sha256=True,
         smoke_samples=0,
+        output_decoder_registry=request["output_decoder_registry"],
     )
     if preflight["status"] != "valid" or preflight["sha256_binding"] != "expected_exact":
         raise CanonicalScreeningError("worker checkpoint preflight is not exact and valid")
+    if preflight["output_contract"] != request["output_contract"]:
+        raise CanonicalScreeningError(
+            "worker checkpoint output contract differs from run request"
+        )
     generator.eval()
-    codec = _build_latent_codec(checkpoint_path, device)
+    codec = build_bound_decoder(
+        request["output_contract"],
+        request["output_decoder_registry"],
+        device,
+    )
 
     e0_path = _assert_bound_file(request["e0"], "E0")
     edev_path = _assert_bound_file(request["edev"], "Edev")
@@ -264,9 +271,30 @@ def _run_generation(
                 z.dtype,
                 channels=channels,
             )
-            generated = generator.sample(z, x_init=x_init)
-            if codec is not None:
-                generated = codec.decode(generated)
+            generated_native = generator.sample(
+                z,
+                x_init=x_init,
+                clamp_output=True,
+            )
+            validate_native_generator_output(
+                generated_native,
+                request["output_contract"],
+                request["output_decoder_registry"],
+            )
+            native_sha256 = [
+                _tensor_sample_sha256(generated_native[index])
+                for index in range(len(sample_ids))
+            ]
+            generated = (
+                generated_native
+                if codec is None
+                else codec.decode(generated_native)
+            )
+            validate_rgb_unit_interval(
+                generated,
+                "canonical screening RGB before E0/Edev/quality",
+                request["output_contract"]["rgb_contract"],
+            )
             assert_finite_tensor("canonical_screening_generated", generated)
             generated_e0 = e0(normalize_for_e0(generated))["embedding"]
             batch_source_paths = [
@@ -298,10 +326,39 @@ def _run_generation(
                 rows.append(
                     {
                         "sample_id": sample_id,
+                        "run_request_sha256": request["run_request_sha256"],
+                        "checkpoint_sha256": request["candidate"][
+                            "checkpoint_sha256"
+                        ],
+                        "checkpoint_model": request["candidate"][
+                            "checkpoint_model"
+                        ],
                         "source_path": str(source_path),
                         "source_sha256": sha256_file(source_path),
                         "candidate_path": str(candidate_path.resolve()),
                         "candidate_sha256": sha256_file(candidate_path),
+                        "output_contract_sha256": request["output_contract"][
+                            "output_contract_sha256"
+                        ],
+                        "output_contract_type": request["output_contract"][
+                            "contract_type"
+                        ],
+                        "decoder_registry_sha256": request[
+                            "output_decoder_registry"
+                        ]["decoder_registry_sha256"],
+                        "output_space": request["output_contract"]["capability"][
+                            "output_space"
+                        ],
+                        "native_output_sha256": native_sha256[local_index],
+                        "native_output_shape": list(
+                            generated_native[local_index].shape
+                        ),
+                        "native_rgb_shape": list(generated[local_index].shape),
+                        "native_rgb_size": list(request["native_rgb_size"]),
+                        "quality_protocol_family": request[
+                            "quality_protocol_family"
+                        ],
+                        "nfe": request["nfe"],
                         "e0_cosine": float(e0_cosine[local_index].cpu()),
                         "edev_cosine": float(edev_cosine[local_index].cpu()),
                     }
@@ -472,7 +529,11 @@ def execute_screening_request(
             "run request candidate is not bound by the immutable candidate manifest"
         )
     policy_path = _assert_bound_file(request["policy"], "screening policy")
-    if validate_policy(_request_repo_root(request), policy_path) != dict(policy):
+    if validate_policy(
+        _request_repo_root(request),
+        policy_path,
+        verify_historical_output_evidence=False,
+    ) != dict(policy):
         raise CanonicalScreeningError("worker policy differs from current validated policy")
     output_dir = Path(str(request["output_dir"])).resolve()
     output_dir.mkdir(parents=True, exist_ok=False)
@@ -501,6 +562,19 @@ def execute_screening_request(
             "implementations": dict(policy["implementations"]),
             "checkpoint_sha256": request["candidate"]["checkpoint_sha256"],
             "checkpoint_model": request["candidate"]["checkpoint_model"],
+            "output_contract_sha256": request["output_contract"][
+                "output_contract_sha256"
+            ],
+            "output_contract_type": request["output_contract"]["contract_type"],
+            "decoder_registry_sha256": request["output_decoder_registry"][
+                "decoder_registry_sha256"
+            ],
+            "output_space": request["output_contract"]["capability"][
+                "output_space"
+            ],
+            "native_rgb_size": list(request["native_rgb_size"]),
+            "quality_protocol_family": request["quality_protocol_family"],
+            "nfe": request["nfe"],
             "pixel_image_size": request["pixel_image_size"],
             "pixel_protocol_config_sha256": request["pixel_protocol_config"][
                 "sha256"
