@@ -7,6 +7,7 @@ from pathlib import Path
 import unittest
 
 import yaml
+from safa.utils.hashing import sha256_file
 
 
 TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
@@ -211,7 +212,15 @@ class GeneratorContractTests(unittest.TestCase):
                 },
                 path,
             )
-            loaded = _load_generator(str(path), {"image_size": 64, "checkpoint_model": "raw"}, "cpu")
+            loaded = _load_generator(
+                str(path),
+                {
+                    "image_size": 64,
+                    "checkpoint_model": "raw",
+                    "checkpoint_sha256": sha256_file(path),
+                },
+                "cpu",
+            )
         output = loaded(torch.randn(1, 128))
         self.assertEqual(tuple(output.shape), (1, 3, 64, 64))
 

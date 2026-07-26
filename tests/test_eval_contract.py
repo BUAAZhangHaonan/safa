@@ -19,6 +19,7 @@ from safa.evaluation.runner import (
     _summarize_rows,
     deterministic_impostor_indices,
 )
+from safa.utils.hashing import sha256_file
 
 
 TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
@@ -555,7 +556,9 @@ class EvalContractTests(unittest.TestCase):
 
             with patch("safa.evaluation.runner.build_generator", side_effect=AssertionError("must not build without model_config")):
                 with self.assertRaisesRegex(ValueError, "model_config"):
-                    _load_generator(str(path), {}, "cpu")
+                    _load_generator(
+                        str(path), {"checkpoint_sha256": sha256_file(path)}, "cpu"
+                    )
 
     @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for eval checkpoint tests")
     def test_eval_generator_loader_rejects_requested_ema_without_state_dict(self) -> None:
@@ -588,7 +591,30 @@ class EvalContractTests(unittest.TestCase):
 
             with patch("safa.evaluation.runner.build_generator", side_effect=AssertionError("must not build without ema state")):
                 with self.assertRaisesRegex(ValueError, "ema_model_state_dict"):
-                    _load_generator(str(path), {"checkpoint_model": "ema"}, "cpu")
+                    _load_generator(
+                        str(path),
+                        {
+                            "checkpoint_model": "ema",
+                            "checkpoint_sha256": sha256_file(path),
+                        },
+                        "cpu",
+                    )
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "torch is required for eval checkpoint tests")
+    def test_eval_generator_loader_requires_expected_checkpoint_sha256(self) -> None:
+        import torch
+
+        from safa.evaluation.runner import _load_generator
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "g.pt"
+            torch.save({"model_state_dict": {}}, path)
+            with self.assertRaisesRegex(ValueError, "checkpoint_sha256.*required"):
+                _load_generator(
+                    str(path),
+                    {"checkpoint_model": "raw"},
+                    "cpu",
+                )
 
     def test_eval_checkpoint_model_source_requires_explicit_config(self) -> None:
         from safa.evaluation import runner

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from safa.utils.hashing import sha256_file
 
 torch = pytest.importorskip("torch")
 
@@ -177,9 +178,30 @@ def test_ddim_checkpoint_roundtrip_and_existing_generators_still_load() -> None:
         torch.save({"model_state_dict": meanflow.state_dict(), "model_config": meanflow.config.to_dict(), "metrics": {}}, paths["meanflow"])
         torch.save({"model_state_dict": flow.state_dict(), "model_config": flow.config.to_dict(), "metrics": {}}, paths["flow"])
 
-        loaded_ddim = _load_generator(str(paths["ddim"]), {"checkpoint_model": "raw"}, "cpu")
-        loaded_meanflow = _load_generator(str(paths["meanflow"]), {"checkpoint_model": "raw"}, "cpu")
-        loaded_flow = _load_generator(str(paths["flow"]), {"checkpoint_model": "raw"}, "cpu")
+        loaded_ddim = _load_generator(
+            str(paths["ddim"]),
+            {
+                "checkpoint_model": "raw",
+                "checkpoint_sha256": sha256_file(paths["ddim"]),
+            },
+            "cpu",
+        )
+        loaded_meanflow = _load_generator(
+            str(paths["meanflow"]),
+            {
+                "checkpoint_model": "raw",
+                "checkpoint_sha256": sha256_file(paths["meanflow"]),
+            },
+            "cpu",
+        )
+        loaded_flow = _load_generator(
+            str(paths["flow"]),
+            {
+                "checkpoint_model": "raw",
+                "checkpoint_sha256": sha256_file(paths["flow"]),
+            },
+            "cpu",
+        )
 
     assert loaded_ddim.config.model_type == "ddim"
     assert loaded_meanflow.config.model_type == "meanflow"

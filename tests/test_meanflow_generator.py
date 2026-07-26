@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from safa.utils.hashing import sha256_file
 
 torch = pytest.importorskip("torch")
 
@@ -241,8 +242,22 @@ def test_meanflow_checkpoint_roundtrip_and_existing_flow_checkpoint_still_load()
         torch.save({"model_state_dict": meanflow.state_dict(), "model_config": meanflow.config.to_dict(), "metrics": {}}, meanflow_path)
         torch.save({"model_state_dict": flow.state_dict(), "model_config": flow.config.to_dict(), "metrics": {}}, flow_path)
 
-        loaded_meanflow = _load_generator(str(meanflow_path), {"checkpoint_model": "raw"}, "cpu")
-        loaded_flow = _load_generator(str(flow_path), {"checkpoint_model": "raw"}, "cpu")
+        loaded_meanflow = _load_generator(
+            str(meanflow_path),
+            {
+                "checkpoint_model": "raw",
+                "checkpoint_sha256": sha256_file(meanflow_path),
+            },
+            "cpu",
+        )
+        loaded_flow = _load_generator(
+            str(flow_path),
+            {
+                "checkpoint_model": "raw",
+                "checkpoint_sha256": sha256_file(flow_path),
+            },
+            "cpu",
+        )
 
     assert loaded_meanflow.config.model_type == "meanflow"
     assert loaded_flow.config.model_type == "conditional_flow_matching"

@@ -8,11 +8,12 @@ import math
 import re
 
 from safa.data.feature_dataset import FeatureAlignedAffectNet
+from safa.evaluation.checkpoint_preflight import strict_load_generator_checkpoint
 from safa.evaluation.metrics import face_count_rates, flatten_finite_numbers, summarize
 from safa.evaluation.perturbations import perturbation_map
 from safa.evaluation.recognizers import InsightFaceDetector, build_recognizers, describe_recognizer_assets, validate_recognizer_configs
 from safa.models.e0 import freeze_e0, load_e0_checkpoint
-from safa.models.generator import build_generator, generator_sample_channels, require_generator_model_config
+from safa.models.generator import build_generator, generator_sample_channels  # noqa: F401
 from safa.training.latent_codec import build_latent_codec_from_train_config
 from safa.training.losses import normalize_for_e0
 from safa.training.transforms import generator_image_transform
@@ -251,17 +252,20 @@ def _write_eval_outputs(config: dict, result: dict, rows: list[dict], dataset_le
 
 
 def _load_generator(checkpoint_path: str, config: dict, device: str):
-    import torch
-
     path = Path(checkpoint_path)
     if not path.is_file():
         raise FileNotFoundError(f"Generator checkpoint does not exist: {path}")
-    payload = torch.load(path, map_location=device)
-    model_config = require_generator_model_config(payload, str(path))
-    state_dict = _generator_state_dict_for_eval(payload, config, str(path))
-    generator = build_generator(model_config)
-    generator.load_state_dict(state_dict)
-    return generator.to(device).eval()
+    if "checkpoint_sha256" not in config:
+        raise ValueError(
+            "checkpoint_sha256 is required for formal eval checkpoint loading"
+        )
+    generator, _ = strict_load_generator_checkpoint(
+        path,
+        config.get("checkpoint_model"),
+        device,
+        expected_checkpoint_sha256=config["checkpoint_sha256"],
+    )
+    return generator
 
 
 def _generator_state_dict_for_eval(payload: dict, config: dict, checkpoint_path: str):
