@@ -26,6 +26,7 @@ from safa.closeout.canonical_screening import (
     validate_run_request,
     validate_run_result,
     validate_supersession_evidence,
+    validate_policy,
     write_exclusive_json,
 )
 from safa.closeout.canonical_screening_worker import (
@@ -1255,6 +1256,65 @@ def test_supersession_evidence_binds_ea7_failed_smoke_chain(
     tampered["run_claims"][0]["sha256"] = "f" * 64
     with pytest.raises(CanonicalScreeningError, match="SHA256 mismatch"):
         validate_supersession_evidence(tmp_path, tampered)
+
+
+def test_current_policy_binds_stopped_c83_preflight_and_forbids_reuse() -> None:
+    root = Path(__file__).parents[1]
+    policy_path = root / "configs/closeout/canonical_screening_512_v1.json"
+
+    policy = validate_policy(root, policy_path)
+
+    supersedes = policy["supersedes"]
+    assert supersedes["policy_sha256"] == (
+        "c83b95e0ca49a0cf5b5b3d67c337000a31b8d2a3299d434fc1051256f18fea50"
+    )
+    assert supersedes["classification"] == "started_incomplete"
+    assert supersedes["request_count"] == 193
+    assert supersedes["result_count"] == 34
+    assert supersedes["valid_count"] == 29
+    assert supersedes["false_invalid_count"] == 5
+    assert supersedes["pending_count"] == 159
+    assert supersedes["scientific_result_reuse"] == "forbidden"
+    assert supersedes["successor_execution"] == "fresh_full_193_preflight"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    [
+        ("request_count", "status differs"),
+        ("reuse", "status differs"),
+        ("root_digest", "root binding differs"),
+        ("bound_path", "path differs"),
+        ("false_invalid_set", "status differs"),
+    ],
+)
+def test_c83_supersession_tampering_fails_closed(
+    mutation: str,
+    match: str,
+) -> None:
+    root = Path(__file__).parents[1]
+    raw = load_json(
+        root / "configs/closeout/canonical_screening_512_v1.json",
+        "current policy",
+    )
+    supersedes = json.loads(json.dumps(raw["supersedes"]))
+    if mutation == "request_count":
+        supersedes["request_count"] = 192
+    elif mutation == "reuse":
+        supersedes["scientific_result_reuse"] = "allowed"
+    elif mutation == "root_digest":
+        supersedes["evidence_root"]["digest"] = "0" * 64
+    elif mutation == "bound_path":
+        supersedes["controller_claim"] = supersedes["wrapper_claim"]
+    elif mutation == "false_invalid_set":
+        supersedes["false_invalid_checkpoint_sha256"] = (
+            supersedes["false_invalid_checkpoint_sha256"][:-1]
+        )
+    else:
+        raise AssertionError(mutation)
+
+    with pytest.raises(CanonicalScreeningError, match=match):
+        validate_supersession_evidence(root, supersedes)
 
 
 def test_preflight_attempt_failure_writes_claim_and_terminal_without_result(

@@ -12,12 +12,15 @@ from safa.closeout.generator_output_contract import (
     GeneratorOutputContractError,
     bind_output_contract,
     build_bound_decoder,
+    canonical_runtime_model_config,
     decoder_registry_digest,
     resolve_checkpoint_output_capability,
     validate_decoder_registry,
+    validate_loaded_generator_capability,
     validate_native_generator_output,
     validate_rgb_unit_interval,
 )
+from safa.models.generator import build_generator
 from safa.evaluation.meanflow_guidance_runner import cached_asset_digest
 
 
@@ -122,7 +125,7 @@ def _latent_payload() -> dict:
             "channel_multipliers": [1, 2, 4, 4],
             "condition_dim": 512,
             "sample_steps": 1,
-            "train_cycle_steps": 8,
+            "train_cycle_steps": 1,
             "sampler": "meanflow",
             "sit_input_channels": 4,
             "sit_data_space": "latent",
@@ -153,6 +156,46 @@ def test_registered_pixel_and_latent_capabilities_are_exact(
     assert latent["capability"]["nfe"] == 1
     assert latent["capability"]["native_output_size"] == [32, 32]
     assert latent["rgb_contract"]["height"] == 256
+
+
+@pytest.mark.parametrize(
+    "truthy_pretrained_path",
+    [
+        "artifacts/checkpoints/external/SiT-XL-2-256.pt",
+        "/historical/e13/init.pt",
+        "/historical/e14/init.pt",
+        "/historical/e15/init.pt",
+        "relative/training-only/init.pt",
+    ],
+)
+def test_runtime_config_canonicalization_omits_cleared_pretrained_path(
+    truthy_pretrained_path: str,
+) -> None:
+    payload = _latent_payload()
+    payload["model_config"]["sit_pretrained_path"] = truthy_pretrained_path
+
+    runtime_config = canonical_runtime_model_config(payload["model_config"])
+    capability = resolve_checkpoint_output_capability(payload, "7" * 64)
+    generator = build_generator(runtime_config)
+
+    assert "sit_pretrained_path" not in runtime_config
+    assert "sit_pretrained_path" not in generator.config.to_dict()
+    validate_loaded_generator_capability(generator, capability)
+
+
+@pytest.mark.parametrize("include_empty_key", [False, True])
+def test_runtime_config_canonicalization_is_idempotent_for_missing_or_empty_path(
+    include_empty_key: bool,
+) -> None:
+    model_config = _latent_payload()["model_config"]
+    if include_empty_key:
+        model_config["sit_pretrained_path"] = ""
+
+    once = canonical_runtime_model_config(model_config)
+    twice = canonical_runtime_model_config(once)
+
+    assert once == twice
+    assert "sit_pretrained_path" not in once
 
 
 def test_pixel_backend_validates_native_rgb_without_decoder(

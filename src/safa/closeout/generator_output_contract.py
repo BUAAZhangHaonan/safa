@@ -50,6 +50,19 @@ def decoder_registry_digest(value: Mapping[str, Any]) -> str:
     return _canonical_digest(value, "decoder_registry_sha256")
 
 
+def canonical_runtime_model_config(
+    model_config: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Serialize the strict-load runtime config through one canonical path."""
+    runtime_input = dict(_mapping(model_config, "generator model_config"))
+    # Pretrained SiT weights are an initialization-only input.  A checkpoint's
+    # serialized state is authoritative during strict reconstruction, so the
+    # path must be cleared before parsing and canonical serialization.  Parsing
+    # after clearing also lets FlowGeneratorConfig.to_dict() omit the empty key.
+    runtime_input["sit_pretrained_path"] = ""
+    return FlowGeneratorConfig.from_dict(runtime_input).to_dict()
+
+
 def _mapping(value: Any, label: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise GeneratorOutputContractError(f"{label} must be a mapping")
@@ -319,11 +332,7 @@ def resolve_checkpoint_output_capability(
         },
         "decoder_fields": training_decoder,
     }
-    runtime_model_config = FlowGeneratorConfig.from_dict(
-        dict(model_config)
-    ).to_dict()
-    if "sit_pretrained_path" in runtime_model_config:
-        runtime_model_config["sit_pretrained_path"] = ""
+    runtime_model_config = canonical_runtime_model_config(model_config)
     if output_space == SIT_DATA_SPACE_LATENT:
         generator_output_tensor = {
             "dtype_family": "floating",
@@ -841,7 +850,11 @@ def validate_loaded_generator_capability(
         raise GeneratorOutputContractError(
             "strict-loaded generator config cannot be canonically serialized"
         )
-    if _canonical_digest(to_dict()) != value["runtime_model_config_sha256"]:
+    actual_runtime_config = canonical_runtime_model_config(to_dict())
+    if (
+        _canonical_digest(actual_runtime_config)
+        != value["runtime_model_config_sha256"]
+    ):
         raise GeneratorOutputContractError(
             "strict-loaded generator canonical config digest differs"
         )

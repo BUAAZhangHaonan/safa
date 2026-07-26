@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -148,6 +149,90 @@ def test_plain_checkpoint_strict_load_and_cpu_smoke_8(tmp_path: Path) -> None:
     assert result["smoke"]["executed_sample_count"] == 8
     assert result["smoke"]["output_shape"] == [8, 4, 32, 32]
     assert generator._safa_checkpoint_preflight["status"] == "valid"
+
+
+def test_strict_load_uses_canonical_runtime_config_for_truthy_pretrained_path(
+    tmp_path: Path,
+) -> None:
+    generator = build_generator(_config())
+    payload = _payload(generator)
+    payload["model_config"]["sit_pretrained_path"] = "/training-only/init.pt"
+    path = tmp_path / "truthy-pretrained-path.pt"
+    torch.save(payload, path)
+
+    loaded, result = strict_load_generator_checkpoint(path, "raw", "cpu")
+
+    assert result["status"] == "valid"
+    assert result["failure_code"] is None
+    assert "sit_pretrained_path" not in loaded.config.to_dict()
+    assert (
+        result["output_capability"]["runtime_model_config_sha256"]
+        == result["output_capability"]["model_config_sha256"]
+    ) is False
+
+
+@pytest.mark.skipif(
+    os.environ.get("SAFA_RUN_REAL_PREFLIGHT_CANONICALIZATION") != "1",
+    reason="explicit five-checkpoint CPU regression only",
+)
+@pytest.mark.parametrize(
+    ("checkpoint_sha256", "checkpoint_relative_path"),
+    [
+        (
+            "1058090b828d8e0243c3ccc9563526e40407a1554fa128e9169fb1c2b546f6b4",
+            "artifacts/checkpoints/e15_cold_v8_lpips_gpu0123_ddp_150ep/"
+            "best_ema_quality.pt",
+        ),
+        (
+            "1244b3a3aa790f6fcb941158acf4a9088d035b2309b24248e15470410140c684",
+            "artifacts/checkpoints/e15_cold_v8_lpips_gpu0123_ddp_150ep/"
+            "best_stage2.pt",
+        ),
+        (
+            "1c2cd0a53f837c3e20e6be07e3a2e7860e4bed3e0cf5ec50b47dfb99fb5a2f35",
+            "artifacts/checkpoints/"
+            "e13_pu_adamw_meanflow_sit_stage2_e14resume_gpu23_200ep/"
+            "best_raw_utility.pt",
+        ),
+        (
+            "1d199b8a32ba9b1a6225157416674aa0bcd05766765a3c619fcc25a97178b3cb",
+            "artifacts/checkpoints/"
+            "e13_pu_adamw_meanflow_sit_stage2_e14resume_gpu23_200ep/"
+            "best_ema_quality.pt",
+        ),
+        (
+            "33a4c9bfb46080e8a75c503c269e21e2c6d436913d2a42db7ed0ea74ea31ce9d",
+            "artifacts/checkpoints/"
+            "e13_pu_adamw_meanflow_sit_stage2_e14resume_gpu23_200ep/best.pt",
+        ),
+    ],
+)
+def test_real_false_invalid_checkpoints_load_with_canonical_runtime_config(
+    checkpoint_sha256: str,
+    checkpoint_relative_path: str,
+) -> None:
+    from safa.closeout.canonical_screening import validate_policy
+
+    policy = validate_policy(
+        ROOT,
+        ROOT / "configs/closeout/canonical_screening_512_v1.json",
+    )
+    _, result = strict_load_generator_checkpoint(
+        ROOT / checkpoint_relative_path,
+        "ema",
+        "cpu",
+        expected_checkpoint_sha256=checkpoint_sha256,
+        compute_sha256=True,
+        smoke_samples=0,
+        output_decoder_registry=policy["output_decoder_registry"],
+    )
+    assert result["status"] == "valid"
+    assert result["failure_code"] is None
+    assert result["tensor_count"] == 139
+    assert result["finite_tensor_count"] == 139
+    assert result["missing_keys"] == []
+    assert result["unexpected_keys"] == []
+    assert result["shape_mismatches"] == []
 
 
 def test_expected_sha256_is_bound_before_deserialization(

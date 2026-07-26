@@ -16,6 +16,7 @@ from typing import Any
 
 from safa.closeout.generator_output_contract import (
     bind_output_contract,
+    canonical_runtime_model_config,
     resolve_checkpoint_output_capability,
     validate_loaded_generator_capability,
 )
@@ -584,10 +585,10 @@ def strict_load_generator_checkpoint(
 
     reconstruction_stdout = StringIO()
     try:
-        # A complete checkpoint load must not depend on an initialization-only
-        # pretrained asset.  The serialized state remains authoritative.
-        if "sit_pretrained_path" in model_config:
-            model_config["sit_pretrained_path"] = ""
+        # Use the same canonical runtime config that is bound into the output
+        # capability.  This removes initialization-only pretrained assets
+        # before parsing, so empty optional fields are omitted identically.
+        model_config = canonical_runtime_model_config(model_config)
         with redirect_stdout(reconstruction_stdout):
             generator = build_generator(model_config)
             _mount_adapter(generator, objective, state_adapter_type, result)

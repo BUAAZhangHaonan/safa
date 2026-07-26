@@ -65,6 +65,26 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def sha256_directory_tree(path: Path) -> str:
+    """Hash every regular file by relative POSIX path and content."""
+    root = path.resolve()
+    if not root.is_dir():
+        raise CanonicalScreeningError(f"evidence directory does not exist: {root}")
+    digest = hashlib.sha256()
+    files = sorted(
+        (item for item in root.rglob("*") if item.is_file()),
+        key=lambda item: item.relative_to(root).as_posix(),
+    )
+    for item in files:
+        digest.update(item.relative_to(root).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        with item.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def write_exclusive_json(path: Path, value: Mapping[str, Any]) -> None:
     content = canonical_json(value)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -186,7 +206,7 @@ def _validate_bound_file(
     )}
 
 
-def validate_supersession_evidence(
+def _validate_ea7_smoke_supersession_evidence(
     repo_root: Path, raw_supersedes: Mapping[str, Any]
 ) -> dict[str, Any]:
     supersedes = _require_mapping(raw_supersedes, "supersession evidence")
@@ -413,6 +433,363 @@ def validate_supersession_evidence(
                 "superseded smoke worker log semantics differ"
             )
     return bound
+
+
+def _validate_c83_preflight_supersession_evidence(
+    repo_root: Path, raw_supersedes: Mapping[str, Any]
+) -> dict[str, Any]:
+    supersedes = _require_mapping(raw_supersedes, "c83 supersession evidence")
+    _require_exact_keys(
+        supersedes,
+        {
+            "policy_sha256",
+            "previous_policy_sha256",
+            "classification",
+            "phase",
+            "request_count",
+            "result_count",
+            "valid_count",
+            "false_invalid_count",
+            "pending_count",
+            "attempt_claim_count",
+            "attempt_terminal_count",
+            "false_invalid_failure_code",
+            "false_invalid_checkpoint_sha256",
+            "scientific_result_reuse",
+            "successor_execution",
+            "evidence_root",
+            "controller_claim",
+            "controller_terminal",
+            "wrapper_claim",
+            "wrapper_exit",
+            "resource_monitor",
+            "resource_observer",
+            "runtime_resource_windows",
+        },
+        "c83 supersession evidence",
+    )
+    c83 = "c83b95e0ca49a0cf5b5b3d67c337000a31b8d2a3299d434fc1051256f18fea50"
+    ea7 = "ea7ae71fd662526b9a45bf3cc6d283884aefc380b292c8f273169a35f42ffc28"
+    false_invalid_sha256 = [
+        "1058090b828d8e0243c3ccc9563526e40407a1554fa128e9169fb1c2b546f6b4",
+        "1244b3a3aa790f6fcb941158acf4a9088d035b2309b24248e15470410140c684",
+        "1c2cd0a53f837c3e20e6be07e3a2e7860e4bed3e0cf5ec50b47dfb99fb5a2f35",
+        "1d199b8a32ba9b1a6225157416674aa0bcd05766765a3c619fcc25a97178b3cb",
+        "33a4c9bfb46080e8a75c503c269e21e2c6d436913d2a42db7ed0ea74ea31ce9d",
+    ]
+    expected_scalars = {
+        "policy_sha256": c83,
+        "previous_policy_sha256": ea7,
+        "classification": "started_incomplete",
+        "phase": "preflight",
+        "request_count": 193,
+        "result_count": 34,
+        "valid_count": 29,
+        "false_invalid_count": 5,
+        "pending_count": 159,
+        "attempt_claim_count": 34,
+        "attempt_terminal_count": 34,
+        "false_invalid_failure_code": "loaded_output_capability_mismatch",
+        "false_invalid_checkpoint_sha256": false_invalid_sha256,
+        "scientific_result_reuse": "forbidden",
+        "successor_execution": "fresh_full_193_preflight",
+    }
+    if any(supersedes[key] != value for key, value in expected_scalars.items()):
+        raise CanonicalScreeningError("c83 supersession status differs")
+
+    evidence_root = _require_mapping(
+        supersedes["evidence_root"], "c83 evidence root"
+    )
+    _require_exact_keys(
+        evidence_root,
+        {"path", "digest", "digest_algorithm"},
+        "c83 evidence root",
+    )
+    root = _repo_path(
+        repo_root,
+        evidence_root["path"],
+        "c83 evidence root",
+        must_exist=False,
+    )
+    expected_root = (
+        repo_root.resolve()
+        / "artifacts/closeout/historical-canonical-512-v1/by_policy"
+        / c83
+    ).resolve()
+    if (
+        root != expected_root
+        or not root.is_dir()
+        or evidence_root["digest_algorithm"]
+        != "sha256_relative_posix_nul_content_nul_v1"
+        or sha256_directory_tree(root)
+        != _require_sha256(evidence_root["digest"], "c83 evidence root digest")
+    ):
+        raise CanonicalScreeningError("c83 evidence root binding differs")
+
+    bound_files = {
+        name: _validate_bound_file(
+            repo_root, supersedes[name], f"c83 {name.replace('_', ' ')}"
+        )
+        for name in (
+            "controller_claim",
+            "controller_terminal",
+            "wrapper_claim",
+            "wrapper_exit",
+            "resource_monitor",
+            "resource_observer",
+            "runtime_resource_windows",
+        )
+    }
+    expected_relative_paths = {
+        "controller_claim": "preflight_control/controller_claim.json",
+        "controller_terminal": "preflight_control/controller_terminal.json",
+        "wrapper_claim": "preflight_control/wrapper_claim.json",
+        "wrapper_exit": "preflight_control/wrapper_exit.json",
+        "resource_monitor": "logs/preflight__monitor.jsonl",
+        "resource_observer": "logs/preflight__observer.jsonl",
+        "runtime_resource_windows": (
+            "preflight_control/runtime_resource_windows.jsonl"
+        ),
+    }
+    for name, relative_path in expected_relative_paths.items():
+        if Path(bound_files[name]["path"]).resolve() != (
+            root / relative_path
+        ).resolve():
+            raise CanonicalScreeningError(
+                f"c83 {name.replace('_', ' ')} path differs"
+            )
+    controller_claim = load_json(
+        Path(bound_files["controller_claim"]["path"]), "c83 controller claim"
+    )
+    controller_terminal = load_json(
+        Path(bound_files["controller_terminal"]["path"]), "c83 controller terminal"
+    )
+    wrapper_claim = load_json(
+        Path(bound_files["wrapper_claim"]["path"]), "c83 wrapper claim"
+    )
+    wrapper_exit = load_json(
+        Path(bound_files["wrapper_exit"]["path"]), "c83 wrapper exit"
+    )
+    expected_config = (
+        repo_root.resolve()
+        / "configs/closeout/canonical_screening_512_v1.json"
+    )
+    wrapper_config = _require_mapping(
+        wrapper_claim.get("config"), "c83 wrapper config"
+    )
+    wrapper_command = wrapper_claim.get("command")
+    guard = _require_mapping(
+        controller_terminal.get("runtime_resource_guard"),
+        "c83 runtime resource guard",
+    )
+    if (
+        controller_claim.get("contract_type")
+        != "safa_canonical_preflight_controller_claim_v1"
+        or controller_claim.get("policy_sha256") != c83
+        or controller_claim.get("supersedes_policy_sha256") != ea7
+        or controller_claim.get("request_count") != 193
+        or controller_claim.get("controller_claim_sha256")
+        != canonical_digest(controller_claim, "controller_claim_sha256")
+        or controller_terminal.get("contract_type")
+        != "safa_canonical_preflight_controller_terminal_v1"
+        or controller_terminal.get("policy_sha256") != c83
+        or controller_terminal.get("controller_claim_sha256")
+        != controller_claim.get("controller_claim_sha256")
+        or controller_terminal.get("status") != "failed"
+        or controller_terminal.get("result_count") != 34
+        or controller_terminal.get("pending_count") != 159
+        or controller_terminal.get("attempt_claim_count") != 34
+        or controller_terminal.get("attempt_terminal_count") != 34
+        or controller_terminal.get("failure")
+        != {"type": "KeyboardInterrupt", "message": ""}
+        or controller_terminal.get("controller_terminal_sha256")
+        != canonical_digest(
+            controller_terminal, "controller_terminal_sha256"
+        )
+        or controller_terminal.get("controller_monitor_samples")
+        != bound_files["resource_monitor"]
+        or guard.get("violated") is not False
+        or guard.get("violation_reason") is not None
+        or guard.get("thread_failure") is not None
+        or guard.get("samples") != bound_files["runtime_resource_windows"]
+        or wrapper_claim.get("contract_type")
+        != "safa_canonical_preflight_wrapper_claim_v1"
+        or wrapper_claim.get("policy_sha256") != c83
+        or wrapper_claim.get("external_timeout_seconds") is not None
+        or Path(str(wrapper_config.get("path"))).resolve() != expected_config
+        or wrapper_config.get("sha256")
+        != "82d596e02c021a064a0a2156524773bd75599acfeb77ac981902ad9cf9745561"
+        or not isinstance(wrapper_command, list)
+        or wrapper_command[-2:] != ["preflight", "--execute"]
+        or wrapper_claim.get("wrapper_claim_sha256")
+        != canonical_digest(wrapper_claim, "wrapper_claim_sha256")
+        or wrapper_exit.get("contract_type")
+        != "safa_canonical_preflight_wrapper_exit_v2"
+        or wrapper_exit.get("policy_sha256") != c83
+        or wrapper_exit.get("wrapper_claim_sha256")
+        != wrapper_claim.get("wrapper_claim_sha256")
+        or wrapper_exit.get("command") != wrapper_command
+        or wrapper_exit.get("started_at") != wrapper_claim.get("started_at")
+        or wrapper_exit.get("exit_code") != 125
+        or wrapper_exit.get("launch_failure")
+        != {"type": "KeyboardInterrupt", "message": ""}
+        or wrapper_exit.get("wrapper_exit_sha256")
+        != canonical_digest(wrapper_exit, "wrapper_exit_sha256")
+        or wrapper_exit.get("controller_claim") != bound_files["controller_claim"]
+        or wrapper_exit.get("controller_terminal")
+        != bound_files["controller_terminal"]
+    ):
+        raise CanonicalScreeningError("c83 stop evidence semantics differ")
+    monitor_rows = load_jsonl(
+        Path(bound_files["resource_monitor"]["path"]), "c83 resource monitor"
+    )
+    observer_rows = load_jsonl(
+        Path(bound_files["resource_observer"]["path"]), "c83 resource observer"
+    )
+    if (
+        not monitor_rows
+        or not observer_rows
+        or any(
+            row.get("policy_sha256") != c83
+            or row.get("phase") != "preflight"
+            or row.get("contract_type")
+            != "safa_canonical_resource_monitor_sample_v1"
+            for row in [*monitor_rows, *observer_rows]
+        )
+        or observer_rows[-1].get("terminal") is not True
+        or observer_rows[-1].get("artifacts", {}).get("preflight_requests")
+        != 193
+        or observer_rows[-1].get("artifacts", {}).get("preflight_results")
+        != 34
+    ):
+        raise CanonicalScreeningError("c83 resource evidence semantics differ")
+
+    requests = sorted((root / "checkpoint_preflight/requests").glob("*.json"))
+    results = sorted((root / "checkpoint_preflight/results").glob("*.json"))
+    claims = sorted((root / "preflight_control/attempts").glob("*.claim.json"))
+    terminals = sorted(
+        (root / "preflight_control/attempts").glob("*.terminal.json")
+    )
+    if (
+        len(requests) != 193
+        or len(results) != 34
+        or len(claims) != 34
+        or len(terminals) != 34
+    ):
+        raise CanonicalScreeningError("c83 preflight filesystem counts differ")
+
+    request_by_stem: dict[str, dict[str, Any]] = {}
+    request_sha256: set[str] = set()
+    for path in requests:
+        request = load_json(path, "c83 preflight request")
+        stem = path.stem
+        if (
+            request.get("contract_type") != PREFLIGHT_REQUEST_CONTRACT
+            or request.get("policy_sha256") != c83
+            or request.get("preflight_request_sha256")
+            != canonical_digest(request, "preflight_request_sha256")
+            or stem
+            != f"{request.get('checkpoint_sha256')}__{request.get('checkpoint_model')}"
+            or request.get("preflight_request_sha256") in request_sha256
+        ):
+            raise CanonicalScreeningError("c83 preflight request semantics differ")
+        request_sha256.add(str(request["preflight_request_sha256"]))
+        request_by_stem[stem] = request
+
+    valid_count = 0
+    invalid_sha256: list[str] = []
+    for result_path in results:
+        stem = result_path.stem
+        request = request_by_stem.get(stem)
+        result = load_json(result_path, "c83 preflight result")
+        strict_result = _require_mapping(
+            result.get("strict_result"), "c83 strict preflight result"
+        )
+        claim_path = root / "preflight_control/attempts" / f"{stem}.claim.json"
+        terminal_path = (
+            root / "preflight_control/attempts" / f"{stem}.terminal.json"
+        )
+        if request is None or not claim_path.is_file() or not terminal_path.is_file():
+            raise CanonicalScreeningError("c83 preflight chain is incomplete")
+        claim = load_json(claim_path, "c83 preflight attempt claim")
+        terminal = load_json(terminal_path, "c83 preflight attempt terminal")
+        status = strict_result.get("status")
+        if status == "valid":
+            valid_count += 1
+        elif (
+            status == "invalid"
+            and strict_result.get("failure_code")
+            == "loaded_output_capability_mismatch"
+            and strict_result.get("failure_message")
+            == (
+                "strict-loaded generator output capability mismatch: "
+                "GeneratorOutputContractError: strict-loaded generator "
+                "canonical config digest differs"
+            )
+            and strict_result.get("tensor_count") == 139
+            and strict_result.get("finite_tensor_count") == 139
+            and strict_result.get("nonfinite_keys") == []
+            and strict_result.get("missing_keys") == []
+            and strict_result.get("unexpected_keys") == []
+            and strict_result.get("shape_mismatches") == []
+        ):
+            invalid_sha256.append(str(result.get("checkpoint_sha256")))
+        else:
+            raise CanonicalScreeningError("c83 preflight status semantics differ")
+        if (
+            result.get("contract_type") != PREFLIGHT_RESULT_CONTRACT
+            or result.get("policy_sha256") != c83
+            or result.get("preflight_request_sha256")
+            != request.get("preflight_request_sha256")
+            or result.get("preflight_result_sha256")
+            != canonical_digest(result, "preflight_result_sha256")
+            or claim.get("contract_type")
+            != "safa_canonical_preflight_attempt_claim_v1"
+            or claim.get("policy_sha256") != c83
+            or claim.get("preflight_request_sha256")
+            != request.get("preflight_request_sha256")
+            or claim.get("attempt_claim_sha256")
+            != canonical_digest(claim, "attempt_claim_sha256")
+            or terminal.get("contract_type")
+            != "safa_canonical_preflight_attempt_terminal_v1"
+            or terminal.get("policy_sha256") != c83
+            or terminal.get("attempt_claim_sha256")
+            != claim.get("attempt_claim_sha256")
+            or terminal.get("status") != "completed"
+            or terminal.get("valid") is not (status == "valid")
+            or terminal.get("preflight_result_sha256")
+            != result.get("preflight_result_sha256")
+            or terminal.get("result_file_sha256") != sha256_file(result_path)
+            or terminal.get("attempt_terminal_sha256")
+            != canonical_digest(terminal, "attempt_terminal_sha256")
+        ):
+            raise CanonicalScreeningError("c83 preflight chain semantics differ")
+    if valid_count != 29 or sorted(invalid_sha256) != false_invalid_sha256:
+        raise CanonicalScreeningError("c83 valid/false-invalid classification differs")
+
+    return {
+        **expected_scalars,
+        "evidence_root": {
+            "path": str(root),
+            "digest": evidence_root["digest"],
+            "digest_algorithm": evidence_root["digest_algorithm"],
+        },
+        **bound_files,
+    }
+
+
+def validate_supersession_evidence(
+    repo_root: Path, raw_supersedes: Mapping[str, Any]
+) -> dict[str, Any]:
+    supersedes = _require_mapping(raw_supersedes, "supersession evidence")
+    if (
+        supersedes.get("policy_sha256")
+        == "c83b95e0ca49a0cf5b5b3d67c337000a31b8d2a3299d434fc1051256f18fea50"
+    ):
+        return _validate_c83_preflight_supersession_evidence(
+            repo_root, supersedes
+        )
+    return _validate_ea7_smoke_supersession_evidence(repo_root, supersedes)
 
 
 def _validate_output_decoder_registry(
