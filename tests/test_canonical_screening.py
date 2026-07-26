@@ -887,6 +887,230 @@ def test_ram_probe_contract_and_execution_digests_are_split() -> None:
     assert module._admission_evidence_digest(tampered) != evidence
 
 
+def test_ram_probe_build_spec_separates_admission_binding_and_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _ram_probe_module()
+    config = tmp_path / "policy.json"
+    manifest_path = tmp_path / "manifest.json"
+    smoke = tmp_path / "smoke.jsonl"
+    for path in (config, manifest_path, smoke):
+        path.write_text("{}\n", encoding="utf-8")
+    policy = {
+        "policy_sha256": "1" * 64,
+        "protocol": {"manifests": {"smoke8": _bound(smoke)}},
+        "implementations": {"worker": _bound(smoke)},
+    }
+    manifest = {"candidate_manifest_sha256": "2" * 64}
+    monkeypatch.setattr(module, "_select_probe_candidates", lambda _value: [])
+    dry = module._build_spec(
+        policy,
+        config,
+        manifest,
+        manifest_path,
+        tmp_path / "probe",
+        None,
+    )
+    binding = {
+        "path": str((tmp_path / "admission.json").resolve()),
+        "sha256": "3" * 64,
+        "canonical_sha256": "4" * 64,
+    }
+    execution = "5" * 64
+    live = module._build_spec(
+        policy,
+        config,
+        manifest,
+        manifest_path,
+        tmp_path / "probe",
+        [
+            {
+                "physical_gpu_index": 0,
+                "physical_gpu_uuid": _gpu_uuid(0),
+            }
+        ],
+        binding,
+        execution,
+    )
+    assert live["admission"] == binding
+    assert live["probe_execution_sha256"] == execution
+    assert live["probe_contract_sha256"] == dry["probe_contract_sha256"]
+    with pytest.raises(CanonicalScreeningError, match="must be paired"):
+        module._build_spec(
+            policy,
+            config,
+            manifest,
+            manifest_path,
+            tmp_path / "probe",
+            [],
+            binding,
+            None,
+        )
+    with pytest.raises(CanonicalScreeningError, match="fields differ"):
+        module._build_spec(
+            policy,
+            config,
+            manifest,
+            manifest_path,
+            tmp_path / "probe",
+            [],
+            {**binding, "probe_execution_sha256": execution},
+            execution,
+        )
+
+
+def test_ram_probe_controller_writes_one_preworker_failure_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _ram_probe_module()
+    artifact_root = tmp_path / "probe"
+    claim = {
+        "schema_version": 1,
+        "contract_type": (
+            "safa_canonical_screening_ram_probe_controller_claim_v1"
+        ),
+        "controller_claim_sha256": "6" * 64,
+    }
+
+    def fail_after_claim(*_args: object, **_kwargs: object) -> None:
+        artifact_root.mkdir()
+        write_exclusive_json(artifact_root / "controller_claim.json", claim)
+        (artifact_root / "input_policy.json").write_text(
+            "{}\n", encoding="utf-8"
+        )
+        write_exclusive_json(artifact_root / "admission.json", {})
+        raise KeyError("probe_execution_sha256")
+
+    monkeypatch.setattr(module, "_run_controller_once", fail_after_claim)
+    with pytest.raises(KeyError, match="probe_execution_sha256"):
+        module._run_controller({}, tmp_path / "p", {}, tmp_path / "m", artifact_root)
+    terminal = load_json(
+        artifact_root / "controller_terminal.json", "controller terminal"
+    )
+    assert terminal["status"] == "failed"
+    assert terminal["stage"] == "admission_to_spec"
+    assert terminal["exception"]["type"] == "KeyError"
+    assert terminal["retry_count"] == 0
+    assert terminal["worker_started"] is False
+    assert not (artifact_root / "probe_result.json").exists()
+    before = (artifact_root / "controller_terminal.json").read_bytes()
+    with pytest.raises(FileExistsError):
+        module._write_controller_failure_terminal(
+            artifact_root, RuntimeError("collision")
+        )
+    assert (artifact_root / "controller_terminal.json").read_bytes() == before
+
+
+def test_ram_probe_controller_positive_mock_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _ram_probe_module()
+    config = tmp_path / "policy.json"
+    manifest_path = tmp_path / "manifest.json"
+    smoke = tmp_path / "smoke.jsonl"
+    for path in (config, manifest_path, smoke):
+        path.write_text("{}\n", encoding="utf-8")
+    artifact_root = tmp_path / "probe"
+    policy = {
+        "policy_sha256": "1" * 64,
+        "python": sys.executable,
+        "resources": {
+            "ram_budget_status": "probe_required",
+            "physical_gpus": [0, 1, 2, 3],
+            "gpu_headroom_bytes": 2 * 1024**3,
+        },
+        "protocol": {"manifests": {"smoke8": _bound(smoke)}},
+        "implementations": {"worker": _bound(smoke)},
+    }
+    manifest = {"candidate_manifest_sha256": "2" * 64}
+    monkeypatch.setenv("TMUX", "fixture")
+    monkeypatch.setattr(module, "_select_probe_candidates", lambda _value: [])
+    monkeypatch.setattr(
+        module,
+        "assert_cpu_resource_admission",
+        lambda *_args: {"memory_percent": 20.0},
+    )
+    monkeypatch.setattr(
+        module,
+        "_gpu_snapshot",
+        lambda: [
+            {
+                "index": index,
+                "uuid": _gpu_uuid(index),
+                "memory_free_mib": 24_000,
+            }
+            for index in range(4)
+        ],
+    )
+    monkeypatch.setattr(module, "_gpu_compute_processes", lambda: [])
+    monkeypatch.setattr(module, "_worker_environment", lambda _uuid: {})
+
+    class Guard:
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> dict:
+            return {
+                "violated": False,
+                "violation_reason": None,
+                "thread_failure": None,
+            }
+
+    class Process:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+    def monitor(
+        _process: object, _policy: dict, _guard: object
+    ) -> tuple[int, int, None, None]:
+        spec = load_json(artifact_root / "probe_spec.json", "probe spec")
+        worker = {
+            "schema_version": 1,
+            "contract_type": module.PROBE_WORKER_RESULT_CONTRACT,
+            "status": "succeeded",
+            "probe_contract_sha256": spec["probe_contract_sha256"],
+            "probe_execution_sha256": spec["probe_execution_sha256"],
+            "purpose": spec["purpose"],
+            "device_binding": {"physical_gpu_index": 0},
+            "steps": [],
+            "worker_vmhwm_bytes": 900,
+            "failure": None,
+            "completed_at": "2026-07-27T00:01:00+00:00",
+        }
+        worker["worker_result_sha256"] = canonical_digest(
+            worker, "worker_result_sha256"
+        )
+        write_exclusive_json(artifact_root / "worker_result.json", worker)
+        return 1000, 0, None, None
+
+    monkeypatch.setattr(module, "RuntimeResourceGuard", Guard)
+    monkeypatch.setattr(module.subprocess, "Popen", Process)
+    monkeypatch.setattr(module, "_monitor_probe_process", monitor)
+    result = module._run_controller(
+        policy, config, manifest, manifest_path, artifact_root
+    )
+    spec = load_json(artifact_root / "probe_spec.json", "probe spec")
+    admission = load_json(artifact_root / "admission.json", "admission")
+    assert result["status"] == "succeeded"
+    assert spec["admission"] == {
+        "path": str((artifact_root / "admission.json").resolve()),
+        "sha256": hashlib.sha256(
+            (artifact_root / "admission.json").read_bytes()
+        ).hexdigest(),
+        "canonical_sha256": admission["admission_sha256"],
+    }
+    assert (
+        spec["probe_execution_sha256"]
+        == admission["probe_execution_sha256"]
+    )
+    assert (artifact_root / "controller_claim.json").is_file()
+    assert not (artifact_root / "controller_terminal.json").exists()
+    assert (artifact_root / "probe_result.json").is_file()
+
+
 def test_worker_environment_overrides_inherited_cuda_remap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2572,7 +2796,7 @@ def test_supersession_evidence_binds_ea7_failed_smoke_chain(
         validate_supersession_evidence(tmp_path, tampered)
 
 
-def test_current_policy_binds_6b_preflight_and_failed_probe() -> None:
+def test_current_policy_binds_fe9_preflight_and_incomplete_probe() -> None:
     root = Path(__file__).parents[1]
     policy_path = root / "configs/closeout/canonical_screening_512_v1.json"
 
@@ -2580,16 +2804,18 @@ def test_current_policy_binds_6b_preflight_and_failed_probe() -> None:
 
     supersedes = policy["supersedes"]
     assert supersedes["policy_sha256"] == (
-        "6b088236579f731183e60c7fc1d7bece31089284aaaf13697a73f3fb6cd42072"
+        "fe9b41136f0b9fa31ce210dfaa5500c3f46f071838ed91288878f57073502060"
     )
     assert supersedes["classification"] == (
-        "completed_preflight_and_failed_ram_probe_superseded"
+        "completed_preflight_and_incomplete_ram_probe_superseded"
     )
     assert supersedes["preflight"]["request_count"] == 193
     assert supersedes["preflight"]["result_count"] == 193
     assert supersedes["preflight"]["valid_count"] == 193
     assert supersedes["preflight"]["invalid_count"] == 0
-    assert supersedes["failed_ram_probe"]["status"] == "failed"
+    assert supersedes["preflight"]["reused_count"] == 0
+    assert supersedes["failed_ram_probe"]["worker_started"] is False
+    assert supersedes["failed_ram_probe"]["gpu_execution_count"] == 0
     assert supersedes["failed_ram_probe"]["capability_step_count"] == 0
     assert supersedes["failed_ram_probe"]["in_place_retry"] == "forbidden"
     assert supersedes["scientific_result_reuse"] == "forbidden"
@@ -2602,11 +2828,13 @@ def test_current_policy_binds_6b_preflight_and_failed_probe() -> None:
         ("request_count", "counts differ"),
         ("reuse", "status differs"),
         ("root_digest", "evidence root differs"),
-        ("failed_root_digest", "failed RAM probe root differs"),
-        ("failed_file_sha", "failed RAM probe files differ"),
+        ("failed_root_digest", "failed root differs"),
+        ("failed_file_sha", "failed root files differ"),
+        ("admission_digest", "status differs"),
+        ("forbidden_entry", "forbidden probe artifacts"),
     ],
 )
-def test_6b_supersession_tampering_fails_closed(
+def test_fe9_supersession_tampering_fails_closed(
     mutation: str,
     match: str,
 ) -> None:
@@ -2625,7 +2853,11 @@ def test_6b_supersession_tampering_fails_closed(
     elif mutation == "failed_root_digest":
         supersedes["failed_ram_probe"]["root"]["digest"] = "0" * 64
     elif mutation == "failed_file_sha":
-        supersedes["failed_ram_probe"]["files"]["worker.log"] = "0" * 64
+        supersedes["failed_ram_probe"]["files"]["admission.json"] = "0" * 64
+    elif mutation == "admission_digest":
+        supersedes["failed_ram_probe"]["admission_evidence_sha256"] = "0" * 64
+    elif mutation == "forbidden_entry":
+        supersedes["failed_ram_probe"]["forbidden_entries"] = []
     else:
         raise AssertionError(mutation)
 

@@ -12,6 +12,7 @@ import shutil
 import signal
 import subprocess
 import time
+import traceback
 from typing import Any, Mapping, Sequence
 
 from run_canonical_checkpoint_screening import (
@@ -461,8 +462,24 @@ def _build_spec(
     manifest_path: Path,
     artifact_root: Path,
     gpu_registry: list[dict[str, Any]] | None,
-    admission: Mapping[str, Any] | None = None,
+    admission_file_binding: Mapping[str, Any] | None = None,
+    probe_execution_sha256: str | None = None,
 ) -> dict[str, Any]:
+    if (admission_file_binding is None) != (
+        probe_execution_sha256 is None
+    ):
+        raise CanonicalScreeningError(
+            "RAM probe admission binding and execution SHA must be paired"
+        )
+    if admission_file_binding is not None:
+        if set(admission_file_binding or {}) != {
+            "path",
+            "sha256",
+            "canonical_sha256",
+        }:
+            raise CanonicalScreeningError(
+                "RAM probe admission file binding fields differ"
+            )
     spec = {
         "schema_version": 1,
         "contract_type": PROBE_CONTRACT,
@@ -489,16 +506,16 @@ def _build_spec(
         "authorized_gpu_registry": (
             None if gpu_registry is None else _canonical_gpu_registry(gpu_registry)
         ),
-        "admission": None if admission is None else dict(admission),
+        "admission": (
+            None
+            if admission_file_binding is None
+            else dict(admission_file_binding)
+        ),
         "artifact_root": str(artifact_root.resolve()),
         "implementations": dict(policy["implementations"]),
         "retry_count": 0,
         "probe_contract_sha256": None,
-        "probe_execution_sha256": (
-            None
-            if admission is None
-            else admission["probe_execution_sha256"]
-        ),
+        "probe_execution_sha256": probe_execution_sha256,
     }
     spec["probe_contract_sha256"] = _probe_contract_digest(spec)
     return spec
@@ -735,7 +752,7 @@ def _run_worker(
     return result
 
 
-def _run_controller(
+def _run_controller_once(
     policy: Mapping[str, Any],
     config: Path,
     manifest: Mapping[str, Any],
@@ -747,6 +764,23 @@ def _run_controller(
     if policy["resources"]["ram_budget_status"] != "probe_required":
         raise CanonicalScreeningError("RAM probe requires probe_required policy")
     artifact_root.mkdir(parents=True, exist_ok=False)
+    controller_claim = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_screening_ram_probe_controller_claim_v1",
+        "policy_sha256": policy["policy_sha256"],
+        "policy_file_sha256": sha256_file(config),
+        "candidate_manifest_sha256": manifest["candidate_manifest_sha256"],
+        "candidate_manifest_file_sha256": sha256_file(manifest_path),
+        "artifact_root": str(artifact_root.resolve()),
+        "retry_count": 0,
+        "started_at": _utc_now(),
+    }
+    controller_claim["controller_claim_sha256"] = canonical_digest(
+        controller_claim, "controller_claim_sha256"
+    )
+    write_exclusive_json(
+        artifact_root / "controller_claim.json", controller_claim
+    )
     policy_snapshot_path = artifact_root / "input_policy.json"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
@@ -829,6 +863,7 @@ def _run_controller(
             "sha256": sha256_file(admission_path),
             "canonical_sha256": admission["admission_sha256"],
         },
+        admission["probe_execution_sha256"],
     )
     if (
         spec["probe_contract_sha256"]
@@ -970,6 +1005,80 @@ def _run_controller(
     if failure is not None:
         raise CanonicalScreeningError(failure)
     return result
+
+
+def _controller_failure_stage(artifact_root: Path) -> str:
+    if not (artifact_root / "input_policy.json").exists():
+        return "policy_snapshot"
+    if not (artifact_root / "admission.json").exists():
+        return "resource_admission"
+    if not (artifact_root / "probe_spec.json").exists():
+        return "admission_to_spec"
+    if not (artifact_root / "worker.log").exists():
+        return "worker_launch"
+    if not (artifact_root / "worker_result.json").exists():
+        return "worker_execution"
+    return "controller_finalize"
+
+
+def _write_controller_failure_terminal(
+    artifact_root: Path, exc: Exception
+) -> dict[str, Any]:
+    claim_path = artifact_root / "controller_claim.json"
+    claim = load_json(claim_path, "RAM probe controller claim")
+    entries = sorted(path.name for path in artifact_root.iterdir())
+    terminal = {
+        "schema_version": 1,
+        "contract_type": (
+            "safa_canonical_screening_ram_probe_controller_terminal_v1"
+        ),
+        "status": "failed",
+        "controller_claim_sha256": claim["controller_claim_sha256"],
+        "stage": _controller_failure_stage(artifact_root),
+        "exception": {
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "traceback": traceback.format_exc(),
+        },
+        "artifact_entries_before_terminal": entries,
+        "worker_started": (artifact_root / "worker.log").exists(),
+        "worker_result_present": (
+            artifact_root / "worker_result.json"
+        ).exists(),
+        "probe_result_present": (artifact_root / "probe_result.json").exists(),
+        "retry_count": 0,
+        "completed_at": _utc_now(),
+    }
+    terminal["controller_terminal_sha256"] = canonical_digest(
+        terminal, "controller_terminal_sha256"
+    )
+    write_exclusive_json(
+        artifact_root / "controller_terminal.json", terminal
+    )
+    return terminal
+
+
+def _run_controller(
+    policy: Mapping[str, Any],
+    config: Path,
+    manifest: Mapping[str, Any],
+    manifest_path: Path,
+    artifact_root: Path,
+) -> dict[str, Any]:
+    root_preexisted = artifact_root.exists()
+    try:
+        return _run_controller_once(
+            policy, config, manifest, manifest_path, artifact_root
+        )
+    except Exception as exc:
+        if (
+            not root_preexisted
+            and artifact_root.is_dir()
+            and (artifact_root / "controller_claim.json").is_file()
+            and not (artifact_root / "controller_terminal.json").exists()
+        ):
+            _write_controller_failure_terminal(artifact_root, exc)
+        raise
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -1614,6 +1614,248 @@ def _validate_6b_supersession_evidence(
     return dict(supersedes)
 
 
+def _validate_fe9_supersession_evidence(
+    repo_root: Path, raw_supersedes: Mapping[str, Any]
+) -> dict[str, Any]:
+    supersedes = _require_mapping(raw_supersedes, "fe9 supersession evidence")
+    _require_exact_keys(
+        supersedes,
+        {
+            "policy_sha256",
+            "classification",
+            "supersession_reason",
+            "scientific_result_reuse",
+            "successor_execution",
+            "preflight",
+            "failed_ram_probe",
+        },
+        "fe9 supersession evidence",
+    )
+    policy_sha = (
+        "fe9b41136f0b9fa31ce210dfaa5500c3f46f071838ed91288878f57073502060"
+    )
+    if {
+        "policy_sha256": supersedes["policy_sha256"],
+        "classification": supersedes["classification"],
+        "supersession_reason": supersedes["supersession_reason"],
+        "scientific_result_reuse": supersedes["scientific_result_reuse"],
+        "successor_execution": supersedes["successor_execution"],
+    } != {
+        "policy_sha256": policy_sha,
+        "classification": (
+            "completed_preflight_and_incomplete_ram_probe_superseded"
+        ),
+        "supersession_reason": (
+            "admission_payload_and_file_binding_interface_fix"
+        ),
+        "scientific_result_reuse": "forbidden",
+        "successor_execution": "fresh_full_193_preflight",
+    }:
+        raise CanonicalScreeningError("fe9 supersession status differs")
+
+    preflight = _require_mapping(supersedes["preflight"], "fe9 preflight")
+    counts = {
+        "request_count": 193,
+        "result_count": 193,
+        "valid_count": 193,
+        "invalid_count": 0,
+        "reused_count": 0,
+        "attempt_claim_count": 193,
+        "attempt_terminal_count": 193,
+        "run_request_count": 0,
+        "generated_png_count": 0,
+    }
+    files = {
+        "controller_claim",
+        "controller_terminal",
+        "controller_summary",
+        "wrapper_claim",
+        "wrapper_exit",
+        "resource_monitor",
+        "resource_observer",
+        "runtime_resource_windows",
+        "startup_admission",
+        "final_plan",
+        "candidate_manifest",
+    }
+    _require_exact_keys(
+        preflight,
+        set(counts) | files | {"evidence_root"},
+        "fe9 preflight",
+    )
+    if any(preflight[key] != value for key, value in counts.items()):
+        raise CanonicalScreeningError("fe9 preflight counts differ")
+    evidence = _require_mapping(
+        preflight["evidence_root"], "fe9 preflight evidence root"
+    )
+    expected_root_relative = (
+        "artifacts/closeout/historical-canonical-512-v1/by_policy/" + policy_sha
+    )
+    if evidence.get("path") != expected_root_relative:
+        raise CanonicalScreeningError("fe9 evidence root identity differs")
+    unresolved_root = repo_root / expected_root_relative
+    if unresolved_root.is_symlink() or not unresolved_root.is_dir():
+        raise CanonicalScreeningError("fe9 evidence root identity differs")
+    root = unresolved_root.resolve()
+    if (
+        evidence.get("digest_algorithm")
+        != "sha256_relative_posix_nul_content_nul_v1"
+        or evidence.get("digest")
+        != "520649529263802abc66b827f585ce2fab4191580d3e00a8aef7d5c5914cd17e"
+        or sha256_directory_tree(root) != evidence["digest"]
+    ):
+        raise CanonicalScreeningError("fe9 evidence root differs")
+    bound = {
+        name: _validate_bound_file(repo_root, preflight[name], f"fe9 {name}")
+        for name in files
+    }
+    summary = load_json(Path(bound["controller_summary"]["path"]), "fe9 summary")
+    terminal = load_json(
+        Path(bound["controller_terminal"]["path"]), "fe9 terminal"
+    )
+    wrapper = load_json(Path(bound["wrapper_exit"]["path"]), "fe9 wrapper")
+    if (
+        summary.get("policy_sha256") != policy_sha
+        or summary.get("preflight")
+        != {
+            "completed": 193,
+            "invalid": 0,
+            "request_count": 193,
+            "reused": 0,
+            "valid": 193,
+        }
+        or terminal.get("status") != "completed"
+        or terminal.get("failure") is not None
+        or terminal.get("result_count") != 193
+        or terminal.get("pending_count") != 0
+        or terminal.get("attempt_claim_count") != 193
+        or terminal.get("attempt_terminal_count") != 193
+        or wrapper.get("exit_code") != 0
+        or wrapper.get("signal") is not None
+        or wrapper.get("launch_failure") is not None
+    ):
+        raise CanonicalScreeningError("fe9 preflight terminal semantics differ")
+
+    failed = _require_mapping(
+        supersedes["failed_ram_probe"], "fe9 failed RAM probe"
+    )
+    expected_failed = {
+        "classification": "preworker_controller_failure_incomplete",
+        "probe_contract_sha256": (
+            "ae3e800037eccef5744924ab7d248cf7c3b0ad757c9f1105e2ff9e8f510127fd"
+        ),
+        "probe_execution_sha256": (
+            "c9c0a3f48b5a8f9e011c5b2be45ebcd512e35b0fd2de43e0374b561b2b021eaa"
+        ),
+        "admission_evidence_sha256": (
+            "dd32e5083c6139795dad945dff8dc104b13370ce053e7ebd22f4719c460b4623"
+        ),
+        "admission_sha256": (
+            "0da039aecf9ad5a0d74a7a13d22a0d51c931a3f1f1298a80640d01c9218fd0b9"
+        ),
+        "root_cause": (
+            "diagnosed_build_spec_admission_binding_interface_mismatch"
+        ),
+        "evidence_level": "code_path_inference",
+        "retry_count": 0,
+        "worker_started": False,
+        "gpu_execution_count": 0,
+        "capability_step_count": 0,
+        "reuse": "forbidden",
+        "in_place_retry": "forbidden",
+    }
+    _require_exact_keys(
+        failed,
+        set(expected_failed) | {"root", "files", "forbidden_entries"},
+        "fe9 failed RAM probe",
+    )
+    if any(failed[key] != value for key, value in expected_failed.items()):
+        raise CanonicalScreeningError("fe9 failed RAM probe status differs")
+    failed_root_binding = _require_mapping(failed["root"], "fe9 failed root")
+    expected_failed_relative = (
+        "artifacts/closeout/historical-canonical-512-v1/"
+        "ram_probe__fe9b41136f0b9fa3"
+    )
+    unresolved_failed = repo_root / expected_failed_relative
+    if (
+        failed_root_binding.get("path") != expected_failed_relative
+        or unresolved_failed.is_symlink()
+        or not unresolved_failed.is_dir()
+    ):
+        raise CanonicalScreeningError("fe9 failed root identity differs")
+    if (
+        failed_root_binding.get("digest_algorithm")
+        != "sha256_relative_posix_nul_content_nul_v1"
+        or failed_root_binding.get("digest")
+        != "88b07f6d41898c735107fcb3c79af4dc0260790531cf64f65faac2087ca6cb5b"
+        or sha256_directory_tree(unresolved_failed)
+        != failed_root_binding["digest"]
+    ):
+        raise CanonicalScreeningError("fe9 failed root differs")
+    expected_files = {
+        "admission.json": (
+            "0f7a8d39d08bf510a292d1bdfb10f95018e8d29e934660a880b3803dde450fe2"
+        ),
+        "input_policy.json": (
+            "bb92566cc14562d4b03fdcab741de233842f69b9bd56acdda074c88f5b8f024d"
+        ),
+    }
+    if (
+        failed["files"] != expected_files
+        or {path.name for path in unresolved_failed.iterdir()} != set(expected_files)
+        or any(
+            not path.is_file() or path.is_symlink()
+            for path in unresolved_failed.iterdir()
+        )
+        or any(
+            sha256_file(unresolved_failed / name) != digest
+            for name, digest in expected_files.items()
+        )
+    ):
+        raise CanonicalScreeningError("fe9 failed root files differ")
+    forbidden = [
+        "controller_claim.json",
+        "controller_terminal.json",
+        "probe_spec.json",
+        "worker.log",
+        "worker_result.json",
+        "probe_result.json",
+        "runtime_resource_windows.jsonl",
+        "work",
+    ]
+    if failed["forbidden_entries"] != forbidden or any(
+        (unresolved_failed / name).exists() for name in forbidden
+    ):
+        raise CanonicalScreeningError("fe9 forbidden probe artifacts exist")
+    admission = load_json(unresolved_failed / "admission.json", "fe9 admission")
+    registry = canonical_gpu_registry(admission["authorized_gpu_registry"])
+    if (
+        admission.get("contract_type")
+        != "safa_canonical_screening_ram_probe_admission_v2"
+        or admission.get("probe_contract_sha256")
+        != failed["probe_contract_sha256"]
+        or admission.get("probe_execution_sha256")
+        != failed["probe_execution_sha256"]
+        or admission.get("admission_evidence_sha256")
+        != ram_probe_admission_evidence_digest(admission)
+        or admission.get("admission_evidence_sha256")
+        != failed["admission_evidence_sha256"]
+        or admission.get("admission_sha256")
+        != canonical_digest(admission, "admission_sha256")
+        or admission.get("admission_sha256") != failed["admission_sha256"]
+        or registry != admission["authorized_gpu_registry"]
+        or admission.get("probe_execution_sha256")
+        != ram_probe_execution_digest(
+            admission["probe_contract_sha256"],
+            registry,
+            admission["admission_evidence_sha256"],
+        )
+        or [row["physical_gpu_index"] for row in registry] != [0, 1, 2, 3]
+    ):
+        raise CanonicalScreeningError("fe9 admission evidence differs")
+    return dict(supersedes)
+
+
 def validate_supersession_evidence(
     repo_root: Path, raw_supersedes: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -1644,6 +1886,11 @@ def validate_supersession_evidence(
         == "6b088236579f731183e60c7fc1d7bece31089284aaaf13697a73f3fb6cd42072"
     ):
         return _validate_6b_supersession_evidence(repo_root, supersedes)
+    if (
+        supersedes.get("policy_sha256")
+        == "fe9b41136f0b9fa31ce210dfaa5500c3f46f071838ed91288878f57073502060"
+    ):
+        return _validate_fe9_supersession_evidence(repo_root, supersedes)
     if (
         supersedes.get("policy_sha256")
         == "ea7ae71fd662526b9a45bf3cc6d283884aefc380b292c8f273169a35f42ffc28"
