@@ -278,7 +278,7 @@
     },
     "ram_probe_launcher": {
       "path": "scripts/run_canonical_screening_ram_probe.py",
-      "sha256": "b4341a38eda1584d7e688a79d749437196675e7f4ef474babb80f794db89964f"
+      "sha256": "08f2484aaa7348e69fb3faa9103197b7bf8f9663ed45989a90b50d728045e727"
     },
     "preflight_wrapper": {
       "path": "scripts/run_canonical_preflight_wrapper.py",

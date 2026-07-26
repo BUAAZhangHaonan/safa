@@ -14,12 +14,11 @@ from typing import Any, Mapping, Sequence
 
 from run_canonical_checkpoint_screening import (
     REPO_ROOT,
-    _disk_percent,
     _gpu_compute_processes,
     _gpu_hard_resource_violation,
     _gpu_snapshot,
-    _memory_percent,
     _worker_environment,
+    RuntimeResourceGuard,
     assert_cpu_resource_admission,
 )
 from run_r9_meanflow_campaign import (
@@ -402,46 +401,64 @@ def _run_controller(
         registry[0]["physical_gpu_uuid"],
     ]
     log_path = artifact_root / "worker.log"
-    with log_path.open("x", encoding="utf-8") as log:
-        process = subprocess.Popen(
-            command,
-            cwd=REPO_ROOT,
-            env=_worker_environment(registry[0]["physical_gpu_uuid"]),
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            text=True,
-            start_new_session=True,
-        )
-        peak_rss = 0
-        failure: str | None = None
-        returncode: int | None = None
-        while True:
-            polled = process.poll()
-            if polled is not None:
-                returncode = polled
-                break
-            rss_bytes, reaped_returncode = _sample_or_reap_process_tree(
-                process, _process_tree_rss_bytes
+    resource_guard = RuntimeResourceGuard(
+        policy,
+        artifact_root / "runtime_resource_windows.jsonl",
+        artifact_root.parent,
+    )
+    resource_guard.start()
+    peak_rss = 0
+    failure: str | None = None
+    returncode: int | None = None
+    try:
+        with log_path.open("x", encoding="utf-8") as log:
+            process = subprocess.Popen(
+                command,
+                cwd=REPO_ROOT,
+                env=_worker_environment(registry[0]["physical_gpu_uuid"]),
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
             )
-            if reaped_returncode is not None:
-                returncode = reaped_returncode
-                break
-            if rss_bytes is None:
-                raise CanonicalScreeningError(
-                    "running RAM probe process RSS sample is missing"
+            while True:
+                polled = process.poll()
+                if polled is not None:
+                    returncode = polled
+                    break
+                rss_bytes, reaped_returncode = _sample_or_reap_process_tree(
+                    process, _process_tree_rss_bytes
                 )
-            peak_rss = max(peak_rss, rss_bytes)
-            if _memory_percent() >= 90:
-                failure = "RAM runtime hard stop reached 90%"
-            elif _disk_percent(artifact_root.parent) >= 90:
-                failure = "disk runtime hard stop reached 90%"
-            else:
-                failure = _gpu_hard_resource_violation(policy)
-            if failure is not None:
-                _terminate_process(process)
-                returncode = process.wait()
-                break
-            time.sleep(0.1)
+                if reaped_returncode is not None:
+                    returncode = reaped_returncode
+                    break
+                if rss_bytes is None:
+                    raise CanonicalScreeningError(
+                        "running RAM probe process RSS sample is missing"
+                    )
+                peak_rss = max(peak_rss, rss_bytes)
+                try:
+                    resource_guard.raise_if_violated()
+                except BaseException as exc:
+                    failure = str(exc)
+                if failure is None:
+                    failure = _gpu_hard_resource_violation(policy)
+                if failure is not None:
+                    _terminate_process(process)
+                    returncode = process.wait()
+                    break
+                time.sleep(0.1)
+    finally:
+        resource_guard_summary = resource_guard.stop()
+    late_failure = resource_guard_summary["violation_reason"]
+    if late_failure is None and resource_guard_summary["thread_failure"] is not None:
+        thread_failure = resource_guard_summary["thread_failure"]
+        late_failure = (
+            "runtime resource guard failed: "
+            f"{thread_failure['type']}: {thread_failure['message']}"
+        )
+    if failure is None and late_failure is not None:
+        failure = late_failure
     if returncode is None:
         raise CanonicalScreeningError("RAM probe worker was not reaped")
     if failure is None and returncode != 0:
@@ -482,6 +499,7 @@ def _run_controller(
         "budget_method": "ceil(single_worker_process_tree_peak_rss_bytes*11/10)",
         "measurement_factor_numerator": 11,
         "measurement_factor_denominator": 10,
+        "runtime_resource_guard": resource_guard_summary,
         "failure": failure,
         "retry_count": 0,
         "completed_at": _utc_now(),

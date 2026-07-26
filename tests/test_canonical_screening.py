@@ -1333,6 +1333,26 @@ def test_runtime_guard_preserves_ram_disk_and_swap_hard_stops(
     )
 
 
+def test_runtime_guard_exposes_monitor_thread_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("config", None)])
+    policy, _, _ = _policy(tmp_path, ledger)
+    monkeypatch.setattr(
+        module,
+        "_cpu_times",
+        lambda: (_ for _ in ()).throw(RuntimeError("proc stat injected")),
+    )
+    guard = module.RuntimeResourceGuard(
+        policy, tmp_path / "guard.jsonl", tmp_path
+    )
+    guard._run()
+    with pytest.raises(CanonicalScreeningError, match="proc stat injected"):
+        guard.raise_if_violated()
+
+
 def test_preflight_monitor_never_queries_gpu(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
