@@ -98,6 +98,10 @@ def canonical_gpu_registry(
         )
     if len(normalized) != len({row["physical_gpu_index"] for row in normalized}):
         raise CanonicalScreeningError("GPU registry has duplicate indices")
+    if len(normalized) != len(
+        {row["physical_gpu_uuid"] for row in normalized}
+    ):
+        raise CanonicalScreeningError("GPU registry has duplicate UUIDs")
     return normalized
 
 
@@ -1380,6 +1384,30 @@ def _validate_5d_preflight_supersession_evidence(
     }
 
 
+def _validate_6b_failed_probe_root_identity(
+    repo_root: Path, raw_binding: Mapping[str, Any]
+) -> Path:
+    binding = _require_mapping(raw_binding, "failed probe root")
+    expected_relative = (
+        "artifacts/closeout/historical-canonical-512-v1/"
+        "ram_probe__6b088236579f7311"
+    )
+    declared = binding.get("path")
+    unresolved = repo_root / expected_relative
+    if (
+        declared != expected_relative
+        or unresolved.is_symlink()
+        or not unresolved.is_dir()
+    ):
+        raise CanonicalScreeningError("failed RAM probe root identity differs")
+    return _repo_path(
+        repo_root,
+        declared,
+        "failed probe root",
+        must_exist=False,
+    )
+
+
 def _validate_6b_supersession_evidence(
     repo_root: Path, raw_supersedes: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -1524,11 +1552,8 @@ def _validate_6b_supersession_evidence(
     if any(failed[key] != value for key, value in expected_failed_scalars.items()):
         raise CanonicalScreeningError("failed RAM probe classification differs")
     failed_root_binding = _require_mapping(failed["root"], "failed probe root")
-    failed_root = _repo_path(
-        repo_root,
-        failed_root_binding["path"],
-        "failed probe root",
-        must_exist=False,
+    failed_root = _validate_6b_failed_probe_root_identity(
+        repo_root, failed_root_binding
     )
     if (
         failed_root

@@ -273,7 +273,7 @@
     },
     "screening_contracts": {
       "path": "src/safa/closeout/canonical_screening.py",
-      "sha256": "e7c4b13594136216108122a9f131bc12d8ebf5b1e222ce4c91046107fd910af7"
+      "sha256": "418b1b3c560e1534e0997a741c9319b4b676a916c6045e0359d3e068c5f6a027"
     },
     "screening_worker": {
       "path": "src/safa/closeout/canonical_screening_worker.py",

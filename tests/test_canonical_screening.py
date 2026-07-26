@@ -12,6 +12,7 @@ import pytest
 
 from safa.closeout.canonical_screening import (
     CanonicalScreeningError,
+    _validate_6b_failed_probe_root_identity,
     _validate_ram_slot_budget_source,
     build_candidate_manifest,
     build_checkpoint_plan,
@@ -20,6 +21,7 @@ from safa.closeout.canonical_screening import (
     build_run_request,
     build_run_result,
     canonical_digest,
+    canonical_gpu_registry,
     canonicalize_nvidia_gpu_uuid,
     canonical_json,
     load_json,
@@ -790,6 +792,50 @@ def test_gpu_uuid_canonicalizer_accepts_verified_representations(
 def test_gpu_uuid_canonicalizer_rejects_malformed_values(raw: object) -> None:
     with pytest.raises(CanonicalScreeningError):
         canonicalize_nvidia_gpu_uuid(raw, "fixture")  # type: ignore[arg-type]
+
+
+def test_gpu_registry_rejects_duplicate_canonical_uuid() -> None:
+    with pytest.raises(CanonicalScreeningError, match="duplicate UUIDs"):
+        canonical_gpu_registry(
+            [
+                {
+                    "physical_gpu_index": 0,
+                    "physical_gpu_uuid": _gpu_uuid(0),
+                },
+                {
+                    "physical_gpu_index": 1,
+                    "physical_gpu_uuid": _gpu_uuid(0).removeprefix("GPU-"),
+                },
+            ]
+        )
+
+
+def test_failed_probe_root_identity_rejects_root_symlink(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "clone"
+    target.mkdir()
+    declared = (
+        tmp_path
+        / "artifacts/closeout/historical-canonical-512-v1/"
+        "ram_probe__6b088236579f7311"
+    )
+    declared.parent.mkdir(parents=True)
+    declared.symlink_to(target, target_is_directory=True)
+    with pytest.raises(CanonicalScreeningError, match="root identity"):
+        _validate_6b_failed_probe_root_identity(
+            tmp_path,
+            {
+                "path": (
+                    "artifacts/closeout/historical-canonical-512-v1/"
+                    "ram_probe__6b088236579f7311"
+                ),
+                "digest": "0" * 64,
+                "digest_algorithm": (
+                    "sha256_relative_posix_nul_content_nul_v1"
+                ),
+            },
+        )
 
 
 def test_ram_probe_contract_and_execution_digests_are_split() -> None:
