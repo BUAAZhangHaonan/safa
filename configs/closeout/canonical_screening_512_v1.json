@@ -1,0 +1,144 @@
+{
+  "schema_version": 1,
+  "contract_type": "safa_canonical_screening_policy_v1",
+  "campaign_id": "historical-canonical-512-v1",
+  "python": "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+  "source": {
+    "ledger": {
+      "path": "artifacts/closeout/historical-ledger-v1-precommit-5e5ec305-20260726/experiment_ledger.jsonl",
+      "sha256": "5d8f50fd9eead11f2094905718fbcb9f55fefebd1c979fe49242f772a159c1e3"
+    },
+    "protocol_registry": {
+      "path": "artifacts/closeout/historical-ledger-v1-precommit-5e5ec305-20260726/protocol_registry.json",
+      "sha256": "7a1fafb8f751769c27bf8ed9f8fcb0810f8069665c4fd5d12f5c14b69a292eb4"
+    },
+    "artifact_manifest": {
+      "path": "artifacts/closeout/historical-ledger-v1-precommit-5e5ec305-20260726/artifact_sha_manifest.jsonl",
+      "sha256": "dcbf0a94ce999274a6aa55468b45e841539aa1c969e86ecba4338ee9dca7f488"
+    }
+  },
+  "protocol": {
+    "seed": 4549,
+    "batch_size": 2,
+    "manifests": {
+      "smoke8": {
+        "path": "configs/closeout/canonical_smoke_8.jsonl",
+        "sha256": "3b5fc19581240b49d26b213840356d0d295309bc0dac5d769277e5d859ac4d2b",
+        "sample_count": 8
+      },
+      "screen512": {
+        "path": "configs/medium_v2/experiments/r9_manifests/validate_512.jsonl",
+        "sha256": "b05bc43a5ad03b77567ef1e1053c4d97ae47b016e8ec149d8a5cd49040e0e391",
+        "sample_count": 512
+      }
+    },
+    "source_index": {
+      "path": "data/index/val_face_mixed_e14.jsonl",
+      "sha256": "da14e23eacefecbc2948d1374fb93961a13d017a9183aa1fe2a2f62b33a4b4ea"
+    },
+    "features": {
+      "directory": "artifacts/e0_features/val_face_mixed_e14_e0_medium_v1",
+      "manifest": {
+        "path": "artifacts/e0_features/val_face_mixed_e14_e0_medium_v1/manifest.json",
+        "sha256": "386fbb59f409882c431e0949ca201c901831fdcf19cfb22743cc671fad7b9c37"
+      },
+      "shard": {
+        "path": "artifacts/e0_features/val_face_mixed_e14_e0_medium_v1/features.pt",
+        "sha256": "7b734059e48f9b1f9129cfc7bd6cbbd271c9f3afb63095837fd3f8fed009615d"
+      }
+    },
+    "e0": {
+      "path": "artifacts/checkpoints/e0_medium_v1/best.pt",
+      "sha256": "d7d2c57a552155776b8c15a4e52e43ec5082fc046aa0aabb4e9709685f7e3d1a"
+    },
+    "edev": {
+      "path": "artifacts/checkpoints/e0_resnet18/best.pt",
+      "sha256": "373b331c917834467e854ddf3fe20f39000532f189ec73f76a1abc55d82e560e"
+    },
+    "quality_script": {
+      "path": "scripts/eval_generation_quality.py",
+      "sha256": "a07addf938323abfe33fdb428f53fa159da254d0aa30cf78437d7ac2e2d6e066"
+    },
+    "pixel_image_size": 256,
+    "pixel_protocol_config": {
+      "path": "configs/medium_v2/experiments/r9_meanflow_semigroup_preflight.yaml",
+      "sha256": "0a9536583af4d3b6234e425bca8ad01d6e52110b81827ad97b71dfa08a40b24d"
+    },
+    "kid_subset_sizes": {
+      "smoke8": 8,
+      "screen512": 50
+    },
+    "metrics": [
+      "e0_cosine",
+      "edev_cosine",
+      "arcface_source_candidate_cosine",
+      "fid",
+      "kid",
+      "niqe",
+      "sharpness"
+    ]
+  },
+  "resources": {
+    "physical_gpus": [0, 1, 2, 3],
+    "workers_per_gpu": 2,
+    "gpu_headroom_bytes": 2147483648,
+    "cpu_admission_percent": 85,
+    "cpu_hard_limit_percent": 90,
+    "ram_admission_percent": 85,
+    "ram_hard_limit_percent": 90,
+    "disk_admission_percent": 85,
+    "disk_hard_limit_percent": 90,
+    "retry_count": 0,
+    "require_tmux": true,
+    "global_lock_root": "/tmp/safa-closeout-screening-gpu-slots-v1"
+  },
+  "arcface": {
+    "model_name": "buffalo_l",
+    "model_root": "/home/hdd3/zhanghaonan/.insightface",
+    "det_size": [224, 224],
+    "provider": "CUDAExecutionProvider",
+    "insightface_version": "0.7.3",
+    "onnxruntime_version": "1.26.0",
+    "assets": {
+      "1k3d68.onnx": "df5c06b8a0c12e422b2ed8947b8869faa4105387f199c477af038aa01f9a45cc",
+      "2d106det.onnx": "f001b856447c413801ef5c42091ed0cd516fcd21f2d6b79635b1e733a7109dbf",
+      "det_10g.onnx": "5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91",
+      "genderage.onnx": "4fde69b1c810857b88c64a335084f1c3fe8f01246c9a191b48c7bb756d6652fb",
+      "w600k_r50.onnx": "4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43"
+    },
+    "execution_probe": {
+      "path": "artifacts/r9_meanflow_flow_map_guidance/shared/arcface_execution_probe_v4.json",
+      "sha256": "1ad7c4c9928a982f25aa6c9f4d47184432585ff239b22fe1a9ac46e8962b29f4"
+    }
+  },
+  "implementations": {
+    "checkpoint_preflight": {
+      "path": "src/safa/evaluation/checkpoint_preflight.py",
+      "sha256": "562a2dec324d9f13f299f2082ee06dfe5fbff20ee0f6c824fcdef55ce861260a"
+    },
+    "arcface_evaluator": {
+      "path": "src/safa/evaluation/r9_evaluator_worker.py",
+      "sha256": "57e083fa6c910d268e2b90fc1aae4bd0d3a8143a67146822c2626bce7612cfd3"
+    },
+    "e0_loader": {
+      "path": "src/safa/models/e0.py",
+      "sha256": "a2cf329e42f10730006937644afaf0b81ae6933b847a6f2abfc47ed716f227b0"
+    },
+    "canonical_quality": {
+      "path": "src/safa/closeout/canonical_quality.py",
+      "sha256": "5d3761f7385b00917c0b3381b61bc56c844dee4bb62499f0e816e344ffb4e8fe"
+    },
+    "screening_contracts": {
+      "path": "src/safa/closeout/canonical_screening.py",
+      "sha256": "7e3dddf01566704542ee7a40f04da924fa6733de84eb61681c918f6132c285f5"
+    },
+    "screening_worker": {
+      "path": "src/safa/closeout/canonical_screening_worker.py",
+      "sha256": "5b5cfa86ca93c392b9074e7da60a4f79f5b797fc0d54b1750940e7f023a45d27"
+    },
+    "controller": {
+      "path": "scripts/run_canonical_checkpoint_screening.py",
+      "sha256": "5c4852ae3ed6a4f47476c5ce7b54735db865917a1ff2e42302772e69eaf91f77"
+    }
+  }
+}
