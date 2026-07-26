@@ -186,6 +186,7 @@ def validate_policy(repo_root: Path, policy_path: Path) -> dict[str, Any]:
             "schema_version",
             "contract_type",
             "campaign_id",
+            "supersedes_policy_sha256",
             "python",
             "source",
             "protocol",
@@ -199,6 +200,11 @@ def validate_policy(repo_root: Path, policy_path: Path) -> dict[str, Any]:
         raise CanonicalScreeningError("canonical screening policy type/version mismatch")
     if raw["campaign_id"] != "historical-canonical-512-v1":
         raise CanonicalScreeningError("canonical screening campaign_id is not frozen")
+    if (
+        raw["supersedes_policy_sha256"]
+        != "f7d9b8e263bdd54af7754889c7e7ce92d3ec7212d3784ac11c819fc3c07381cd"
+    ):
+        raise CanonicalScreeningError("canonical superseded policy binding differs")
     if raw["python"] != "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python":
         raise CanonicalScreeningError("canonical screening interpreter is not frozen")
 
@@ -382,6 +388,7 @@ def validate_policy(repo_root: Path, policy_path: Path) -> dict[str, Any]:
             "screening_contracts",
             "screening_worker",
             "controller",
+            "preflight_wrapper",
         },
         "implementations",
     )
@@ -394,6 +401,7 @@ def validate_policy(repo_root: Path, policy_path: Path) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "contract_type": POLICY_CONTRACT,
         "campaign_id": raw["campaign_id"],
+        "supersedes_policy_sha256": raw["supersedes_policy_sha256"],
         "python": raw["python"],
         "policy_file": {
             "path": str(policy_path.resolve()),

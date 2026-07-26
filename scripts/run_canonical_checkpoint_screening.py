@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -96,6 +97,7 @@ def _paths(campaign_root: Path, policy_sha256: str) -> dict[str, Path]:
         "logs": policy_root / "logs",
         "admissions": policy_root / "admissions",
         "summaries": policy_root / "summaries",
+        "preflight_control": policy_root / "preflight_control",
     }
 
 
@@ -261,6 +263,39 @@ def assert_resource_admission(
     }
 
 
+def assert_cpu_resource_admission(
+    policy: Mapping[str, Any], campaign_root: Path
+) -> dict[str, Any]:
+    resources = policy["resources"]
+    cpu_percent = _cpu_load_percent()
+    memory_percent = _memory_percent()
+    disk_percent = _disk_percent(campaign_root.parent)
+    if cpu_percent >= float(resources["cpu_admission_percent"]):
+        raise CanonicalScreeningError(
+            f"CPU admission failed: {cpu_percent:.2f}% >= "
+            f"{resources['cpu_admission_percent']}%"
+        )
+    if memory_percent >= float(resources["ram_admission_percent"]):
+        raise CanonicalScreeningError(
+            f"RAM admission failed: {memory_percent:.2f}% >= "
+            f"{resources['ram_admission_percent']}%"
+        )
+    if disk_percent >= float(resources["disk_admission_percent"]):
+        raise CanonicalScreeningError(
+            f"disk admission failed: {disk_percent:.2f}% >= "
+            f"{resources['disk_admission_percent']}%"
+        )
+    swap_in, swap_out = _swap_pages()
+    return {
+        "observed_at": _utc_now(),
+        "admission_kind": "cpu_only",
+        "cpu_load_percent": cpu_percent,
+        "memory_percent": memory_percent,
+        "disk_percent": disk_percent,
+        "swap_pages": {"in": swap_in, "out": swap_out},
+    }
+
+
 def _write_admission(
     policy: Mapping[str, Any],
     paths: Mapping[str, Path],
@@ -304,52 +339,219 @@ def materialize_preflights(
     if not requests:
         raise CanonicalScreeningError("no checkpoint preflight requests exist")
     paths["preflight_results"].mkdir(parents=True, exist_ok=True)
+    if any(paths["preflight_results"].glob("*.json")):
+        raise CanonicalScreeningError(
+            "current-policy preflight refuses result reuse; use a new policy namespace"
+        )
     completed = 0
-    reused = 0
     valid = 0
     invalid = 0
-    for request_path in requests:
+    attempt_root = paths["preflight_control"] / "attempts"
+    for sequence, request_path in enumerate(requests, start=1):
         request = _load_preflight_request(request_path, policy)
         result_path = paths["preflight_results"] / request_path.name
-        if result_path.is_file():
-            reused += 1
-            is_valid, _ = validate_preflight_result(
-                load_json(result_path, "checkpoint preflight result"),
-                request,
-                policy,
+        admission = assert_cpu_resource_admission(policy, paths["root"])
+        claim = {
+            "schema_version": 1,
+            "contract_type": "safa_canonical_preflight_attempt_claim_v1",
+            "policy_sha256": policy["policy_sha256"],
+            "sequence": sequence,
+            "request_path": str(request_path.resolve()),
+            "preflight_request_sha256": request["preflight_request_sha256"],
+            "checkpoint_sha256": request["checkpoint_sha256"],
+            "checkpoint_model": request["checkpoint_model"],
+            "admission": admission,
+            "started_at": _utc_now(),
+            "worker_pid": os.getpid(),
+        }
+        claim["attempt_claim_sha256"] = hashlib.sha256(
+            canonical_json(claim)
+        ).hexdigest()
+        claim_path = attempt_root / f"{request_path.stem}.claim.json"
+        terminal_path = attempt_root / f"{request_path.stem}.terminal.json"
+        write_exclusive_json(claim_path, claim)
+        try:
+            checkpoint = _root(Path(str(request["checkpoint_path"])))
+            strict_result = preflight_generator_checkpoint(
+                checkpoint,
+                str(request["checkpoint_model"]),
+                "cpu",
+                expected_checkpoint_sha256=str(request["checkpoint_sha256"]),
+                compute_sha256=True,
+                smoke_samples=0,
             )
+            result = build_preflight_result(request, policy, strict_result)
+            is_valid, _ = validate_preflight_result(result, request, policy)
+            write_exclusive_json(result_path, result)
+            terminal = {
+                "schema_version": 1,
+                "contract_type": "safa_canonical_preflight_attempt_terminal_v1",
+                "policy_sha256": policy["policy_sha256"],
+                "attempt_claim_sha256": claim["attempt_claim_sha256"],
+                "preflight_request_sha256": request["preflight_request_sha256"],
+                "status": "completed",
+                "valid": is_valid,
+                "result_path": str(result_path.resolve()),
+                "result_file_sha256": sha256_file(result_path),
+                "preflight_result_sha256": result["preflight_result_sha256"],
+                "failure": None,
+                "completed_at": _utc_now(),
+            }
+            terminal["attempt_terminal_sha256"] = hashlib.sha256(
+                canonical_json(terminal)
+            ).hexdigest()
+            write_exclusive_json(terminal_path, terminal)
+            completed += 1
             if is_valid:
                 valid += 1
             else:
                 invalid += 1
-            continue
-        assert_resource_admission(policy, paths["root"], require_idle_gpus=False)
-        checkpoint = _root(Path(str(request["checkpoint_path"])))
-        strict_result = preflight_generator_checkpoint(
-            checkpoint,
-            str(request["checkpoint_model"]),
-            "cpu",
-            expected_checkpoint_sha256=str(request["checkpoint_sha256"]),
-            compute_sha256=True,
-            smoke_samples=0,
-        )
-        result = build_preflight_result(request, policy, strict_result)
-        validate_preflight_result(result, request, policy)
-        write_exclusive_json(result_path, result)
-        completed += 1
-        if strict_result["status"] == "valid":
-            valid += 1
-        else:
-            invalid += 1
-        _append_monitor_sample(policy, paths, "preflight")
+            _append_monitor_sample(policy, paths, "preflight")
+        except BaseException as exc:
+            terminal = {
+                "schema_version": 1,
+                "contract_type": "safa_canonical_preflight_attempt_terminal_v1",
+                "policy_sha256": policy["policy_sha256"],
+                "attempt_claim_sha256": claim["attempt_claim_sha256"],
+                "preflight_request_sha256": request["preflight_request_sha256"],
+                "status": "failed",
+                "valid": None,
+                "result_path": None,
+                "result_file_sha256": None,
+                "preflight_result_sha256": None,
+                "failure": {"type": type(exc).__name__, "message": str(exc)},
+                "completed_at": _utc_now(),
+            }
+            terminal["attempt_terminal_sha256"] = hashlib.sha256(
+                canonical_json(terminal)
+            ).hexdigest()
+            write_exclusive_json(terminal_path, terminal)
+            raise
     _append_monitor_sample(policy, paths, "preflight", terminal=True)
     return {
         "request_count": len(requests),
         "completed": completed,
-        "reused": reused,
+        "reused": 0,
         "valid": valid,
         "invalid": invalid,
     }
+
+
+def _execute_preflight_controller(
+    policy: Mapping[str, Any], paths: Mapping[str, Path]
+) -> dict[str, Any]:
+    if "TMUX" not in os.environ:
+        raise CanonicalScreeningError("CPU checkpoint preflight must run inside tmux")
+    control = paths["preflight_control"]
+    claim = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_preflight_controller_claim_v1",
+        "campaign_id": policy["campaign_id"],
+        "policy_sha256": policy["policy_sha256"],
+        "supersedes_policy_sha256": policy["supersedes_policy_sha256"],
+        "request_count": len(list(paths["preflight_requests"].glob("*.json"))),
+        "controller_pid": os.getpid(),
+        "started_at": _utc_now(),
+        "external_timeout_seconds": None,
+    }
+    claim["controller_claim_sha256"] = hashlib.sha256(
+        canonical_json(claim)
+    ).hexdigest()
+    claim_path = control / "controller_claim.json"
+    terminal_path = control / "controller_terminal.json"
+    summary_path = control / "controller_summary.json"
+    log_path = control / "controller.log"
+    write_exclusive_json(claim_path, claim)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    summary: dict[str, Any] | None = None
+    caught: BaseException | None = None
+    with log_path.open("x", encoding="utf-8", buffering=1) as log_handle:
+        with redirect_stdout(log_handle), redirect_stderr(log_handle):
+            try:
+                print(canonical_json({"event": "controller_started", **claim}).decode(), end="")
+                materialized = materialize_preflights(policy, paths)
+                refreshed = build_checkpoint_plan(
+                    REPO_ROOT, policy, paths["preflight_results"]
+                )
+                final_plan = _final_plan_path(paths, policy)
+                write_exclusive_json(final_plan, refreshed)
+                validate_checkpoint_plan(
+                    refreshed,
+                    repo_root=REPO_ROOT,
+                    policy=policy,
+                    preflight_root=paths["preflight_results"],
+                )
+                summary = {
+                    "preflight": materialized,
+                    "counts": refreshed["counts"],
+                    "final_plan": {
+                        "path": str(final_plan.resolve()),
+                        "sha256": sha256_file(final_plan),
+                        "canonical_sha256": refreshed["checkpoint_plan_sha256"],
+                    },
+                }
+            except BaseException as exc:
+                caught = exc
+                print(
+                    canonical_json(
+                        {
+                            "event": "controller_exception",
+                            "type": type(exc).__name__,
+                            "message": str(exc),
+                        }
+                    ).decode(),
+                    end="",
+                )
+            finally:
+                result_count = len(list(paths["preflight_results"].glob("*.json")))
+                attempt_claim_count = len(
+                    list((control / "attempts").glob("*.claim.json"))
+                )
+                attempt_terminal_count = len(
+                    list((control / "attempts").glob("*.terminal.json"))
+                )
+                terminal = {
+                    "schema_version": 1,
+                    "contract_type": "safa_canonical_preflight_controller_terminal_v1",
+                    "policy_sha256": policy["policy_sha256"],
+                    "controller_claim_sha256": claim["controller_claim_sha256"],
+                    "status": "completed" if caught is None else "failed",
+                    "result_count": result_count,
+                    "pending_count": claim["request_count"] - result_count,
+                    "attempt_claim_count": attempt_claim_count,
+                    "attempt_terminal_count": attempt_terminal_count,
+                    "failure": (
+                        None
+                        if caught is None
+                        else {"type": type(caught).__name__, "message": str(caught)}
+                    ),
+                    "completed_at": _utc_now(),
+                }
+                terminal["controller_terminal_sha256"] = hashlib.sha256(
+                    canonical_json(terminal)
+                ).hexdigest()
+                write_exclusive_json(terminal_path, terminal)
+                if summary is not None:
+                    summary_value = {
+                        "schema_version": 1,
+                        "contract_type": "safa_canonical_preflight_controller_summary_v1",
+                        "policy_sha256": policy["policy_sha256"],
+                        "controller_claim_sha256": claim["controller_claim_sha256"],
+                        "controller_terminal_sha256": terminal[
+                            "controller_terminal_sha256"
+                        ],
+                        **summary,
+                    }
+                    summary_value["controller_summary_sha256"] = hashlib.sha256(
+                        canonical_json(summary_value)
+                    ).hexdigest()
+                    write_exclusive_json(summary_path, summary_value)
+                print(canonical_json({"event": "controller_terminal", **terminal}).decode(), end="")
+    if caught is not None:
+        raise caught
+    if summary is None:
+        raise CanonicalScreeningError("preflight controller produced no summary")
+    return summary
 
 
 def _write_run_requests(
@@ -448,26 +650,50 @@ def _tmux_commands(
 ) -> dict[str, list[str]]:
     python = str(policy["python"])
     script = str(Path(__file__).resolve())
-    controller = [
-        "tmux",
-        "new-session",
-        "-d",
-        "-s",
-        f"safa-screening-{phase}-controller",
-        " ".join(
-            [
-                python,
-                script,
-                "--config",
-                str(config.resolve()),
-                "--campaign-root",
-                str(campaign_root.resolve()),
-                "--phase",
-                phase,
-                "--execute",
-            ]
-        ),
-    ]
+    controller_invocation = " ".join(
+        [
+            python,
+            script,
+            "--config",
+            str(config.resolve()),
+            "--campaign-root",
+            str(campaign_root.resolve()),
+            "--phase",
+            phase,
+            "--execute",
+        ]
+    )
+    if phase == "preflight":
+        controller = [
+            "tmux",
+            "new-session",
+            "-d",
+            "-s",
+            "safa-screening-preflight-controller",
+            "-c",
+            str(REPO_ROOT),
+            python,
+            str(REPO_ROOT / "scripts/run_canonical_preflight_wrapper.py"),
+            "--repo-root",
+            str(REPO_ROOT),
+            "--config",
+            str(config.resolve()),
+            "--campaign-root",
+            str(campaign_root.resolve()),
+            "--policy-sha256",
+            str(policy["policy_sha256"]),
+            "--python",
+            python,
+        ]
+    else:
+        controller = [
+            "tmux",
+            "new-session",
+            "-d",
+            "-s",
+            f"safa-screening-{phase}-controller",
+            controller_invocation,
+        ]
     monitor = [
         "tmux",
         "new-session",
@@ -1006,18 +1232,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
     if args.phase == "preflight":
-        summary = materialize_preflights(policy, paths)
-        refreshed = build_checkpoint_plan(
-            REPO_ROOT, policy, paths["preflight_results"]
-        )
-        write_exclusive_json(_final_plan_path(paths, policy), refreshed)
-        validate_checkpoint_plan(
-            refreshed,
-            repo_root=REPO_ROOT,
-            policy=policy,
-            preflight_root=paths["preflight_results"],
-        )
-        print(json.dumps({"preflight": summary, "counts": refreshed["counts"]}, sort_keys=True))
+        summary = _execute_preflight_controller(policy, paths)
+        print(json.dumps(summary, sort_keys=True))
         return 0
     if args.phase == "prepare-screening":
         final_plan_path = _final_plan_path(paths, policy)

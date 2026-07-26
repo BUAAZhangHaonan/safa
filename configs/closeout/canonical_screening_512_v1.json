@@ -2,6 +2,7 @@
   "schema_version": 1,
   "contract_type": "safa_canonical_screening_policy_v1",
   "campaign_id": "historical-canonical-512-v1",
+  "supersedes_policy_sha256": "f7d9b8e263bdd54af7754889c7e7ce92d3ec7212d3784ac11c819fc3c07381cd",
   "python": "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
   "source": {
     "ledger": {
@@ -130,7 +131,7 @@
     },
     "screening_contracts": {
       "path": "src/safa/closeout/canonical_screening.py",
-      "sha256": "7e3dddf01566704542ee7a40f04da924fa6733de84eb61681c918f6132c285f5"
+      "sha256": "8d1c8a86e9534d681f4247ad4d765c21bb2511e9a4d599922ea3a9ab36abe669"
     },
     "screening_worker": {
       "path": "src/safa/closeout/canonical_screening_worker.py",
@@ -138,7 +139,11 @@
     },
     "controller": {
       "path": "scripts/run_canonical_checkpoint_screening.py",
-      "sha256": "5c4852ae3ed6a4f47476c5ce7b54735db865917a1ff2e42302772e69eaf91f77"
+      "sha256": "88a9f7645b211cc2adac8f5cce80c088402380fe841f3af0737925940e7b3912"
+    },
+    "preflight_wrapper": {
+      "path": "scripts/run_canonical_preflight_wrapper.py",
+      "sha256": "8494785fcf83b89944a532c6f18fcefaea0644bbb56598562ccda4cb09face6b"
     }
   }
 }

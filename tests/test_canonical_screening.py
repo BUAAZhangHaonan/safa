@@ -19,6 +19,7 @@ from safa.closeout.canonical_screening import (
     build_run_result,
     canonical_digest,
     canonical_json,
+    load_json,
     validate_candidate_manifest,
     validate_checkpoint_plan,
     validate_preflight_result,
@@ -37,6 +38,15 @@ from safa.closeout.canonical_quality import evaluate_locked_kid
 def _controller_module():
     path = Path(__file__).parents[1] / "scripts" / "run_canonical_checkpoint_screening.py"
     spec = importlib.util.spec_from_file_location("canonical_controller_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _wrapper_module():
+    path = Path(__file__).parents[1] / "scripts" / "run_canonical_preflight_wrapper.py"
+    spec = importlib.util.spec_from_file_location("canonical_wrapper_test", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -67,10 +77,13 @@ def _policy(tmp_path: Path, ledger: Path) -> tuple[dict, Path, dict]:
             "screening_contracts",
             "screening_worker",
             "controller",
+            "preflight_wrapper",
         )
     }
     policy = {
         "campaign_id": "historical-canonical-512-v1",
+        "supersedes_policy_sha256": "f7d9b8e263bdd54af7754889c7e7ce92d3ec7212d3784ac11c819fc3c07381cd",
+        "python": "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
         "policy_sha256": "1" * 64,
         "source": {
             "ledger": {
@@ -694,6 +707,186 @@ def test_monitor_is_append_only_and_audit_reconstructable(
     assert rows[0]["terminal"] is False and rows[1]["terminal"] is True
     assert rows[0]["gpus"][0]["uuid"] == "GPU-a"
     assert rows[0]["artifacts"]["generated_png"] == 0
+
+
+def test_cpu_admission_never_depends_on_gpu_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("config", None)])
+    policy, _, _ = _policy(tmp_path, ledger)
+    policy["resources"].update({
+        "cpu_admission_percent": 85,
+        "ram_admission_percent": 85,
+        "disk_admission_percent": 85,
+    })
+    monkeypatch.setattr(module, "_cpu_load_percent", lambda: 10.0)
+    monkeypatch.setattr(module, "_memory_percent", lambda: 20.0)
+    monkeypatch.setattr(module, "_disk_percent", lambda _path: 30.0)
+    monkeypatch.setattr(module, "_swap_pages", lambda: (1, 2))
+    monkeypatch.setattr(
+        module,
+        "_gpu_snapshot",
+        lambda: (_ for _ in ()).throw(AssertionError("GPU must not be queried")),
+    )
+    snapshot = module.assert_cpu_resource_admission(policy, tmp_path)
+    assert snapshot["admission_kind"] == "cpu_only"
+
+
+def test_preflight_attempt_failure_writes_claim_and_terminal_without_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("candidate", "a" * 64)])
+    policy, _, _ = _policy(tmp_path, ledger)
+    paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
+    plan = build_checkpoint_plan(tmp_path, policy, paths["preflight_results"])
+    request = plan["preflight_requests"][0]
+    request_path = (
+        paths["preflight_requests"]
+        / f"{request['checkpoint_sha256']}__{request['checkpoint_model']}.json"
+    )
+    write_exclusive_json(request_path, request)
+    monkeypatch.setenv("TMUX", "fixture")
+    monkeypatch.setattr(
+        module,
+        "assert_cpu_resource_admission",
+        lambda *_args: {"admission_kind": "cpu_only"},
+    )
+    monkeypatch.setattr(
+        module,
+        "preflight_generator_checkpoint",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("injected")),
+    )
+    with pytest.raises(RuntimeError, match="injected"):
+        module.materialize_preflights(policy, paths)
+    attempts = paths["preflight_control"] / "attempts"
+    claim = load_json(next(attempts.glob("*.claim.json")), "attempt claim")
+    terminal = load_json(next(attempts.glob("*.terminal.json")), "attempt terminal")
+    assert terminal["attempt_claim_sha256"] == claim["attempt_claim_sha256"]
+    assert terminal["status"] == "failed"
+    assert terminal["failure"]["type"] == "RuntimeError"
+    assert list(paths["preflight_results"].glob("*.json")) == []
+
+
+def test_controller_failure_persists_log_and_global_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("config", None)])
+    policy, _, _ = _policy(tmp_path, ledger)
+    paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
+    monkeypatch.setenv("TMUX", "fixture")
+    monkeypatch.setattr(
+        module,
+        "materialize_preflights",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("controller injected")),
+    )
+    with pytest.raises(RuntimeError, match="controller injected"):
+        module._execute_preflight_controller(policy, paths)
+    control = paths["preflight_control"]
+    terminal = load_json(control / "controller_terminal.json", "controller terminal")
+    assert terminal["status"] == "failed"
+    assert terminal["failure"]["message"] == "controller injected"
+    assert "controller_exception" in (control / "controller.log").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_wrapper_records_native_stderr_and_sigkill_without_controller_claim(
+    tmp_path: Path,
+) -> None:
+    wrapper = _wrapper_module()
+    config = tmp_path / "policy.json"
+    config.write_text("{}\n", encoding="utf-8")
+    policy_root = tmp_path / "campaign" / "by_policy" / ("1" * 64)
+    value = wrapper.run_wrapped_controller(
+        policy_root=policy_root,
+        policy_sha256="1" * 64,
+        config=config,
+        command=[
+            sys.executable,
+            "-c",
+            (
+                "import os,signal;"
+                "os.write(2,b'native-before-kill\\n');"
+                "os.kill(os.getpid(),signal.SIGKILL)"
+            ),
+        ],
+    )
+    assert value["exit_code"] == 137
+    assert value["signal"] == 9
+    assert value["controller_claim"] is None
+    assert value["controller_terminal"] is None
+    log_path = Path(value["controller_process_log"]["path"])
+    assert log_path.read_bytes() == b"native-before-kill\n"
+    assert load_json(
+        policy_root / "preflight_control" / "wrapper_exit.json", "wrapper exit"
+    ) == value
+
+
+def test_wrapper_records_pre_main_failure_without_controller_artifacts(
+    tmp_path: Path,
+) -> None:
+    wrapper = _wrapper_module()
+    config = tmp_path / "policy.json"
+    config.write_text("{bad policy}\n", encoding="utf-8")
+    policy_root = tmp_path / "campaign" / "by_policy" / ("2" * 64)
+    value = wrapper.run_wrapped_controller(
+        policy_root=policy_root,
+        policy_sha256="2" * 64,
+        config=config,
+        command=[
+            sys.executable,
+            "-c",
+            "import os,sys;os.write(1,b'pre-main\\n');sys.exit(2)",
+        ],
+    )
+    assert value["exit_code"] == 2
+    assert value["signal"] is None
+    assert value["controller_claim"] is None
+    assert value["controller_terminal"] is None
+    assert Path(value["controller_process_log"]["path"]).read_bytes() == b"pre-main\n"
+
+
+def test_preflight_tmux_wrapper_has_exit_recorder_and_no_timeout(
+    tmp_path: Path,
+) -> None:
+    module = _controller_module()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("config", None)])
+    policy, policy_path, _ = _policy(tmp_path, ledger)
+    commands = module._tmux_commands(
+        policy, policy_path, tmp_path / "campaign", "preflight"
+    )
+    controller = " ".join(commands["controller"])
+    assert "run_canonical_preflight_wrapper.py" in controller
+    assert "--policy-sha256" in controller
+    assert "timeout" not in controller.lower()
+
+
+def test_current_policy_preflight_refuses_partial_result_reuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("candidate", "c" * 64)])
+    policy, _, _ = _policy(tmp_path, ledger)
+    paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
+    plan = build_checkpoint_plan(tmp_path, policy, paths["preflight_results"])
+    request = plan["preflight_requests"][0]
+    write_exclusive_json(
+        paths["preflight_requests"]
+        / f"{request['checkpoint_sha256']}__{request['checkpoint_model']}.json",
+        request,
+    )
+    write_exclusive_json(paths["preflight_results"] / "partial.json", {"partial": True})
+    monkeypatch.setenv("TMUX", "fixture")
+    with pytest.raises(CanonicalScreeningError, match="refuses result reuse"):
+        module.materialize_preflights(policy, paths)
 
 
 def test_write_exclusive_json_rejects_overwrite(tmp_path: Path) -> None:
