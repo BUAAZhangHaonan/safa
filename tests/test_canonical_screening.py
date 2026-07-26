@@ -219,7 +219,7 @@ def _policy(tmp_path: Path, ledger: Path) -> tuple[dict, Path, dict]:
             "physical_gpus": [0, 1, 2, 3],
             "workers_per_gpu": 2,
             "gpu_headroom_bytes": 2 * 1024**3,
-            "cpu_admission_percent": 85,
+            "cpu_admission_percent": 90,
             "cpu_hard_limit_percent": 90,
             "cpu_window_seconds": 60,
             "cpu_consecutive_hard_windows": 2,
@@ -981,7 +981,7 @@ def test_cpu_admission_never_depends_on_gpu_state(
     _write_jsonl(ledger, [_row("config", None)])
     policy, _, _ = _policy(tmp_path, ledger)
     policy["resources"].update({
-        "cpu_admission_percent": 85,
+        "cpu_admission_percent": 90,
         "ram_admission_percent": 85,
         "disk_admission_percent": 85,
     })
@@ -998,14 +998,22 @@ def test_cpu_admission_never_depends_on_gpu_state(
     assert snapshot["admission_kind"] == "cpu_only"
 
 
-def test_cpu_startup_admission_rejects_exactly_85_without_gpu_query(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("cpu_percent", "should_pass"),
+    [(89.1, True), (90.0, False)],
+)
+def test_cpu_startup_admission_uses_strict_below_90_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cpu_percent: float,
+    should_pass: bool,
 ) -> None:
     module = _controller_module()
     ledger = tmp_path / "ledger.jsonl"
     _write_jsonl(ledger, [_row("config", None)])
     policy, _, _ = _policy(tmp_path, ledger)
-    monkeypatch.setattr(module, "_cpu_load_percent", lambda: 85.0)
+    policy["resources"]["cpu_admission_percent"] = 90
+    monkeypatch.setattr(module, "_cpu_load_percent", lambda: cpu_percent)
     monkeypatch.setattr(module, "_memory_percent", lambda: 20.0)
     monkeypatch.setattr(module, "_disk_percent", lambda _path: 30.0)
     monkeypatch.setattr(
@@ -1013,8 +1021,13 @@ def test_cpu_startup_admission_rejects_exactly_85_without_gpu_query(
         "_gpu_snapshot",
         lambda: (_ for _ in ()).throw(AssertionError("GPU must not be queried")),
     )
-    with pytest.raises(CanonicalScreeningError, match="CPU admission failed"):
-        module.assert_cpu_resource_admission(policy, tmp_path)
+    if should_pass:
+        assert module.assert_cpu_resource_admission(
+            policy, tmp_path
+        )["cpu_load_percent"] == cpu_percent
+    else:
+        with pytest.raises(CanonicalScreeningError, match="CPU admission failed"):
+            module.assert_cpu_resource_admission(policy, tmp_path)
 
 
 def test_cpu_window_requires_two_consecutive_windows_and_latches() -> None:
@@ -1025,7 +1038,8 @@ def test_cpu_window_requires_two_consecutive_windows_and_latches() -> None:
     assert single.consecutive_high == 0
     exact = module.CpuWindowState(90.0, 2)
     assert exact.record(90.0) is False
-    assert exact.consecutive_high == 0
+    assert exact.consecutive_high == 1
+    assert exact.record(90.0) is True
     consecutive = module.CpuWindowState(90.0, 2)
     assert consecutive.record(91.0) is False
     assert consecutive.record(92.0) is True
@@ -1258,7 +1272,7 @@ def test_supersession_evidence_binds_ea7_failed_smoke_chain(
         validate_supersession_evidence(tmp_path, tampered)
 
 
-def test_current_policy_binds_stopped_c83_preflight_and_forbids_reuse() -> None:
+def test_current_policy_binds_stopped_310_preflight_and_forbids_reuse() -> None:
     root = Path(__file__).parents[1]
     policy_path = root / "configs/closeout/canonical_screening_512_v1.json"
 
@@ -1266,14 +1280,14 @@ def test_current_policy_binds_stopped_c83_preflight_and_forbids_reuse() -> None:
 
     supersedes = policy["supersedes"]
     assert supersedes["policy_sha256"] == (
-        "c83b95e0ca49a0cf5b5b3d67c337000a31b8d2a3299d434fc1051256f18fea50"
+        "310f5b539315d3bc957530856c0f810bf5b32afc97469fdb9467bf3facdc9cda"
     )
     assert supersedes["classification"] == "started_incomplete"
     assert supersedes["request_count"] == 193
-    assert supersedes["result_count"] == 34
-    assert supersedes["valid_count"] == 29
-    assert supersedes["false_invalid_count"] == 5
-    assert supersedes["pending_count"] == 159
+    assert supersedes["result_count"] == 0
+    assert supersedes["checkpoint_attempt_claim_count"] == 0
+    assert supersedes["wrapper_claim_count"] == 1
+    assert supersedes["pending_count"] == 193
     assert supersedes["scientific_result_reuse"] == "forbidden"
     assert supersedes["successor_execution"] == "fresh_full_193_preflight"
 
@@ -1285,10 +1299,10 @@ def test_current_policy_binds_stopped_c83_preflight_and_forbids_reuse() -> None:
         ("reuse", "status differs"),
         ("root_digest", "root binding differs"),
         ("bound_path", "path differs"),
-        ("false_invalid_set", "status differs"),
+        ("wrapper_claim_count", "status differs"),
     ],
 )
-def test_c83_supersession_tampering_fails_closed(
+def test_310_supersession_tampering_fails_closed(
     mutation: str,
     match: str,
 ) -> None:
@@ -1305,11 +1319,9 @@ def test_c83_supersession_tampering_fails_closed(
     elif mutation == "root_digest":
         supersedes["evidence_root"]["digest"] = "0" * 64
     elif mutation == "bound_path":
-        supersedes["controller_claim"] = supersedes["wrapper_claim"]
-    elif mutation == "false_invalid_set":
-        supersedes["false_invalid_checkpoint_sha256"] = (
-            supersedes["false_invalid_checkpoint_sha256"][:-1]
-        )
+        supersedes["wrapper_claim"] = supersedes["wrapper_exit"]
+    elif mutation == "wrapper_claim_count":
+        supersedes["wrapper_claim_count"] = 0
     else:
         raise AssertionError(mutation)
 

@@ -778,6 +778,232 @@ def _validate_c83_preflight_supersession_evidence(
     }
 
 
+def _validate_310_preflight_supersession_evidence(
+    repo_root: Path, raw_supersedes: Mapping[str, Any]
+) -> dict[str, Any]:
+    supersedes = _require_mapping(raw_supersedes, "310 supersession evidence")
+    _require_exact_keys(
+        supersedes,
+        {
+            "policy_sha256",
+            "previous_policy_sha256",
+            "classification",
+            "phase",
+            "stage",
+            "request_count",
+            "result_count",
+            "pending_count",
+            "checkpoint_attempt_claim_count",
+            "checkpoint_attempt_terminal_count",
+            "wrapper_claim_count",
+            "generated_png_count",
+            "startup_cpu_observed_percent",
+            "superseded_cpu_admission_percent",
+            "successor_cpu_admission_percent",
+            "failure_message",
+            "scientific_result_reuse",
+            "successor_execution",
+            "evidence_root",
+            "checkpoint_plan",
+            "wrapper_claim",
+            "wrapper_exit",
+            "controller_process_log",
+            "resource_observer",
+        },
+        "310 supersession evidence",
+    )
+    policy_sha256 = (
+        "310f5b539315d3bc957530856c0f810bf5b32afc97469fdb9467bf3facdc9cda"
+    )
+    previous_policy_sha256 = (
+        "c83b95e0ca49a0cf5b5b3d67c337000a31b8d2a3299d434fc1051256f18fea50"
+    )
+    failure_message = "CPU admission failed: 89.10% >= 85%"
+    expected_scalars = {
+        "policy_sha256": policy_sha256,
+        "previous_policy_sha256": previous_policy_sha256,
+        "classification": "started_incomplete",
+        "phase": "preflight",
+        "stage": "startup_admission_before_controller_claim",
+        "request_count": 193,
+        "result_count": 0,
+        "pending_count": 193,
+        "checkpoint_attempt_claim_count": 0,
+        "checkpoint_attempt_terminal_count": 0,
+        "wrapper_claim_count": 1,
+        "generated_png_count": 0,
+        "startup_cpu_observed_percent": 89.10,
+        "superseded_cpu_admission_percent": 85,
+        "successor_cpu_admission_percent": 90,
+        "failure_message": failure_message,
+        "scientific_result_reuse": "forbidden",
+        "successor_execution": "fresh_full_193_preflight",
+    }
+    if any(supersedes[key] != value for key, value in expected_scalars.items()):
+        raise CanonicalScreeningError("310 supersession status differs")
+
+    evidence_root = _require_mapping(
+        supersedes["evidence_root"], "310 evidence root"
+    )
+    _require_exact_keys(
+        evidence_root,
+        {"path", "digest", "digest_algorithm"},
+        "310 evidence root",
+    )
+    root = _repo_path(
+        repo_root,
+        evidence_root["path"],
+        "310 evidence root",
+        must_exist=False,
+    )
+    expected_root = (
+        repo_root.resolve()
+        / "artifacts/closeout/historical-canonical-512-v1/by_policy"
+        / policy_sha256
+    ).resolve()
+    if (
+        root != expected_root
+        or not root.is_dir()
+        or evidence_root["digest_algorithm"]
+        != "sha256_relative_posix_nul_content_nul_v1"
+        or sha256_directory_tree(root)
+        != _require_sha256(evidence_root["digest"], "310 evidence root digest")
+    ):
+        raise CanonicalScreeningError("310 evidence root binding differs")
+
+    expected_relative_paths = {
+        "checkpoint_plan": "checkpoint_plan.json",
+        "wrapper_claim": "preflight_control/wrapper_claim.json",
+        "wrapper_exit": "preflight_control/wrapper_exit.json",
+        "controller_process_log": "preflight_control/controller_process.log",
+        "resource_observer": "logs/preflight__observer.jsonl",
+    }
+    bound_files = {
+        name: _validate_bound_file(
+            repo_root, supersedes[name], f"310 {name.replace('_', ' ')}"
+        )
+        for name in expected_relative_paths
+    }
+    for name, relative_path in expected_relative_paths.items():
+        if Path(bound_files[name]["path"]).resolve() != (
+            root / relative_path
+        ).resolve():
+            raise CanonicalScreeningError(
+                f"310 {name.replace('_', ' ')} path differs"
+            )
+
+    wrapper_claim = load_json(
+        Path(bound_files["wrapper_claim"]["path"]), "310 wrapper claim"
+    )
+    wrapper_exit = load_json(
+        Path(bound_files["wrapper_exit"]["path"]), "310 wrapper exit"
+    )
+    wrapper_config = _require_mapping(
+        wrapper_claim.get("config"), "310 wrapper config"
+    )
+    wrapper_command = wrapper_claim.get("command")
+    if (
+        wrapper_claim.get("contract_type")
+        != "safa_canonical_preflight_wrapper_claim_v1"
+        or wrapper_claim.get("policy_sha256") != policy_sha256
+        or wrapper_claim.get("external_timeout_seconds") is not None
+        or wrapper_config.get("sha256")
+        != "6479b5a207fefdf331f8c988b3b9bc456cbe2d872cba4dfd5bb0491048f845ee"
+        or Path(str(wrapper_config.get("path"))).resolve()
+        != (
+            repo_root.resolve()
+            / "configs/closeout/canonical_screening_512_v1.json"
+        )
+        or not isinstance(wrapper_command, list)
+        or wrapper_command[-2:] != ["preflight", "--execute"]
+        or wrapper_claim.get("wrapper_claim_sha256")
+        != canonical_digest(wrapper_claim, "wrapper_claim_sha256")
+        or wrapper_exit.get("contract_type")
+        != "safa_canonical_preflight_wrapper_exit_v2"
+        or wrapper_exit.get("policy_sha256") != policy_sha256
+        or wrapper_exit.get("wrapper_claim_sha256")
+        != wrapper_claim.get("wrapper_claim_sha256")
+        or wrapper_exit.get("command") != wrapper_command
+        or wrapper_exit.get("started_at") != wrapper_claim.get("started_at")
+        or wrapper_exit.get("exit_code") != 2
+        or wrapper_exit.get("signal") is not None
+        or wrapper_exit.get("launch_failure") is not None
+        or wrapper_exit.get("controller_claim") is not None
+        or wrapper_exit.get("controller_terminal") is not None
+        or wrapper_exit.get("controller_process_log")
+        != bound_files["controller_process_log"]
+        or wrapper_exit.get("wrapper_exit_sha256")
+        != canonical_digest(wrapper_exit, "wrapper_exit_sha256")
+    ):
+        raise CanonicalScreeningError("310 wrapper stop evidence semantics differ")
+    if Path(bound_files["controller_process_log"]["path"]).read_text(
+        encoding="utf-8"
+    ) != f"CANONICAL SCREENING BLOCKED: {failure_message}\n":
+        raise CanonicalScreeningError("310 admission failure log differs")
+
+    requests = sorted((root / "checkpoint_preflight/requests").glob("*.json"))
+    results = list((root / "checkpoint_preflight/results").glob("*.json"))
+    attempts = root / "preflight_control/attempts"
+    checkpoint_claims = list(attempts.glob("*.claim.json"))
+    checkpoint_terminals = list(attempts.glob("*.terminal.json"))
+    generated_pngs = list(root.glob("**/*.png"))
+    request_digests: set[str] = set()
+    if (
+        len(requests) != 193
+        or results
+        or checkpoint_claims
+        or checkpoint_terminals
+        or generated_pngs
+    ):
+        raise CanonicalScreeningError("310 preflight filesystem counts differ")
+    for path in requests:
+        request = load_json(path, "310 preflight request")
+        request_digest = request.get("preflight_request_sha256")
+        if (
+            request.get("contract_type") != PREFLIGHT_REQUEST_CONTRACT
+            or request.get("policy_sha256") != policy_sha256
+            or request_digest
+            != canonical_digest(request, "preflight_request_sha256")
+            or path.stem
+            != f"{request.get('checkpoint_sha256')}__{request.get('checkpoint_model')}"
+            or request_digest in request_digests
+        ):
+            raise CanonicalScreeningError("310 preflight request semantics differ")
+        request_digests.add(str(request_digest))
+
+    observer_rows = load_jsonl(
+        Path(bound_files["resource_observer"]["path"]), "310 resource observer"
+    )
+    if (
+        not observer_rows
+        or any(
+            row.get("policy_sha256") != policy_sha256
+            or row.get("phase") != "preflight"
+            or row.get("contract_type")
+            != "safa_canonical_resource_monitor_sample_v1"
+            or row.get("gpus") is not None
+            or row.get("compute_processes") is not None
+            for row in observer_rows
+        )
+        or observer_rows[-1].get("terminal") is not True
+        or observer_rows[-1].get("artifacts", {}).get("preflight_requests")
+        != 193
+        or observer_rows[-1].get("artifacts", {}).get("preflight_results")
+        != 0
+    ):
+        raise CanonicalScreeningError("310 resource observer semantics differ")
+
+    return {
+        **expected_scalars,
+        "evidence_root": {
+            "path": str(root),
+            "digest": evidence_root["digest"],
+            "digest_algorithm": evidence_root["digest_algorithm"],
+        },
+        **bound_files,
+    }
+
+
 def validate_supersession_evidence(
     repo_root: Path, raw_supersedes: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -787,6 +1013,13 @@ def validate_supersession_evidence(
         == "c83b95e0ca49a0cf5b5b3d67c337000a31b8d2a3299d434fc1051256f18fea50"
     ):
         return _validate_c83_preflight_supersession_evidence(
+            repo_root, supersedes
+        )
+    if (
+        supersedes.get("policy_sha256")
+        == "310f5b539315d3bc957530856c0f810bf5b32afc97469fdb9467bf3facdc9cda"
+    ):
+        return _validate_310_preflight_supersession_evidence(
             repo_root, supersedes
         )
     return _validate_ea7_smoke_supersession_evidence(repo_root, supersedes)
@@ -1199,7 +1432,7 @@ def validate_policy(
         or resources["workers_per_gpu"] != 2
         or resources["retry_count"] != 0
         or resources["require_tmux"] is not True
-        or resources["cpu_admission_percent"] != 85
+        or resources["cpu_admission_percent"] != 90
         or resources["cpu_hard_limit_percent"] != 90
         or resources["cpu_window_seconds"] != 60
         or resources["cpu_consecutive_hard_windows"] != 2

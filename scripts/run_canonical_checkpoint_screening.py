@@ -310,7 +310,7 @@ class CpuWindowState:
         self.window_count += 1
         if self.violated:
             return True
-        if cpu_percent > self.hard_limit_percent:
+        if cpu_percent >= self.hard_limit_percent:
             self.consecutive_high += 1
         else:
             self.consecutive_high = 0
@@ -404,7 +404,7 @@ class RuntimeResourceGuard:
                         self._violation_reason = (
                             f"CPU runtime hard stop: "
                             f"{self.cpu_state.consecutive_high} consecutive "
-                            f"{self.window_seconds}s windows exceeded "
+                            f"{self.window_seconds}s windows met or exceeded "
                             f"{self.cpu_state.hard_limit_percent:.0f}%"
                         )
                     if (

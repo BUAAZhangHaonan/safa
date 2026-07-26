@@ -3,59 +3,48 @@
   "contract_type": "safa_canonical_screening_policy_v1",
   "campaign_id": "historical-canonical-512-v1",
   "supersedes": {
-      "policy_sha256": "c83b95e0ca49a0cf5b5b3d67c337000a31b8d2a3299d434fc1051256f18fea50",
-      "previous_policy_sha256": "ea7ae71fd662526b9a45bf3cc6d283884aefc380b292c8f273169a35f42ffc28",
-      "classification": "started_incomplete",
-      "phase": "preflight",
+      "policy_sha256": "310f5b539315d3bc957530856c0f810bf5b32afc97469fdb9467bf3facdc9cda",
+      "previous_policy_sha256": "c83b95e0ca49a0cf5b5b3d67c337000a31b8d2a3299d434fc1051256f18fea50",
+    "classification": "started_incomplete",
+    "phase": "preflight",
+    "stage": "startup_admission_before_controller_claim",
       "request_count": 193,
-      "result_count": 34,
-      "valid_count": 29,
-      "false_invalid_count": 5,
-      "pending_count": 159,
-      "attempt_claim_count": 34,
-      "attempt_terminal_count": 34,
-      "false_invalid_failure_code": "loaded_output_capability_mismatch",
-      "false_invalid_checkpoint_sha256": [
-          "1058090b828d8e0243c3ccc9563526e40407a1554fa128e9169fb1c2b546f6b4",
-          "1244b3a3aa790f6fcb941158acf4a9088d035b2309b24248e15470410140c684",
-          "1c2cd0a53f837c3e20e6be07e3a2e7860e4bed3e0cf5ec50b47dfb99fb5a2f35",
-          "1d199b8a32ba9b1a6225157416674aa0bcd05766765a3c619fcc25a97178b3cb",
-          "33a4c9bfb46080e8a75c503c269e21e2c6d436913d2a42db7ed0ea74ea31ce9d"
-      ],
+      "result_count": 0,
+      "pending_count": 193,
+      "checkpoint_attempt_claim_count": 0,
+      "checkpoint_attempt_terminal_count": 0,
+      "wrapper_claim_count": 1,
+      "generated_png_count": 0,
+      "startup_cpu_observed_percent": 89.1,
+      "superseded_cpu_admission_percent": 85,
+      "successor_cpu_admission_percent": 90,
+      "failure_message": "CPU admission failed: 89.10% >= 85%",
       "scientific_result_reuse": "forbidden",
       "successor_execution": "fresh_full_193_preflight",
-      "evidence_root": {
-          "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/c83b95e0ca49a0cf5b5b3d67c337000a31b8d2a3299d434fc1051256f18fea50",
-          "digest": "6d2de811ba927cc1f701755755adbee29050c8edb9f4daefbea2668d6330cd8e",
-          "digest_algorithm": "sha256_relative_posix_nul_content_nul_v1"
-      },
-      "controller_claim": {
-          "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/c83b95e0ca49a0cf5b5b3d67c337000a31b8d2a3299d434fc1051256f18fea50/preflight_control/controller_claim.json",
-          "sha256": "06693607a6bf5aa232404d68e1387e0079ada725d41a641e56051f5759fabe7a"
-      },
-      "controller_terminal": {
-          "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/c83b95e0ca49a0cf5b5b3d67c337000a31b8d2a3299d434fc1051256f18fea50/preflight_control/controller_terminal.json",
-          "sha256": "c88bbed6f57736ff45dbc471e5b0eb87cb9c63fd3fd5e8bd527446f91148947d"
-      },
+    "evidence_root": {
+          "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/310f5b539315d3bc957530856c0f810bf5b32afc97469fdb9467bf3facdc9cda",
+          "digest": "c7db1ea3f6f220d684f90b76528e19c7efe5b97b5ac159e56b87f292e7cb4c48",
+      "digest_algorithm": "sha256_relative_posix_nul_content_nul_v1"
+    },
+    "checkpoint_plan": {
+      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/310f5b539315d3bc957530856c0f810bf5b32afc97469fdb9467bf3facdc9cda/checkpoint_plan.json",
+      "sha256": "f1d55a36af075644b4a7aff2cd141c89fd8fe4891259a00d7d651e0dfd79b7c7"
+    },
       "wrapper_claim": {
-          "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/c83b95e0ca49a0cf5b5b3d67c337000a31b8d2a3299d434fc1051256f18fea50/preflight_control/wrapper_claim.json",
-          "sha256": "4de83fc190df5001d7defcd01cde40eee3c91971ef30cc5ebdc97cd36712bb66"
+          "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/310f5b539315d3bc957530856c0f810bf5b32afc97469fdb9467bf3facdc9cda/preflight_control/wrapper_claim.json",
+          "sha256": "a30e34bc24f2431feb239f7031398bab010041cb7bde9d3ac733778a97bbff03"
       },
       "wrapper_exit": {
-          "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/c83b95e0ca49a0cf5b5b3d67c337000a31b8d2a3299d434fc1051256f18fea50/preflight_control/wrapper_exit.json",
-          "sha256": "973e229f0c8140f8ba9dbd8ef463faf7f239200bf5673015f7e1b0eafd86c836"
+          "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/310f5b539315d3bc957530856c0f810bf5b32afc97469fdb9467bf3facdc9cda/preflight_control/wrapper_exit.json",
+          "sha256": "23af1f75256318584638faf9307f0e3bf8d85a96f40c97737aadb9fc29a1fb49"
       },
-      "resource_monitor": {
-          "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/c83b95e0ca49a0cf5b5b3d67c337000a31b8d2a3299d434fc1051256f18fea50/logs/preflight__monitor.jsonl",
-          "sha256": "7fe2dcf3fc2ea21e36824036ff4a154e8d37922fb4e6ddc50c2e263ebddda5ec"
+      "controller_process_log": {
+          "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/310f5b539315d3bc957530856c0f810bf5b32afc97469fdb9467bf3facdc9cda/preflight_control/controller_process.log",
+          "sha256": "0ba41522ad5a1bed1ba8bda161e6512ec5960660fef0033290e4bb69c5e05b2a"
       },
       "resource_observer": {
-          "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/c83b95e0ca49a0cf5b5b3d67c337000a31b8d2a3299d434fc1051256f18fea50/logs/preflight__observer.jsonl",
-          "sha256": "4e548ed176c92a125010f8983daa2f5018264ff170d0c6754134824b9f1ac1e2"
-      },
-      "runtime_resource_windows": {
-          "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/c83b95e0ca49a0cf5b5b3d67c337000a31b8d2a3299d434fc1051256f18fea50/preflight_control/runtime_resource_windows.jsonl",
-          "sha256": "b6084240f289f12707d4636e2f5ddc0032a19968406cd963f771c6bcc445b5c7"
+          "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/310f5b539315d3bc957530856c0f810bf5b32afc97469fdb9467bf3facdc9cda/logs/preflight__observer.jsonl",
+          "sha256": "d98ad204e71c889c0a2cfb1a568c679ddce56fb946190e61dc75e5e111e000ba"
       }
   },
   "python": "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
@@ -138,7 +127,7 @@
     "physical_gpus": [0, 1, 2, 3],
     "workers_per_gpu": 2,
     "gpu_headroom_bytes": 2147483648,
-    "cpu_admission_percent": 85,
+    "cpu_admission_percent": 90,
     "cpu_hard_limit_percent": 90,
     "cpu_window_seconds": 60,
     "cpu_consecutive_hard_windows": 2,
@@ -276,7 +265,7 @@
     },
     "screening_contracts": {
       "path": "src/safa/closeout/canonical_screening.py",
-      "sha256": "fdca6a8f05c9082c969ec3cd398f21da19bcee86e01349c6050612d6f9ee8e25"
+      "sha256": "60d114d888a8554a899b2696e9e028485654ca3c98a68265755ba96281563b50"
     },
     "screening_worker": {
       "path": "src/safa/closeout/canonical_screening_worker.py",
@@ -284,7 +273,7 @@
     },
     "controller": {
       "path": "scripts/run_canonical_checkpoint_screening.py",
-      "sha256": "5e3eb12a3dbe7a78dad80cc590ae607785129b627df96f05258fbb5683d2ef9e"
+      "sha256": "59694c8361ce7a9e5143e28380d3e13f5304fb320ec63eaf7e3b734b66e916a9"
     },
     "preflight_wrapper": {
       "path": "scripts/run_canonical_preflight_wrapper.py",
