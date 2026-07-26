@@ -25,6 +25,7 @@ from safa.closeout.canonical_screening import (
     validate_preflight_result,
     validate_run_request,
     validate_run_result,
+    validate_supersession_evidence,
     write_exclusive_json,
 )
 from safa.closeout.canonical_screening_worker import (
@@ -108,7 +109,24 @@ def _policy(tmp_path: Path, ledger: Path) -> tuple[dict, Path, dict]:
             "kid_subset_sizes": {"smoke8": 8, "screen512": 50},
             "metrics": [],
         },
-        "resources": {"physical_gpus": [0, 1, 2, 3]},
+        "resources": {
+            "physical_gpus": [0, 1, 2, 3],
+            "workers_per_gpu": 2,
+            "gpu_headroom_bytes": 2 * 1024**3,
+            "cpu_admission_percent": 85,
+            "cpu_hard_limit_percent": 90,
+            "cpu_window_seconds": 60,
+            "cpu_consecutive_hard_windows": 2,
+            "resource_poll_seconds": 10,
+            "swap_consecutive_hard_intervals": 3,
+            "ram_admission_percent": 85,
+            "ram_hard_limit_percent": 90,
+            "disk_admission_percent": 85,
+            "disk_hard_limit_percent": 90,
+            "retry_count": 0,
+            "require_tmux": True,
+            "global_lock_root": str(tmp_path / "locks"),
+        },
         "implementations": implementations,
         "arcface": {"model_name": "buffalo_l"},
     }
@@ -734,6 +752,189 @@ def test_cpu_admission_never_depends_on_gpu_state(
     assert snapshot["admission_kind"] == "cpu_only"
 
 
+def test_cpu_startup_admission_rejects_exactly_85_without_gpu_query(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("config", None)])
+    policy, _, _ = _policy(tmp_path, ledger)
+    monkeypatch.setattr(module, "_cpu_load_percent", lambda: 85.0)
+    monkeypatch.setattr(module, "_memory_percent", lambda: 20.0)
+    monkeypatch.setattr(module, "_disk_percent", lambda _path: 30.0)
+    monkeypatch.setattr(
+        module,
+        "_gpu_snapshot",
+        lambda: (_ for _ in ()).throw(AssertionError("GPU must not be queried")),
+    )
+    with pytest.raises(CanonicalScreeningError, match="CPU admission failed"):
+        module.assert_cpu_resource_admission(policy, tmp_path)
+
+
+def test_cpu_window_requires_two_consecutive_windows_and_latches() -> None:
+    module = _controller_module()
+    single = module.CpuWindowState(90.0, 2)
+    assert single.record(93.0) is False
+    assert single.record(10.0) is False
+    assert single.consecutive_high == 0
+    exact = module.CpuWindowState(90.0, 2)
+    assert exact.record(90.0) is False
+    assert exact.consecutive_high == 0
+    consecutive = module.CpuWindowState(90.0, 2)
+    assert consecutive.record(91.0) is False
+    assert consecutive.record(92.0) is True
+    assert consecutive.record(10.0) is True
+    assert consecutive.violated is True
+
+
+def test_runtime_guard_preserves_ram_disk_and_swap_hard_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("config", None)])
+    policy, _, _ = _policy(tmp_path, ledger)
+    monkeypatch.setattr(module, "_cpu_times", lambda: (100, 50))
+
+    class FiniteWait:
+        def __init__(self, intervals: int) -> None:
+            self.intervals = intervals
+            self.calls = 0
+
+        def wait(self, _seconds: int) -> bool:
+            self.calls += 1
+            return self.calls > self.intervals
+
+    def run_case(
+        name: str,
+        *,
+        memory_percent: float,
+        disk_percent: float,
+        swaps: list[tuple[int, int]],
+        intervals: int,
+    ) -> str:
+        monotonic_values = iter(float(10 * index) for index in range(intervals + 1))
+        swap_values = iter(swaps)
+        monkeypatch.setattr(module.time, "monotonic", lambda: next(monotonic_values))
+        monkeypatch.setattr(module, "_memory_percent", lambda: memory_percent)
+        monkeypatch.setattr(module, "_disk_percent", lambda _path: disk_percent)
+        monkeypatch.setattr(module, "_swap_pages", lambda: next(swap_values))
+        guard = module.RuntimeResourceGuard(
+            policy, tmp_path / f"{name}.jsonl", tmp_path
+        )
+        guard._stop = FiniteWait(intervals)
+        guard._run()
+        with pytest.raises(CanonicalScreeningError) as error:
+            guard.raise_if_violated()
+        return str(error.value)
+
+    assert "RAM runtime hard stop" in run_case(
+        "ram",
+        memory_percent=90.0,
+        disk_percent=10.0,
+        swaps=[(0, 0), (0, 0)],
+        intervals=1,
+    )
+    assert "disk runtime hard stop" in run_case(
+        "disk",
+        memory_percent=10.0,
+        disk_percent=90.0,
+        swaps=[(0, 0), (0, 0)],
+        intervals=1,
+    )
+    assert "sustained swap I/O" in run_case(
+        "swap",
+        memory_percent=10.0,
+        disk_percent=10.0,
+        swaps=[(0, 0), (1, 0), (2, 0), (3, 0)],
+        intervals=3,
+    )
+
+
+def test_preflight_monitor_never_queries_gpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("config", None)])
+    policy, _, _ = _policy(tmp_path, ledger)
+    paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
+    monkeypatch.setattr(module, "_cpu_load_percent", lambda: 10.0)
+    monkeypatch.setattr(module, "_memory_percent", lambda: 20.0)
+    monkeypatch.setattr(module, "_disk_percent", lambda _path: 30.0)
+    monkeypatch.setattr(module, "_swap_pages", lambda: (1, 2))
+    monkeypatch.setattr(
+        module,
+        "_gpu_snapshot",
+        lambda: (_ for _ in ()).throw(AssertionError("GPU must not be queried")),
+    )
+    monkeypatch.setattr(
+        module,
+        "_gpu_compute_processes",
+        lambda: (_ for _ in ()).throw(AssertionError("GPU must not be queried")),
+    )
+    sample = module._monitor_sample(
+        policy, paths, "preflight", terminal=False
+    )
+    assert sample["gpus"] is None
+    assert sample["compute_processes"] is None
+
+
+def test_supersession_evidence_binds_failed_8ce_terminal_and_exit(
+    tmp_path: Path,
+) -> None:
+    old_policy = (
+        "8ce4855b042161ff5698ce400f8b80122"
+        "add90d6025ffd08f31fe49d8ef84a7f"
+    )
+    terminal_path = tmp_path / "controller_terminal.json"
+    terminal_path.write_bytes(
+        canonical_json(
+            {
+                "contract_type": "safa_canonical_preflight_controller_terminal_v1",
+                "policy_sha256": old_policy,
+                "status": "failed",
+                "result_count": 1,
+                "pending_count": 192,
+            }
+        )
+    )
+    controller_log = _bound(tmp_path / "controller.log")
+    process_log = _bound(tmp_path / "controller_process.log")
+    terminal = _bound(terminal_path)
+    wrapper_path = tmp_path / "wrapper_exit.json"
+    wrapper_path.write_bytes(
+        canonical_json(
+            {
+                "contract_type": "safa_canonical_preflight_wrapper_exit_v2",
+                "policy_sha256": old_policy,
+                "exit_code": 2,
+                "signal": None,
+                "controller_terminal": terminal,
+                "controller_process_log": process_log,
+            }
+        )
+    )
+    supersedes = {
+        "policy_sha256": old_policy,
+        "classification": "started_incomplete",
+        "result_count": 1,
+        "pending_count": 192,
+        "controller_terminal": terminal,
+        "wrapper_exit": _bound(wrapper_path),
+        "controller_log": controller_log,
+        "controller_process_log": process_log,
+    }
+    assert (
+        validate_supersession_evidence(tmp_path, supersedes)["classification"]
+        == "started_incomplete"
+    )
+    tampered = json.loads(json.dumps(supersedes))
+    tampered["controller_log"]["sha256"] = "f" * 64
+    with pytest.raises(CanonicalScreeningError, match="SHA256 mismatch"):
+        validate_supersession_evidence(tmp_path, tampered)
+
+
 def test_preflight_attempt_failure_writes_claim_and_terminal_without_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -760,14 +961,55 @@ def test_preflight_attempt_failure_writes_claim_and_terminal_without_result(
         "preflight_generator_checkpoint",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("injected")),
     )
+    guard = types.SimpleNamespace(raise_if_violated=lambda: None)
     with pytest.raises(RuntimeError, match="injected"):
-        module.materialize_preflights(policy, paths)
+        module.materialize_preflights(policy, paths, guard, "d" * 64)
     attempts = paths["preflight_control"] / "attempts"
     claim = load_json(next(attempts.glob("*.claim.json")), "attempt claim")
     terminal = load_json(next(attempts.glob("*.terminal.json")), "attempt terminal")
     assert terminal["attempt_claim_sha256"] == claim["attempt_claim_sha256"]
     assert terminal["status"] == "failed"
     assert terminal["failure"]["type"] == "RuntimeError"
+    assert list(paths["preflight_results"].glob("*.json")) == []
+
+
+def test_runtime_stop_before_result_writes_one_failed_attempt_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("candidate", "a" * 64)])
+    policy, _, _ = _policy(tmp_path, ledger)
+    paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
+    plan = build_checkpoint_plan(tmp_path, policy, paths["preflight_results"])
+    request = plan["preflight_requests"][0]
+    write_exclusive_json(
+        paths["preflight_requests"]
+        / f"{request['checkpoint_sha256']}__{request['checkpoint_model']}.json",
+        request,
+    )
+    monkeypatch.setenv("TMUX", "fixture")
+    monkeypatch.setattr(
+        module, "preflight_generator_checkpoint", lambda *_args, **_kwargs: {}
+    )
+
+    class Guard:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def raise_if_violated(self) -> None:
+            self.calls += 1
+            if self.calls == 2:
+                raise CanonicalScreeningError("CPU runtime hard stop")
+
+    with pytest.raises(CanonicalScreeningError, match="CPU runtime hard stop"):
+        module.materialize_preflights(policy, paths, Guard(), "d" * 64)
+    attempts = paths["preflight_control"] / "attempts"
+    terminals = list(attempts.glob("*.terminal.json"))
+    assert len(terminals) == 1
+    terminal = load_json(terminals[0], "attempt terminal")
+    assert terminal["status"] == "failed"
+    assert terminal["failure"]["message"] == "CPU runtime hard stop"
     assert list(paths["preflight_results"].glob("*.json")) == []
 
 
@@ -780,6 +1022,39 @@ def test_controller_failure_persists_log_and_global_terminal(
     policy, _, _ = _policy(tmp_path, ledger)
     paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
     monkeypatch.setenv("TMUX", "fixture")
+    admission_calls = 0
+
+    def admit(*_args):
+        nonlocal admission_calls
+        admission_calls += 1
+        return {"admission_kind": "cpu_only"}
+
+    class FakeGuard:
+        def __init__(self, _policy, sample_path: Path, _disk_path: Path) -> None:
+            self.started = False
+            self.sample_path = sample_path
+
+        def start(self) -> None:
+            self.started = True
+            self.sample_path.parent.mkdir(parents=True, exist_ok=True)
+            self.sample_path.write_bytes(b'{"sample":1}\n')
+
+        def stop(self) -> dict:
+            return {
+                "started": self.started,
+                "thread_failure": None,
+                "violation_reason": None,
+                "violated": False,
+                "samples": {
+                    "path": str(self.sample_path.resolve()),
+                    "sha256": hashlib.sha256(
+                        self.sample_path.read_bytes()
+                    ).hexdigest(),
+                },
+            }
+
+    monkeypatch.setattr(module, "assert_cpu_resource_admission", admit)
+    monkeypatch.setattr(module, "RuntimeResourceGuard", FakeGuard)
     monkeypatch.setattr(
         module,
         "materialize_preflights",
@@ -789,8 +1064,15 @@ def test_controller_failure_persists_log_and_global_terminal(
         module._execute_preflight_controller(policy, paths)
     control = paths["preflight_control"]
     terminal = load_json(control / "controller_terminal.json", "controller terminal")
+    assert admission_calls == 1
     assert terminal["status"] == "failed"
     assert terminal["failure"]["message"] == "controller injected"
+    assert terminal["runtime_resource_guard"]["started"] is True
+    samples = terminal["runtime_resource_guard"]["samples"]
+    assert Path(samples["path"]).is_file()
+    assert samples["sha256"] == hashlib.sha256(
+        Path(samples["path"]).read_bytes()
+    ).hexdigest()
     assert "controller_exception" in (control / "controller.log").read_text(
         encoding="utf-8"
     )
@@ -885,8 +1167,9 @@ def test_current_policy_preflight_refuses_partial_result_reuse(
     )
     write_exclusive_json(paths["preflight_results"] / "partial.json", {"partial": True})
     monkeypatch.setenv("TMUX", "fixture")
+    guard = types.SimpleNamespace(raise_if_violated=lambda: None)
     with pytest.raises(CanonicalScreeningError, match="refuses result reuse"):
-        module.materialize_preflights(policy, paths)
+        module.materialize_preflights(policy, paths, guard, "d" * 64)
 
 
 def test_write_exclusive_json_rejects_overwrite(tmp_path: Path) -> None:

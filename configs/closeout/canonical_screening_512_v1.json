@@ -2,7 +2,28 @@
   "schema_version": 1,
   "contract_type": "safa_canonical_screening_policy_v1",
   "campaign_id": "historical-canonical-512-v1",
-  "supersedes_policy_sha256": "f7d9b8e263bdd54af7754889c7e7ce92d3ec7212d3784ac11c819fc3c07381cd",
+  "supersedes": {
+    "policy_sha256": "8ce4855b042161ff5698ce400f8b80122add90d6025ffd08f31fe49d8ef84a7f",
+    "classification": "started_incomplete",
+    "result_count": 1,
+    "pending_count": 192,
+    "controller_terminal": {
+      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/8ce4855b042161ff5698ce400f8b80122add90d6025ffd08f31fe49d8ef84a7f/preflight_control/controller_terminal.json",
+      "sha256": "5bdc2d15ab859c90414c1721d1d0021357a72063f32615730da805926ec89959"
+    },
+    "wrapper_exit": {
+      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/8ce4855b042161ff5698ce400f8b80122add90d6025ffd08f31fe49d8ef84a7f/preflight_control/wrapper_exit.json",
+      "sha256": "d45fd136f1df90f4c0faf8ac3b969e5e33b33e2396cb3a9d6a0085e49a213f84"
+    },
+    "controller_log": {
+      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/8ce4855b042161ff5698ce400f8b80122add90d6025ffd08f31fe49d8ef84a7f/preflight_control/controller.log",
+      "sha256": "dbc1db7af6a1bbd1d08ae1aace8ec4447043e3349b43a87e80cf095d12da9332"
+    },
+    "controller_process_log": {
+      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/8ce4855b042161ff5698ce400f8b80122add90d6025ffd08f31fe49d8ef84a7f/preflight_control/controller_process.log",
+      "sha256": "0823b072d932cf3192ec1bef9c61a6352f8acfee514be9d8c678e8ff090eeb7c"
+    }
+  },
   "python": "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
   "source": {
     "ledger": {
@@ -85,6 +106,10 @@
     "gpu_headroom_bytes": 2147483648,
     "cpu_admission_percent": 85,
     "cpu_hard_limit_percent": 90,
+    "cpu_window_seconds": 60,
+    "cpu_consecutive_hard_windows": 2,
+    "resource_poll_seconds": 10,
+    "swap_consecutive_hard_intervals": 3,
     "ram_admission_percent": 85,
     "ram_hard_limit_percent": 90,
     "disk_admission_percent": 85,
@@ -131,7 +156,7 @@
     },
     "screening_contracts": {
       "path": "src/safa/closeout/canonical_screening.py",
-      "sha256": "8d1c8a86e9534d681f4247ad4d765c21bb2511e9a4d599922ea3a9ab36abe669"
+      "sha256": "3928d0493a9df5f53872f54aecafc4b2e27993a6edaba602aad335ebefffa3a0"
     },
     "screening_worker": {
       "path": "src/safa/closeout/canonical_screening_worker.py",
@@ -139,7 +164,7 @@
     },
     "controller": {
       "path": "scripts/run_canonical_checkpoint_screening.py",
-      "sha256": "88a9f7645b211cc2adac8f5cce80c088402380fe841f3af0737925940e7b3912"
+      "sha256": "fcf1e902ed05d0f843dc0bc96e3883896a5e9201d6c288a485493fa5450fd7a4"
     },
     "preflight_wrapper": {
       "path": "scripts/run_canonical_preflight_wrapper.py",

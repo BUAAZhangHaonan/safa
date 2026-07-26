@@ -14,6 +14,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, Mapping, Sequence
 
@@ -296,6 +297,223 @@ def assert_cpu_resource_admission(
     }
 
 
+class CpuWindowState:
+    def __init__(self, hard_limit_percent: float, consecutive_limit: int) -> None:
+        self.hard_limit_percent = hard_limit_percent
+        self.consecutive_limit = consecutive_limit
+        self.consecutive_high = 0
+        self.window_count = 0
+        self.violated = False
+
+    def record(self, cpu_percent: float) -> bool:
+        self.window_count += 1
+        if self.violated:
+            return True
+        if cpu_percent > self.hard_limit_percent:
+            self.consecutive_high += 1
+        else:
+            self.consecutive_high = 0
+        if self.consecutive_high >= self.consecutive_limit:
+            self.violated = True
+        return self.violated
+
+
+class RuntimeResourceGuard:
+    def __init__(
+        self,
+        policy: Mapping[str, Any],
+        sample_path: Path,
+        disk_path: Path,
+    ) -> None:
+        resources = policy["resources"]
+        self.policy_sha256 = str(policy["policy_sha256"])
+        self.window_seconds = int(resources["cpu_window_seconds"])
+        self.poll_seconds = int(resources["resource_poll_seconds"])
+        self.cpu_state = CpuWindowState(
+            float(resources["cpu_hard_limit_percent"]),
+            int(resources["cpu_consecutive_hard_windows"]),
+        )
+        self.ram_hard_limit_percent = float(resources["ram_hard_limit_percent"])
+        self.disk_hard_limit_percent = float(resources["disk_hard_limit_percent"])
+        self.disk_path = disk_path
+        self.sample_path = sample_path
+        self.swap_consecutive_io = 0
+        self.swap_consecutive_limit = int(
+            resources["swap_consecutive_hard_intervals"]
+        )
+        self._violation_reason: str | None = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="safa-canonical-runtime-resource-guard",
+            daemon=True,
+        )
+        self._lock = threading.Lock()
+        self._thread_failure: BaseException | None = None
+        self._started = False
+
+    def start(self) -> None:
+        self._thread.start()
+        self._started = True
+
+    def _run(self) -> None:
+        try:
+            previous_total, previous_idle = _cpu_times()
+            cpu_window_started = time.monotonic()
+            previous_swap = _swap_pages()
+            sequence = 0
+            while not self._stop.wait(self.poll_seconds):
+                cpu_percent: float | None = None
+                now = time.monotonic()
+                if now - cpu_window_started >= self.window_seconds:
+                    current_total, current_idle = _cpu_times()
+                    total_delta = current_total - previous_total
+                    idle_delta = current_idle - previous_idle
+                    if (
+                        total_delta <= 0
+                        or idle_delta < 0
+                        or idle_delta > total_delta
+                    ):
+                        raise CanonicalScreeningError(
+                            "CPU runtime window counters are invalid"
+                        )
+                    cpu_percent = (
+                        100.0 * (total_delta - idle_delta) / total_delta
+                    )
+                    previous_total, previous_idle = current_total, current_idle
+                    cpu_window_started = now
+                memory_percent = _memory_percent()
+                disk_percent = _disk_percent(self.disk_path)
+                current_swap = _swap_pages()
+                sequence += 1
+                with self._lock:
+                    cpu_violated = (
+                        self.cpu_state.record(cpu_percent)
+                        if cpu_percent is not None
+                        else False
+                    )
+                    if (
+                        current_swap[0] > previous_swap[0]
+                        or current_swap[1] > previous_swap[1]
+                    ):
+                        self.swap_consecutive_io += 1
+                    else:
+                        self.swap_consecutive_io = 0
+                    if cpu_violated and self._violation_reason is None:
+                        self._violation_reason = (
+                            f"CPU runtime hard stop: "
+                            f"{self.cpu_state.consecutive_high} consecutive "
+                            f"{self.window_seconds}s windows exceeded "
+                            f"{self.cpu_state.hard_limit_percent:.0f}%"
+                        )
+                    if (
+                        memory_percent >= self.ram_hard_limit_percent
+                        and self._violation_reason is None
+                    ):
+                        self._violation_reason = (
+                            f"RAM runtime hard stop: {memory_percent:.2f}% >= "
+                            f"{self.ram_hard_limit_percent:.0f}%"
+                        )
+                    if (
+                        disk_percent >= self.disk_hard_limit_percent
+                        and self._violation_reason is None
+                    ):
+                        self._violation_reason = (
+                            f"disk runtime hard stop: {disk_percent:.2f}% >= "
+                            f"{self.disk_hard_limit_percent:.0f}%"
+                        )
+                    if (
+                        self.swap_consecutive_io >= self.swap_consecutive_limit
+                        and self._violation_reason is None
+                    ):
+                        self._violation_reason = (
+                            "sustained swap I/O observed for "
+                            f"{self.swap_consecutive_limit} consecutive "
+                            f"{self.poll_seconds}s resource intervals"
+                        )
+                    consecutive = self.cpu_state.consecutive_high
+                    swap_consecutive = self.swap_consecutive_io
+                    violation_reason = self._violation_reason
+                sample = {
+                    "schema_version": 1,
+                    "contract_type": "safa_canonical_runtime_resource_window_v1",
+                    "policy_sha256": self.policy_sha256,
+                    "sequence": sequence,
+                    "resource_poll_seconds": self.poll_seconds,
+                    "window_seconds": self.window_seconds,
+                    "cpu_percent": cpu_percent,
+                    "cpu_hard_limit_percent": self.cpu_state.hard_limit_percent,
+                    "cpu_consecutive_high": consecutive,
+                    "cpu_consecutive_limit": self.cpu_state.consecutive_limit,
+                    "memory_percent": memory_percent,
+                    "ram_hard_limit_percent": self.ram_hard_limit_percent,
+                    "disk_percent": disk_percent,
+                    "disk_hard_limit_percent": self.disk_hard_limit_percent,
+                    "swap_pages": {"in": current_swap[0], "out": current_swap[1]},
+                    "swap_consecutive_io": swap_consecutive,
+                    "swap_consecutive_limit": self.swap_consecutive_limit,
+                    "violation_reason": violation_reason,
+                    "violated": violation_reason is not None,
+                    "completed_at": _utc_now(),
+                }
+                sample["resource_window_sha256"] = hashlib.sha256(
+                    canonical_json(sample)
+                ).hexdigest()
+                _append_jsonl(self.sample_path, sample)
+                previous_swap = current_swap
+        except BaseException as exc:
+            with self._lock:
+                self._thread_failure = exc
+
+    def raise_if_violated(self) -> None:
+        with self._lock:
+            violation_reason = self._violation_reason
+            thread_failure = self._thread_failure
+        if thread_failure is not None:
+            raise CanonicalScreeningError(
+                "runtime resource guard failed: "
+                f"{type(thread_failure).__name__}: {thread_failure}"
+            )
+        if violation_reason is not None:
+            raise CanonicalScreeningError(violation_reason)
+
+    def stop(self) -> dict[str, Any]:
+        self._stop.set()
+        if self._started:
+            self._thread.join()
+        with self._lock:
+            summary = {
+                "started": self._started,
+                "window_seconds": self.window_seconds,
+                "resource_poll_seconds": self.poll_seconds,
+                "cpu_hard_limit_percent": self.cpu_state.hard_limit_percent,
+                "cpu_consecutive_limit": self.cpu_state.consecutive_limit,
+                "window_count": self.cpu_state.window_count,
+                "final_cpu_consecutive_high": self.cpu_state.consecutive_high,
+                "final_swap_consecutive_io": self.swap_consecutive_io,
+                "swap_consecutive_limit": self.swap_consecutive_limit,
+                "violation_reason": self._violation_reason,
+                "violated": self._violation_reason is not None,
+                "thread_failure": (
+                    None
+                    if self._thread_failure is None
+                    else {
+                        "type": type(self._thread_failure).__name__,
+                        "message": str(self._thread_failure),
+                    }
+                ),
+            }
+        summary["samples"] = (
+            {
+                "path": str(self.sample_path.resolve()),
+                "sha256": sha256_file(self.sample_path),
+            }
+            if self.sample_path.is_file()
+            else None
+        )
+        return summary
+
+
 def _write_admission(
     policy: Mapping[str, Any],
     paths: Mapping[str, Path],
@@ -331,7 +549,10 @@ def _load_preflight_request(
 
 
 def materialize_preflights(
-    policy: Mapping[str, Any], paths: Mapping[str, Path]
+    policy: Mapping[str, Any],
+    paths: Mapping[str, Path],
+    resource_guard: RuntimeResourceGuard,
+    startup_admission_sha256: str,
 ) -> dict[str, int]:
     if "TMUX" not in os.environ:
         raise CanonicalScreeningError("CPU checkpoint preflight must run inside tmux")
@@ -348,9 +569,9 @@ def materialize_preflights(
     invalid = 0
     attempt_root = paths["preflight_control"] / "attempts"
     for sequence, request_path in enumerate(requests, start=1):
+        resource_guard.raise_if_violated()
         request = _load_preflight_request(request_path, policy)
         result_path = paths["preflight_results"] / request_path.name
-        admission = assert_cpu_resource_admission(policy, paths["root"])
         claim = {
             "schema_version": 1,
             "contract_type": "safa_canonical_preflight_attempt_claim_v1",
@@ -360,7 +581,7 @@ def materialize_preflights(
             "preflight_request_sha256": request["preflight_request_sha256"],
             "checkpoint_sha256": request["checkpoint_sha256"],
             "checkpoint_model": request["checkpoint_model"],
-            "admission": admission,
+            "startup_admission_sha256": startup_admission_sha256,
             "started_at": _utc_now(),
             "worker_pid": os.getpid(),
         }
@@ -380,6 +601,7 @@ def materialize_preflights(
                 compute_sha256=True,
                 smoke_samples=0,
             )
+            resource_guard.raise_if_violated()
             result = build_preflight_result(request, policy, strict_result)
             is_valid, _ = validate_preflight_result(result, request, policy)
             write_exclusive_json(result_path, result)
@@ -406,7 +628,6 @@ def materialize_preflights(
                 valid += 1
             else:
                 invalid += 1
-            _append_monitor_sample(policy, paths, "preflight")
         except BaseException as exc:
             terminal = {
                 "schema_version": 1,
@@ -427,6 +648,8 @@ def materialize_preflights(
             ).hexdigest()
             write_exclusive_json(terminal_path, terminal)
             raise
+        _append_monitor_sample(policy, paths, "preflight")
+        resource_guard.raise_if_violated()
     _append_monitor_sample(policy, paths, "preflight", terminal=True)
     return {
         "request_count": len(requests),
@@ -442,6 +665,10 @@ def _execute_preflight_controller(
 ) -> dict[str, Any]:
     if "TMUX" not in os.environ:
         raise CanonicalScreeningError("CPU checkpoint preflight must run inside tmux")
+    startup_snapshot = assert_cpu_resource_admission(policy, paths["root"])
+    startup_admission = _write_admission(
+        policy, paths, "preflight_cpu_startup", startup_snapshot
+    )
     control = paths["preflight_control"]
     claim = {
         "schema_version": 1,
@@ -449,6 +676,7 @@ def _execute_preflight_controller(
         "campaign_id": policy["campaign_id"],
         "policy_sha256": policy["policy_sha256"],
         "supersedes_policy_sha256": policy["supersedes_policy_sha256"],
+        "startup_admission": startup_admission,
         "request_count": len(list(paths["preflight_requests"].glob("*.json"))),
         "controller_pid": os.getpid(),
         "started_at": _utc_now(),
@@ -465,11 +693,22 @@ def _execute_preflight_controller(
     log_path.parent.mkdir(parents=True, exist_ok=True)
     summary: dict[str, Any] | None = None
     caught: BaseException | None = None
+    resource_guard = RuntimeResourceGuard(
+        policy,
+        control / "runtime_resource_windows.jsonl",
+        paths["root"].parent,
+    )
     with log_path.open("x", encoding="utf-8", buffering=1) as log_handle:
         with redirect_stdout(log_handle), redirect_stderr(log_handle):
             try:
+                resource_guard.start()
                 print(canonical_json({"event": "controller_started", **claim}).decode(), end="")
-                materialized = materialize_preflights(policy, paths)
+                materialized = materialize_preflights(
+                    policy,
+                    paths,
+                    resource_guard,
+                    startup_admission["canonical_sha256"],
+                )
                 refreshed = build_checkpoint_plan(
                     REPO_ROOT, policy, paths["preflight_results"]
                 )
@@ -503,6 +742,25 @@ def _execute_preflight_controller(
                     end="",
                 )
             finally:
+                resource_guard_summary = resource_guard.stop()
+                if (
+                    caught is None
+                    and resource_guard_summary["thread_failure"] is not None
+                ):
+                    failure = resource_guard_summary["thread_failure"]
+                    caught = CanonicalScreeningError(
+                        "runtime resource guard failed before controller terminal: "
+                        f"{failure['type']}: {failure['message']}"
+                    )
+                    summary = None
+                if (
+                    caught is None
+                    and resource_guard_summary["violation_reason"] is not None
+                ):
+                    caught = CanonicalScreeningError(
+                        str(resource_guard_summary["violation_reason"])
+                    )
+                    summary = None
                 result_count = len(list(paths["preflight_results"].glob("*.json")))
                 attempt_claim_count = len(
                     list((control / "attempts").glob("*.claim.json"))
@@ -520,6 +778,21 @@ def _execute_preflight_controller(
                     "pending_count": claim["request_count"] - result_count,
                     "attempt_claim_count": attempt_claim_count,
                     "attempt_terminal_count": attempt_terminal_count,
+                    "runtime_resource_guard": resource_guard_summary,
+                    "controller_monitor_samples": (
+                        {
+                            "path": str(
+                                (paths["logs"] / "preflight__monitor.jsonl").resolve()
+                            ),
+                            "sha256": sha256_file(
+                                paths["logs"] / "preflight__monitor.jsonl"
+                            ),
+                        }
+                        if (
+                            paths["logs"] / "preflight__monitor.jsonl"
+                        ).is_file()
+                        else None
+                    ),
                     "failure": (
                         None
                         if caught is None
@@ -799,6 +1072,7 @@ def _monitor_sample(
     *,
     terminal: bool,
 ) -> dict[str, Any]:
+    cpu_only = phase == "preflight"
     log_rows = []
     if paths["logs"].exists():
         for path in sorted(paths["logs"].glob(f"{phase}*__*.log")):
@@ -822,8 +1096,8 @@ def _monitor_sample(
         "memory_percent": _memory_percent(),
         "disk_percent": _disk_percent(paths["root"].parent),
         "swap_pages": {"in": _swap_pages()[0], "out": _swap_pages()[1]},
-        "gpus": _gpu_snapshot(),
-        "compute_processes": _gpu_compute_processes(),
+        "gpus": None if cpu_only else _gpu_snapshot(),
+        "compute_processes": None if cpu_only else _gpu_compute_processes(),
         "logs": log_rows,
         "artifacts": _artifact_progress(paths, phase),
     }
@@ -888,63 +1162,24 @@ def _cleanup_active_workers(
     active.clear()
 
 
-def _hard_resource_violation(
+def _gpu_hard_resource_violation(
     policy: Mapping[str, Any],
-    campaign_root: Path,
-    previous_swap: tuple[int, int],
-    sustained_swap_intervals: int,
-) -> tuple[str | None, tuple[int, int], int]:
+) -> str | None:
     resources = policy["resources"]
-    cpu_percent = _cpu_load_percent()
-    memory_percent = _memory_percent()
-    disk_percent = _disk_percent(campaign_root.parent)
-    if cpu_percent >= float(resources["cpu_hard_limit_percent"]):
-        return (
-            f"CPU hard limit reached: {cpu_percent:.2f}%",
-            previous_swap,
-            sustained_swap_intervals,
-        )
-    if memory_percent >= float(resources["ram_hard_limit_percent"]):
-        return (
-            f"RAM hard limit reached: {memory_percent:.2f}%",
-            previous_swap,
-            sustained_swap_intervals,
-        )
-    if disk_percent >= float(resources["disk_hard_limit_percent"]):
-        return (
-            f"disk hard limit reached: {disk_percent:.2f}%",
-            previous_swap,
-            sustained_swap_intervals,
-        )
     for gpu in _gpu_snapshot():
         if gpu["index"] not in resources["physical_gpus"]:
             continue
         percent = 100.0 * gpu["memory_used_mib"] / gpu["memory_total_mib"]
         if percent >= 90.0:
             return (
-                f"GPU{gpu['index']} memory hard limit reached: {percent:.2f}%",
-                previous_swap,
-                sustained_swap_intervals,
+                f"GPU{gpu['index']} memory hard limit reached: {percent:.2f}%"
             )
         if gpu["temperature_c"] > 85:
             return (
                 f"GPU{gpu['index']} temperature hard limit reached: "
-                f"{gpu['temperature_c']}C",
-                previous_swap,
-                sustained_swap_intervals,
+                f"{gpu['temperature_c']}C"
             )
-    current_swap = _swap_pages()
-    if current_swap[0] > previous_swap[0] or current_swap[1] > previous_swap[1]:
-        sustained_swap_intervals += 1
-    else:
-        sustained_swap_intervals = 0
-    if sustained_swap_intervals >= 3:
-        return (
-            "sustained swap I/O observed for three resource intervals",
-            current_swap,
-            sustained_swap_intervals,
-        )
-    return None, current_swap, sustained_swap_intervals
+    return None
 
 
 def _claim_slot(lock_root: Path, gpu_index: int, slot_index: int, request: Path) -> Path:
@@ -1041,13 +1276,18 @@ def _run_gpu_phase(
     failures: list[str] = []
     active: list[dict[str, Any]] = []
     request_queue = deque(requests)
-    previous_swap = _swap_pages()
-    sustained_swap_intervals = 0
     stop_reason: str | None = None
     unexpected: BaseException | None = None
     monitor_path = _append_monitor_sample(policy, paths, phase)
+    resource_guard = RuntimeResourceGuard(
+        policy,
+        paths["logs"] / f"{phase}__runtime_resource_windows.jsonl",
+        paths["root"].parent,
+    )
     try:
+        resource_guard.start()
         while request_queue or active:
+            resource_guard.raise_if_violated()
             while request_queue and slot_pool.free_count:
                 request = request_queue.popleft()
                 gpu, slot_index = slot_pool.acquire()
@@ -1105,12 +1345,7 @@ def _run_gpu_phase(
             if failures:
                 stop_reason = "worker_nonzero_exit"
                 break
-            violation, previous_swap, sustained_swap_intervals = _hard_resource_violation(
-                policy,
-                paths["root"],
-                previous_swap,
-                sustained_swap_intervals,
-            )
+            violation = _gpu_hard_resource_violation(policy)
             if violation is not None:
                 failures.append(violation)
                 stop_reason = "resource_hard_stop"
@@ -1123,6 +1358,20 @@ def _run_gpu_phase(
         stop_reason = "controller_exception"
         failures.append(f"{type(exc).__name__}: {exc}")
     finally:
+        resource_guard_summary = resource_guard.stop()
+        late_resource_failure = (
+            resource_guard_summary["violation_reason"]
+            or (
+                "runtime resource guard failed: "
+                f"{resource_guard_summary['thread_failure']['type']}: "
+                f"{resource_guard_summary['thread_failure']['message']}"
+                if resource_guard_summary["thread_failure"] is not None
+                else None
+            )
+        )
+        if late_resource_failure is not None and late_resource_failure not in failures:
+            failures.append(late_resource_failure)
+            stop_reason = "resource_hard_stop"
         if failures or unexpected is not None:
             _cleanup_active_workers(active, slot_pool)
         _append_monitor_sample(policy, paths, phase, terminal=True)
@@ -1137,6 +1386,7 @@ def _run_gpu_phase(
                 "path": str(monitor_path.resolve()),
                 "sha256": sha256_file(monitor_path),
             },
+            "runtime_resource_guard": resource_guard_summary,
         }
         stop["controller_summary_sha256"] = hashlib.sha256(
             canonical_json(stop)
@@ -1157,6 +1407,7 @@ def _run_gpu_phase(
             "path": str(monitor_path.resolve()),
             "sha256": sha256_file(monitor_path),
         },
+        "runtime_resource_guard": resource_guard_summary,
     }
     summary["controller_summary_sha256"] = hashlib.sha256(
         canonical_json(summary)

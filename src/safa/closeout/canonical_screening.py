@@ -177,6 +177,83 @@ def _validate_bound_file(
     )}
 
 
+def validate_supersession_evidence(
+    repo_root: Path, raw_supersedes: Mapping[str, Any]
+) -> dict[str, Any]:
+    supersedes = _require_mapping(raw_supersedes, "supersession evidence")
+    _require_exact_keys(
+        supersedes,
+        {
+            "policy_sha256",
+            "classification",
+            "result_count",
+            "pending_count",
+            "controller_terminal",
+            "wrapper_exit",
+            "controller_log",
+            "controller_process_log",
+        },
+        "supersession evidence",
+    )
+    if (
+        supersedes["policy_sha256"]
+        != "8ce4855b042161ff5698ce400f8b80122add90d6025ffd08f31fe49d8ef84a7f"
+        or supersedes["classification"] != "started_incomplete"
+        or supersedes["result_count"] != 1
+        or supersedes["pending_count"] != 192
+    ):
+        raise CanonicalScreeningError("canonical supersession status differs")
+    root = repo_root.resolve()
+    bound = {
+        "policy_sha256": supersedes["policy_sha256"],
+        "classification": "started_incomplete",
+        "result_count": 1,
+        "pending_count": 192,
+        **{
+            name: _validate_bound_file(
+                root, supersedes[name], f"supersession {name}"
+            )
+            for name in (
+                "controller_terminal",
+                "wrapper_exit",
+                "controller_log",
+                "controller_process_log",
+            )
+        },
+    }
+    terminal = load_json(
+        Path(bound["controller_terminal"]["path"]),
+        "superseded controller terminal",
+    )
+    if (
+        terminal.get("contract_type")
+        != "safa_canonical_preflight_controller_terminal_v1"
+        or terminal.get("policy_sha256") != bound["policy_sha256"]
+        or terminal.get("status") != "failed"
+        or terminal.get("result_count") != 1
+        or terminal.get("pending_count") != 192
+    ):
+        raise CanonicalScreeningError(
+            "superseded controller terminal semantics differ"
+        )
+    wrapper_exit = load_json(
+        Path(bound["wrapper_exit"]["path"]),
+        "superseded wrapper exit",
+    )
+    if (
+        wrapper_exit.get("contract_type")
+        != "safa_canonical_preflight_wrapper_exit_v2"
+        or wrapper_exit.get("policy_sha256") != bound["policy_sha256"]
+        or wrapper_exit.get("exit_code") != 2
+        or wrapper_exit.get("signal") is not None
+        or wrapper_exit.get("controller_terminal") != bound["controller_terminal"]
+        or wrapper_exit.get("controller_process_log")
+        != bound["controller_process_log"]
+    ):
+        raise CanonicalScreeningError("superseded wrapper exit semantics differ")
+    return bound
+
+
 def validate_policy(repo_root: Path, policy_path: Path) -> dict[str, Any]:
     root = repo_root.resolve()
     raw = load_json(policy_path, "canonical screening policy")
@@ -186,7 +263,7 @@ def validate_policy(repo_root: Path, policy_path: Path) -> dict[str, Any]:
             "schema_version",
             "contract_type",
             "campaign_id",
-            "supersedes_policy_sha256",
+            "supersedes",
             "python",
             "source",
             "protocol",
@@ -200,11 +277,7 @@ def validate_policy(repo_root: Path, policy_path: Path) -> dict[str, Any]:
         raise CanonicalScreeningError("canonical screening policy type/version mismatch")
     if raw["campaign_id"] != "historical-canonical-512-v1":
         raise CanonicalScreeningError("canonical screening campaign_id is not frozen")
-    if (
-        raw["supersedes_policy_sha256"]
-        != "f7d9b8e263bdd54af7754889c7e7ce92d3ec7212d3784ac11c819fc3c07381cd"
-    ):
-        raise CanonicalScreeningError("canonical superseded policy binding differs")
+    bound_supersedes = validate_supersession_evidence(root, raw["supersedes"])
     if raw["python"] != "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python":
         raise CanonicalScreeningError("canonical screening interpreter is not frozen")
 
@@ -314,6 +387,10 @@ def validate_policy(repo_root: Path, policy_path: Path) -> dict[str, Any]:
             "gpu_headroom_bytes",
             "cpu_admission_percent",
             "cpu_hard_limit_percent",
+            "cpu_window_seconds",
+            "cpu_consecutive_hard_windows",
+            "resource_poll_seconds",
+            "swap_consecutive_hard_intervals",
             "ram_admission_percent",
             "ram_hard_limit_percent",
             "disk_admission_percent",
@@ -331,6 +408,10 @@ def validate_policy(repo_root: Path, policy_path: Path) -> dict[str, Any]:
         or resources["require_tmux"] is not True
         or resources["cpu_admission_percent"] != 85
         or resources["cpu_hard_limit_percent"] != 90
+        or resources["cpu_window_seconds"] != 60
+        or resources["cpu_consecutive_hard_windows"] != 2
+        or resources["resource_poll_seconds"] != 10
+        or resources["swap_consecutive_hard_intervals"] != 3
         or resources["ram_admission_percent"] != 85
         or resources["ram_hard_limit_percent"] != 90
         or resources["disk_admission_percent"] != 85
@@ -401,7 +482,8 @@ def validate_policy(repo_root: Path, policy_path: Path) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "contract_type": POLICY_CONTRACT,
         "campaign_id": raw["campaign_id"],
-        "supersedes_policy_sha256": raw["supersedes_policy_sha256"],
+        "supersedes": bound_supersedes,
+        "supersedes_policy_sha256": bound_supersedes["policy_sha256"],
         "python": raw["python"],
         "policy_file": {
             "path": str(policy_path.resolve()),
