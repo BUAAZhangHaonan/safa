@@ -15,6 +15,7 @@ from safa.closeout.canonical_screening import (
     _require_no_repo_path_component_symlinks,
     _require_tree_without_symlinks,
     _validate_6b_failed_probe_root_identity,
+    _validate_ram_probe_artifact_seal,
     _validate_ram_slot_budget_source,
     build_candidate_manifest,
     build_checkpoint_plan,
@@ -1015,6 +1016,12 @@ def test_ram_probe_controller_positive_mock_chain(
     manifest_path.write_text("{}\n", encoding="utf-8")
     artifact_root = tmp_path / "probe"
     policy = validate_policy(root, config)
+    policy["resources"] = {
+        key: value
+        for key, value in policy["resources"].items()
+        if key not in {"ram_slot_budget_bytes", "ram_slot_budget_source"}
+    }
+    policy["resources"]["ram_budget_status"] = "probe_required"
     manifest = {"candidate_manifest_sha256": "2" * 64}
     monkeypatch.setenv("TMUX", "fixture")
     monkeypatch.setattr(module, "_select_probe_candidates", lambda _value: [])
@@ -1134,6 +1141,115 @@ def test_ram_projection_accepts_84_99_and_rejects_exact_85() -> None:
             used_bytes=0,
             slot_budget_bytes=850_000,
             slot_count=1,
+            admission_limit_percent=85,
+            budget_source=source,
+        )
+
+
+def test_sealed_4d_ram_probe_artifact_tree_and_source() -> None:
+    root = Path(__file__).resolve().parents[1]
+    policy = validate_policy(
+        root,
+        root / "configs/closeout/canonical_screening_512_v1.json",
+        verify_historical_output_evidence=False,
+    )
+    resources = policy["resources"]
+    source = resources["ram_slot_budget_source"]
+    seal = source["probe_artifact_seal"]
+    assert resources["ram_budget_status"] == "sealed"
+    assert resources["ram_slot_budget_bytes"] == 3_768_299_111
+    assert source["peak_sampled_process_tree_rss_bytes"] == 3_275_694_080
+    assert source["worker_vmhwm_bytes"] == 3_425_726_464
+    assert source["ram_budget_basis_bytes"] == 3_425_726_464
+    assert seal["file_count"] == 28
+    assert seal["directory_count"] == 5
+    assert seal["symlink_count"] == 0
+    assert len([name for name in seal["files"] if name.endswith(".png")]) == 16
+    assert seal["controller_terminal"] == "absent_by_contract"
+    assert seal["scientific_result_reuse"] == "forbidden"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("controller_terminal", "present"),
+        ("scientific_result_reuse", "allowed"),
+        ("file_count", 27),
+    ],
+)
+def test_sealed_4d_ram_probe_rejects_contract_tamper(
+    field: str, value: object
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    raw = load_json(
+        root / "configs/closeout/canonical_screening_512_v1.json",
+        "canonical policy",
+    )
+    seal = dict(raw["resources"]["ram_slot_budget_source"]["probe_artifact_seal"])
+    seal[field] = value
+    with pytest.raises(CanonicalScreeningError, match="artifact tree"):
+        _validate_ram_probe_artifact_seal(root, seal)
+
+
+@pytest.mark.parametrize("symlink_kind", ["root", "ancestor"])
+def test_sealed_4d_ram_probe_rejects_path_component_symlinks(
+    tmp_path: Path, symlink_kind: str
+) -> None:
+    source_repo = Path(__file__).resolve().parents[1]
+    raw = load_json(
+        source_repo / "configs/closeout/canonical_screening_512_v1.json",
+        "canonical policy",
+    )
+    seal = raw["resources"]["ram_slot_budget_source"]["probe_artifact_seal"]
+    source_root = (
+        source_repo
+        / "artifacts/closeout/historical-canonical-512-v1/"
+        "ram_probe__4d0345b6fc29cc8e"
+    )
+    expected_root = (
+        tmp_path
+        / "artifacts/closeout/historical-canonical-512-v1/"
+        "ram_probe__4d0345b6fc29cc8e"
+    )
+    if symlink_kind == "root":
+        expected_root.parent.mkdir(parents=True)
+        expected_root.symlink_to(source_root, target_is_directory=True)
+    else:
+        (tmp_path / "artifacts").mkdir()
+        (tmp_path / "artifacts/closeout").symlink_to(
+            source_repo / "artifacts/closeout",
+            target_is_directory=True,
+        )
+    with pytest.raises(CanonicalScreeningError, match="symlink"):
+        _validate_ram_probe_artifact_seal(tmp_path, seal)
+
+
+def test_eight_worker_ram_projection_is_strictly_below_85_percent() -> None:
+    module = _controller_module()
+    total = 100_000_000_000
+    slot_budget = 3_768_299_111
+    slots = 8
+    reserved = slots * slot_budget
+    exact_85_used = 85_000_000_000 - reserved
+    source = {"contract_type": "safa_canonical_screening_ram_budget_source_v2"}
+    accepted = module._ram_reservation_projection(
+        total_bytes=total,
+        used_bytes=exact_85_used - 1,
+        slot_budget_bytes=slot_budget,
+        slot_count=slots,
+        admission_limit_percent=85,
+        budget_source=source,
+    )
+    assert accepted["slot_count"] == 8
+    assert accepted["reserved_bytes"] == 30_146_392_888
+    assert accepted["projected_used_bytes"] == 84_999_999_999
+    assert accepted["projected_used_percent"] < 85
+    with pytest.raises(CanonicalScreeningError, match="RAM reservation"):
+        module._ram_reservation_projection(
+            total_bytes=total,
+            used_bytes=exact_85_used,
+            slot_budget_bytes=slot_budget,
+            slot_count=slots,
             admission_limit_percent=85,
             budget_source=source,
         )
@@ -2971,7 +3087,7 @@ def test_worker_rejects_truncated_arcface_probe_request() -> None:
         )
 
 
-def test_current_policy_binds_4c5_preflight_failed_probe_and_arcface() -> None:
+def test_current_policy_binds_4d_preflight_successful_probe_and_arcface() -> None:
     root = Path(__file__).parents[1]
     policy_path = root / "configs/closeout/canonical_screening_512_v1.json"
 
@@ -2979,25 +3095,30 @@ def test_current_policy_binds_4c5_preflight_failed_probe_and_arcface() -> None:
 
     supersedes = policy["supersedes"]
     assert supersedes["policy_sha256"] == (
-        "4c5ecb55501fa6b09b63377e892f1cee3e0140abd2a02859d33b9b33375a1576"
+        "4d0345b6fc29cc8ec50ddc0255188a466ae78edae2e472fed9deda461cf76cbc"
     )
     assert supersedes["classification"] == (
-        "completed_preflight_and_failed_ram_probe_superseded"
+        "completed_preflight_and_successful_resource_only_probe_superseded"
     )
     assert supersedes["preflight"]["request_count"] == 193
     assert supersedes["preflight"]["result_count"] == 193
     assert supersedes["preflight"]["valid_count"] == 193
     assert supersedes["preflight"]["invalid_count"] == 0
     assert supersedes["preflight"]["reused_count"] == 0
-    assert supersedes["failed_ram_probe"]["generation_candidate_count"] == 1
-    assert supersedes["failed_ram_probe"]["generation_sample_count"] == 8
-    assert supersedes["failed_ram_probe"]["e0_edev_sample_count"] == 8
-    assert supersedes["failed_ram_probe"]["arcface_inference_count"] == 0
-    assert supersedes["failed_ram_probe"]["quality_evaluation_count"] == 0
-    assert supersedes["failed_ram_probe"]["pixel_candidate_count"] == 0
-    assert supersedes["failed_ram_probe"]["worker_result_present"] is False
-    assert supersedes["failed_ram_probe"]["png_reuse"] == "forbidden"
-    assert supersedes["failed_ram_probe"]["in_place_retry"] == "forbidden"
+    probe = supersedes["successful_ram_probe"]
+    assert probe["classification"] == "successful_resource_measurement_only"
+    assert probe["controller_terminal"] == "absent_by_contract"
+    assert probe["resource_measurement_only"] is True
+    assert probe["scientific_result_reuse"] == "forbidden"
+    assert probe["retry_count"] == 0
+    assert probe["artifact_seal"]["file_count"] == 28
+    assert len(
+        [
+            name
+            for name in probe["artifact_seal"]["files"]
+            if name.endswith(".png")
+        ]
+    ) == 16
     assert supersedes["scientific_result_reuse"] == "forbidden"
     assert supersedes["successor_execution"] == "fresh_full_193_preflight"
 
@@ -3009,13 +3130,13 @@ def test_current_policy_binds_4c5_preflight_failed_probe_and_arcface() -> None:
         ("reuse", "status differs"),
         ("root_digest", "evidence root differs"),
         ("preflight_path_alias", "file identity differs"),
-        ("failed_root_digest", "failed root differs"),
-        ("failed_file_sha", "failed root files differ"),
-        ("png_sha", "failed root files differ"),
-        ("generation_count", "classification differs"),
+        ("probe_root_digest", "artifact tree differs"),
+        ("probe_file_sha", "file differs"),
+        ("controller_terminal", "artifact tree differs"),
+        ("resource_only", "probe semantics differ"),
     ],
 )
-def test_4c5_supersession_tampering_fails_closed(
+def test_4d_supersession_tampering_fails_closed(
     mutation: str,
     match: str,
 ) -> None:
@@ -3035,14 +3156,20 @@ def test_4c5_supersession_tampering_fails_closed(
         supersedes["preflight"]["final_plan"]["path"] = supersedes[
             "preflight"
         ]["candidate_manifest"]["path"]
-    elif mutation == "failed_root_digest":
-        supersedes["failed_ram_probe"]["root"]["digest"] = "0" * 64
-    elif mutation == "failed_file_sha":
-        supersedes["failed_ram_probe"]["files"]["admission.json"] = "0" * 64
-    elif mutation == "png_sha":
-        supersedes["failed_ram_probe"]["png_files"]["000000.png"] = "0" * 64
-    elif mutation == "generation_count":
-        supersedes["failed_ram_probe"]["generation_sample_count"] = 7
+    elif mutation == "probe_root_digest":
+        supersedes["successful_ram_probe"]["artifact_seal"]["root"][
+            "digest"
+        ] = "0" * 64
+    elif mutation == "probe_file_sha":
+        supersedes["successful_ram_probe"]["artifact_seal"]["files"][
+            "admission.json"
+        ] = "0" * 64
+    elif mutation == "controller_terminal":
+        supersedes["successful_ram_probe"]["artifact_seal"][
+            "controller_terminal"
+        ] = "present"
+    elif mutation == "resource_only":
+        supersedes["successful_ram_probe"]["resource_measurement_only"] = False
     else:
         raise AssertionError(mutation)
 

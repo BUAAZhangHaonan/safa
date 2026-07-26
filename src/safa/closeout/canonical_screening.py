@@ -195,6 +195,82 @@ def sha256_directory_tree(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _validate_ram_probe_artifact_seal(
+    repo_root: Path, raw_seal: Mapping[str, Any]
+) -> dict[str, Any]:
+    seal = _require_mapping(raw_seal, "RAM probe artifact seal")
+    _require_exact_keys(
+        seal,
+        {
+            "root",
+            "file_count",
+            "directory_count",
+            "symlink_count",
+            "files",
+            "controller_terminal",
+            "scientific_result_reuse",
+        },
+        "RAM probe artifact seal",
+    )
+    root_binding = _require_mapping(seal["root"], "RAM probe sealed root")
+    _require_exact_keys(
+        root_binding,
+        {"path", "digest", "digest_algorithm"},
+        "RAM probe sealed root",
+    )
+    expected_relative_root = (
+        "artifacts/closeout/historical-canonical-512-v1/"
+        "ram_probe__4d0345b6fc29cc8e"
+    )
+    if root_binding["path"] != expected_relative_root:
+        raise CanonicalScreeningError("sealed RAM probe root identity differs")
+    _require_no_repo_path_component_symlinks(
+        repo_root,
+        expected_relative_root,
+        "sealed RAM probe root",
+    )
+    unresolved_root = repo_root.resolve() / expected_relative_root
+    _require_tree_without_symlinks(unresolved_root, "sealed RAM probe root")
+    root = unresolved_root.resolve()
+    expected_root = (
+        repo_root.resolve()
+        / "artifacts/closeout/historical-canonical-512-v1/"
+        "ram_probe__4d0345b6fc29cc8e"
+    ).resolve()
+    if root != expected_root or not root.is_dir():
+        raise CanonicalScreeningError("sealed RAM probe root differs")
+    entries = list(root.rglob("*"))
+    symlinks = [entry for entry in entries if entry.is_symlink()]
+    files = [entry for entry in entries if entry.is_file()]
+    directories = [entry for entry in entries if entry.is_dir()]
+    expected_files = _require_mapping(seal["files"], "RAM probe sealed files")
+    actual_paths = {entry.relative_to(root).as_posix() for entry in files}
+    if (
+        root_binding["digest_algorithm"]
+        != "sha256_relative_posix_nul_content_nul_v1"
+        or root_binding["digest"] != sha256_directory_tree(root)
+        or seal["file_count"] != 28
+        or seal["file_count"] != len(files)
+        or seal["directory_count"] != 5
+        or seal["directory_count"] != len(directories)
+        or seal["symlink_count"] != 0
+        or symlinks
+        or set(expected_files) != actual_paths
+        or len([path for path in actual_paths if path.endswith(".png")]) != 16
+        or seal["controller_terminal"] != "absent_by_contract"
+        or (root / "controller_terminal.json").exists()
+        or seal["scientific_result_reuse"] != "forbidden"
+    ):
+        raise CanonicalScreeningError("sealed RAM probe artifact tree differs")
+    for relative_path, expected_sha256 in expected_files.items():
+        _require_sha256(expected_sha256, f"RAM probe sealed file {relative_path}")
+        if sha256_file(root / relative_path) != expected_sha256:
+            raise CanonicalScreeningError(
+                f"sealed RAM probe file differs: {relative_path}"
+            )
+    return dict(seal)
+
+
 def write_exclusive_json(path: Path, value: Mapping[str, Any]) -> None:
     content = canonical_json(value)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2408,6 +2484,206 @@ def _validate_4c5_supersession_evidence(
     return dict(supersedes)
 
 
+def _validate_4d_supersession_evidence(
+    repo_root: Path, raw_supersedes: Mapping[str, Any]
+) -> dict[str, Any]:
+    supersedes = _require_mapping(raw_supersedes, "4d supersession evidence")
+    _require_exact_keys(
+        supersedes,
+        {
+            "policy_sha256",
+            "classification",
+            "supersession_reason",
+            "scientific_result_reuse",
+            "successor_execution",
+            "preflight",
+            "successful_ram_probe",
+        },
+        "4d supersession evidence",
+    )
+    policy_sha = (
+        "4d0345b6fc29cc8ec50ddc0255188a466ae78edae2e472fed9deda461cf76cbc"
+    )
+    if {
+        key: supersedes[key]
+        for key in (
+            "policy_sha256",
+            "classification",
+            "supersession_reason",
+            "scientific_result_reuse",
+            "successor_execution",
+        )
+    } != {
+        "policy_sha256": policy_sha,
+        "classification": (
+            "completed_preflight_and_successful_resource_only_probe_superseded"
+        ),
+        "supersession_reason": "ram_budget_sealed_from_successful_probe",
+        "scientific_result_reuse": "forbidden",
+        "successor_execution": "fresh_full_193_preflight",
+    }:
+        raise CanonicalScreeningError("4d supersession status differs")
+
+    preflight = _require_mapping(supersedes["preflight"], "4d preflight")
+    file_names = {
+        "controller_claim",
+        "controller_terminal",
+        "controller_summary",
+        "wrapper_claim",
+        "wrapper_exit",
+        "resource_monitor",
+        "resource_observer",
+        "runtime_resource_windows",
+        "startup_admission",
+        "final_plan",
+        "candidate_manifest",
+    }
+    counts = {
+        "request_count": 193,
+        "result_count": 193,
+        "valid_count": 193,
+        "invalid_count": 0,
+        "reused_count": 0,
+        "attempt_claim_count": 193,
+        "attempt_terminal_count": 193,
+        "run_request_count": 0,
+        "generated_png_count": 0,
+    }
+    _require_exact_keys(
+        preflight, set(counts) | file_names | {"evidence_root"}, "4d preflight"
+    )
+    if any(preflight[key] != value for key, value in counts.items()):
+        raise CanonicalScreeningError("4d preflight counts differ")
+    relative_root = (
+        "artifacts/closeout/historical-canonical-512-v1/by_policy/" + policy_sha
+    )
+    preflight_root = repo_root.resolve() / relative_root
+    evidence = _require_mapping(preflight["evidence_root"], "4d evidence root")
+    _require_tree_without_symlinks(preflight_root, "4d preflight evidence root")
+    if (
+        evidence
+        != {
+            "path": relative_root,
+            "digest": (
+                "cc6fcb6b226617c02a1aada2b1f0051d4af15c3ba07215576b3d3d0fd0ae5211"
+            ),
+            "digest_algorithm": "sha256_relative_posix_nul_content_nul_v1",
+        }
+        or sha256_directory_tree(preflight_root) != evidence["digest"]
+    ):
+        raise CanonicalScreeningError("4d preflight evidence root differs")
+    expected_paths = {
+        "controller_claim": relative_root + "/preflight_control/controller_claim.json",
+        "controller_terminal": (
+            relative_root + "/preflight_control/controller_terminal.json"
+        ),
+        "controller_summary": (
+            relative_root + "/preflight_control/controller_summary.json"
+        ),
+        "wrapper_claim": relative_root + "/preflight_control/wrapper_claim.json",
+        "wrapper_exit": relative_root + "/preflight_control/wrapper_exit.json",
+        "resource_monitor": relative_root + "/logs/preflight__monitor.jsonl",
+        "resource_observer": relative_root + "/logs/preflight__observer.jsonl",
+        "runtime_resource_windows": (
+            relative_root + "/preflight_control/runtime_resource_windows.jsonl"
+        ),
+        "startup_admission": (
+            relative_root
+            + "/admissions/preflight_cpu_startup__"
+            "01443f03dad7e773895781eea35ecbd514cbc5d88958dd82b5f5768e7331adab.json"
+        ),
+        "final_plan": (
+            "artifacts/closeout/historical-canonical-512-v1/"
+            "checkpoint_plan_final__4d0345b6fc29cc8e.json"
+        ),
+        "candidate_manifest": (
+            "artifacts/closeout/historical-canonical-512-v1/"
+            "candidate_manifest__4d0345b6fc29cc8e.json"
+        ),
+    }
+    if any(preflight[name].get("path") != path for name, path in expected_paths.items()):
+        raise CanonicalScreeningError("4d preflight file identity differs")
+    bound = {
+        name: _validate_bound_file(repo_root, preflight[name], f"4d {name}")
+        for name in file_names
+    }
+    summary = load_json(Path(bound["controller_summary"]["path"]), "4d summary")
+    terminal = load_json(Path(bound["controller_terminal"]["path"]), "4d terminal")
+    wrapper = load_json(Path(bound["wrapper_exit"]["path"]), "4d wrapper")
+    plan = load_json(Path(bound["final_plan"]["path"]), "4d final plan")
+    manifest = load_json(Path(bound["candidate_manifest"]["path"]), "4d manifest")
+    if (
+        summary.get("policy_sha256") != policy_sha
+        or summary.get("preflight")
+        != {
+            "completed": 193,
+            "invalid": 0,
+            "request_count": 193,
+            "reused": 0,
+            "valid": 193,
+        }
+        or terminal.get("status") != "completed"
+        or terminal.get("failure") is not None
+        or terminal.get("pending_count") != 0
+        or terminal.get("result_count") != 193
+        or wrapper.get("exit_code") != 0
+        or wrapper.get("signal") is not None
+        or wrapper.get("launch_failure") is not None
+        or plan.get("checkpoint_plan_sha256")
+        != "a1899d29511b08761c5d37c7101aa2a203c0046d244eb0f1ec7b4214ec3ad543"
+        or manifest.get("candidate_manifest_sha256")
+        != "f2bee5cd0a762e01a275bdd4768658f574384918455cd16a46ff08656b276bb4"
+        or manifest.get("candidate_count") != 193
+    ):
+        raise CanonicalScreeningError("4d preflight terminal semantics differ")
+
+    probe = _require_mapping(
+        supersedes["successful_ram_probe"], "4d successful RAM probe"
+    )
+    _require_exact_keys(
+        probe,
+        {
+            "classification",
+            "artifact_seal",
+            "probe_result",
+            "controller_terminal",
+            "resource_measurement_only",
+            "scientific_result_reuse",
+            "retry_count",
+        },
+        "4d successful RAM probe",
+    )
+    seal = _validate_ram_probe_artifact_seal(repo_root, probe["artifact_seal"])
+    result_binding = _validate_bound_file(
+        repo_root, probe["probe_result"], "4d successful probe result"
+    )
+    result = load_json(Path(result_binding["path"]), "4d successful probe result")
+    if (
+        probe["classification"] != "successful_resource_measurement_only"
+        or probe["controller_terminal"] != "absent_by_contract"
+        or probe["resource_measurement_only"] is not True
+        or probe["scientific_result_reuse"] != "forbidden"
+        or probe["retry_count"] != 0
+        or probe["artifact_seal"] != seal
+        or result.get("status") != "succeeded"
+        or result.get("failure") is not None
+        or result.get("worker_returncode") != 0
+        or result.get("termination") is not None
+        or result.get("retry_count") != 0
+        or result.get("probe_result_sha256")
+        != canonical_digest(result, "probe_result_sha256")
+    ):
+        raise CanonicalScreeningError("4d successful probe semantics differ")
+    return {
+        **dict(supersedes),
+        "successful_ram_probe": {
+            **dict(probe),
+            "artifact_seal": seal,
+            "probe_result": result_binding,
+        },
+    }
+
+
 def validate_supersession_evidence(
     repo_root: Path, raw_supersedes: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -2448,6 +2724,11 @@ def validate_supersession_evidence(
         == "4c5ecb55501fa6b09b63377e892f1cee3e0140abd2a02859d33b9b33375a1576"
     ):
         return _validate_4c5_supersession_evidence(repo_root, supersedes)
+    if (
+        supersedes.get("policy_sha256")
+        == "4d0345b6fc29cc8ec50ddc0255188a466ae78edae2e472fed9deda461cf76cbc"
+    ):
+        return _validate_4d_supersession_evidence(repo_root, supersedes)
     if (
         supersedes.get("policy_sha256")
         == "ea7ae71fd662526b9a45bf3cc6d283884aefc380b292c8f273169a35f42ffc28"
@@ -2713,23 +2994,37 @@ def _validate_ram_slot_budget_source(
     expected_predecessor_policy_sha256: str,
 ) -> dict[str, Any]:
     source = _require_mapping(raw_source, "RAM slot budget source")
+    source_is_v2 = (
+        source.get("contract_type")
+        == "safa_canonical_screening_ram_budget_source_v2"
+    )
+    source_fields = {
+        "contract_type",
+        "method",
+        "measurement_factor_numerator",
+        "measurement_factor_denominator",
+        "peak_sampled_process_tree_rss_bytes",
+        "worker_vmhwm_bytes",
+        "ram_budget_basis_bytes",
+        "ram_slot_budget_bytes",
+        "probe_result",
+    }
+    if source_is_v2:
+        source_fields.add("probe_artifact_seal")
     _require_exact_keys(
         source,
-        {
-            "contract_type",
-            "method",
-            "measurement_factor_numerator",
-            "measurement_factor_denominator",
-            "peak_sampled_process_tree_rss_bytes",
-            "worker_vmhwm_bytes",
-            "ram_budget_basis_bytes",
-            "ram_slot_budget_bytes",
-            "probe_result",
-        },
+        source_fields,
         "RAM slot budget source",
     )
     probe_binding = _validate_bound_file(
         repo_root, source["probe_result"], "RAM slot budget probe result"
+    )
+    artifact_seal = (
+        _validate_ram_probe_artifact_seal(
+            repo_root, source["probe_artifact_seal"]
+        )
+        if source_is_v2
+        else None
     )
     probe_path = Path(probe_binding["path"])
     result = load_json(probe_path, "RAM slot budget probe result")
@@ -2969,33 +3264,68 @@ def _validate_ram_slot_budget_source(
         raise CanonicalScreeningError(
             "sealed RAM probe predecessor must be a probe-required policy"
         )
-    probe_policy = validate_policy(
-        repo_root,
-        snapshot_path,
-        verify_historical_output_evidence=False,
-        policy_identity_path=policy_identity,
-    )
-    if (
-        policy_binding.get("sha256") != snapshot.get("sha256")
-        or policy_binding.get("canonical_sha256")
-        != probe_policy["policy_sha256"]
-        or expected_predecessor_policy_sha256 != probe_policy["policy_sha256"]
-    ):
-        raise CanonicalScreeningError(
-            "sealed RAM probe predecessor policy binding differs"
-        )
     implementations = _require_mapping(
         spec.get("implementations"), "RAM probe implementations"
     )
-    for name, binding in implementations.items():
-        implementation_path = Path(str(binding.get("path", ""))).resolve()
+    if source_is_v2:
         if (
-            not implementation_path.is_file()
-            or sha256_file(implementation_path) != binding.get("sha256")
+            policy_binding.get("sha256") != snapshot.get("sha256")
+            or policy_binding.get("canonical_sha256")
+            != expected_predecessor_policy_sha256
         ):
             raise CanonicalScreeningError(
-                f"sealed RAM probe implementation binding differs: {name}"
+                "sealed RAM probe predecessor policy binding differs"
             )
+        snapshot_implementations = _require_mapping(
+            snapshot_raw.get("implementations"),
+            "RAM probe predecessor implementations",
+        )
+        if set(implementations) != set(snapshot_implementations):
+            raise CanonicalScreeningError(
+                "sealed RAM probe implementation registry differs"
+            )
+        for name, binding in implementations.items():
+            snapshot_binding = _require_mapping(
+                snapshot_implementations[name],
+                f"RAM probe predecessor implementation {name}",
+            )
+            implementation_path = Path(str(binding.get("path", ""))).resolve()
+            snapshot_implementation_path = (
+                repo_root.resolve() / str(snapshot_binding.get("path", ""))
+            ).resolve()
+            if (
+                implementation_path != snapshot_implementation_path
+                or binding.get("sha256") != snapshot_binding.get("sha256")
+            ):
+                raise CanonicalScreeningError(
+                    f"sealed RAM probe implementation binding differs: {name}"
+                )
+    else:
+        probe_policy = validate_policy(
+            repo_root,
+            snapshot_path,
+            verify_historical_output_evidence=False,
+            policy_identity_path=policy_identity,
+        )
+        if (
+            policy_binding.get("sha256") != snapshot.get("sha256")
+            or policy_binding.get("canonical_sha256")
+            != probe_policy["policy_sha256"]
+            or expected_predecessor_policy_sha256
+            != probe_policy["policy_sha256"]
+        ):
+            raise CanonicalScreeningError(
+                "sealed RAM probe predecessor policy binding differs"
+            )
+        for name, binding in implementations.items():
+            implementation_path = Path(str(binding.get("path", ""))).resolve()
+            if (
+                not implementation_path.is_file()
+                or sha256_file(implementation_path) != binding.get("sha256")
+            ):
+                raise CanonicalScreeningError(
+                    f"sealed RAM probe implementation binding differs: {name}"
+                )
 
     registry = admission.get("authorized_gpu_registry")
     expected_indices = [0, 1, 2, 3]
@@ -3048,7 +3378,10 @@ def _validate_ram_slot_budget_source(
 
     if (
         source["contract_type"]
-        != "safa_canonical_screening_ram_budget_source_v1"
+        not in {
+            "safa_canonical_screening_ram_budget_source_v1",
+            "safa_canonical_screening_ram_budget_source_v2",
+        }
         or source["method"] != expected_method
         or source["measurement_factor_numerator"] != numerator
         or source["measurement_factor_denominator"] != denominator
@@ -3059,10 +3392,13 @@ def _validate_ram_slot_budget_source(
         or declared_budget_bytes != budget
     ):
         raise CanonicalScreeningError("sealed RAM slot budget differs")
-    return {
+    normalized_source = {
         **dict(source),
         "probe_result": probe_binding,
     }
+    if source_is_v2:
+        normalized_source["probe_artifact_seal"] = artifact_seal
+    return normalized_source
 
 
 def validate_policy(
