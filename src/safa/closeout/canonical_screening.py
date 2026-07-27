@@ -893,6 +893,7 @@ def _validate_c83_preflight_supersession_evidence(
             "false_invalid_checkpoint_sha256",
             "scientific_result_reuse",
             "successor_execution",
+            "ram_budget_source_policy_sha256",
             "evidence_root",
             "controller_claim",
             "controller_terminal",
@@ -1239,6 +1240,7 @@ def _validate_310_preflight_supersession_evidence(
             "failure_message",
             "scientific_result_reuse",
             "successor_execution",
+            "ram_budget_source_policy_sha256",
             "evidence_root",
             "checkpoint_plan",
             "wrapper_claim",
@@ -1274,6 +1276,9 @@ def _validate_310_preflight_supersession_evidence(
         "failure_message": failure_message,
         "scientific_result_reuse": "forbidden",
         "successor_execution": "fresh_full_193_preflight",
+        "ram_budget_source_policy_sha256": (
+            "4d0345b6fc29cc8ec50ddc0255188a466ae78edae2e472fed9deda461cf76cbc"
+        ),
     }
     if any(supersedes[key] != value for key, value in expected_scalars.items()):
         raise CanonicalScreeningError("310 supersession status differs")
@@ -3013,6 +3018,229 @@ def _validate_5dbb_supersession_evidence(
     return dict(supersedes)
 
 
+def _validate_9300_zero_result_supersession_evidence(
+    repo_root: Path, raw_supersedes: Mapping[str, Any]
+) -> dict[str, Any]:
+    supersedes = _require_mapping(
+        raw_supersedes, "9300 zero-result supersession evidence"
+    )
+    _require_exact_keys(
+        supersedes,
+        {
+            "policy_sha256",
+            "previous_policy_sha256",
+            "classification",
+            "supersession_reason",
+            "scientific_result_reuse",
+            "successor_execution",
+            "ram_budget_source_policy_sha256",
+            "counts",
+            "evidence_root",
+            "checkpoint_plan",
+            "request_set",
+            "absence_evidence",
+        },
+        "9300 zero-result supersession evidence",
+    )
+    policy_sha = (
+        "9300a01c5f308840918dca8717f06bd6684e3a52967478950b5a9146b8f62508"
+    )
+    previous_policy_sha = (
+        "5dbb82fdb1c89d8f7afd463a2f0b40743f42abd7b0f07dcefab144a32787c7af"
+    )
+    if {
+        key: supersedes[key]
+        for key in (
+            "policy_sha256",
+            "previous_policy_sha256",
+            "classification",
+            "supersession_reason",
+            "scientific_result_reuse",
+            "successor_execution",
+            "ram_budget_source_policy_sha256",
+        )
+    } != {
+        "policy_sha256": policy_sha,
+        "previous_policy_sha256": previous_policy_sha,
+        "classification": (
+            "prepared_execution_barrier_not_crossed_superseded"
+        ),
+        "supersession_reason": (
+            "cpu_preflight_durable_observer_contract_upgrade"
+        ),
+        "scientific_result_reuse": "forbidden",
+        "successor_execution": "fresh_full_193_preflight",
+        "ram_budget_source_policy_sha256": (
+            "4d0345b6fc29cc8ec50ddc0255188a466ae78edae2e472fed9deda461cf76cbc"
+        ),
+    }:
+        raise CanonicalScreeningError(
+            "9300 zero-result supersession status differs"
+        )
+    expected_counts = {
+        "checkpoint_plan_count": 1,
+        "preflight_request_count": 193,
+        "preflight_result_count": 0,
+        "attempt_claim_count": 0,
+        "attempt_terminal_count": 0,
+        "controller_artifact_count": 0,
+        "generated_png_count": 0,
+    }
+    if supersedes["counts"] != expected_counts:
+        raise CanonicalScreeningError(
+            "9300 zero-result supersession counts differ"
+        )
+    relative_root = (
+        "artifacts/closeout/historical-canonical-512-v1/by_policy/"
+        + policy_sha
+    )
+    evidence_root = repo_root.resolve() / relative_root
+    _require_tree_without_symlinks(
+        evidence_root, "9300 zero-result evidence root"
+    )
+    evidence = _require_mapping(
+        supersedes["evidence_root"], "9300 zero-result evidence root"
+    )
+    if (
+        evidence
+        != {
+            "path": relative_root,
+            "digest": (
+                "3c82e2103c4dc5c0f3c83c4b26d51e9"
+                "d9168cb1d8486c7512d89d04cda386ac3"
+            ),
+            "digest_algorithm": (
+                "sha256_relative_posix_nul_content_nul_v1"
+            ),
+            "file_count": 194,
+        }
+        or sha256_directory_tree(evidence_root)
+        != evidence["digest"]
+        or len([path for path in evidence_root.rglob("*") if path.is_file()])
+        != evidence["file_count"]
+    ):
+        raise CanonicalScreeningError(
+            "9300 zero-result evidence root differs"
+        )
+    plan_path = evidence_root / "checkpoint_plan.json"
+    plan_binding = _validate_bound_file(
+        repo_root,
+        supersedes["checkpoint_plan"],
+        "9300 zero-result checkpoint plan",
+    )
+    plan = load_json(plan_path, "9300 zero-result checkpoint plan")
+    if (
+        Path(plan_binding["path"]) != plan_path.resolve()
+        or plan_binding["sha256"]
+        != "b2b79a6879e1b771d4e72cd404e332520631407c2c7612f1c32ea7dfad31066b"
+        or plan.get("checkpoint_plan_sha256")
+        != "f6ddb992eebc528d27d994cc6d536e9c792d6d86429e209ad539fcc555e4410f"
+        or plan.get("counts", {}).get("preflight_requests") != 193
+        or plan.get("counts", {}).get("pending_preflight") != 193
+        or plan.get("counts", {}).get("eligible_candidates") != 0
+    ):
+        raise CanonicalScreeningError(
+            "9300 zero-result checkpoint plan differs"
+        )
+    request_root = evidence_root / "checkpoint_preflight/requests"
+    request_set = _require_mapping(
+        supersedes["request_set"], "9300 zero-result request set"
+    )
+    _require_tree_without_symlinks(
+        request_root, "9300 zero-result request set"
+    )
+    request_paths = sorted(request_root.glob("*.json"))
+    if (
+        request_set
+        != {
+            "path": relative_root + "/checkpoint_preflight/requests",
+            "digest": (
+                "3ca9eab230df733daff633a812d6856e6"
+                "8b30cd0a9e81aad4f195632e5ca53e8"
+            ),
+            "digest_algorithm": (
+                "sha256_relative_posix_nul_content_nul_v1"
+            ),
+            "file_count": 193,
+        }
+        or sha256_directory_tree(request_root)
+        != request_set["digest"]
+        or len(request_paths) != request_set["file_count"]
+    ):
+        raise CanonicalScreeningError(
+            "9300 zero-result request set differs"
+        )
+    request_keys = set()
+    for path in request_paths:
+        request = load_json(path, "9300 zero-result preflight request")
+        if (
+            request.get("policy_sha256") != policy_sha
+            or request.get("preflight_request_sha256")
+            != canonical_digest(
+                request, "preflight_request_sha256"
+            )
+            or request.get("checkpoint_model") not in {"raw", "ema"}
+            or path.name
+            != (
+                f"{request.get('checkpoint_sha256')}__"
+                f"{request.get('checkpoint_model')}.json"
+            )
+        ):
+            raise CanonicalScreeningError(
+                "9300 zero-result request semantics differ"
+            )
+        request_keys.add(
+            (
+                request["checkpoint_sha256"],
+                request["checkpoint_model"],
+            )
+        )
+    if len(request_keys) != 193:
+        raise CanonicalScreeningError(
+            "9300 zero-result request identities differ"
+        )
+    absence = _require_mapping(
+        supersedes["absence_evidence"],
+        "9300 zero-result absence evidence",
+    )
+    expected_absence = {
+        "preflight_results": "absent",
+        "preflight_control": "absent",
+        "preflight_request_manifest": "absent",
+        "admissions": "absent",
+        "logs": "absent",
+        "final_plan": "absent",
+        "candidate_manifest": "absent",
+    }
+    if absence != expected_absence:
+        raise CanonicalScreeningError(
+            "9300 zero-result absence status differs"
+        )
+    absent_paths = (
+        evidence_root / "checkpoint_preflight/results",
+        evidence_root / "preflight_control",
+        evidence_root
+        / "checkpoint_preflight/preflight_request_manifest.json",
+        evidence_root / "admissions",
+        evidence_root / "logs",
+        repo_root.resolve()
+        / (
+            "artifacts/closeout/historical-canonical-512-v1/"
+            "checkpoint_plan_final__9300a01c5f308840.json"
+        ),
+        repo_root.resolve()
+        / (
+            "artifacts/closeout/historical-canonical-512-v1/"
+            "candidate_manifest__9300a01c5f308840.json"
+        ),
+    )
+    if any(path.exists() for path in absent_paths):
+        raise CanonicalScreeningError(
+            "9300 zero-result absence evidence differs"
+        )
+    return dict(supersedes)
+
+
 def validate_supersession_evidence(
     repo_root: Path, raw_supersedes: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -3063,6 +3291,13 @@ def validate_supersession_evidence(
         == "5dbb82fdb1c89d8f7afd463a2f0b40743f42abd7b0f07dcefab144a32787c7af"
     ):
         return _validate_5dbb_supersession_evidence(repo_root, supersedes)
+    if (
+        supersedes.get("policy_sha256")
+        == "9300a01c5f308840918dca8717f06bd6684e3a52967478950b5a9146b8f62508"
+    ):
+        return _validate_9300_zero_result_supersession_evidence(
+            repo_root, supersedes
+        )
     if (
         supersedes.get("policy_sha256")
         == "ea7ae71fd662526b9a45bf3cc6d283884aefc380b292c8f273169a35f42ffc28"
