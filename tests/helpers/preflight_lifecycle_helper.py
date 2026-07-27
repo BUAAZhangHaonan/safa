@@ -367,13 +367,274 @@ def load_module(path: Path):
 def wrapper(args: argparse.Namespace) -> int:
     module = load_module(args.wrapper_module)
     module.OBSERVER_TERMINAL_WAIT_SECONDS = args.terminal_timeout
-    module.PROCESS_TERMINATION_WAIT_SECONDS = 10.0
+    module.PROCESS_TERMINATION_WAIT_SECONDS = (
+        0.5
+        if args.observer_mode
+        in {
+            "controller_fault_monitor",
+            "controller_fault_monitor_fsync",
+            "controller_fault_monitor_cleanup_write",
+        }
+        else 0.05
+        if args.observer_mode.startswith("controller_fault_")
+        else 10.0
+    )
     helper = Path(__file__).resolve()
     controller_code = (
-        "import time,sys;"
-        f"time.sleep({args.controller_seconds});"
-        f"sys.exit({args.controller_exit})"
+        (
+            "import signal,time,sys;"
+            "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+            f"time.sleep({args.controller_seconds});"
+            "sys.exit(0)"
+        )
+        if args.observer_mode
+        in {
+            "controller_fault_monitor",
+            "controller_fault_monitor_fsync",
+            "controller_fault_monitor_cleanup_write",
+        }
+        else (
+            "import time,sys;"
+            f"time.sleep({args.controller_seconds});"
+            f"sys.exit({args.controller_exit})"
+        )
     )
+    if args.observer_mode == "controller_fault_identity":
+        original_require_identity = module._require_process_identity
+
+        def fail_controller_identity(pid: int, label: str):
+            if label == "CPU preflight controller":
+                raise RuntimeError("fixture controller identity failure")
+            return original_require_identity(pid, label)
+
+        module._require_process_identity = fail_controller_identity
+    if args.observer_mode == "controller_fault_pgid":
+        original_require_identity = module._require_process_identity
+
+        def wrong_controller_pgid(pid: int, label: str):
+            value = original_require_identity(pid, label)
+            if label == "CPU preflight controller":
+                value = {**value, "pgid": pid + 1}
+            return value
+
+        module._require_process_identity = wrong_controller_pgid
+    if args.observer_mode in {
+        "controller_fault_start_write",
+        "controller_fault_start_write_process_exit_write",
+    }:
+        original_write = module._write_exclusive
+
+        def fail_start_write(path: Path, value: Mapping[str, Any]) -> None:
+            if path.name == "controller_process_start.json":
+                raise RuntimeError("fixture controller start write failure")
+            if (
+                args.observer_mode
+                == "controller_fault_start_write_process_exit_write"
+                and path.name == "controller_process_exit.json"
+            ):
+                raise RuntimeError("fixture controller exit write failure")
+            original_write(path, value)
+
+        module._write_exclusive = fail_start_write
+    if args.observer_mode in {
+        "controller_fault_monitor",
+        "controller_fault_monitor_fsync",
+        "controller_fault_monitor_cleanup_write",
+    }:
+        original_assert_tmux = module._assert_tmux_process_identity
+        process_start_path = (
+            args.policy_root
+            / "preflight_control/controller_process_start.json"
+        )
+        monitor_failure_injected = False
+
+        def fail_monitor_identity(*call_args: Any, **call_kwargs: Any):
+            nonlocal monitor_failure_injected
+            if (
+                not monitor_failure_injected
+                and call_args
+                and call_args[0] == module.OBSERVER_SESSION
+                and process_start_path.is_file()
+            ):
+                monitor_failure_injected = True
+                time.sleep(0.1)
+                raise RuntimeError("fixture controller monitor failure")
+            return original_assert_tmux(*call_args, **call_kwargs)
+
+        module._assert_tmux_process_identity = fail_monitor_identity
+    if args.observer_mode in {
+        "controller_fault_log_fsync",
+        "controller_fault_log_close",
+        "controller_fault_monitor_fsync",
+        "controller_fault_log_fsync_close",
+    }:
+        process_log_path = (
+            args.policy_root / "preflight_control/controller_process.log"
+        ).resolve()
+
+        def is_process_log_descriptor(descriptor: int) -> bool:
+            try:
+                return Path(
+                    os.readlink(f"/proc/self/fd/{descriptor}")
+                ).resolve() == process_log_path
+            except FileNotFoundError:
+                return False
+
+        if args.observer_mode in {
+            "controller_fault_log_fsync",
+            "controller_fault_monitor_fsync",
+        }:
+            original_fsync = module.os.fsync
+
+            def fail_log_fsync(descriptor: int) -> None:
+                if is_process_log_descriptor(descriptor):
+                    raise OSError("fixture controller log fsync failure")
+                original_fsync(descriptor)
+
+            module.os.fsync = fail_log_fsync
+        elif args.observer_mode == "controller_fault_log_close":
+            original_close = module.os.close
+
+            def fail_log_close(descriptor: int) -> None:
+                is_log = is_process_log_descriptor(descriptor)
+                original_close(descriptor)
+                if is_log:
+                    raise OSError("fixture controller log close failure")
+
+            module.os.close = fail_log_close
+        else:
+            original_fsync = module.os.fsync
+            original_close = module.os.close
+
+            def fail_log_fsync_and_close(descriptor: int) -> None:
+                if is_process_log_descriptor(descriptor):
+                    raise OSError("fixture controller log fsync failure")
+                original_fsync(descriptor)
+
+            def fail_log_close_after_fsync(descriptor: int) -> None:
+                is_log = is_process_log_descriptor(descriptor)
+                original_close(descriptor)
+                if is_log:
+                    raise OSError("fixture controller log close failure")
+
+            module.os.fsync = fail_log_fsync_and_close
+            module.os.close = fail_log_close_after_fsync
+    if args.observer_mode in {
+        "controller_fault_observer_launch_write",
+        "controller_fault_observer_cleanup_write",
+        "controller_fault_monitor_cleanup_write",
+        "controller_fault_wrapper_exit_write",
+    }:
+        original_contract_write = module._write_exclusive
+        contract_failure_injected = False
+
+        def fail_contract_write(
+            path: Path, value: Mapping[str, Any]
+        ) -> None:
+            nonlocal contract_failure_injected
+            target = {
+                "controller_fault_observer_launch_write": (
+                    "observer_launch.json"
+                ),
+                "controller_fault_observer_cleanup_write": (
+                    "observer_cleanup.json"
+                ),
+                "controller_fault_monitor_cleanup_write": (
+                    "observer_cleanup.json"
+                ),
+                "controller_fault_wrapper_exit_write": "wrapper_exit.json",
+            }[args.observer_mode]
+            if not contract_failure_injected and path.name == target:
+                contract_failure_injected = True
+                raise OSError(f"fixture {target} write failure")
+            original_contract_write(path, value)
+
+        module._write_exclusive = fail_contract_write
+    if args.observer_mode == "controller_fault_process_exit_binding":
+        original_sha256_file = module._sha256_file
+
+        def fail_process_exit_binding(path: Path) -> str:
+            if path.name == "controller_process_exit.json":
+                raise OSError("fixture process exit binding hash failure")
+            return original_sha256_file(path)
+
+        module._sha256_file = fail_process_exit_binding
+    if args.observer_mode == "controller_fault_observer_launch_binding":
+        original_sha256_file = module._sha256_file
+
+        def fail_observer_launch_binding(path: Path) -> str:
+            if path.name == "observer_bootstrap.json":
+                raise OSError(
+                    "fixture observer launch binding hash failure"
+                )
+            return original_sha256_file(path)
+
+        module._sha256_file = fail_observer_launch_binding
+    if args.observer_mode == "controller_fault_process_log_mkdir":
+        original_mkdir = module.Path.mkdir
+        control_path = (
+            args.policy_root / "preflight_control"
+        ).resolve()
+        mkdir_failure_injected = False
+
+        def fail_process_log_mkdir(
+            self: Path, *call_args: Any, **call_kwargs: Any
+        ) -> None:
+            nonlocal mkdir_failure_injected
+            if (
+                not mkdir_failure_injected
+                and self.resolve() == control_path
+                and (control_path / "observer_launch.json").is_file()
+                and not (
+                    control_path / "controller_process.log"
+                ).exists()
+            ):
+                mkdir_failure_injected = True
+                raise OSError("fixture process log parent mkdir failure")
+            original_mkdir(self, *call_args, **call_kwargs)
+
+        module.Path.mkdir = fail_process_log_mkdir
+    if args.observer_mode == "controller_fault_final_binding":
+        original_optional_binding = module._optional_binding
+        process_log_binding_calls = 0
+
+        def fail_final_binding(path: Path):
+            nonlocal process_log_binding_calls
+            if path.name == "controller_process.log":
+                process_log_binding_calls += 1
+                if process_log_binding_calls == 2:
+                    raise OSError("fixture final binding failure")
+            return original_optional_binding(path)
+
+        module._optional_binding = fail_final_binding
+    if (
+        args.observer_mode
+        == "controller_fault_after_exact_owner_seal"
+    ):
+        original_probe = module._probe_observer_gate
+        exact_owner_failure_injected = False
+
+        def fail_after_exact_owner(*call_args: Any, **call_kwargs: Any):
+            recorder = call_kwargs["owner_recorder"]
+
+            def record_then_fail(*owner_args: Any) -> None:
+                nonlocal exact_owner_failure_injected
+                recorder(*owner_args)
+                if not exact_owner_failure_injected:
+                    exact_owner_failure_injected = True
+                    raise OSError(
+                        "fixture failure after exact owner seal"
+                    )
+
+            return original_probe(
+                *call_args,
+                **{
+                    **call_kwargs,
+                    "owner_recorder": record_then_fail,
+                },
+            )
+
+        module._probe_observer_gate = fail_after_exact_owner
     if args.observer_mode == "terminal_validator_exception":
         def reject_terminal(*_args: Any, **_kwargs: Any):
             raise RuntimeError("fixture terminal validator failure")
@@ -911,6 +1172,24 @@ def parse_args() -> argparse.Namespace:
             "snapshot_failed_to_completed",
             "snapshot_delete",
             "snapshot_exception_replacement",
+            "controller_fault_identity",
+            "controller_fault_pgid",
+            "controller_fault_start_write",
+            "controller_fault_monitor",
+            "controller_fault_log_fsync",
+            "controller_fault_log_close",
+            "controller_fault_monitor_fsync",
+            "controller_fault_log_fsync_close",
+            "controller_fault_start_write_process_exit_write",
+            "controller_fault_observer_launch_write",
+            "controller_fault_observer_cleanup_write",
+            "controller_fault_monitor_cleanup_write",
+            "controller_fault_process_exit_binding",
+            "controller_fault_final_binding",
+            "controller_fault_wrapper_exit_write",
+            "controller_fault_observer_launch_binding",
+            "controller_fault_process_log_mkdir",
+            "controller_fault_after_exact_owner_seal",
         ),
         required=True,
     )
@@ -937,6 +1216,24 @@ def parse_args() -> argparse.Namespace:
             "snapshot_failed_to_completed",
             "snapshot_delete",
             "snapshot_exception_replacement",
+            "controller_fault_identity",
+            "controller_fault_pgid",
+            "controller_fault_start_write",
+            "controller_fault_monitor",
+            "controller_fault_log_fsync",
+            "controller_fault_log_close",
+            "controller_fault_monitor_fsync",
+            "controller_fault_log_fsync_close",
+            "controller_fault_start_write_process_exit_write",
+            "controller_fault_observer_launch_write",
+            "controller_fault_observer_cleanup_write",
+            "controller_fault_monitor_cleanup_write",
+            "controller_fault_process_exit_binding",
+            "controller_fault_final_binding",
+            "controller_fault_wrapper_exit_write",
+            "controller_fault_observer_launch_binding",
+            "controller_fault_process_log_mkdir",
+            "controller_fault_after_exact_owner_seal",
         ),
         required=True,
     )

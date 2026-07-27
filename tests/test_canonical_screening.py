@@ -10117,11 +10117,495 @@ def test_preflight_wrapper_uses_first_strict_terminal_snapshot(
 
 
 def test_preflight_wrapper_has_no_post_validation_terminal_path_read() -> None:
-    source = inspect.getsource(_wrapper_module().run_wrapped_controller)
+    source = inspect.getsource(
+        _wrapper_module()._run_wrapped_controller_owned
+    )
     assert "observer_terminal[\"path\"]" not in source
     assert ".read_text(" not in source
     assert source.count("_wait_observer_terminal(") == 1
     assert source.count("_read_observer_terminal(") == 1
+
+
+@pytest.mark.parametrize(
+    ("fault", "expected_stage"),
+    (
+        ("initial_identity", "termination_initial_identity"),
+        ("initial_pgid", "termination_initial_identity"),
+        ("sigterm", "termination_sigterm"),
+        ("sigkill_recheck", "termination_sigkill"),
+        ("sigkill_wait", "termination_sigkill_wait"),
+    ),
+)
+def test_controller_process_closure_faults_are_structured_and_reaped(
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+    expected_stage: str,
+) -> None:
+    wrapper = _wrapper_module()
+
+    class Process:
+        pid = 4242
+
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+            self.wait_calls = 0
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.returncode = -wrapper.signal.SIGTERM
+
+        def kill(self) -> None:
+            self.returncode = -wrapper.signal.SIGKILL
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_calls += 1
+            if (
+                fault
+                in {"sigterm", "sigkill_recheck", "sigkill_wait"}
+                and self.wait_calls == 1
+            ):
+                raise subprocess.TimeoutExpired("fixture", timeout)
+            if fault == "sigkill_wait" and self.wait_calls == 2:
+                raise RuntimeError("fixture SIGKILL wait failure")
+            assert self.returncode is not None
+            return self.returncode
+
+    process = Process()
+    identity = {"pid": process.pid, "pgid": process.pid, "start_ticks": 1}
+
+    def assert_identity(
+        _identity: Mapping[str, int], label: str
+    ) -> None:
+        if fault == "initial_identity" and "termination" in label:
+            raise RuntimeError("fixture initial identity failure")
+        if fault == "sigkill_recheck" and "SIGKILL" in label:
+            raise RuntimeError("fixture SIGKILL identity failure")
+
+    monkeypatch.setattr(wrapper, "_assert_process_identity", assert_identity)
+
+    def getpgid(_pid: int) -> int:
+        if fault == "initial_pgid":
+            raise RuntimeError("fixture PGID failure")
+        return process.pid
+
+    monkeypatch.setattr(wrapper.os, "getpgid", getpgid)
+
+    def killpg(_pid: int, sig: int) -> None:
+        if fault == "sigterm" and sig == wrapper.signal.SIGTERM:
+            raise RuntimeError("fixture SIGTERM failure")
+        if sig == wrapper.signal.SIGKILL:
+            process.returncode = -wrapper.signal.SIGKILL
+
+    monkeypatch.setattr(wrapper.os, "killpg", killpg)
+    return_code, closure = wrapper._close_owned_controller_process(
+        process, identity, terminate=True
+    )
+    assert return_code in {
+        -wrapper.signal.SIGTERM,
+        -wrapper.signal.SIGKILL,
+    }
+    assert closure["status"] == "reaped"
+    assert closure["wait_observed"] is True
+    assert closure["process_residual"] is False
+    assert expected_stage in {
+        failure["stage"] for failure in closure["failures"]
+    }
+    assert closure["controller_process_closure_sha256"] == (
+        canonical_digest(
+            closure, "controller_process_closure_sha256"
+        )
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("tmux") is None,
+    reason="requires Linux /proc and tmux",
+)
+@pytest.mark.parametrize(
+    "fault_mode",
+    (
+        "controller_fault_identity",
+        "controller_fault_pgid",
+        "controller_fault_start_write",
+        "controller_fault_monitor",
+        "controller_fault_log_fsync",
+        "controller_fault_log_close",
+        "controller_fault_monitor_fsync",
+        "controller_fault_log_fsync_close",
+        "controller_fault_start_write_process_exit_write",
+        "controller_fault_observer_cleanup_write",
+        "controller_fault_monitor_cleanup_write",
+        "controller_fault_process_exit_binding",
+        "controller_fault_final_binding",
+        "controller_fault_wrapper_exit_write",
+    ),
+)
+def test_preflight_wrapper_post_popen_faults_close_durably(
+    tmp_path: Path,
+    fault_mode: str,
+) -> None:
+    wrapper = _wrapper_module()
+    repo_root = Path(__file__).parents[1]
+    helper = repo_root / "tests/helpers/preflight_lifecycle_helper.py"
+    policy_sha256 = hashlib.sha256(
+        f"controller-close:{fault_mode}".encode()
+    ).hexdigest()
+    policy_root = tmp_path / "campaign" / "by_policy" / policy_sha256
+    config = tmp_path / "policy.json"
+    config.write_text("{}\n", encoding="utf-8")
+    _prepare_wrapper_contract_inputs(wrapper, policy_root)
+    sessions = (wrapper.CONTROLLER_SESSION, wrapper.OBSERVER_SESSION)
+    command = [
+        sys.executable,
+        str(helper),
+        "wrapper",
+        "--wrapper-module",
+        str(repo_root / "scripts/run_canonical_preflight_wrapper.py"),
+        "--repo-root",
+        str(repo_root),
+        "--policy-root",
+        str(policy_root),
+        "--policy",
+        policy_sha256,
+        "--config",
+        str(config),
+        "--observer-mode",
+        fault_mode,
+        "--controller-seconds",
+        (
+            "0.2"
+            if fault_mode
+            in {
+                "controller_fault_monitor",
+                "controller_fault_log_fsync",
+                "controller_fault_log_close",
+                "controller_fault_monitor_fsync",
+                "controller_fault_log_fsync_close",
+                "controller_fault_observer_cleanup_write",
+                "controller_fault_monitor_cleanup_write",
+                "controller_fault_process_exit_binding",
+                "controller_fault_final_binding",
+                "controller_fault_wrapper_exit_write",
+            }
+            else "30"
+        ),
+        "--controller-exit",
+        "0",
+        "--terminal-timeout",
+        "0.5",
+    ]
+    try:
+        subprocess.run(
+            [
+                "tmux",
+                "new-session",
+                "-d",
+                "-s",
+                wrapper.CONTROLLER_SESSION,
+                "-e",
+                (
+                    f"{wrapper.OBSERVER_SESSION_ENV}="
+                    f"{wrapper.OBSERVER_SESSION}"
+                ),
+                "-c",
+                str(repo_root),
+                *command,
+            ],
+            check=True,
+        )
+        wrapper_exit_path = (
+            policy_root / "preflight_control/wrapper_exit.json"
+        )
+        deadline = time.monotonic() + 20.0
+        while not wrapper_exit_path.is_file():
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"controller closure timed out: {fault_mode}"
+                )
+            time.sleep(0.05)
+        wrapper_exit = load_json(
+            wrapper_exit_path, "controller fault wrapper exit"
+        )
+        assert wrapper_exit["exit_code"] != 0
+        assert wrapper_exit["launch_failure"] is not None
+        failure_stages = {
+            wrapper_exit["launch_failure"]["stage"],
+            *(
+                failure["stage"]
+                for failure in wrapper_exit["launch_failure"][
+                    "secondary_failures"
+                ]
+            ),
+        }
+        expected_stages = {
+            "controller_fault_monitor_fsync": {
+                "controller_monitor",
+                "controller_log_fsync",
+            },
+            "controller_fault_log_fsync_close": {
+                "controller_log_fsync",
+                "controller_log_close",
+            },
+            "controller_fault_start_write_process_exit_write": {
+                "controller_launch_or_start",
+                "controller_process_exit_write",
+            },
+            "controller_fault_observer_cleanup_write": {
+                "observer_cleanup_write",
+            },
+            "controller_fault_monitor_cleanup_write": {
+                "controller_monitor",
+                "observer_cleanup_write",
+            },
+            "controller_fault_process_exit_binding": {
+                "controller_process_exit_binding",
+            },
+            "controller_fault_final_binding": {
+                "wrapper_process_log_binding",
+            },
+            "controller_fault_wrapper_exit_write": {
+                "wrapper_exit_write",
+            },
+        }
+        if fault_mode in expected_stages:
+            assert expected_stages[fault_mode] <= failure_stages
+        closure_binding = wrapper_exit["controller_process_closure"]
+        assert closure_binding is not None
+        closure = load_json(
+            Path(closure_binding["path"]), "controller process closure"
+        )
+        assert closure["wait_observed"] is True
+        assert closure["process_residual"] is False
+        process_exit_binding = wrapper_exit["controller_process_exit"]
+        if fault_mode in {
+            "controller_fault_start_write_process_exit_write",
+            "controller_fault_process_exit_binding",
+        }:
+            assert process_exit_binding is None
+        else:
+            assert process_exit_binding is not None
+            process_exit = load_json(
+                Path(process_exit_binding["path"]),
+                "controller process exit",
+            )
+            assert process_exit["exit_code"] == (
+                closure["wait_return_code"]
+                if closure["wait_return_code"] >= 0
+                else 128 - closure["wait_return_code"]
+            )
+        if fault_mode in {
+            "controller_fault_monitor",
+            "controller_fault_log_fsync",
+            "controller_fault_log_close",
+            "controller_fault_monitor_fsync",
+            "controller_fault_log_fsync_close",
+            "controller_fault_observer_cleanup_write",
+            "controller_fault_monitor_cleanup_write",
+            "controller_fault_process_exit_binding",
+            "controller_fault_final_binding",
+            "controller_fault_wrapper_exit_write",
+        }:
+            assert closure["wait_return_code"] == 0
+            assert wrapper_exit["controller_exit_code"] == 0
+            assert wrapper_exit["observer_terminal"] is not None
+            assert wrapper_exit["observer_terminal_validation_failure"] is None
+        cleanup_binding = wrapper_exit["observer_cleanup"]
+        if fault_mode in {
+            "controller_fault_observer_cleanup_write",
+            "controller_fault_monitor_cleanup_write",
+        }:
+            assert cleanup_binding is None
+        else:
+            assert cleanup_binding is not None
+            cleanup = load_json(
+                Path(cleanup_binding["path"]),
+                "controller fault cleanup",
+            )
+            assert cleanup["session_residual"] is False
+            assert cleanup["process_residual"] is False
+            assert cleanup["foreign_session_residual"] is not True
+            assert cleanup["foreign_pane_residual"] is not True
+        session_deadline = time.monotonic() + 5.0
+        while any(
+            subprocess.run(
+                ["tmux", "has-session", "-t", session],
+                capture_output=True,
+                text=True,
+            ).returncode
+            == 0
+            for session in sessions
+        ):
+            if time.monotonic() >= session_deadline:
+                raise AssertionError(
+                    f"controller fault left a tmux session: {fault_mode}"
+                )
+            time.sleep(0.02)
+        for session in sessions:
+            assert (
+                subprocess.run(
+                    ["tmux", "has-session", "-t", session],
+                    capture_output=True,
+                    text=True,
+                ).returncode
+                != 0
+            )
+    finally:
+        for session in sessions:
+            subprocess.run(
+                ["tmux", "kill-session", "-t", session],
+                capture_output=True,
+                text=True,
+            )
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("tmux") is None,
+    reason="requires Linux /proc and tmux",
+)
+@pytest.mark.parametrize(
+    "fault_mode",
+    (
+        "controller_fault_observer_launch_write",
+        "controller_fault_observer_launch_binding",
+        "controller_fault_process_log_mkdir",
+        "controller_fault_after_exact_owner_seal",
+    ),
+)
+def test_preflight_wrapper_observer_launch_write_fault_closes_owner(
+    tmp_path: Path,
+    fault_mode: str,
+) -> None:
+    wrapper = _wrapper_module()
+    repo_root = Path(__file__).parents[1]
+    helper = repo_root / "tests/helpers/preflight_lifecycle_helper.py"
+    policy_sha256 = hashlib.sha256(fault_mode.encode()).hexdigest()
+    policy_root = tmp_path / "campaign" / "by_policy" / policy_sha256
+    config = tmp_path / "policy.json"
+    config.write_text("{}\n", encoding="utf-8")
+    _prepare_wrapper_contract_inputs(wrapper, policy_root)
+    sessions = (wrapper.CONTROLLER_SESSION, wrapper.OBSERVER_SESSION)
+    command = [
+        sys.executable,
+        str(helper),
+        "wrapper",
+        "--wrapper-module",
+        str(repo_root / "scripts/run_canonical_preflight_wrapper.py"),
+        "--repo-root",
+        str(repo_root),
+        "--policy-root",
+        str(policy_root),
+        "--policy",
+        policy_sha256,
+        "--config",
+        str(config),
+        "--observer-mode",
+        fault_mode,
+        "--controller-seconds",
+        "30",
+        "--controller-exit",
+        "0",
+        "--terminal-timeout",
+        "0.5",
+    ]
+    try:
+        subprocess.run(
+            [
+                "tmux",
+                "new-session",
+                "-d",
+                "-s",
+                wrapper.CONTROLLER_SESSION,
+                "-e",
+                (
+                    f"{wrapper.OBSERVER_SESSION_ENV}="
+                    f"{wrapper.OBSERVER_SESSION}"
+                ),
+                "-c",
+                str(repo_root),
+                *command,
+            ],
+            check=True,
+        )
+        wrapper_exit_path = (
+            policy_root / "preflight_control/wrapper_exit.json"
+        )
+        deadline = time.monotonic() + 20.0
+        while not wrapper_exit_path.is_file():
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    "observer launch write closure timed out"
+                )
+            time.sleep(0.05)
+        wrapper_exit = load_json(
+            wrapper_exit_path, "observer launch write wrapper exit"
+        )
+        assert wrapper_exit["exit_code"] != 0
+        assert (
+            wrapper_exit["observer_launch"] is not None
+        ) is (
+            fault_mode
+            in {
+                "controller_fault_process_log_mkdir",
+                "controller_fault_after_exact_owner_seal",
+            }
+        )
+        stages = {
+            wrapper_exit["launch_failure"]["stage"],
+            *(
+                failure["stage"]
+                for failure in wrapper_exit["launch_failure"][
+                    "secondary_failures"
+                ]
+            ),
+        }
+        if fault_mode == "controller_fault_observer_launch_write":
+            assert "observer_launch_write" in stages
+        elif fault_mode == "controller_fault_after_exact_owner_seal":
+            assert "observer_launch" in stages
+            assert (
+                "failure after exact owner seal"
+                in wrapper_exit["launch_failure"]["message"]
+            )
+        else:
+            assert "outer_emergency_closure" in stages
+            assert (
+                "binding hash failure"
+                if fault_mode
+                == "controller_fault_observer_launch_binding"
+                else "parent mkdir failure"
+            ) in wrapper_exit["launch_failure"]["message"]
+        cleanup_binding = wrapper_exit["observer_cleanup"]
+        assert cleanup_binding is not None
+        cleanup = load_json(
+            Path(cleanup_binding["path"]),
+            "observer launch write cleanup",
+        )
+        assert cleanup["session_residual"] is False
+        assert cleanup["process_residual"] is False
+        session_deadline = time.monotonic() + 5.0
+        while any(
+            subprocess.run(
+                ["tmux", "has-session", "-t", session],
+                capture_output=True,
+                text=True,
+            ).returncode
+            == 0
+            for session in sessions
+        ):
+            if time.monotonic() >= session_deadline:
+                raise AssertionError(
+                    "observer launch write left a tmux session"
+                )
+            time.sleep(0.02)
+    finally:
+        for session in sessions:
+            subprocess.run(
+                ["tmux", "kill-session", "-t", session],
+                capture_output=True,
+                text=True,
+            )
 
 
 @pytest.mark.skipif(

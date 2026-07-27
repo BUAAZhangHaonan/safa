@@ -16,7 +16,7 @@ import stat
 import subprocess
 import sys
 import time
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 
 CONTROLLER_SESSION = "safa-screening-preflight-controller"
@@ -142,6 +142,61 @@ def _optional_binding(path: Path) -> dict[str, str] | None:
     if not path.is_file():
         return None
     return {"path": str(path.resolve()), "sha256": _sha256_file(path)}
+
+
+def _merge_launch_failure(
+    current: Mapping[str, Any] | None,
+    *,
+    stage: str,
+    failure_type: str,
+    message: str,
+) -> dict[str, Any]:
+    entry = {
+        "stage": stage,
+        "type": failure_type,
+        "message": message,
+    }
+    if current is None:
+        return {
+            **entry,
+            "secondary_failures": [],
+        }
+    merged = dict(current)
+    secondary = list(merged.get("secondary_failures", []))
+    secondary.append(entry)
+    merged["secondary_failures"] = secondary
+    return merged
+
+
+def _publish_wrapper_exit_total(
+    path: Path, value: Mapping[str, Any]
+) -> dict[str, Any]:
+    published = dict(value)
+    try:
+        _write_exclusive(path, published)
+        return published
+    except BaseException as exc:
+        if path.is_file():
+            observed = json.loads(path.read_text(encoding="utf-8"))
+            if observed == published:
+                return observed
+            raise RuntimeError(
+                "wrapper exit path contains an unbound publication"
+            ) from exc
+        published["launch_failure"] = _merge_launch_failure(
+            published.get("launch_failure"),
+            stage="wrapper_exit_write",
+            failure_type=type(exc).__name__,
+            message=str(exc),
+        )
+        if published.get("exit_code") == 0:
+            published["exit_code"] = 125
+        published["completed_at"] = _utc_now()
+        published["wrapper_exit_sha256"] = _canonical_digest(
+            published, "wrapper_exit_sha256"
+        )
+        _write_exclusive(path, published)
+        return published
 
 
 def _tmux_session() -> str:
@@ -843,6 +898,16 @@ def _probe_observer_gate(
     wrapper_binding: Mapping[str, str],
     owner_nonce: str,
     observer_command: Sequence[str],
+    owner_recorder: Callable[
+        [
+            Mapping[str, Any],
+            Mapping[str, Any],
+            Mapping[str, Any],
+            Mapping[str, int] | None,
+        ],
+        None,
+    ]
+    | None = None,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + OBSERVER_IDENTITY_WAIT_SECONDS
     last_probe: dict[str, Any] | None = None
@@ -896,6 +961,13 @@ def _probe_observer_gate(
                     "monotonic owner seal"
                 ),
             }
+        if owner_recorder is not None:
+            owner_recorder(
+                candidate_tmux,
+                candidate_server,
+                candidate_seal,
+                None if process is None else dict(process),
+            )
         if process is not None:
             candidate_process = dict(process)
             if best_process is None:
@@ -1214,6 +1286,16 @@ def _launch_and_probe_observer_gate(
     wrapper_binding: Mapping[str, str],
     owner_nonce: str,
     observer_command: Sequence[str],
+    owner_recorder: Callable[
+        [
+            Mapping[str, Any],
+            Mapping[str, Any],
+            Mapping[str, Any],
+            Mapping[str, int] | None,
+        ],
+        None,
+    ]
+    | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     gate_command = _observer_gate_command(
         ready_path=ready_path,
@@ -1272,6 +1354,7 @@ def _launch_and_probe_observer_gate(
         wrapper_binding=wrapper_binding,
         owner_nonce=owner_nonce,
         observer_command=observer_command,
+        owner_recorder=owner_recorder,
     )
     return probe, client
 
@@ -1698,6 +1781,174 @@ def _terminate_owned_process(
         _assert_process_identity(expected_identity, "owned controller")
         os.killpg(process.pid, signal.SIGKILL)
         process.wait()
+
+
+def _close_owned_controller_process(
+    process: subprocess.Popen[Any],
+    expected_identity: Mapping[str, int] | None,
+    *,
+    terminate: bool,
+) -> tuple[int | None, dict[str, Any]]:
+    """Close an owned controller without allowing cleanup errors to escape.
+
+    The returned code is populated only by a successful ``Popen.wait`` call.
+    Every exception is retained in the durable closure report.  The exact
+    Popen child can still be terminated safely when its process-group identity
+    could not be sealed because an unreaped child PID cannot be reused.
+    """
+
+    started_at = _utc_now()
+    failures: list[dict[str, str]] = []
+    term_sent = False
+    kill_sent = False
+    waited = False
+    return_code: int | None = None
+    group_identity_verified = False
+
+    def record(stage: str, exc: BaseException) -> None:
+        failures.append(
+            {
+                "stage": stage,
+                "type": type(exc).__name__,
+                "message": str(exc),
+            }
+        )
+
+    def wait_owned(
+        stage: str, timeout: float | None = None
+    ) -> int | None:
+        nonlocal waited, return_code
+        try:
+            if timeout is None:
+                observed = process.wait()
+            else:
+                observed = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise
+        except BaseException as exc:
+            record(stage, exc)
+            return None
+        waited = True
+        return_code = int(observed)
+        return return_code
+
+    try:
+        running = process.poll() is None
+    except BaseException as exc:
+        record("initial_poll", exc)
+        running = True
+
+    if running and terminate:
+        try:
+            if expected_identity is None:
+                raise RuntimeError(
+                    "owned controller process identity was not sealed"
+                )
+            if expected_identity["pid"] != process.pid:
+                raise RuntimeError(
+                    "owned controller PID differs from sealed identity"
+                )
+            _assert_process_identity(
+                expected_identity, "owned controller termination"
+            )
+            if expected_identity["pgid"] != process.pid:
+                raise RuntimeError(
+                    "owned controller process group differs"
+                )
+            if os.getpgid(process.pid) != process.pid:
+                raise RuntimeError(
+                    "live owned controller process group differs"
+                )
+            group_identity_verified = True
+        except BaseException as exc:
+            record("termination_initial_identity", exc)
+        try:
+            if group_identity_verified:
+                os.killpg(process.pid, signal.SIGTERM)
+            else:
+                process.terminate()
+            term_sent = True
+        except BaseException as exc:
+            record("termination_sigterm", exc)
+        try:
+            wait_owned(
+                "termination_sigterm_wait",
+                PROCESS_TERMINATION_WAIT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            try:
+                if group_identity_verified:
+                    assert expected_identity is not None
+                    _assert_process_identity(
+                        expected_identity,
+                        "owned controller SIGKILL recheck",
+                    )
+                    if os.getpgid(process.pid) != process.pid:
+                        raise RuntimeError(
+                            "owned controller process group changed "
+                            "before SIGKILL"
+                        )
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+                kill_sent = True
+            except BaseException as exc:
+                record("termination_sigkill", exc)
+            wait_owned("termination_sigkill_wait")
+    elif running:
+        wait_owned("natural_wait")
+    else:
+        wait_owned("already_exited_wait")
+
+    if not waited:
+        try:
+            if process.poll() is None:
+                if not kill_sent:
+                    process.kill()
+                    kill_sent = True
+                wait_owned("final_exact_child_wait")
+            else:
+                wait_owned("final_reap_wait")
+        except BaseException as exc:
+            record("final_reap", exc)
+
+    try:
+        residual: bool | None = process.poll() is None
+    except BaseException as exc:
+        record("final_poll", exc)
+        residual = None
+    status = (
+        "reaped"
+        if waited and residual is False
+        else "live_residual"
+        if residual is True
+        else "unknown_residual"
+    )
+    report = {
+        "schema_version": 1,
+        "contract_type": (
+            "safa_canonical_preflight_controller_process_closure_v1"
+        ),
+        "controller_pid": process.pid,
+        "sealed_process": (
+            None if expected_identity is None else dict(expected_identity)
+        ),
+        "terminate_requested": terminate,
+        "group_identity_verified": group_identity_verified,
+        "term_sent": term_sent,
+        "kill_sent": kill_sent,
+        "wait_observed": waited,
+        "wait_return_code": return_code,
+        "process_residual": residual,
+        "status": status,
+        "failures": failures,
+        "started_at": started_at,
+        "completed_at": _utc_now(),
+    }
+    report["controller_process_closure_sha256"] = _canonical_digest(
+        report, "controller_process_closure_sha256"
+    )
+    return return_code, report
 
 
 def _terminate_bound_observer(
@@ -2434,7 +2685,7 @@ def _validate_terminal_stop_binding(
     return observer_stop_binding
 
 
-def run_wrapped_controller(
+def _run_wrapped_controller_owned(
     *,
     repo_root: Path,
     policy_root: Path,
@@ -2442,11 +2693,13 @@ def run_wrapped_controller(
     config: Path,
     command: Sequence[str],
     observer_command: Sequence[str],
+    emergency_state: dict[str, Any],
 ) -> dict[str, Any]:
     control = policy_root.resolve() / "preflight_control"
     wrapper_claim_path = control / "wrapper_claim.json"
     process_log_path = control / "controller_process.log"
     process_exit_path = control / "controller_process_exit.json"
+    process_closure_path = control / "controller_process_closure.json"
     process_start_path = control / "controller_process_start.json"
     observer_launch_path = control / "observer_launch.json"
     observer_bootstrap_path = control / "observer_bootstrap.json"
@@ -2460,6 +2713,17 @@ def run_wrapped_controller(
         policy_root.resolve() / "checkpoint_preflight/preflight_request_manifest.json"
     )
     started_at = _utc_now()
+    emergency_state.update(
+        {
+            "control": control,
+            "wrapper_exit_path": wrapper_exit_path,
+            "observer_cleanup_path": observer_cleanup_path,
+            "process_closure_path": process_closure_path,
+            "policy_sha256": policy_sha256,
+            "command": list(command),
+            "started_at": started_at,
+        }
+    )
     controller_session = _tmux_session()
     controller_tmux = _tmux_identity(CONTROLLER_SESSION)
     controller_tmux_server = _tmux_server_identity(
@@ -2506,6 +2770,8 @@ def run_wrapped_controller(
         "sha256": _sha256_file(wrapper_claim_path),
         "canonical_sha256": claim["wrapper_claim_sha256"],
     }
+    emergency_state["claim"] = claim
+    emergency_state["wrapper_binding"] = wrapper_binding
     observer_launch_failure: dict[str, str] | None = None
     observer_owner_nonce = secrets.token_hex(
         TMUX_OWNER_NONCE_HEX_LENGTH // 2
@@ -2524,6 +2790,51 @@ def run_wrapped_controller(
     observer_tmux_owner_seal: dict[str, Any] | None = None
     observer_process: dict[str, int] | None = None
     observer_bootstrap: dict[str, Any] | None = None
+
+    def record_exact_owner(
+        tmux_identity: Mapping[str, Any],
+        tmux_server: Mapping[str, Any],
+        owner_seal: Mapping[str, Any],
+        process_identity: Mapping[str, int] | None,
+    ) -> None:
+        candidate = {
+            "tmux": dict(tmux_identity),
+            "tmux_server": dict(tmux_server),
+            "owner_seal": dict(owner_seal),
+            "process": (
+                None
+                if process_identity is None
+                else dict(process_identity)
+            ),
+            "process_snapshot_failure": None,
+        }
+        previous = emergency_state.get("provisional_observer")
+        if previous is not None:
+            for field in ("tmux", "tmux_server", "owner_seal"):
+                if previous.get(field) != candidate[field]:
+                    raise RuntimeError(
+                        "emergency observer owner identity changed"
+                    )
+            previous_process = previous.get("process")
+            if (
+                previous_process is not None
+                and candidate["process"] is not None
+                and previous_process != candidate["process"]
+            ):
+                raise RuntimeError(
+                    "emergency observer process identity changed"
+                )
+            if candidate["process"] is None:
+                candidate["process"] = previous_process
+        emergency_state["provisional_observer"] = candidate
+        if candidate["process"] is not None:
+            emergency_state["observer"] = {
+                "tmux": candidate["tmux"],
+                "tmux_server": candidate["tmux_server"],
+                "owner_seal": candidate["owner_seal"],
+                "process": candidate["process"],
+            }
+
     try:
         (
             observer_gate_probe,
@@ -2537,6 +2848,7 @@ def run_wrapped_controller(
             wrapper_binding=wrapper_binding,
             owner_nonce=observer_owner_nonce,
             observer_command=observer_command,
+            owner_recorder=record_exact_owner,
         )
         provisional_tmux = observer_gate_probe.get(
             "best_tmux"
@@ -2559,6 +2871,15 @@ def run_wrapped_controller(
             provisional_process_snapshot_failure = dict(
                 process_probe["failure"]
             )
+        emergency_state["provisional_observer"] = {
+            "tmux": provisional_tmux,
+            "tmux_server": provisional_tmux_server,
+            "owner_seal": provisional_tmux_owner_seal,
+            "process": provisional_process,
+            "process_snapshot_failure": (
+                provisional_process_snapshot_failure
+            ),
+        }
         observer_gate_ready = observer_gate_probe.get("gate_ready")
         if observer_gate_probe.get("status") != "exact_ready":
             raise RuntimeError(
@@ -2613,6 +2934,12 @@ def run_wrapped_controller(
             wrapper_binding=wrapper_binding,
             expected_command=observer_command,
         )
+        emergency_state["observer"] = {
+            "tmux": observer_tmux,
+            "tmux_server": observer_tmux_server,
+            "owner_seal": observer_tmux_owner_seal,
+            "process": observer_process,
+        }
         if (
             observer_tmux != provisional_tmux
             or observer_tmux_server != provisional_tmux_server
@@ -2628,6 +2955,21 @@ def run_wrapped_controller(
             )
         observer_launch_status = "launched"
     except BaseException as exc:
+        recorded_owner = emergency_state.get(
+            "provisional_observer"
+        )
+        if recorded_owner is not None:
+            provisional_tmux = recorded_owner.get("tmux")
+            provisional_tmux_server = recorded_owner.get(
+                "tmux_server"
+            )
+            provisional_tmux_owner_seal = recorded_owner.get(
+                "owner_seal"
+            )
+            provisional_process = recorded_owner.get("process")
+            provisional_process_snapshot_failure = (
+                recorded_owner.get("process_snapshot_failure")
+            )
         observer_tmux = None
         observer_tmux_server = None
         observer_tmux_owner_seal = None
@@ -2710,15 +3052,35 @@ def run_wrapped_controller(
     observer_launch["observer_launch_sha256"] = _canonical_digest(
         observer_launch, "observer_launch_sha256"
     )
-    _write_exclusive(observer_launch_path, observer_launch)
-    observer_launch_binding = {
-        "path": str(observer_launch_path.resolve()),
-        "sha256": _sha256_file(observer_launch_path),
-        "canonical_sha256": observer_launch[
-            "observer_launch_sha256"
-        ],
-    }
+    try:
+        _write_exclusive(observer_launch_path, observer_launch)
+        observer_launch_binding: dict[str, str] | None = {
+            "path": str(observer_launch_path.resolve()),
+            "sha256": _sha256_file(observer_launch_path),
+            "canonical_sha256": observer_launch[
+                "observer_launch_sha256"
+            ],
+        }
+        emergency_state["observer_launch_binding"] = (
+            observer_launch_binding
+        )
+    except BaseException as exc:
+        observer_launch_failure = _merge_launch_failure(
+            observer_launch_failure,
+            stage="observer_launch_write",
+            failure_type=type(exc).__name__,
+            message=str(exc),
+        )
+        observer_launch_binding = None
     if observer_launch_failure is not None:
+        durable_launch_failure = dict(observer_launch_failure)
+        if "stage" not in durable_launch_failure:
+            durable_launch_failure = _merge_launch_failure(
+                None,
+                stage="observer_launch",
+                failure_type=str(observer_launch_failure["type"]),
+                message=str(observer_launch_failure["message"]),
+            )
         if (
             provisional_tmux is not None
             and provisional_tmux_server is not None
@@ -2813,14 +3175,23 @@ def run_wrapped_controller(
         launch_cleanup["observer_cleanup_sha256"] = _canonical_digest(
             launch_cleanup, "observer_cleanup_sha256"
         )
-        _write_exclusive(observer_cleanup_path, launch_cleanup)
-        observer_cleanup_binding = {
-            "path": str(observer_cleanup_path.resolve()),
-            "sha256": _sha256_file(observer_cleanup_path),
-            "canonical_sha256": launch_cleanup[
-                "observer_cleanup_sha256"
-            ],
-        }
+        try:
+            _write_exclusive(observer_cleanup_path, launch_cleanup)
+            observer_cleanup_binding = {
+                "path": str(observer_cleanup_path.resolve()),
+                "sha256": _sha256_file(observer_cleanup_path),
+                "canonical_sha256": launch_cleanup[
+                    "observer_cleanup_sha256"
+                ],
+            }
+        except BaseException as exc:
+            durable_launch_failure = _merge_launch_failure(
+                durable_launch_failure,
+                stage="observer_cleanup_write",
+                failure_type=type(exc).__name__,
+                message=str(exc),
+            )
+            observer_cleanup_binding = None
         not_started = {
             "schema_version": 1,
             "contract_type": (
@@ -2833,7 +3204,7 @@ def run_wrapped_controller(
             "command": list(command),
             "status": "not_started",
             "process": None,
-            "reason": dict(observer_launch_failure),
+            "reason": dict(durable_launch_failure),
             "started_at": None,
             "completed_at": _utc_now(),
         }
@@ -2842,14 +3213,23 @@ def run_wrapped_controller(
                 not_started, "controller_process_start_sha256"
             )
         )
-        _write_exclusive(process_start_path, not_started)
-        not_started_binding = {
-            "path": str(process_start_path.resolve()),
-            "sha256": _sha256_file(process_start_path),
-            "canonical_sha256": not_started[
-                "controller_process_start_sha256"
-            ],
-        }
+        try:
+            _write_exclusive(process_start_path, not_started)
+            not_started_binding = {
+                "path": str(process_start_path.resolve()),
+                "sha256": _sha256_file(process_start_path),
+                "canonical_sha256": not_started[
+                    "controller_process_start_sha256"
+                ],
+            }
+        except BaseException as exc:
+            durable_launch_failure = _merge_launch_failure(
+                durable_launch_failure,
+                stage="controller_not_started_write",
+                failure_type=type(exc).__name__,
+                message=str(exc),
+            )
+            not_started_binding = None
         not_started_exit = {
             "schema_version": 1,
             "contract_type": (
@@ -2866,7 +3246,7 @@ def run_wrapped_controller(
             "status": "not_started",
             "exit_code": None,
             "signal": None,
-            "launch_failure": dict(observer_launch_failure),
+            "launch_failure": dict(durable_launch_failure),
             "controller_process_log": None,
             "controller_claim": None,
             "controller_terminal": None,
@@ -2877,14 +3257,23 @@ def run_wrapped_controller(
         ] = _canonical_digest(
             not_started_exit, "controller_process_exit_sha256"
         )
-        _write_exclusive(process_exit_path, not_started_exit)
-        process_exit_binding = {
-            "path": str(process_exit_path.resolve()),
-            "sha256": _sha256_file(process_exit_path),
-            "canonical_sha256": not_started_exit[
-                "controller_process_exit_sha256"
-            ],
-        }
+        try:
+            _write_exclusive(process_exit_path, not_started_exit)
+            process_exit_binding = {
+                "path": str(process_exit_path.resolve()),
+                "sha256": _sha256_file(process_exit_path),
+                "canonical_sha256": not_started_exit[
+                    "controller_process_exit_sha256"
+                ],
+            }
+        except BaseException as exc:
+            durable_launch_failure = _merge_launch_failure(
+                durable_launch_failure,
+                stage="controller_not_started_exit_write",
+                failure_type=type(exc).__name__,
+                message=str(exc),
+            )
+            process_exit_binding = None
         failed_wrapper_exit = {
             "schema_version": 1,
             "contract_type": (
@@ -2898,7 +3287,7 @@ def run_wrapped_controller(
             "exit_code": 125,
             "controller_exit_code": None,
             "signal": None,
-            "launch_failure": dict(observer_launch_failure),
+            "launch_failure": dict(durable_launch_failure),
             "controller_process_exit": process_exit_binding,
             "controller_process_log": None,
             "observer_launch": observer_launch_binding,
@@ -2919,17 +3308,22 @@ def run_wrapped_controller(
                 failed_wrapper_exit, "wrapper_exit_sha256"
             )
         )
-        _write_exclusive(wrapper_exit_path, failed_wrapper_exit)
-        return failed_wrapper_exit
+        return _publish_wrapper_exit_total(
+            wrapper_exit_path, failed_wrapper_exit
+        )
     process_log_path.parent.mkdir(parents=True, exist_ok=True)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     descriptor: int | None = None
+    process: subprocess.Popen[Any] | None = None
     return_code: int | None = None
     controller_pid: int | None = None
     controller_process_start: dict[str, Any] | None = None
     controller_process_start_binding: dict[str, str] | None = None
+    controller_process_closure: dict[str, Any] | None = None
+    controller_process_closure_binding: dict[str, str] | None = None
+    process_exit_binding: dict[str, str] | None = None
     observer_stop_binding: dict[str, str] | None = None
     observer_cleanup_binding: dict[str, str] | None = None
     observer_cleanup_residual = False
@@ -2941,7 +3335,23 @@ def run_wrapped_controller(
     observer_terminal_value: dict[str, Any] | None = None
     observer_terminal_validation_failure: dict[str, str] | None = None
     late_observer_terminal_validation_failure: dict[str, str] | None = None
-    launch_failure: dict[str, str] | None = None
+    launch_failure: dict[str, Any] | None = None
+
+    def optional_artifact_binding(
+        path: Path, stage: str
+    ) -> dict[str, str] | None:
+        nonlocal launch_failure
+        try:
+            return _optional_binding(path)
+        except BaseException as exc:
+            launch_failure = _merge_launch_failure(
+                launch_failure,
+                stage=stage,
+                failure_type=type(exc).__name__,
+                message=str(exc),
+            )
+            return None
+
     try:
         descriptor = os.open(process_log_path, flags, 0o644)
         controller_environment = dict(os.environ)
@@ -2955,6 +3365,7 @@ def run_wrapped_controller(
             start_new_session=True,
             env=controller_environment,
         )
+        emergency_state["controller_process"] = process
         controller_pid = process.pid
         controller_process_start = {
             "schema_version": 1,
@@ -2970,20 +3381,43 @@ def run_wrapped_controller(
         }
         if controller_process_start["process"]["pgid"] != process.pid:
             raise RuntimeError("CPU preflight controller process group differs")
+        emergency_state["controller_identity"] = (
+            controller_process_start["process"]
+        )
         controller_process_start[
             "controller_process_start_sha256"
         ] = _canonical_digest(
             controller_process_start,
             "controller_process_start_sha256",
         )
-        _write_exclusive(process_start_path, controller_process_start)
-        controller_process_start_binding = {
-            "path": str(process_start_path.resolve()),
-            "sha256": _sha256_file(process_start_path),
-            "canonical_sha256": controller_process_start[
-                "controller_process_start_sha256"
-            ],
-        }
+        try:
+            _write_exclusive(
+                process_start_path, controller_process_start
+            )
+        except BaseException as exc:
+            launch_failure = _merge_launch_failure(
+                launch_failure,
+                stage="controller_process_start_write",
+                failure_type=type(exc).__name__,
+                message=str(exc),
+            )
+            raise
+        try:
+            controller_process_start_binding = {
+                "path": str(process_start_path.resolve()),
+                "sha256": _sha256_file(process_start_path),
+                "canonical_sha256": controller_process_start[
+                    "controller_process_start_sha256"
+                ],
+            }
+        except BaseException as exc:
+            launch_failure = _merge_launch_failure(
+                launch_failure,
+                stage="controller_process_start_binding",
+                failure_type=type(exc).__name__,
+                message=str(exc),
+            )
+            raise
         while process.poll() is None:
             try:
                 _assert_tmux_process_identity(
@@ -3006,69 +3440,202 @@ def run_wrapped_controller(
                         "sha256": _sha256_file(observer_stop_path),
                         "canonical_sha256": stop["observer_stop_sha256"],
                     }
-                    launch_failure = {
-                        "type": "ObserverHardStop",
-                        "message": str(stop["failure"]),
-                    }
-                    _terminate_owned_process(
-                        process, controller_process_start["process"]
+                    launch_failure = _merge_launch_failure(
+                        launch_failure,
+                        stage="controller_monitor_observer_hard_stop",
+                        failure_type="ObserverHardStop",
+                        message=str(stop["failure"]),
                     )
                     break
             except BaseException as exc:
-                launch_failure = {
-                    "type": type(exc).__name__,
-                    "message": str(exc),
-                }
-                _terminate_owned_process(
-                    process, controller_process_start["process"]
+                launch_failure = _merge_launch_failure(
+                    launch_failure,
+                    stage="controller_monitor",
+                    failure_type=type(exc).__name__,
+                    message=str(exc),
                 )
                 break
             time.sleep(0.1)
-        return_code = process.wait()
-        if observer_stop_path.is_file() and observer_stop_binding is None:
-            stop = _validate_observer_stop(
-                observer_stop_path,
-                policy_sha256=policy_sha256,
-                wrapper_binding=wrapper_binding,
-                observer_launch_binding=observer_launch_binding,
-                observer_process=observer_process,
-                process_start_binding=controller_process_start_binding,
-            )
-            observer_stop_binding = {
-                "path": str(observer_stop_path.resolve()),
-                "sha256": _sha256_file(observer_stop_path),
-                "canonical_sha256": stop["observer_stop_sha256"],
-            }
     except BaseException as exc:
-        launch_failure = {"type": type(exc).__name__, "message": str(exc)}
-        return_code = 125
+        launch_failure = _merge_launch_failure(
+            launch_failure,
+            stage="controller_launch_or_start",
+            failure_type=type(exc).__name__,
+            message=str(exc),
+        )
     finally:
+        if process is not None:
+            sealed_process = (
+                None
+                if controller_process_start is None
+                else controller_process_start.get("process")
+            )
+            return_code, controller_process_closure = (
+                _close_owned_controller_process(
+                    process,
+                    sealed_process,
+                    terminate=launch_failure is not None,
+                )
+            )
+            if controller_process_closure["failures"]:
+                for closure_failure in controller_process_closure[
+                    "failures"
+                ]:
+                    launch_failure = _merge_launch_failure(
+                        launch_failure,
+                        stage=(
+                            "controller_closure."
+                            f"{closure_failure['stage']}"
+                        ),
+                        failure_type=str(closure_failure["type"]),
+                        message=str(closure_failure["message"]),
+                    )
+            if (
+                not controller_process_closure["wait_observed"]
+                or controller_process_closure["process_residual"] is not False
+            ):
+                launch_failure = _merge_launch_failure(
+                    launch_failure,
+                    stage="controller_closure.residual",
+                    failure_type="ControllerProcessResidual",
+                    message=(
+                        "controller process was not proven reaped by wait"
+                    ),
+                )
+            try:
+                _write_exclusive(
+                    process_closure_path, controller_process_closure
+                )
+                controller_process_closure_binding = {
+                    "path": str(process_closure_path.resolve()),
+                    "sha256": _sha256_file(process_closure_path),
+                    "canonical_sha256": controller_process_closure[
+                        "controller_process_closure_sha256"
+                    ],
+                }
+            except BaseException as exc:
+                launch_failure = _merge_launch_failure(
+                    launch_failure,
+                    stage="controller_closure_write",
+                    failure_type=type(exc).__name__,
+                    message=str(exc),
+                )
         if descriptor is not None:
-            os.fsync(descriptor)
-            os.close(descriptor)
-    exit_code, signal_number = _normalized_exit(return_code)
-    process_exit = {
-        "schema_version": 1,
-        "contract_type": "safa_canonical_preflight_controller_process_exit_v2",
-        "policy_sha256": policy_sha256,
-        "wrapper_claim_sha256": claim["wrapper_claim_sha256"],
-        "observer_launch": observer_launch_binding,
-        "controller_process_start": controller_process_start_binding,
-        "observer_stop": observer_stop_binding,
-        "controller_pid": controller_pid,
-        "command": list(command),
-        "exit_code": exit_code,
-        "signal": signal_number,
-        "launch_failure": launch_failure,
-        "controller_process_log": _optional_binding(process_log_path),
-        "controller_claim": _optional_binding(control / "controller_claim.json"),
-        "controller_terminal": _optional_binding(control / "controller_terminal.json"),
-        "completed_at": _utc_now(),
-    }
-    process_exit["controller_process_exit_sha256"] = _canonical_digest(
-        process_exit, "controller_process_exit_sha256"
-    )
-    _write_exclusive(process_exit_path, process_exit)
+            try:
+                try:
+                    os.fsync(descriptor)
+                except BaseException as exc:
+                    launch_failure = _merge_launch_failure(
+                        launch_failure,
+                        stage="controller_log_fsync",
+                        failure_type=type(exc).__name__,
+                        message=str(exc),
+                    )
+            finally:
+                try:
+                    os.close(descriptor)
+                except BaseException as exc:
+                    launch_failure = _merge_launch_failure(
+                        launch_failure,
+                        stage="controller_log_close",
+                        failure_type=type(exc).__name__,
+                        message=str(exc),
+                    )
+    if (
+        process is not None
+        and controller_process_closure is not None
+        and controller_process_closure["wait_observed"]
+        and return_code is not None
+    ):
+        exit_code, signal_number = _normalized_exit(return_code)
+        if observer_stop_path.is_file() and observer_stop_binding is None:
+            try:
+                stop = _validate_observer_stop(
+                    observer_stop_path,
+                    policy_sha256=policy_sha256,
+                    wrapper_binding=wrapper_binding,
+                    observer_launch_binding=observer_launch_binding,
+                    observer_process=observer_process,
+                    process_start_binding=controller_process_start_binding,
+                    require_live_identity=False,
+                )
+                observer_stop_binding = {
+                    "path": str(observer_stop_path.resolve()),
+                    "sha256": _sha256_file(observer_stop_path),
+                    "canonical_sha256": stop["observer_stop_sha256"],
+                }
+            except BaseException as exc:
+                launch_failure = _merge_launch_failure(
+                    launch_failure,
+                    stage="observer_stop_validation",
+                    failure_type=type(exc).__name__,
+                    message=str(exc),
+                )
+        process_exit = {
+            "schema_version": 1,
+            "contract_type": "safa_canonical_preflight_controller_process_exit_v2",
+            "policy_sha256": policy_sha256,
+            "wrapper_claim_sha256": claim["wrapper_claim_sha256"],
+            "observer_launch": observer_launch_binding,
+            "controller_process_start": controller_process_start_binding,
+            "controller_process_closure": (
+                controller_process_closure_binding
+            ),
+            "observer_stop": observer_stop_binding,
+            "controller_pid": controller_pid,
+            "command": list(command),
+            "exit_code": exit_code,
+            "signal": signal_number,
+            "launch_failure": launch_failure,
+            "controller_process_log": optional_artifact_binding(
+                process_log_path, "controller_process_log_binding"
+            ),
+            "controller_claim": optional_artifact_binding(
+                control / "controller_claim.json",
+                "controller_claim_binding",
+            ),
+            "controller_terminal": optional_artifact_binding(
+                control / "controller_terminal.json",
+                "controller_terminal_binding",
+            ),
+            "completed_at": _utc_now(),
+        }
+        process_exit["controller_process_exit_sha256"] = _canonical_digest(
+            process_exit, "controller_process_exit_sha256"
+        )
+        try:
+            _write_exclusive(process_exit_path, process_exit)
+        except BaseException as exc:
+            launch_failure = _merge_launch_failure(
+                launch_failure,
+                stage="controller_process_exit_write",
+                failure_type=type(exc).__name__,
+                message=str(exc),
+            )
+            process_exit = None
+            process_exit_binding = None
+        else:
+            try:
+                process_exit_binding = {
+                    "path": str(process_exit_path.resolve()),
+                    "sha256": _sha256_file(process_exit_path),
+                    "canonical_sha256": process_exit[
+                        "controller_process_exit_sha256"
+                    ],
+                }
+            except BaseException as exc:
+                launch_failure = _merge_launch_failure(
+                    launch_failure,
+                    stage="controller_process_exit_binding",
+                    failure_type=type(exc).__name__,
+                    message=str(exc),
+                )
+                process_exit = None
+                process_exit_binding = None
+    else:
+        exit_code = 125
+        signal_number = None
+        process_exit = None
     try:
         observer_terminal_snapshot_result = _wait_observer_terminal(
             control / "observer_terminal.json",
@@ -3100,11 +3667,12 @@ def run_wrapped_controller(
             "type": type(exc).__name__,
             "message": str(exc),
         }
-        if launch_failure is None:
-            launch_failure = {
-                "type": "ObserverTerminalValidationError",
-                "message": str(exc),
-            }
+        launch_failure = _merge_launch_failure(
+            launch_failure,
+            stage="observer_terminal_validation",
+            failure_type="ObserverTerminalValidationError",
+            message=str(exc),
+        )
     if observer_terminal is None:
         try:
             termination = _terminate_bound_observer(
@@ -3208,15 +3776,27 @@ def run_wrapped_controller(
         cleanup["observer_cleanup_sha256"] = _canonical_digest(
             cleanup, "observer_cleanup_sha256"
         )
-        _write_exclusive(observer_cleanup_path, cleanup)
+        try:
+            _write_exclusive(observer_cleanup_path, cleanup)
+            observer_cleanup_binding = {
+                "path": str(observer_cleanup_path.resolve()),
+                "sha256": _sha256_file(observer_cleanup_path),
+                "canonical_sha256": cleanup[
+                    "observer_cleanup_sha256"
+                ],
+            }
+        except BaseException as exc:
+            launch_failure = _merge_launch_failure(
+                launch_failure,
+                stage="observer_cleanup_write",
+                failure_type=type(exc).__name__,
+                message=str(exc),
+            )
+            observer_cleanup_binding = None
+            observer_cleanup_failed = True
         observer_cleanup_residual = bool(
             cleanup["session_residual"] or cleanup["process_residual"]
         )
-        observer_cleanup_binding = {
-            "path": str(observer_cleanup_path.resolve()),
-            "sha256": _sha256_file(observer_cleanup_path),
-            "canonical_sha256": cleanup["observer_cleanup_sha256"],
-        }
     else:
         try:
             termination = _terminate_bound_observer(
@@ -3259,42 +3839,152 @@ def run_wrapped_controller(
         cleanup["observer_cleanup_sha256"] = _canonical_digest(
             cleanup, "observer_cleanup_sha256"
         )
-        _write_exclusive(observer_cleanup_path, cleanup)
+        try:
+            _write_exclusive(observer_cleanup_path, cleanup)
+            observer_cleanup_binding = {
+                "path": str(observer_cleanup_path.resolve()),
+                "sha256": _sha256_file(observer_cleanup_path),
+                "canonical_sha256": cleanup[
+                    "observer_cleanup_sha256"
+                ],
+            }
+        except BaseException as exc:
+            launch_failure = _merge_launch_failure(
+                launch_failure,
+                stage="observer_cleanup_write",
+                failure_type=type(exc).__name__,
+                message=str(exc),
+            )
+            observer_cleanup_binding = None
+            observer_cleanup_failed = True
         observer_cleanup_residual = bool(
             cleanup["session_residual"] or cleanup["process_residual"]
         )
         observer_cleanup_failed = (
-            cleanup["status"] != "closed_terminal_observer"
+            observer_cleanup_failed
+            or cleanup["status"] != "closed_terminal_observer"
         )
-        observer_cleanup_binding = {
-            "path": str(observer_cleanup_path.resolve()),
-            "sha256": _sha256_file(observer_cleanup_path),
-            "canonical_sha256": cleanup["observer_cleanup_sha256"],
-        }
     observer_status = (
         None
         if observer_terminal_value is None
         else observer_terminal_value.get("status")
     )
     effective_exit_code = exit_code
-    if (
-        observer_terminal is None
-        or observer_status != "completed"
-        or observer_terminal_validation_failure is not None
-        or late_observer_terminal is not None
-        or observer_cleanup_residual
-        or observer_cleanup_failed
-    ):
+    strict_binding_failure: dict[str, str] | None = None
+    try:
+        if controller_process_start_binding is None:
+            raise RuntimeError(
+                "controller process start binding is absent"
+            )
+        if controller_process_closure_binding is None:
+            raise RuntimeError(
+                "controller process closure binding is absent"
+            )
+        if process_exit is None:
+            raise RuntimeError("controller process exit binding is absent")
+        if wrapper_binding != _json_binding(
+            wrapper_claim_path, "wrapper_claim_sha256"
+        ):
+            raise RuntimeError("wrapper claim binding changed")
+        if observer_launch_binding != _json_binding(
+            observer_launch_path, "observer_launch_sha256"
+        ):
+            raise RuntimeError("observer launch binding changed")
+        if controller_process_start_binding != _json_binding(
+            process_start_path, "controller_process_start_sha256"
+        ):
+            raise RuntimeError(
+                "controller process start binding changed"
+            )
+        if controller_process_closure_binding != _json_binding(
+            process_closure_path, "controller_process_closure_sha256"
+        ):
+            raise RuntimeError(
+                "controller process closure binding changed"
+            )
+        process_exit_binding = _json_binding(
+            process_exit_path, "controller_process_exit_sha256"
+        )
+        if process_exit_binding["canonical_sha256"] != process_exit[
+            "controller_process_exit_sha256"
+        ]:
+            raise RuntimeError(
+                "controller process exit binding changed"
+            )
+        if observer_cleanup_binding != _json_binding(
+            observer_cleanup_path, "observer_cleanup_sha256"
+        ):
+            raise RuntimeError("observer cleanup binding changed")
+        if observer_terminal != observer_terminal_snapshot:
+            raise RuntimeError(
+                "observer terminal strict snapshot binding changed"
+            )
+    except BaseException as exc:
+        strict_binding_failure = {
+            "type": type(exc).__name__,
+            "message": str(exc),
+        }
+    strict_success = (
+        launch_failure is None
+        and strict_binding_failure is None
+        and process_exit is not None
+        and exit_code == 0
+        and process_exit.get("launch_failure") is None
+        and controller_process_closure is not None
+        and controller_process_closure.get("status") == "reaped"
+        and controller_process_closure.get("wait_observed") is True
+        and controller_process_closure.get("wait_return_code")
+        == return_code
+        and controller_process_closure.get("process_residual") is False
+        and controller_process_closure.get("failures") == []
+        and observer_terminal is not None
+        and observer_status == "completed"
+        and observer_terminal_validation_failure is None
+        and late_observer_terminal is None
+        and late_observer_terminal_validation_failure is None
+        and not observer_cleanup_residual
+        and not observer_cleanup_failed
+        and cleanup.get("status") == "closed_terminal_observer"
+        and observer_cleanup_binding is not None
+    )
+    if not strict_success:
         if effective_exit_code == 0:
             effective_exit_code = 124
+        if strict_binding_failure is not None:
+            launch_failure = _merge_launch_failure(
+                launch_failure,
+                stage="strict_binding_validation",
+                failure_type=str(strict_binding_failure["type"]),
+                message=str(strict_binding_failure["message"]),
+            )
         if launch_failure is None:
-            launch_failure = {
-                "type": "RuntimeError",
-                "message": (
-                    "CPU preflight observer crossed the terminal boundary "
-                    "or did not complete without residuals"
+            launch_failure = _merge_launch_failure(
+                None,
+                stage="strict_success_gate",
+                failure_type="RuntimeError",
+                message=(
+                    "CPU preflight wrapper strict success conjunction "
+                    "was not satisfied"
+                    + (
+                        ""
+                        if strict_binding_failure is None
+                        else f": {strict_binding_failure}"
+                    )
                 ),
-            }
+            )
+    process_log_binding = optional_artifact_binding(
+        process_log_path, "wrapper_process_log_binding"
+    )
+    controller_claim_binding = optional_artifact_binding(
+        control / "controller_claim.json",
+        "wrapper_controller_claim_binding",
+    )
+    controller_terminal_binding = optional_artifact_binding(
+        control / "controller_terminal.json",
+        "wrapper_controller_terminal_binding",
+    )
+    if launch_failure is not None and effective_exit_code == 0:
+        effective_exit_code = 124
     value = {
         "schema_version": 1,
         "contract_type": "safa_canonical_preflight_wrapper_exit_v4",
@@ -3307,20 +3997,15 @@ def run_wrapped_controller(
         "controller_exit_code": exit_code,
         "signal": signal_number,
         "launch_failure": launch_failure,
-        "controller_process_exit": {
-            "path": str(process_exit_path.resolve()),
-            "sha256": _sha256_file(process_exit_path),
-            "canonical_sha256": process_exit[
-                "controller_process_exit_sha256"
-            ],
-        },
-        "controller_process_log": _optional_binding(process_log_path),
+        "controller_process_exit": process_exit_binding,
+        "controller_process_closure": (
+            controller_process_closure_binding
+        ),
+        "controller_process_log": process_log_binding,
         "observer_launch": observer_launch_binding,
-        "controller_process_start": process_exit[
-            "controller_process_start"
-        ],
-        "controller_claim": _optional_binding(control / "controller_claim.json"),
-        "controller_terminal": _optional_binding(control / "controller_terminal.json"),
+        "controller_process_start": controller_process_start_binding,
+        "controller_claim": controller_claim_binding,
+        "controller_terminal": controller_terminal_binding,
         "observer_terminal": observer_terminal,
         "observer_terminal_snapshot": observer_terminal_snapshot,
         "late_observer_terminal": late_observer_terminal,
@@ -3339,8 +4024,260 @@ def run_wrapped_controller(
     value["wrapper_exit_sha256"] = _canonical_digest(
         value, "wrapper_exit_sha256"
     )
-    _write_exclusive(wrapper_exit_path, value)
-    return value
+    return _publish_wrapper_exit_total(wrapper_exit_path, value)
+
+
+def run_wrapped_controller(
+    *,
+    repo_root: Path,
+    policy_root: Path,
+    policy_sha256: str,
+    config: Path,
+    command: Sequence[str],
+    observer_command: Sequence[str],
+) -> dict[str, Any]:
+    emergency_state: dict[str, Any] = {}
+    try:
+        return _run_wrapped_controller_owned(
+            repo_root=repo_root,
+            policy_root=policy_root,
+            policy_sha256=policy_sha256,
+            config=config,
+            command=command,
+            observer_command=observer_command,
+            emergency_state=emergency_state,
+        )
+    except BaseException as exc:
+        failure = _merge_launch_failure(
+            None,
+            stage="outer_emergency_closure",
+            failure_type=type(exc).__name__,
+            message=str(exc),
+        )
+        control = emergency_state.get(
+            "control",
+            policy_root.resolve() / "preflight_control",
+        )
+        wrapper_exit_path = emergency_state.get(
+            "wrapper_exit_path", control / "wrapper_exit.json"
+        )
+        cleanup_path = emergency_state.get(
+            "observer_cleanup_path",
+            control / "observer_cleanup.json",
+        )
+        closure_path = emergency_state.get(
+            "process_closure_path",
+            control / "controller_process_closure.json",
+        )
+        controller_closure_binding: dict[str, str] | None = None
+        controller_return_code: int | None = None
+        process = emergency_state.get("controller_process")
+        if process is not None:
+            controller_return_code, controller_closure = (
+                _close_owned_controller_process(
+                    process,
+                    emergency_state.get("controller_identity"),
+                    terminate=True,
+                )
+            )
+            for item in controller_closure["failures"]:
+                failure = _merge_launch_failure(
+                    failure,
+                    stage=f"outer_controller.{item['stage']}",
+                    failure_type=str(item["type"]),
+                    message=str(item["message"]),
+                )
+            try:
+                if not closure_path.exists():
+                    _write_exclusive(
+                        closure_path, controller_closure
+                    )
+                controller_closure_binding = _json_binding(
+                    closure_path,
+                    "controller_process_closure_sha256",
+                )
+            except BaseException as closure_exc:
+                failure = _merge_launch_failure(
+                    failure,
+                    stage="outer_controller_closure_write",
+                    failure_type=type(closure_exc).__name__,
+                    message=str(closure_exc),
+                )
+        observer_termination: dict[str, Any] | None = None
+        observer = emergency_state.get("observer")
+        provisional = emergency_state.get("provisional_observer")
+        try:
+            if observer is not None:
+                observer_termination = _terminate_bound_observer(
+                    observer["tmux"],
+                    observer["tmux_server"],
+                    observer["owner_seal"],
+                    observer["process"],
+                )
+            elif (
+                provisional is not None
+                and provisional.get("tmux") is not None
+                and provisional.get("tmux_server") is not None
+                and provisional.get("owner_seal") is not None
+            ):
+                observer_termination = (
+                    _terminate_provisional_tmux_owner(
+                        provisional["tmux"],
+                        provisional["tmux_server"],
+                        provisional["owner_seal"],
+                        provisional.get("process"),
+                        provisional.get(
+                            "process_snapshot_failure"
+                        ),
+                    )
+                )
+        except BaseException as observer_exc:
+            failure = _merge_launch_failure(
+                failure,
+                stage="outer_observer_termination",
+                failure_type=type(observer_exc).__name__,
+                message=str(observer_exc),
+            )
+            observer_termination = {
+                "session": OBSERVER_SESSION,
+                "status": "cleanup_failed",
+                "session_residual": True,
+                "process_residual": True,
+                "foreign_session_residual": None,
+                "foreign_pane_residual": None,
+                "failure": {
+                    "type": type(observer_exc).__name__,
+                    "message": str(observer_exc),
+                },
+                "started_at": _utc_now(),
+                "completed_at": _utc_now(),
+            }
+        cleanup_binding: dict[str, str] | None = None
+        if observer_termination is not None:
+            cleanup = {
+                "schema_version": 1,
+                "contract_type": (
+                    "safa_canonical_preflight_observer_cleanup_v1"
+                ),
+                "policy_sha256": policy_sha256,
+                "wrapper_claim": emergency_state.get(
+                    "wrapper_binding"
+                ),
+                "observer_launch": emergency_state.get(
+                    "observer_launch_binding"
+                ),
+                "reason": "outer_emergency_closure",
+                **observer_termination,
+            }
+            cleanup["observer_cleanup_sha256"] = (
+                _canonical_digest(
+                    cleanup, "observer_cleanup_sha256"
+                )
+            )
+            try:
+                if not cleanup_path.exists():
+                    _write_exclusive(cleanup_path, cleanup)
+                cleanup_binding = _json_binding(
+                    cleanup_path, "observer_cleanup_sha256"
+                )
+            except BaseException as cleanup_exc:
+                failure = _merge_launch_failure(
+                    failure,
+                    stage="outer_observer_cleanup_write",
+                    failure_type=type(cleanup_exc).__name__,
+                    message=str(cleanup_exc),
+                )
+
+        def optional(path: Path, stage: str) -> dict[str, str] | None:
+            nonlocal failure
+            try:
+                return _optional_binding(path)
+            except BaseException as binding_exc:
+                failure = _merge_launch_failure(
+                    failure,
+                    stage=stage,
+                    failure_type=type(binding_exc).__name__,
+                    message=str(binding_exc),
+                )
+                return None
+
+        claim = emergency_state.get("claim")
+        normalized_controller_exit = (
+            None
+            if controller_return_code is None
+            else _normalized_exit(controller_return_code)[0]
+        )
+        value = {
+            "schema_version": 1,
+            "contract_type": (
+                "safa_canonical_preflight_wrapper_exit_v4"
+            ),
+            "policy_sha256": policy_sha256,
+            "wrapper_claim_sha256": (
+                None
+                if claim is None
+                else claim.get("wrapper_claim_sha256")
+            ),
+            "command": list(command),
+            "started_at": emergency_state.get(
+                "started_at", _utc_now()
+            ),
+            "completed_at": _utc_now(),
+            "exit_code": 125,
+            "controller_exit_code": normalized_controller_exit,
+            "signal": (
+                None
+                if controller_return_code is None
+                else _normalized_exit(controller_return_code)[1]
+            ),
+            "launch_failure": failure,
+            "controller_process_exit": optional(
+                control / "controller_process_exit.json",
+                "outer_controller_process_exit_binding",
+            ),
+            "controller_process_closure": (
+                controller_closure_binding
+            ),
+            "controller_process_log": optional(
+                control / "controller_process.log",
+                "outer_controller_process_log_binding",
+            ),
+            "observer_launch": emergency_state.get(
+                "observer_launch_binding"
+            ),
+            "controller_process_start": optional(
+                control / "controller_process_start.json",
+                "outer_controller_process_start_binding",
+            ),
+            "controller_claim": optional(
+                control / "controller_claim.json",
+                "outer_controller_claim_binding",
+            ),
+            "controller_terminal": optional(
+                control / "controller_terminal.json",
+                "outer_controller_terminal_binding",
+            ),
+            "observer_terminal": optional(
+                control / "observer_terminal.json",
+                "outer_observer_terminal_binding",
+            ),
+            "observer_terminal_snapshot": None,
+            "late_observer_terminal": None,
+            "late_observer_terminal_snapshot": None,
+            "observer_terminal_validation_failure": None,
+            "late_observer_terminal_validation_failure": None,
+            "observer_stop": optional(
+                control / "observer_stop.json",
+                "outer_observer_stop_binding",
+            ),
+            "observer_cleanup": cleanup_binding,
+        }
+        value["wrapper_exit_sha256"] = _canonical_digest(
+            value, "wrapper_exit_sha256"
+        )
+        return _publish_wrapper_exit_total(
+            wrapper_exit_path, value
+        )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:

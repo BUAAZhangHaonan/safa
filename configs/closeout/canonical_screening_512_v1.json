@@ -348,7 +348,7 @@
     },
     "preflight_wrapper": {
       "path": "scripts/run_canonical_preflight_wrapper.py",
-      "sha256": "c4cd76882b4130307d0970e0d58389b121761637e87c6ddda0beadf6c91f4cdc"
+      "sha256": "0f6cdb4b83a17604558ce04235f4182b206372c3a1fd74b3caced7ee841190be"
     },
     "gpu_wrapper": {
       "path": "scripts/run_canonical_gpu_wrapper.py",
