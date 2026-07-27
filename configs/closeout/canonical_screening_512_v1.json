@@ -3,69 +3,46 @@
   "contract_type": "safa_canonical_screening_policy_v1",
   "campaign_id": "historical-canonical-512-v1",
   "supersedes": {
-    "policy_sha256": "5dbb82fdb1c89d8f7afd463a2f0b40743f42abd7b0f07dcefab144a32787c7af",
-    "classification": "completed_preflight_and_smoke8_scientific_success_execution_barrier_incomplete_superseded",
-    "supersession_reason": "gpu_ready_barrier_and_phase_local_accounting_upgrade",
+    "policy_sha256": "9300a01c5f308840918dca8717f06bd6684e3a52967478950b5a9146b8f62508",
+    "previous_policy_sha256": "5dbb82fdb1c89d8f7afd463a2f0b40743f42abd7b0f07dcefab144a32787c7af",
+    "classification": "prepared_execution_barrier_not_crossed_superseded",
+    "supersession_reason": "cpu_preflight_durable_observer_contract_upgrade",
     "scientific_result_reuse": "forbidden",
-    "successor_execution": "fresh_full_193_preflight_and_smoke8",
+    "successor_execution": "fresh_full_193_preflight",
     "ram_budget_source_policy_sha256": "4d0345b6fc29cc8ec50ddc0255188a466ae78edae2e472fed9deda461cf76cbc",
     "counts": {
+      "checkpoint_plan_count": 1,
       "preflight_request_count": 193,
-      "preflight_result_count": 193,
-      "preflight_valid_count": 193,
-      "run_request_count": 386,
-      "run_result_count": 386,
-      "run_claim_count": 386,
-      "per_sample_count": 386,
-      "generated_png_count": 3088,
-      "screen512_request_count": 0
+      "preflight_result_count": 0,
+      "attempt_claim_count": 0,
+      "attempt_terminal_count": 0,
+      "controller_artifact_count": 0,
+      "generated_png_count": 0
     },
     "evidence_root": {
-      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/5dbb82fdb1c89d8f7afd463a2f0b40743f42abd7b0f07dcefab144a32787c7af",
-      "digest": "929210949ed4518f6585cd90eb306b9eb856cfae0821cbcdaab86b371ed66978",
-      "digest_algorithm": "sha256_relative_posix_nul_content_nul_v1"
+      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/9300a01c5f308840918dca8717f06bd6684e3a52967478950b5a9146b8f62508",
+      "digest": "3c82e2103c4dc5c0f3c83c4b26d51e9d9168cb1d8486c7512d89d04cda386ac3",
+      "digest_algorithm": "sha256_relative_posix_nul_content_nul_v1",
+      "file_count": 194
     },
-    "files": {
-      "preflight_controller_summary": {
-        "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/5dbb82fdb1c89d8f7afd463a2f0b40743f42abd7b0f07dcefab144a32787c7af/preflight_control/controller_summary.json",
-        "sha256": "efb1dd1b15a36f2b14671521c0e3c26ab6e59b15cfe482ab13c7478ada982c1f"
-      },
-      "preflight_controller_terminal": {
-        "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/5dbb82fdb1c89d8f7afd463a2f0b40743f42abd7b0f07dcefab144a32787c7af/preflight_control/controller_terminal.json",
-        "sha256": "617a3bac1c8a29d225a7ce3183d46450ca9fcbc0764f486d46babacde9f14f02"
-      },
-      "final_plan": {
-        "path": "artifacts/closeout/historical-canonical-512-v1/checkpoint_plan_final__5dbb82fdb1c89d8f.json",
-        "sha256": "6d632284bacc7046412f4c418c5274530f8dfc9427680109e4ec0b54d1136981"
-      },
-      "candidate_manifest": {
-        "path": "artifacts/closeout/historical-canonical-512-v1/candidate_manifest__5dbb82fdb1c89d8f.json",
-        "sha256": "6f9fcde6ff98225374470d553d6c0ca67787dde1a32337fccb1bc8ef399d9b87"
-      },
-      "smoke_summary": {
-        "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/5dbb82fdb1c89d8f7afd463a2f0b40743f42abd7b0f07dcefab144a32787c7af/summaries/smoke8__completed.json",
-        "sha256": "117f8df552f07d479c53cba050b8de1f1969660d503c7246c320f3b5c26e931d"
-      },
-      "smoke_admission": {
-        "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/5dbb82fdb1c89d8f7afd463a2f0b40743f42abd7b0f07dcefab144a32787c7af/admissions/smoke8__88c500a7256e8f923adf070cc1bdd4271fbedd23d5d71e925e720d35dd4c6870.json",
-        "sha256": "65721b780f0a7c49cecafa1dfd8d94d7c4ef25b137b2eb076fde3d8216cc898b"
-      },
-      "smoke_monitor": {
-        "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/5dbb82fdb1c89d8f7afd463a2f0b40743f42abd7b0f07dcefab144a32787c7af/logs/smoke8__monitor.jsonl",
-        "sha256": "eb6dc273c389fef5e219c84ef7716c92792309444fd39167d9b6ef9d69090df2"
-      },
-      "smoke_runtime_guard": {
-        "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/5dbb82fdb1c89d8f7afd463a2f0b40743f42abd7b0f07dcefab144a32787c7af/logs/smoke8__runtime_resource_windows.jsonl",
-        "sha256": "ed8bd5716750b73349351f1e807f90be12306ac7a70198870f53f36621e64374"
-      }
+    "checkpoint_plan": {
+      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/9300a01c5f308840918dca8717f06bd6684e3a52967478950b5a9146b8f62508/checkpoint_plan.json",
+      "sha256": "b2b79a6879e1b771d4e72cd404e332520631407c2c7612f1c32ea7dfad31066b"
     },
-    "execution_audit": {
-      "smoke_scientific_contract": "completed_and_deterministic",
-      "external_observer_claim": "absent",
-      "external_observer_ready": "absent",
-      "external_observer_samples": "absent",
-      "execution_compliance": "p1_failed",
-      "screen512": "never_started"
+    "request_set": {
+      "path": "artifacts/closeout/historical-canonical-512-v1/by_policy/9300a01c5f308840918dca8717f06bd6684e3a52967478950b5a9146b8f62508/checkpoint_preflight/requests",
+      "digest": "3ca9eab230df733daff633a812d6856e68b30cd0a9e81aad4f195632e5ca53e8",
+      "digest_algorithm": "sha256_relative_posix_nul_content_nul_v1",
+      "file_count": 193
+    },
+    "absence_evidence": {
+      "preflight_results": "absent",
+      "preflight_control": "absent",
+      "preflight_request_manifest": "absent",
+      "admissions": "absent",
+      "logs": "absent",
+      "final_plan": "absent",
+      "candidate_manifest": "absent"
     }
   },
   "python": "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
@@ -355,7 +332,7 @@
     },
     "screening_contracts": {
       "path": "src/safa/closeout/canonical_screening.py",
-        "sha256": "fe078d7ba750a5d963fc72de877b78aad2019987c96fd69c82f428aaa15be4b1"
+        "sha256": "745d7c6a845f3ec5c60f8e1aa8b2d3d650ff0be1065860bb4ac5728fa1948c95"
     },
     "screening_worker": {
       "path": "src/safa/closeout/canonical_screening_worker.py",
@@ -363,7 +340,7 @@
     },
     "controller": {
       "path": "scripts/run_canonical_checkpoint_screening.py",
-        "sha256": "b385b7ac6c9dc4ec5f42e8ee190c6f548c2d5c14d4d7619a47dec6461a6c84c2"
+      "sha256": "c12c1959caa575ae1dd9ec06dc0a7dfad7a7edce37290d95005c54c59f11f08f"
     },
     "ram_probe_launcher": {
       "path": "scripts/run_canonical_screening_ram_probe.py",
@@ -371,7 +348,7 @@
     },
     "preflight_wrapper": {
       "path": "scripts/run_canonical_preflight_wrapper.py",
-      "sha256": "8494785fcf83b89944a532c6f18fcefaea0644bbb56598562ccda4cb09face6b"
+      "sha256": "c4cd76882b4130307d0970e0d58389b121761637e87c6ddda0beadf6c91f4cdc"
     },
     "gpu_wrapper": {
       "path": "scripts/run_canonical_gpu_wrapper.py",

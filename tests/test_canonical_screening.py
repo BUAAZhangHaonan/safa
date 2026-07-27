@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import sys
 import threading
+import time
 import types
+from typing import Any, Mapping
 
 import pytest
 
@@ -417,6 +421,7 @@ def _admission_snapshot(policy: dict) -> dict:
     projected_used_bytes = memory_used_bytes + reserved_bytes
     return {
         "gpus": [],
+        "compute_processes": [],
         "authorized_gpu_registry": [
             {
                 "physical_gpu_index": index,
@@ -5150,7 +5155,7 @@ def test_worker_rejects_truncated_arcface_probe_request() -> None:
         )
 
 
-def test_current_policy_binds_5dbb_preflight_smoke_and_execution_audit() -> None:
+def test_current_policy_binds_9300_zero_result_preflight_supersession() -> None:
     root = Path(__file__).parents[1]
     policy_path = root / "configs/closeout/canonical_screening_512_v1.json"
 
@@ -5158,27 +5163,26 @@ def test_current_policy_binds_5dbb_preflight_smoke_and_execution_audit() -> None
 
     supersedes = policy["supersedes"]
     assert supersedes["policy_sha256"] == (
+        "9300a01c5f308840918dca8717f06bd6684e3a52967478950b5a9146b8f62508"
+    )
+    assert supersedes["previous_policy_sha256"] == (
         "5dbb82fdb1c89d8f7afd463a2f0b40743f42abd7b0f07dcefab144a32787c7af"
     )
-    assert supersedes["classification"] == (
-        "completed_preflight_and_smoke8_scientific_success_"
-        "execution_barrier_incomplete_superseded"
+    assert (
+        supersedes["classification"]
+        == "prepared_execution_barrier_not_crossed_superseded"
     )
     assert supersedes["counts"]["preflight_request_count"] == 193
-    assert supersedes["counts"]["preflight_result_count"] == 193
-    assert supersedes["counts"]["preflight_valid_count"] == 193
-    assert supersedes["counts"]["run_request_count"] == 386
-    assert supersedes["counts"]["run_result_count"] == 386
-    assert supersedes["counts"]["generated_png_count"] == 3088
-    assert supersedes["counts"]["screen512_request_count"] == 0
-    assert supersedes["execution_audit"]["execution_compliance"] == "p1_failed"
-    assert supersedes["execution_audit"]["external_observer_ready"] == "absent"
-    assert supersedes["execution_audit"]["screen512"] == "never_started"
-    assert supersedes["scientific_result_reuse"] == "forbidden"
+    assert supersedes["counts"]["preflight_result_count"] == 0
+    assert supersedes["counts"]["controller_artifact_count"] == 0
+    assert supersedes["counts"]["generated_png_count"] == 0
+    assert supersedes["absence_evidence"]["preflight_control"] == "absent"
     assert (
-        supersedes["successor_execution"]
-        == "fresh_full_193_preflight_and_smoke8"
+        supersedes["absence_evidence"]["preflight_request_manifest"]
+        == "absent"
     )
+    assert supersedes["scientific_result_reuse"] == "forbidden"
+    assert supersedes["successor_execution"] == "fresh_full_193_preflight"
     assert supersedes["ram_budget_source_policy_sha256"] == (
         "4d0345b6fc29cc8ec50ddc0255188a466ae78edae2e472fed9deda461cf76cbc"
     )
@@ -5191,13 +5195,13 @@ def test_current_policy_binds_5dbb_preflight_smoke_and_execution_audit() -> None
         ("request_count", "counts differ"),
         ("reuse", "status differs"),
         ("root_digest", "evidence root differs"),
-        ("preflight_path_alias", "file identity differs"),
-        ("observer_audit", "execution audit differs"),
+        ("request_digest", "request set differs"),
+        ("absence", "absence status differs"),
         ("successor", "status differs"),
         ("ram_lineage", "status differs"),
     ],
 )
-def test_5dbb_supersession_tampering_fails_closed(
+def test_9300_zero_result_supersession_tampering_fails_closed(
     mutation: str,
     match: str,
 ) -> None:
@@ -5208,19 +5212,17 @@ def test_5dbb_supersession_tampering_fails_closed(
     )
     supersedes = json.loads(json.dumps(raw["supersedes"]))
     if mutation == "request_count":
-        supersedes["counts"]["run_request_count"] = 385
+        supersedes["counts"]["preflight_request_count"] = 192
     elif mutation == "reuse":
         supersedes["scientific_result_reuse"] = "allowed"
     elif mutation == "root_digest":
         supersedes["evidence_root"]["digest"] = "0" * 64
-    elif mutation == "preflight_path_alias":
-        supersedes["files"]["final_plan"]["path"] = supersedes["files"][
-            "candidate_manifest"
-        ]["path"]
-    elif mutation == "observer_audit":
-        supersedes["execution_audit"]["external_observer_ready"] = "present"
+    elif mutation == "request_digest":
+        supersedes["request_set"]["digest"] = "0" * 64
+    elif mutation == "absence":
+        supersedes["absence_evidence"]["preflight_control"] = "present"
     elif mutation == "successor":
-        supersedes["successor_execution"] = "fresh_full_193_preflight"
+        supersedes["successor_execution"] = "fresh_full_193_preflight_and_smoke8"
     elif mutation == "ram_lineage":
         supersedes["ram_budget_source_policy_sha256"] = "0" * 64
     else:
@@ -5264,9 +5266,14 @@ def test_preflight_attempt_failure_writes_claim_and_terminal_without_result(
         "preflight_generator_checkpoint",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("injected")),
     )
+    monkeypatch.setattr(
+        module, "_assert_preflight_observer_live", lambda *_args: None
+    )
     guard = types.SimpleNamespace(raise_if_violated=lambda: None)
     with pytest.raises(RuntimeError, match="injected"):
-        module.materialize_preflights(policy, paths, guard, "d" * 64)
+        module.materialize_preflights(
+            policy, paths, guard, "d" * 64, {"sha256": "e" * 64}
+        )
     attempts = paths["preflight_control"] / "attempts"
     claim = load_json(next(attempts.glob("*.claim.json")), "attempt claim")
     terminal = load_json(next(attempts.glob("*.terminal.json")), "attempt terminal")
@@ -5295,6 +5302,9 @@ def test_runtime_stop_before_result_writes_one_failed_attempt_terminal(
     monkeypatch.setattr(
         module, "preflight_generator_checkpoint", lambda *_args, **_kwargs: {}
     )
+    monkeypatch.setattr(
+        module, "_assert_preflight_observer_live", lambda *_args: None
+    )
 
     class Guard:
         def __init__(self) -> None:
@@ -5306,7 +5316,13 @@ def test_runtime_stop_before_result_writes_one_failed_attempt_terminal(
                 raise CanonicalScreeningError("CPU runtime hard stop")
 
     with pytest.raises(CanonicalScreeningError, match="CPU runtime hard stop"):
-        module.materialize_preflights(policy, paths, Guard(), "d" * 64)
+        module.materialize_preflights(
+            policy,
+            paths,
+            Guard(),
+            "d" * 64,
+            {"sha256": "e" * 64},
+        )
     attempts = paths["preflight_control"] / "attempts"
     terminals = list(attempts.glob("*.terminal.json"))
     assert len(terminals) == 1
@@ -5324,23 +5340,44 @@ def test_controller_failure_persists_log_and_global_terminal(
     _write_jsonl(ledger, [_row("config", None)])
     policy, _, _ = _policy(tmp_path, ledger)
     paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
-    monkeypatch.setenv("TMUX", "fixture")
     admission_calls = 0
 
-    def admit(*_args):
+    def admit(*_args, **_kwargs):
         nonlocal admission_calls
         admission_calls += 1
-        return {"admission_kind": "cpu_only"}
+        return _admission_snapshot(policy)
 
     class FakeGuard:
-        def __init__(self, _policy, sample_path: Path, _disk_path: Path) -> None:
+        def __init__(
+            self,
+            _policy,
+            sample_path: Path,
+            _disk_path: Path,
+            authorized_gpu_registry: list[dict],
+        ) -> None:
             self.started = False
             self.sample_path = sample_path
+            self.policy_sha256 = _policy["policy_sha256"]
+            self.authorized_gpu_registry = authorized_gpu_registry
 
         def start(self) -> None:
             self.started = True
-            self.sample_path.parent.mkdir(parents=True, exist_ok=True)
-            self.sample_path.write_bytes(b'{"sample":1}\n')
+            sample = {
+                "schema_version": 1,
+                "contract_type": (
+                    "safa_canonical_runtime_resource_window_v1"
+                ),
+                "policy_sha256": self.policy_sha256,
+                "sequence": 1,
+                "violated": False,
+            }
+            sample["resource_window_sha256"] = canonical_digest(
+                sample, "resource_window_sha256"
+            )
+            _write_jsonl(self.sample_path, [sample])
+
+        def wait_first_sample(self, _timeout: float) -> dict:
+            return module.load_jsonl(self.sample_path, "resource")[0]
 
         def stop(self) -> dict:
             return {
@@ -5356,8 +5393,46 @@ def test_controller_failure_persists_log_and_global_terminal(
                 },
             }
 
-    monkeypatch.setattr(module, "assert_cpu_resource_admission", admit)
+    fake_binding = {
+        "path": str((tmp_path / "bound.json").resolve()),
+        "sha256": "a" * 64,
+        "canonical_sha256": "b" * 64,
+    }
+    monkeypatch.setattr(
+        module,
+        "_current_tmux_session",
+        lambda expected, _label: expected,
+    )
+    monkeypatch.setattr(
+        module,
+        "_process_identity",
+        lambda pid: {"pid": pid, "pgid": pid, "start_ticks": 1},
+    )
+    monkeypatch.setattr(
+        module,
+        "_validate_preflight_wrapper_provenance",
+        lambda *_args: (
+            {"checkpoint_plan": fake_binding},
+            fake_binding,
+            {"request_count": 0},
+            fake_binding,
+            fake_binding,
+            fake_binding,
+        ),
+    )
+    monkeypatch.setattr(module, "assert_resource_admission", admit)
     monkeypatch.setattr(module, "RuntimeResourceGuard", FakeGuard)
+    monkeypatch.setattr(
+        module,
+        "_wait_preflight_observer_ready",
+        lambda *_args: (
+            {"observer_ready_sha256": "c" * 64},
+            fake_binding,
+        ),
+    )
+    monkeypatch.setattr(
+        module, "_assert_preflight_observer_live", lambda *_args: None
+    )
     monkeypatch.setattr(
         module,
         "materialize_preflights",
@@ -5381,17 +5456,3210 @@ def test_controller_failure_persists_log_and_global_terminal(
     )
 
 
-def test_wrapper_records_native_stderr_and_sigkill_without_controller_claim(
+def _prepare_wrapper_contract_inputs(wrapper, policy_root: Path) -> None:
+    plan = {"schema_version": 1}
+    plan["checkpoint_plan_sha256"] = wrapper._canonical_digest(
+        plan, "checkpoint_plan_sha256"
+    )
+    wrapper._write_exclusive(policy_root / "checkpoint_plan.json", plan)
+    manifest = {"schema_version": 1}
+    manifest[
+        "preflight_request_manifest_sha256"
+    ] = wrapper._canonical_digest(
+        manifest, "preflight_request_manifest_sha256"
+    )
+    wrapper._write_exclusive(
+        policy_root
+        / "checkpoint_preflight"
+        / "preflight_request_manifest.json",
+        manifest,
+    )
+
+
+def _patch_wrapper_tmux(
+    wrapper, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fake_terminal = tmp_path / "fake_observer_terminal.json"
+    fake_terminal.write_text(
+        json.dumps({"status": "completed"}) + "\n", encoding="utf-8"
+    )
+    fake_terminal_binding = {
+        "path": str(fake_terminal),
+        "sha256": hashlib.sha256(fake_terminal.read_bytes()).hexdigest(),
+        "canonical_sha256": "b" * 64,
+    }
+    monkeypatch.setattr(
+        wrapper, "_tmux_session", lambda: wrapper.CONTROLLER_SESSION
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_tmux_identity",
+        lambda session: {
+            "session": session,
+            "pane": (
+                "%0" if session == wrapper.CONTROLLER_SESSION else "%1"
+            ),
+            "pane_pid": os.getpid(),
+            "pane_current_command": "python",
+        },
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_tmux_pane_identity",
+        lambda pane: {
+            "session": (
+                wrapper.CONTROLLER_SESSION
+                if pane == "%0"
+                else wrapper.OBSERVER_SESSION
+            ),
+            "pane": pane,
+            "pane_pid": os.getpid(),
+            "pane_current_command": "python",
+        },
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_tmux_server_identity",
+        lambda _target=None: {
+            "server_pid": os.getpid(),
+            "socket_path": str((tmp_path / "tmux.sock").resolve()),
+        },
+    )
+    fixture_tmux = {
+        "session": wrapper.OBSERVER_SESSION,
+        "pane": "%1",
+        "pane_pid": os.getpid(),
+        "pane_current_command": "python",
+    }
+    fixture_server = {
+        "server_pid": os.getpid(),
+        "socket_path": str((tmp_path / "tmux.sock").resolve()),
+    }
+    fixture_process = wrapper._require_process_identity(
+        os.getpid(), "fixture"
+    )
+    fixture_process["pgid"] = fixture_process["pid"]
+    real_process_identity = wrapper._process_identity
+    real_read_process_stat = wrapper._read_process_stat
+    monkeypatch.setattr(
+        wrapper,
+        "_process_identity",
+        lambda pid: (
+            dict(fixture_process)
+            if pid == fixture_process["pid"]
+            else real_process_identity(pid)
+        ),
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_read_process_stat",
+        lambda pid: (
+            (dict(fixture_process), "S")
+            if pid == fixture_process["pid"]
+            else real_read_process_stat(pid)
+        ),
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_build_tmux_owner_seal",
+        lambda tmux, server, owner_nonce: {
+            "server_pid": server["server_pid"],
+            "server_start_ticks": fixture_process["start_ticks"],
+            "socket_path": server["socket_path"],
+            "socket_device": 1,
+            "socket_inode": 2,
+            "session": tmux["session"],
+            "pane": tmux["pane"],
+            "pane_pid": tmux["pane_pid"],
+            "owner_nonce": owner_nonce,
+        },
+    )
+
+    def fake_wait_identity(
+        _session,
+        owner_nonce,
+        bootstrap_path,
+        **wait_kwargs,
+    ):
+        bootstrap = {
+            "schema_version": 1,
+            "contract_type": (
+                "safa_canonical_preflight_observer_bootstrap_v1"
+            ),
+            "policy_sha256": wait_kwargs["policy_sha256"],
+            "wrapper_claim": dict(wait_kwargs["wrapper_binding"]),
+            "observer_session": wrapper.OBSERVER_SESSION,
+            "owner_nonce": owner_nonce,
+            "process": dict(fixture_process),
+            "executable": sys.executable,
+            "command": list(wait_kwargs["expected_command"]),
+            "tmux": dict(fixture_tmux),
+            "published_at": wrapper._utc_now(),
+        }
+        bootstrap["observer_bootstrap_sha256"] = (
+            wrapper._canonical_digest(
+                bootstrap, "observer_bootstrap_sha256"
+            )
+        )
+        wrapper._write_exclusive(bootstrap_path, bootstrap)
+        return (
+            dict(fixture_tmux),
+            dict(fixture_server),
+            {
+                "server_pid": fixture_server["server_pid"],
+                "server_start_ticks": fixture_process["start_ticks"],
+                "socket_path": fixture_server["socket_path"],
+                "socket_device": 1,
+                "socket_inode": 2,
+                "session": fixture_tmux["session"],
+                "pane": fixture_tmux["pane"],
+                "pane_pid": fixture_tmux["pane_pid"],
+                "owner_nonce": owner_nonce,
+            },
+            dict(fixture_process),
+            bootstrap,
+        )
+
+    monkeypatch.setattr(
+        wrapper,
+        "_wait_tmux_process_identity",
+        fake_wait_identity,
+    )
+    def fake_gate_launch(
+        *,
+        ready_path,
+        release_path,
+        bootstrap_path,
+        policy_sha256,
+        wrapper_binding,
+        owner_nonce,
+        observer_command,
+        **_kwargs,
+    ):
+        ready = {
+            "schema_version": 1,
+            "contract_type": (
+                "safa_canonical_preflight_observer_gate_ready_v1"
+            ),
+            "policy_sha256": policy_sha256,
+            "wrapper_claim": dict(wrapper_binding),
+            "observer_session": wrapper.OBSERVER_SESSION,
+            "owner_nonce": owner_nonce,
+            "process": dict(fixture_process),
+            "gate_executable": sys.executable,
+            "gate_command": [sys.executable, "gate"],
+            "tmux": dict(fixture_tmux),
+            "tmux_server": dict(fixture_server),
+            "release_path": str(release_path.resolve()),
+            "bootstrap_path": str(bootstrap_path.resolve()),
+            "observer_command": list(observer_command),
+            "published_at": wrapper._utc_now(),
+        }
+        ready["observer_gate_ready_sha256"] = (
+            wrapper._canonical_digest(
+                ready, "observer_gate_ready_sha256"
+            )
+        )
+        wrapper._write_exclusive(ready_path, ready)
+        return (
+            {
+                "status": "exact_ready",
+                "tmux": dict(fixture_tmux),
+                "tmux_server": dict(fixture_server),
+                "tmux_owner_seal": {
+                    "server_pid": fixture_server["server_pid"],
+                    "server_start_ticks": fixture_process[
+                        "start_ticks"
+                    ],
+                    "socket_path": fixture_server["socket_path"],
+                    "socket_device": 1,
+                    "socket_inode": 2,
+                    "session": fixture_tmux["session"],
+                    "pane": fixture_tmux["pane"],
+                    "pane_pid": fixture_tmux["pane_pid"],
+                    "owner_nonce": owner_nonce,
+                },
+                "process": dict(fixture_process),
+                "gate_ready": ready,
+                "failure": None,
+                "session_residual": True,
+            },
+            {
+                "returncode": 0,
+                "stdout": "",
+                "stderr": "",
+                "failure": None,
+                "command": ["tmux", "new-session"],
+            },
+        )
+
+    monkeypatch.setattr(
+        wrapper,
+        "_launch_and_probe_observer_gate",
+        fake_gate_launch,
+    )
+    monkeypatch.setattr(
+        wrapper, "_set_observer_remain_on_exit", lambda _seal: None
+    )
+    monkeypatch.setattr(
+        wrapper.subprocess,
+        "run",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            returncode=0, stdout="", stderr=""
+        ),
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_wait_observer_terminal",
+        lambda *_args, **_kwargs: (
+            {"status": "completed", "observer_stop": None},
+            dict(fake_terminal_binding),
+        ),
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_read_observer_terminal",
+        lambda *_args, **_kwargs: (
+            {"status": "completed", "observer_stop": None},
+            dict(fake_terminal_binding),
+        ),
+    )
+    monkeypatch.setattr(
+        wrapper, "_wait_bound_observer_exit", lambda *_args: True
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_terminate_bound_observer",
+        lambda *_args, **_kwargs: {
+            "session": wrapper.OBSERVER_SESSION,
+            "sealed_tmux": {
+                "session": wrapper.OBSERVER_SESSION,
+                "pane": "%1",
+                "pane_pid": os.getpid(),
+                "pane_current_command": "python",
+            },
+            "sealed_tmux_server": {
+                "server_pid": os.getpid(),
+                "socket_path": str((tmp_path / "tmux.sock").resolve()),
+            },
+            "sealed_tmux_owner": {
+                "server_pid": fixture_server["server_pid"],
+                "server_start_ticks": fixture_process["start_ticks"],
+                "socket_path": fixture_server["socket_path"],
+                "socket_device": 1,
+                "socket_inode": 2,
+                "session": fixture_tmux["session"],
+                "pane": fixture_tmux["pane"],
+                "pane_pid": fixture_tmux["pane_pid"],
+                "owner_nonce": "a" * 64,
+            },
+            "sealed_process": dict(fixture_process),
+            "status": "closed_terminal_observer",
+            "session_residual": False,
+            "process_residual": False,
+            "started_at": wrapper._utc_now(),
+            "completed_at": wrapper._utc_now(),
+        },
+    )
+
+
+def _run_provisional_observer_launch_failure(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    mutation: str,
+    cleanup_mode: str = "executed",
+    gate_mode: str = "exact_ready",
+    remain_failure: bool = False,
+    gate_failure_message: str | None = None,
+) -> tuple[Any, dict[str, Any], Path, dict[str, Any]]:
+    wrapper = _wrapper_module()
+    policy_sha256 = "7" * 64
+    policy_root = tmp_path / "campaign" / "by_policy" / policy_sha256
+    config = tmp_path / "policy.json"
+    config.write_text("{}\n", encoding="utf-8")
+    _prepare_wrapper_contract_inputs(wrapper, policy_root)
+    observer_command = [sys.executable, "-c", "pass"]
+    controller_command = [sys.executable, "-c", "raise SystemExit(0)"]
+    control = policy_root / "preflight_control"
+    controller_process = wrapper._require_process_identity(
+        os.getpid(), "fixture controller"
+    )
+    controller_process["pgid"] = controller_process["pid"]
+    observer_process = {"pid": 401, "pgid": 401, "start_ticks": 88}
+    server = {
+        "server_pid": os.getpid(),
+        "socket_path": str((tmp_path / "tmux.sock").resolve()),
+    }
+    controller_tmux = {
+        "session": wrapper.CONTROLLER_SESSION,
+        "pane": "%0",
+        "pane_pid": os.getpid(),
+        "pane_current_command": "python",
+    }
+    observer_tmux = {
+        "session": wrapper.OBSERVER_SESSION,
+        "pane": "%1",
+        "pane_pid": observer_process["pid"],
+        "pane_current_command": "python",
+    }
+    owner_nonce = "a" * 64
+    owner_seal = _test_tmux_owner_seal(
+        observer_tmux,
+        server,
+        owner_nonce=owner_nonce,
+        server_start_ticks=controller_process["start_ticks"],
+    )
+    state: dict[str, Any] = {
+        "owner": "sealed",
+        "kill_calls": 0,
+        "popen_calls": 0,
+        "tmux_commands": [],
+    }
+    monkeypatch.setattr(
+        wrapper.secrets, "token_hex", lambda _size: owner_nonce
+    )
+
+    monkeypatch.setattr(
+        wrapper, "_tmux_session", lambda: wrapper.CONTROLLER_SESSION
+    )
+
+    def tmux_identity(session: str) -> dict[str, Any]:
+        if session == wrapper.CONTROLLER_SESSION:
+            return dict(controller_tmux)
+        if state["owner"] == "absent":
+            raise wrapper.TmuxTargetAbsent("observer absent")
+        if state["owner"] == "foreign":
+            return {
+                **observer_tmux,
+                "pane_pid": 999,
+                "pane_current_command": "bash",
+            }
+        return dict(observer_tmux)
+
+    def pane_identity(pane: str) -> dict[str, Any]:
+        if pane == controller_tmux["pane"]:
+            return dict(controller_tmux)
+        if state["owner"] == "absent":
+            raise wrapper.TmuxTargetAbsent("observer pane absent")
+        if state["owner"] == "foreign":
+            return {
+                **observer_tmux,
+                "pane_pid": 999,
+                "pane_current_command": "bash",
+            }
+        return dict(observer_tmux)
+
+    monkeypatch.setattr(wrapper, "_tmux_identity", tmux_identity)
+    monkeypatch.setattr(wrapper, "_tmux_pane_identity", pane_identity)
+    monkeypatch.setattr(
+        wrapper,
+        "_tmux_server_identity",
+        lambda _target=None: dict(server),
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_build_tmux_owner_seal",
+        lambda tmux, observed_server, expected_nonce: (
+            dict(owner_seal)
+            if (
+                tmux == observer_tmux
+                and observed_server == server
+                and expected_nonce == owner_nonce
+            )
+            else (_ for _ in ()).throw(
+                AssertionError("provisional owner inputs differ")
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_tmux_owner_nonce",
+        lambda _pane, _socket: (
+            "b" * 64
+            if state["owner"] in {"foreign", "unsealed"}
+            else owner_nonce
+        ),
+    )
+
+    def process_identity(pid: int):
+        if pid == os.getpid():
+            return dict(controller_process)
+        if pid == observer_process["pid"] and state["owner"] == "sealed":
+            return dict(observer_process)
+        return None
+
+    def process_stat(pid: int):
+        identity = process_identity(pid)
+        return None if identity is None else (identity, "S")
+
+    monkeypatch.setattr(wrapper, "_process_identity", process_identity)
+    monkeypatch.setattr(wrapper, "_read_process_stat", process_stat)
+    monkeypatch.setattr(
+        wrapper.os,
+        "readlink",
+        lambda path: (
+            sys.executable
+            if path == f"/proc/{observer_process['pid']}/exe"
+            else (_ for _ in ()).throw(
+                AssertionError(f"unexpected executable probe: {path}")
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_process_command",
+        lambda pid: (
+            list(observer_command)
+            if pid == observer_process["pid"]
+            else (_ for _ in ()).throw(
+                AssertionError("unexpected process command PID")
+            )
+        ),
+    )
+    monkeypatch.setattr(wrapper, "OBSERVER_IDENTITY_WAIT_SECONDS", 0.0)
+
+    def fake_tmux_run(command, **_kwargs):
+        state["tmux_commands"].append(list(command))
+        if mutation != "never_publish":
+            wrapper_value = json.loads(
+                (control / "wrapper_claim.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            wrapper_binding = {
+                "path": str((control / "wrapper_claim.json").resolve()),
+                "sha256": hashlib.sha256(
+                    (control / "wrapper_claim.json").read_bytes()
+                ).hexdigest(),
+                "canonical_sha256": wrapper_value[
+                    "wrapper_claim_sha256"
+                ],
+            }
+            bootstrap = {
+                "schema_version": 1,
+                "contract_type": (
+                    "safa_canonical_preflight_observer_bootstrap_v1"
+                ),
+                "policy_sha256": policy_sha256,
+                "wrapper_claim": wrapper_binding,
+                "observer_session": wrapper.OBSERVER_SESSION,
+                "owner_nonce": owner_nonce,
+                "process": dict(observer_process),
+                "executable": sys.executable,
+                "command": list(observer_command),
+                "tmux": dict(observer_tmux),
+                "published_at": wrapper._utc_now(),
+            }
+            if mutation == "wrapper":
+                bootstrap["wrapper_claim"] = {
+                    **wrapper_binding,
+                    "canonical_sha256": "0" * 64,
+                }
+            elif mutation == "command":
+                bootstrap["command"] = [sys.executable, "-c", "pass # changed"]
+            elif mutation == "process":
+                bootstrap["process"] = {
+                    **observer_process,
+                    "start_ticks": observer_process["start_ticks"] + 1,
+                }
+            bootstrap["observer_bootstrap_sha256"] = (
+                wrapper._canonical_digest(
+                    bootstrap, "observer_bootstrap_sha256"
+                )
+            )
+            if mutation == "canonical":
+                bootstrap["observer_bootstrap_sha256"] = "0" * 64
+            wrapper._write_exclusive(
+                control / "observer_bootstrap.json", bootstrap
+            )
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(wrapper.subprocess, "run", fake_tmux_run)
+    def failed_bootstrap_gate_launch(
+        *,
+        ready_path,
+        release_path,
+        bootstrap_path,
+        policy_sha256,
+        wrapper_binding,
+        owner_nonce,
+        observer_command,
+        **_kwargs,
+    ):
+        if gate_mode.startswith("sealed_then_"):
+            final_owner = gate_mode.removeprefix("sealed_then_")
+            state["owner"] = final_owner
+            final_tmux = (
+                None
+                if final_owner == "absent"
+                else {
+                    **observer_tmux,
+                    **(
+                        {
+                            "pane_pid": 999,
+                            "pane_current_command": "bash",
+                        }
+                        if final_owner == "foreign"
+                        else {}
+                    ),
+                }
+            )
+            return (
+                {
+                    "status": (
+                        "absent"
+                        if final_owner == "absent"
+                        else "owner_unsealed_unknown"
+                        if final_owner == "unsealed"
+                        else "foreign_or_incomplete_owner"
+                    ),
+                    "tmux": final_tmux,
+                    "tmux_server": (
+                        None if final_owner == "absent" else dict(server)
+                    ),
+                    "tmux_owner_seal": None,
+                    "process": None,
+                    "process_probe": {"status": "not_observed"},
+                    "gate_ready": None,
+                    "failure": {
+                        "type": "FixtureWeakLaterProbe",
+                        "message": gate_mode,
+                    },
+                    "session_residual": final_owner != "absent",
+                    "best_tmux": dict(observer_tmux),
+                    "best_tmux_server": dict(server),
+                    "best_tmux_owner_seal": dict(owner_seal),
+                    "best_process": dict(observer_process),
+                    "best_process_probe": {
+                        "status": "live",
+                        "pid": observer_process["pid"],
+                        "state": "S",
+                        "identity": dict(observer_process),
+                    },
+                },
+                {
+                    "returncode": 0,
+                    "stdout": "",
+                    "stderr": "",
+                    "failure": None,
+                    "command": ["tmux", "new-session"],
+                },
+            )
+        if gate_mode != "exact_ready":
+            if gate_mode == "foreign_or_incomplete_owner":
+                state["owner"] = "foreign"
+            exact_owner = gate_mode.startswith("exact_owner_")
+            process_probe = (
+                {"status": "not_observed"}
+                if not exact_owner
+                else
+                {
+                    "status": "error",
+                    "pid": observer_process["pid"],
+                    "failure": {
+                        "type": "OSError",
+                        "message": (
+                            gate_failure_message
+                            or "fixture process stat failed"
+                        ),
+                    },
+                }
+                if gate_mode == "exact_owner_process_probe_failed"
+                else {
+                    "status": "live",
+                    "pid": observer_process["pid"],
+                    "state": "S",
+                    "identity": dict(observer_process),
+                }
+            )
+            return (
+                {
+                    "status": gate_mode,
+                    "tmux": (
+                        {
+                            **observer_tmux,
+                            "pane_pid": 999,
+                            "pane_current_command": "bash",
+                        }
+                        if gate_mode == "foreign_or_incomplete_owner"
+                        else dict(observer_tmux)
+                    ),
+                    "tmux_server": dict(server),
+                    "tmux_owner_seal": (
+                        dict(owner_seal) if exact_owner else None
+                    ),
+                    "process": (
+                        None
+                        if gate_mode
+                        == "exact_owner_process_probe_failed"
+                        else dict(observer_process)
+                        if exact_owner
+                        else None
+                    ),
+                    "process_probe": process_probe,
+                    "gate_ready": None,
+                    "failure": {
+                        "type": "FixtureProbeFailure",
+                        "message": (
+                            gate_failure_message or gate_mode
+                        ),
+                    },
+                    "session_residual": True,
+                },
+                {
+                    "returncode": 0,
+                    "stdout": "",
+                    "stderr": "",
+                    "failure": None,
+                    "command": [
+                        "tmux",
+                        "new-session",
+                        "exec gate",
+                    ],
+                },
+            )
+        ready = {
+            "schema_version": 1,
+            "contract_type": (
+                "safa_canonical_preflight_observer_gate_ready_v1"
+            ),
+            "policy_sha256": policy_sha256,
+            "wrapper_claim": dict(wrapper_binding),
+            "observer_session": wrapper.OBSERVER_SESSION,
+            "owner_nonce": owner_nonce,
+            "process": dict(observer_process),
+            "gate_executable": sys.executable,
+            "gate_command": [sys.executable, "gate"],
+            "tmux": dict(observer_tmux),
+            "tmux_server": dict(server),
+            "release_path": str(release_path.resolve()),
+            "bootstrap_path": str(bootstrap_path.resolve()),
+            "observer_command": list(observer_command),
+            "published_at": wrapper._utc_now(),
+        }
+        ready["observer_gate_ready_sha256"] = (
+            wrapper._canonical_digest(
+                ready, "observer_gate_ready_sha256"
+            )
+        )
+        wrapper._write_exclusive(ready_path, ready)
+        fake_tmux_run(["fixture-bootstrap"])
+        return (
+            {
+                "status": "exact_ready",
+                "tmux": dict(observer_tmux),
+                "tmux_server": dict(server),
+                "tmux_owner_seal": dict(owner_seal),
+                "process": dict(observer_process),
+                "gate_ready": ready,
+                "failure": None,
+                "session_residual": True,
+            },
+            {
+                "returncode": 0,
+                "stdout": "",
+                "stderr": "",
+                "failure": None,
+                "command": ["tmux", "new-session"],
+            },
+        )
+
+    monkeypatch.setattr(
+        wrapper,
+        "_launch_and_probe_observer_gate",
+        failed_bootstrap_gate_launch,
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_set_observer_remain_on_exit",
+        (
+            lambda _seal: (_ for _ in ()).throw(
+                RuntimeError("fixture remain-on-exit failed")
+            )
+            if remain_failure
+            else lambda _seal: None
+        ),
+    )
+
+    def forbidden_popen(*_args, **_kwargs):
+        state["popen_calls"] += 1
+        raise AssertionError("controller process must remain not_started")
+
+    monkeypatch.setattr(wrapper.subprocess, "Popen", forbidden_popen)
+
+    def conditional(seal):
+        assert dict(seal) == owner_seal
+        state["kill_calls"] += 1
+        if cleanup_mode == "executed":
+            state["owner"] = "absent"
+            return (
+                "executed",
+                types.SimpleNamespace(
+                    returncode=0, stdout="", stderr=""
+                ),
+            )
+        if cleanup_mode in {"foreign", "reject"}:
+            if cleanup_mode == "foreign":
+                state["owner"] = "foreign"
+            return (
+                "condition_rejected",
+                types.SimpleNamespace(
+                    returncode=0,
+                    stdout=wrapper.TMUX_CONDITIONAL_KILL_REJECTED,
+                    stderr="",
+                ),
+            )
+        return (
+            "command_failed",
+            types.SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="fixture conditional kill failed",
+            ),
+        )
+
+    monkeypatch.setattr(
+        wrapper, "_conditional_kill_tmux_owner", conditional
+    )
+    value = wrapper.run_wrapped_controller(
+        repo_root=tmp_path,
+        policy_root=policy_root,
+        policy_sha256=policy_sha256,
+        config=config,
+        observer_command=observer_command,
+        command=controller_command,
+    )
+    return wrapper, value, policy_root, state
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("never_publish", "canonical", "wrapper", "command", "process"),
+)
+def test_wrapper_provisional_owner_closes_each_bootstrap_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    wrapper, value, policy_root, state = (
+        _run_provisional_observer_launch_failure(
+            tmp_path, monkeypatch, mutation=mutation
+        )
+    )
+    control = policy_root / "preflight_control"
+    launch = load_json(control / "observer_launch.json", "failed launch")
+    cleanup = load_json(control / "observer_cleanup.json", "launch cleanup")
+    process_start = load_json(
+        control / "controller_process_start.json", "not-started controller"
+    )
+    process_exit = load_json(
+        control / "controller_process_exit.json", "not-started exit"
+    )
+    assert value["exit_code"] != 0
+    assert value["controller_exit_code"] is None
+    assert launch["contract_type"].endswith("observer_launch_failed_v1")
+    assert launch["status"] == "failed"
+    assert launch["provisional_tmux_owner_seal"] is not None
+    assert launch["tmux"] is None
+    assert cleanup["status"] == "closed_provisional_observer"
+    assert cleanup["session_residual"] is False
+    assert cleanup["process_residual"] is False
+    assert process_start["status"] == "not_started"
+    assert process_start["process"] is None
+    assert process_exit["status"] == "not_started"
+    assert process_exit["controller_pid"] is None
+    assert process_exit["exit_code"] is None
+    assert state["kill_calls"] == 1
+    assert state["popen_calls"] == 0
+    attempts = policy_root / "preflight_control/attempts"
+    results = policy_root / "checkpoint_preflight/results"
+    gpu_control = policy_root / "gpu_control"
+    execution_counts = {
+        "controller_process_starts": state["popen_calls"],
+        "preflight_request_executions": (
+            len(list(attempts.glob("*.claim.json")))
+            if attempts.exists()
+            else 0
+        ),
+        "preflight_results": (
+            len(list(results.glob("*.json"))) if results.exists() else 0
+        ),
+        "generator_outputs": len(
+            list(
+                (
+                    policy_root / "checkpoint_preflight"
+                ).rglob("*.png")
+            )
+        ),
+        "gpu_control_artifacts": (
+            len(list(gpu_control.rglob("*")))
+            if gpu_control.exists()
+            else 0
+        ),
+    }
+    assert execution_counts == {
+        "controller_process_starts": 0,
+        "preflight_request_executions": 0,
+        "preflight_results": 0,
+        "generator_outputs": 0,
+        "gpu_control_artifacts": 0,
+    }
+    assert not (control / "controller_process.log").exists()
+    assert value["wrapper_exit_sha256"] == wrapper._canonical_digest(
+        value, "wrapper_exit_sha256"
+    )
+
+
+def test_wrapper_provisional_cleanup_refuses_foreign_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, value, policy_root, state = (
+        _run_provisional_observer_launch_failure(
+            tmp_path,
+            monkeypatch,
+            mutation="canonical",
+            cleanup_mode="foreign",
+        )
+    )
+    cleanup = load_json(
+        policy_root / "preflight_control/observer_cleanup.json",
+        "foreign launch cleanup",
+    )
+    assert value["exit_code"] != 0
+    assert cleanup["status"] == "identity_replaced_not_terminated"
+    assert cleanup["session_residual"] is False
+    assert cleanup["foreign_session_residual"] is True
+    assert cleanup["foreign_tmux"]["pane_pid"] == 999
+    assert state["owner"] == "foreign"
+    assert state["popen_calls"] == 0
+
+
+def test_wrapper_provisional_cleanup_failure_is_durable_with_live_seal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, value, policy_root, state = (
+        _run_provisional_observer_launch_failure(
+            tmp_path,
+            monkeypatch,
+            mutation="canonical",
+            cleanup_mode="command_failed",
+        )
+    )
+    cleanup = load_json(
+        policy_root / "preflight_control/observer_cleanup.json",
+        "failed launch cleanup",
+    )
+    assert value["exit_code"] != 0
+    assert cleanup["status"] == "conditional_kill_command_failed"
+    assert cleanup["session_residual"] is True
+    assert cleanup["process_residual"] is True
+    assert cleanup["failure"]["type"] == "TmuxConditionalKillCommandError"
+    assert state["owner"] == "sealed"
+    assert state["popen_calls"] == 0
+
+
+def test_wrapper_gate_post_seal_option_failure_closes_exact_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper, value, policy_root, state = (
+        _run_provisional_observer_launch_failure(
+            tmp_path,
+            monkeypatch,
+            mutation="never_publish",
+            remain_failure=True,
+        )
+    )
+    control = policy_root / "preflight_control"
+    launch = load_json(control / "observer_launch.json", "partial launch")
+    cleanup = load_json(control / "observer_cleanup.json", "partial cleanup")
+    process_start = load_json(
+        control / "controller_process_start.json", "partial not-started"
+    )
+    process_exit = load_json(
+        control / "controller_process_exit.json", "partial exit"
+    )
+    assert value["exit_code"] != 0
+    assert "remain-on-exit failed" in launch["failure"]["message"]
+    assert launch["provisional_tmux_owner_seal"] is not None
+    assert cleanup["status"] == "closed_provisional_observer"
+    assert cleanup["session_residual"] is False
+    assert process_start["status"] == "not_started"
+    assert process_exit["status"] == "not_started"
+    assert state["kill_calls"] == 1
+    assert state["popen_calls"] == 0
+    assert not (policy_root / "checkpoint_preflight/results").exists()
+    assert not (policy_root / "preflight_control/attempts").exists()
+    assert not (policy_root / "gpu_control").exists()
+    assert not list(policy_root.rglob("*.png"))
+    assert value["wrapper_exit_sha256"] == wrapper._canonical_digest(
+        value, "wrapper_exit_sha256"
+    )
+
+
+@pytest.mark.parametrize(
+    "gate_mode",
+    (
+        "foreign_or_incomplete_owner",
+        "owner_unsealed_unknown",
+    ),
+)
+def test_wrapper_gate_unowned_probe_never_kills_and_closes_durably(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gate_mode: str,
+) -> None:
+    _, value, policy_root, state = (
+        _run_provisional_observer_launch_failure(
+            tmp_path,
+            monkeypatch,
+            mutation="never_publish",
+            gate_mode=gate_mode,
+        )
+    )
+    control = policy_root / "preflight_control"
+    launch = load_json(control / "observer_launch.json", "unowned launch")
+    cleanup = load_json(control / "observer_cleanup.json", "unowned cleanup")
+    process_start = load_json(
+        control / "controller_process_start.json", "unowned not-started"
+    )
+    process_exit = load_json(
+        control / "controller_process_exit.json", "unowned exit"
+    )
+    assert value["exit_code"] != 0
+    assert launch["observer_gate_client"]["returncode"] == 0
+    assert launch["observer_gate_probe"]["status"] == gate_mode
+    assert launch["provisional_tmux_owner_seal"] is None
+    assert cleanup["status"] == "observer_owner_not_sealed"
+    assert cleanup["session_residual"] is True
+    assert state["kill_calls"] == 0
+    assert state["popen_calls"] == 0
+    assert process_start["status"] == "not_started"
+    assert process_start["process"] is None
+    assert process_exit["status"] == "not_started"
+    assert process_exit["controller_pid"] is None
+    assert not (policy_root / "checkpoint_preflight/results").exists()
+    assert not (policy_root / "preflight_control/attempts").exists()
+    assert not (policy_root / "gpu_control").exists()
+    assert not list(policy_root.rglob("*.png"))
+    if gate_mode == "foreign_or_incomplete_owner":
+        assert state["owner"] == "foreign"
+
+
+@pytest.mark.parametrize("later_owner", ("absent", "unsealed", "foreign"))
+def test_wrapper_later_weak_probe_uses_best_seal_without_killing_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    later_owner: str,
+) -> None:
+    wrapper, value, policy_root, state = (
+        _run_provisional_observer_launch_failure(
+            tmp_path,
+            monkeypatch,
+            mutation="never_publish",
+            gate_mode=f"sealed_then_{later_owner}",
+            cleanup_mode="reject",
+        )
+    )
+    control = policy_root / "preflight_control"
+    launch = load_json(control / "observer_launch.json", "weak later launch")
+    cleanup = load_json(control / "observer_cleanup.json", "weak later cleanup")
+    process_start = load_json(
+        control / "controller_process_start.json", "weak later start"
+    )
+    process_exit = load_json(
+        control / "controller_process_exit.json", "weak later exit"
+    )
+    assert value["exit_code"] != 0
+    assert launch["observer_gate_probe"]["status"] == (
+        "absent"
+        if later_owner == "absent"
+        else "owner_unsealed_unknown"
+        if later_owner == "unsealed"
+        else "foreign_or_incomplete_owner"
+    )
+    assert launch["provisional_tmux_owner_seal"] is not None
+    assert (
+        launch["provisional_tmux_owner_seal"]["owner_nonce"]
+        == "a" * 64
+    )
+    assert cleanup["tmux_kill_status"] == "condition_rejected"
+    assert cleanup["status"] == "identity_replaced_not_terminated"
+    assert state["kill_calls"] == 1
+    assert state["owner"] == later_owner
+    assert state["popen_calls"] == 0
+    assert process_start["status"] == "not_started"
+    assert process_exit["status"] == "not_started"
+    assert not (policy_root / "preflight_control/attempts").exists()
+    assert not (policy_root / "checkpoint_preflight/results").exists()
+    assert not (policy_root / "gpu_control").exists()
+    assert not list(policy_root.rglob("*.png"))
+    assert value["wrapper_exit_sha256"] == wrapper._canonical_digest(
+        value, "wrapper_exit_sha256"
+    )
+
+
+@pytest.mark.parametrize(
+    ("gate_mode", "failure_message", "expected_cleanup_status"),
+    (
+        (
+            "exact_owner_ready_invalid",
+            "ready canonical digest differs",
+            "closed_provisional_observer",
+        ),
+        (
+            "exact_owner_ready_invalid",
+            "ready process identity differs",
+            "closed_provisional_observer",
+        ),
+        (
+            "exact_owner_process_probe_failed",
+            "process stat permission denied",
+            "cleanup_indeterminate_process_residual",
+        ),
+    ),
+)
+def test_wrapper_gate_post_seal_probe_failure_keeps_exact_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gate_mode: str,
+    failure_message: str,
+    expected_cleanup_status: str,
+) -> None:
+    _, value, policy_root, state = (
+        _run_provisional_observer_launch_failure(
+            tmp_path,
+            monkeypatch,
+            mutation="never_publish",
+            gate_mode=gate_mode,
+            gate_failure_message=failure_message,
+        )
+    )
+    control = policy_root / "preflight_control"
+    launch = load_json(control / "observer_launch.json", "sealed failure launch")
+    cleanup = load_json(
+        control / "observer_cleanup.json", "sealed failure cleanup"
+    )
+    process_start = load_json(
+        control / "controller_process_start.json",
+        "sealed failure not-started",
+    )
+    process_exit = load_json(
+        control / "controller_process_exit.json",
+        "sealed failure exit",
+    )
+    assert value["exit_code"] != 0
+    assert launch["observer_gate_probe"]["status"] == gate_mode
+    assert failure_message in launch["failure"]["message"]
+    assert launch["provisional_tmux_owner_seal"] is not None
+    assert cleanup["status"] == expected_cleanup_status
+    assert cleanup["session_residual"] is False
+    if gate_mode == "exact_owner_process_probe_failed":
+        assert cleanup["process_residual"] is None
+        assert cleanup["process_probe_failure"]["message"] == failure_message
+    else:
+        assert cleanup["process_residual"] is False
+    assert state["kill_calls"] == 1
+    assert state["owner"] == "absent"
+    assert state["popen_calls"] == 0
+    assert process_start["status"] == "not_started"
+    assert process_start["process"] is None
+    assert process_exit["status"] == "not_started"
+    assert process_exit["controller_pid"] is None
+    assert process_exit["exit_code"] is None
+    assert not (policy_root / "preflight_control/attempts").exists()
+    assert not (policy_root / "checkpoint_preflight/results").exists()
+    assert not (policy_root / "gpu_control").exists()
+    assert not list(policy_root.rglob("*.png"))
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_status"),
+    (
+        ("ready_canonical", "exact_owner_ready_invalid"),
+        ("ready_identity", "exact_owner_ready_invalid"),
+        ("process_stat", "exact_owner_process_probe_failed"),
+    ),
+)
+def test_wrapper_probe_owner_seal_is_monotonic_after_exact_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+    expected_status: str,
+) -> None:
+    wrapper = _wrapper_module()
+    monkeypatch.setattr(wrapper, "OBSERVER_IDENTITY_WAIT_SECONDS", 0.0)
+    tmux_identity = {
+        "session": wrapper.OBSERVER_SESSION,
+        "pane": "%71",
+        "pane_pid": 701,
+        "pane_current_command": "python",
+    }
+    tmux_server = {
+        "server_pid": 601,
+        "socket_path": str((tmp_path / "tmux.sock").resolve()),
+    }
+    process = {"pid": 701, "pgid": 701, "start_ticks": 88}
+    owner_nonce = "a" * 64
+    owner_seal = _test_tmux_owner_seal(
+        tmux_identity,
+        tmux_server,
+        owner_nonce=owner_nonce,
+    )
+    monkeypatch.setattr(
+        wrapper, "_tmux_identity", lambda _session: dict(tmux_identity)
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_tmux_server_identity",
+        lambda _target=None: dict(tmux_server),
+    )
+    monkeypatch.setattr(
+        wrapper, "_tmux_owner_nonce_raw", lambda *_args: owner_nonce
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_build_tmux_owner_seal",
+        lambda *_args: dict(owner_seal),
+    )
+    if failure_kind == "process_stat":
+        monkeypatch.setattr(
+            wrapper,
+            "_read_process_stat",
+            lambda _pid: (_ for _ in ()).throw(
+                PermissionError("process stat permission denied")
+            ),
+        )
+    else:
+        monkeypatch.setattr(
+            wrapper,
+            "_read_process_stat",
+            lambda _pid: (dict(process), "S"),
+        )
+    ready_path = tmp_path / "observer_gate_ready.json"
+    release_path = tmp_path / "observer_gate_release.json"
+    bootstrap_path = tmp_path / "observer_bootstrap.json"
+    wrapper_binding = {
+        "path": str((tmp_path / "wrapper.json").resolve()),
+        "sha256": "b" * 64,
+        "canonical_sha256": "c" * 64,
+    }
+    observer_command = [sys.executable, "-c", "pass"]
+    if failure_kind != "process_stat":
+        ready_process = (
+            {**process, "start_ticks": process["start_ticks"] + 1}
+            if failure_kind == "ready_identity"
+            else dict(process)
+        )
+        ready = {
+            "schema_version": 1,
+            "contract_type": (
+                "safa_canonical_preflight_observer_gate_ready_v1"
+            ),
+            "policy_sha256": "d" * 64,
+            "wrapper_claim": wrapper_binding,
+            "observer_session": wrapper.OBSERVER_SESSION,
+            "owner_nonce": owner_nonce,
+            "process": ready_process,
+            "gate_executable": sys.executable,
+            "gate_command": [sys.executable, "gate"],
+            "tmux": tmux_identity,
+            "tmux_server": tmux_server,
+            "release_path": str(release_path.resolve()),
+            "bootstrap_path": str(bootstrap_path.resolve()),
+            "observer_command": observer_command,
+            "published_at": wrapper._utc_now(),
+        }
+        ready["observer_gate_ready_sha256"] = (
+            wrapper._canonical_digest(
+                ready, "observer_gate_ready_sha256"
+            )
+        )
+        if failure_kind == "ready_canonical":
+            ready["observer_gate_ready_sha256"] = "0" * 64
+        wrapper._write_exclusive(ready_path, ready)
+        monkeypatch.setattr(
+            wrapper.os, "readlink", lambda _path: sys.executable
+        )
+        monkeypatch.setattr(
+            wrapper,
+            "_process_command",
+            lambda _pid: [sys.executable, "gate"],
+        )
+    probe = wrapper._probe_observer_gate(
+        ready_path=ready_path,
+        release_path=release_path,
+        bootstrap_path=bootstrap_path,
+        policy_sha256="d" * 64,
+        wrapper_binding=wrapper_binding,
+        owner_nonce=owner_nonce,
+        observer_command=observer_command,
+    )
+    assert probe["status"] == expected_status
+    assert probe["tmux_owner_seal"] == owner_seal
+    if failure_kind == "process_stat":
+        assert probe["process_probe"]["status"] == "error"
+        assert probe["process"] is None
+    else:
+        assert probe["process_probe"]["status"] == "live"
+        assert probe["process"] == process
+
+
+@pytest.mark.parametrize(
+    ("later_observation", "expected_status"),
+    (
+        ("absent", "absent"),
+        ("unsealed", "owner_unsealed_unknown"),
+        ("foreign", "foreign_or_incomplete_owner"),
+    ),
+)
+def test_wrapper_probe_retains_best_exact_evidence_after_weaker_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    later_observation: str,
+    expected_status: str,
+) -> None:
+    wrapper = _wrapper_module()
+    tmux_identity = {
+        "session": wrapper.OBSERVER_SESSION,
+        "pane": "%81",
+        "pane_pid": 801,
+        "pane_current_command": "python",
+    }
+    foreign_tmux = {
+        **tmux_identity,
+        "pane": "%82",
+        "pane_pid": 802,
+        "pane_current_command": "bash",
+    }
+    tmux_server = {
+        "server_pid": 701,
+        "socket_path": str((tmp_path / "tmux.sock").resolve()),
+    }
+    process = {"pid": 801, "pgid": 801, "start_ticks": 99}
+    owner_nonce = "a" * 64
+    owner_seal = _test_tmux_owner_seal(
+        tmux_identity, tmux_server, owner_nonce=owner_nonce
+    )
+    calls = {"identity": 0, "nonce": 0}
+
+    def identity(_session: str) -> dict[str, Any]:
+        calls["identity"] += 1
+        if calls["identity"] == 1:
+            return dict(tmux_identity)
+        if later_observation == "absent":
+            raise wrapper.TmuxTargetAbsent("later observer absent")
+        if later_observation == "foreign":
+            return dict(foreign_tmux)
+        return dict(tmux_identity)
+
+    def nonce(*_args) -> str:
+        calls["nonce"] += 1
+        if calls["nonce"] == 1:
+            return owner_nonce
+        if later_observation == "unsealed":
+            raise RuntimeError("later owner environment is absent")
+        return "b" * 64
+
+    clock = iter((0.0, 0.1, 1.0))
+    monkeypatch.setattr(wrapper, "OBSERVER_IDENTITY_WAIT_SECONDS", 0.5)
+    monkeypatch.setattr(wrapper.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(wrapper.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(wrapper, "_tmux_identity", identity)
+    monkeypatch.setattr(
+        wrapper,
+        "_tmux_server_identity",
+        lambda _target=None: dict(tmux_server),
+    )
+    monkeypatch.setattr(wrapper, "_tmux_owner_nonce_raw", nonce)
+    monkeypatch.setattr(
+        wrapper,
+        "_build_tmux_owner_seal",
+        lambda *_args: dict(owner_seal),
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_read_process_stat",
+        lambda _pid: (dict(process), "S"),
+    )
+    probe = wrapper._probe_observer_gate(
+        ready_path=tmp_path / "observer_gate_ready.json",
+        release_path=tmp_path / "observer_gate_release.json",
+        bootstrap_path=tmp_path / "observer_bootstrap.json",
+        policy_sha256="d" * 64,
+        wrapper_binding={
+            "path": str((tmp_path / "wrapper.json").resolve()),
+            "sha256": "b" * 64,
+            "canonical_sha256": "c" * 64,
+        },
+        owner_nonce=owner_nonce,
+        observer_command=[sys.executable, "-c", "pass"],
+    )
+    assert probe["status"] == expected_status
+    assert probe["best_tmux"] == tmux_identity
+    assert probe["best_tmux_server"] == tmux_server
+    assert probe["best_tmux_owner_seal"] == owner_seal
+    assert probe["best_process"] == process
+    assert probe["best_process_probe"]["status"] == "live"
+    assert probe["tmux_owner_seal"] is None
+    assert probe["process"] is None
+
+
+def test_wrapper_gate_new_session_is_one_exec_command() -> None:
+    wrapper = _wrapper_module()
+    command = wrapper._observer_gate_command(
+        ready_path=Path("/tmp/ready.json"),
+        release_path=Path("/tmp/release.json"),
+        bootstrap_path=Path("/tmp/bootstrap.json"),
+        policy_sha256="a" * 64,
+        wrapper_binding={
+            "path": "/tmp/wrapper.json",
+            "sha256": "b" * 64,
+            "canonical_sha256": "c" * 64,
+        },
+        owner_nonce="d" * 64,
+        observer_command=[sys.executable, "-c", "pass"],
+    )
+    shell_command = "exec " + wrapper.shlex.join(command)
+    assert shell_command.startswith("exec ")
+    assert ";" not in shell_command
+    assert "set-option" not in shell_command
+    assert "remain-on-exit" not in shell_command
+
+
+def test_wrapper_gate_creation_binds_nonce_atomically_before_replacement_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper = _wrapper_module()
+    owner_nonce = "a" * 64
+    tmux_commands: list[list[str]] = []
+
+    def run(command: list[str], **kwargs):
+        tmux_commands.append(list(command))
+        assert kwargs == {"capture_output": True, "text": True}
+        return types.SimpleNamespace(
+            returncode=0, stdout="", stderr=""
+        )
+
+    replacement_probe = {
+        "status": "foreign_or_incomplete_owner",
+        "tmux": {
+            "session": wrapper.OBSERVER_SESSION,
+            "pane": "%92",
+            "pane_pid": 902,
+            "pane_current_command": "bash",
+        },
+        "tmux_server": {
+            "server_pid": 901,
+            "socket_path": "/tmp/tmux-test/default",
+        },
+        "tmux_owner_seal": None,
+        "process": None,
+        "process_probe": {"status": "not_observed"},
+        "gate_ready": None,
+        "failure": {
+            "type": "TmuxOwnerMarkerMismatch",
+            "message": "replacement changed the session environment",
+        },
+        "session_residual": True,
+    }
+    monkeypatch.setattr(wrapper.subprocess, "run", run)
+    monkeypatch.setattr(
+        wrapper,
+        "_probe_observer_gate",
+        lambda **_kwargs: dict(replacement_probe),
+    )
+    probe, client = wrapper._launch_and_probe_observer_gate(
+        repo_root=tmp_path,
+        ready_path=tmp_path / "ready.json",
+        release_path=tmp_path / "release.json",
+        bootstrap_path=tmp_path / "bootstrap.json",
+        policy_sha256="d" * 64,
+        wrapper_binding={
+            "path": str((tmp_path / "wrapper.json").resolve()),
+            "sha256": "b" * 64,
+            "canonical_sha256": "c" * 64,
+        },
+        owner_nonce=owner_nonce,
+        observer_command=[sys.executable, "-c", "pass"],
+    )
+    assert probe == replacement_probe
+    assert client["returncode"] == 0
+    assert len(tmux_commands) == 1
+    command = tmux_commands[0]
+    assert command[:4] == ["tmux", "new-session", "-d", "-s"]
+    assert command[4] == wrapper.OBSERVER_SESSION
+    assert command.count("-e") == 2
+    assert (
+        f"{wrapper.TMUX_OWNER_ENV}={owner_nonce}" in command
+    )
+    assert (
+        f"{wrapper.OBSERVER_SESSION_ENV}={wrapper.OBSERVER_SESSION}"
+        in command
+    )
+    assert command[-1].startswith("exec ")
+    assert "set-option" not in command
+    assert len(wrapper.OBSERVER_SESSION) == (
+        len(wrapper.OBSERVER_SESSION_PREFIX) + 1 + 64
+    )
+    assert wrapper.OBSERVER_SESSION.startswith(
+        f"{wrapper.OBSERVER_SESSION_PREFIX}-"
+    )
+
+
+def _test_process_stat(
+    pid: int,
+    *,
+    state: str = "S",
+    pgid: int | None = None,
+    start_ticks: int = 777,
+    command: str = "python worker",
+) -> str:
+    resolved_pgid = pid if pgid is None else pgid
+    fields = (
+        [state, "1", str(resolved_pgid), str(resolved_pgid)]
+        + ["0"] * 15
+        + [str(start_ticks)]
+    )
+    return f"{pid} ({command}) {' '.join(fields)}\n"
+
+
+def test_wrapper_process_identity_initial_stat_disappearance_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper = _wrapper_module()
+    pid = os.getpid()
+    monkeypatch.setattr(
+        wrapper.Path,
+        "read_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            FileNotFoundError(pid)
+        ),
+    )
+    assert wrapper._process_identity_state(pid) is None
+    assert wrapper._process_identity(pid) is None
+
+
+def test_wrapper_process_identity_zombie_skips_executable_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper = _wrapper_module()
+    pid = 401
+    raw_stat = _test_process_stat(
+        pid, state="Z", pgid=401, start_ticks=88
+    )
+    monkeypatch.setattr(
+        wrapper.Path,
+        "read_text",
+        lambda *_args, **_kwargs: raw_stat,
+    )
+    monkeypatch.setattr(
+        wrapper.os,
+        "readlink",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("zombie executable must not be probed")
+        ),
+    )
+    monkeypatch.setattr(
+        wrapper.os,
+        "getpgid",
+        lambda _pid: (_ for _ in ()).throw(
+            AssertionError("zombie process group must not be probed")
+        ),
+    )
+    assert wrapper._process_identity_state(pid) == (
+        {"pid": pid, "pgid": 401, "start_ticks": 88},
+        "Z",
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="requires Linux /proc zombie semantics",
+)
+def test_wrapper_real_zombie_with_missing_executable_keeps_identity() -> None:
+    wrapper = _wrapper_module()
+    process = subprocess.Popen(
+        [sys.executable, "-c", "pass"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 5.0
+        snapshot = None
+        while time.monotonic() < deadline:
+            snapshot = wrapper._read_process_stat(process.pid)
+            if snapshot is not None and snapshot[1] == "Z":
+                break
+            time.sleep(0.01)
+        assert snapshot is not None
+        assert snapshot[1] == "Z"
+        with pytest.raises(FileNotFoundError):
+            os.readlink(f"/proc/{process.pid}/exe")
+        assert wrapper._process_identity_state(process.pid) == snapshot
+    finally:
+        process.wait(timeout=5.0)
+
+
+def test_wrapper_process_identity_live_missing_executable_stat_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper = _wrapper_module()
+    pid = 402
+    reads: list[str | BaseException] = [
+        _test_process_stat(pid, start_ticks=89),
+        FileNotFoundError(pid),
+    ]
+
+    def read_stat(*_args, **_kwargs):
+        value = reads.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    monkeypatch.setattr(wrapper.Path, "read_text", read_stat)
+    monkeypatch.setattr(
+        wrapper.os,
+        "readlink",
+        lambda _path: (_ for _ in ()).throw(FileNotFoundError(pid)),
+    )
+    assert wrapper._process_identity_state(pid) is None
+    assert reads == []
+
+
+def test_wrapper_process_identity_live_missing_executable_same_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper = _wrapper_module()
+    pid = 403
+    raw_stat = _test_process_stat(pid, start_ticks=90)
+    monkeypatch.setattr(
+        wrapper.Path, "read_text", lambda *_args, **_kwargs: raw_stat
+    )
+    monkeypatch.setattr(
+        wrapper.os,
+        "readlink",
+        lambda _path: (_ for _ in ()).throw(FileNotFoundError(pid)),
+    )
+    with pytest.raises(
+        RuntimeError, match="executable is absent.*remains live"
+    ):
+        wrapper._process_identity_state(pid)
+
+
+def test_wrapper_process_identity_live_missing_executable_pid_reuse_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper = _wrapper_module()
+    pid = 404
+    reads = iter(
+        (
+            _test_process_stat(pid, start_ticks=91),
+            _test_process_stat(pid, start_ticks=92),
+        )
+    )
+    monkeypatch.setattr(
+        wrapper.Path,
+        "read_text",
+        lambda *_args, **_kwargs: next(reads),
+    )
+    monkeypatch.setattr(
+        wrapper.os,
+        "readlink",
+        lambda _path: (_ for _ in ()).throw(FileNotFoundError(pid)),
+    )
+    with pytest.raises(RuntimeError, match="identity changed"):
+        wrapper._process_identity_state(pid)
+
+
+@pytest.mark.parametrize("second_state", ("absent", "same_live"))
+def test_wrapper_process_identity_getpgid_esrch_revalidates_stat(
+    monkeypatch: pytest.MonkeyPatch,
+    second_state: str,
+) -> None:
+    wrapper = _wrapper_module()
+    pid = 405
+    raw_stat = _test_process_stat(pid, start_ticks=93)
+    reads: list[str | BaseException] = [
+        raw_stat,
+        (
+            FileNotFoundError(pid)
+            if second_state == "absent"
+            else raw_stat
+        ),
+    ]
+
+    def read_stat(*_args, **_kwargs):
+        value = reads.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    monkeypatch.setattr(wrapper.Path, "read_text", read_stat)
+    monkeypatch.setattr(wrapper.os, "readlink", lambda _path: "/python")
+    monkeypatch.setattr(
+        wrapper.os,
+        "getpgid",
+        lambda _pid: (_ for _ in ()).throw(ProcessLookupError(pid)),
+    )
+    if second_state == "absent":
+        assert wrapper._process_identity_state(pid) is None
+    else:
+        with pytest.raises(
+            RuntimeError, match="process group is absent.*remains live"
+        ):
+            wrapper._process_identity_state(pid)
+    assert reads == []
+
+
+def test_wrapper_process_identity_final_stat_pid_reuse_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper = _wrapper_module()
+    pid = 406
+    reads = iter(
+        (
+            _test_process_stat(pid, start_ticks=94),
+            _test_process_stat(pid, start_ticks=95),
+        )
+    )
+    monkeypatch.setattr(
+        wrapper.Path,
+        "read_text",
+        lambda *_args, **_kwargs: next(reads),
+    )
+    monkeypatch.setattr(wrapper.os, "readlink", lambda _path: "/python")
+    monkeypatch.setattr(wrapper.os, "getpgid", lambda _pid: pid)
+    with pytest.raises(RuntimeError, match="identity changed during snapshot"):
+        wrapper._process_identity_state(pid)
+
+
+def test_wrapper_process_identity_parses_command_spaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper = _wrapper_module()
+    pid = 407
+    raw_stat = _test_process_stat(
+        pid,
+        pgid=400,
+        start_ticks=96,
+        command="tmux: server worker",
+    )
+    monkeypatch.setattr(
+        wrapper.Path, "read_text", lambda *_args, **_kwargs: raw_stat
+    )
+    monkeypatch.setattr(wrapper.os, "readlink", lambda _path: "/tmux")
+    monkeypatch.setattr(wrapper.os, "getpgid", lambda _pid: 400)
+    assert wrapper._process_identity_state(pid) == (
+        {"pid": pid, "pgid": 400, "start_ticks": 96},
+        "S",
+    )
+
+
+@pytest.mark.parametrize(
+    "raw_stat",
+    (
+        "malformed",
+        "408 (python) S 1",
+        _test_process_stat(409, start_ticks=97),
+        _test_process_stat(408, state="SS", start_ticks=97),
+    ),
+)
+def test_wrapper_process_identity_snapshot_parse_error_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_stat: str,
+) -> None:
+    wrapper = _wrapper_module()
+    pid = 408
+    monkeypatch.setattr(
+        wrapper.Path,
+        "read_text",
+        lambda *_args, **_kwargs: raw_stat,
+    )
+    with pytest.raises(RuntimeError, match="stat is malformed"):
+        wrapper._process_identity_state(pid)
+
+
+@pytest.mark.parametrize("stage", ("stat", "executable", "process_group"))
+def test_wrapper_process_identity_permission_failure_is_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    wrapper = _wrapper_module()
+    pid = 410
+    raw_stat = _test_process_stat(pid, start_ticks=98)
+
+    def read_stat(*_args, **_kwargs):
+        if stage == "stat":
+            raise PermissionError(pid)
+        return raw_stat
+
+    def read_executable(_path):
+        if stage == "executable":
+            raise PermissionError(pid)
+        return "/python"
+
+    def read_process_group(_pid):
+        if stage == "process_group":
+            raise PermissionError(pid)
+        return pid
+
+    monkeypatch.setattr(
+        wrapper.Path,
+        "read_text",
+        read_stat,
+    )
+    monkeypatch.setattr(wrapper.os, "readlink", read_executable)
+    monkeypatch.setattr(wrapper.os, "getpgid", read_process_group)
+    with pytest.raises(RuntimeError, match="permission denied"):
+        wrapper._process_identity_state(pid)
+
+
+def test_controller_process_identity_parses_parenthesized_command_spaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _controller_module()
+    fields = ["S", "1", "301", "301"] + ["0"] * 15 + ["777"]
+    raw_stat = f"301 (tmux: server) {' '.join(fields)}\n"
+    monkeypatch.setattr(
+        module.Path,
+        "read_text",
+        lambda *_args, **_kwargs: raw_stat,
+    )
+    assert module._process_identity(301) == {
+        "pid": 301,
+        "pgid": 301,
+        "start_ticks": 777,
+    }
+
+
+@pytest.mark.parametrize(
+    ("reference", "field"),
+    tuple(
+        (reference, field)
+        for reference in (
+            "controller_process_exit",
+            "observer_claim",
+            "observer_ready",
+        )
+        for field in ("path", "sha256", "canonical_sha256")
+    ),
+)
+def test_wrapper_observer_terminal_rejects_reference_binding_tamper(
+    tmp_path: Path,
+    reference: str,
+    field: str,
+) -> None:
+    wrapper = _wrapper_module()
+    policy_sha256 = "7" * 64
+    observer_process = {"pid": 41, "pgid": 41, "start_ticks": 99}
+    observer_launch_binding = {
+        "path": str((tmp_path / "observer_launch.json").resolve()),
+        "sha256": "2" * 64,
+        "canonical_sha256": "3" * 64,
+    }
+
+    def artifact(
+        name: str, digest_field: str, body: dict[str, Any]
+    ) -> tuple[Path, dict[str, str]]:
+        value = dict(body)
+        value[digest_field] = wrapper._canonical_digest(
+            value, digest_field
+        )
+        artifact_path = tmp_path / f"{name}.json"
+        wrapper._write_exclusive(artifact_path, value)
+        return artifact_path, {
+            "path": str(artifact_path.resolve()),
+            "sha256": wrapper._sha256_file(artifact_path),
+            "canonical_sha256": value[digest_field],
+        }
+
+    process_exit_path, process_exit_binding = artifact(
+        "controller_process_exit",
+        "controller_process_exit_sha256",
+        {"contract_type": "fixture_process_exit"},
+    )
+    _, claim_binding = artifact(
+        "observer_claim",
+        "observer_claim_sha256",
+        {
+            "contract_type": "safa_canonical_preflight_observer_claim_v1",
+            "phase": "preflight",
+            "policy_sha256": policy_sha256,
+            "observer_launch": observer_launch_binding,
+            "observer_session": wrapper.OBSERVER_SESSION,
+            "observer_pid": observer_process["pid"],
+            "observer_process": observer_process,
+        },
+    )
+    _, ready_binding = artifact(
+        "observer_ready",
+        "observer_ready_sha256",
+        {
+            "contract_type": "safa_canonical_preflight_observer_ready_v1",
+            "phase": "preflight",
+            "policy_sha256": policy_sha256,
+            "observer_claim": claim_binding,
+            "observer_claim_sha256": claim_binding["canonical_sha256"],
+            "observer_launch": observer_launch_binding,
+            "observer_session": wrapper.OBSERVER_SESSION,
+            "observer_pid": observer_process["pid"],
+            "observer_process": observer_process,
+        },
+    )
+    bindings = {
+        "controller_process_exit": process_exit_binding,
+        "observer_claim": claim_binding,
+        "observer_ready": ready_binding,
+    }
+    changed = dict(bindings[reference])
+    changed[field] = (
+        str((tmp_path / "other.json").resolve())
+        if field == "path"
+        else ("0" if field == "sha256" else "1") * 64
+    )
+    bindings[reference] = changed
+    terminal = {
+        "contract_type": "safa_canonical_preflight_observer_terminal_v1",
+        "policy_sha256": policy_sha256,
+        "status": "completed",
+        "failure": None,
+        **bindings,
+    }
+    terminal["observer_terminal_sha256"] = wrapper._canonical_digest(
+        terminal, "observer_terminal_sha256"
+    )
+    terminal_path = tmp_path / "observer_terminal.json"
+    wrapper._write_exclusive(terminal_path, terminal)
+    with pytest.raises(RuntimeError, match="observer terminal"):
+        wrapper._read_observer_terminal(
+            terminal_path,
+            process_exit_path,
+            policy_sha256=policy_sha256,
+            observer_launch_binding=observer_launch_binding,
+            observer_process=observer_process,
+        )
+
+
+def _completed_terminal_fixture(
+    tmp_path: Path,
+) -> tuple[
+    Any,
+    Path,
+    Path,
+    str,
+    dict[str, str],
+    dict[str, int],
+]:
+    wrapper = _wrapper_module()
+    policy_sha256 = "8" * 64
+    observer_process = {"pid": 81, "pgid": 81, "start_ticks": 181}
+    observer_launch_binding = {
+        "path": str((tmp_path / "observer_launch.json").resolve()),
+        "sha256": "2" * 64,
+        "canonical_sha256": "3" * 64,
+    }
+
+    def artifact(
+        name: str, digest_field: str, body: dict[str, Any]
+    ) -> tuple[Path, dict[str, str], dict[str, Any]]:
+        value = dict(body)
+        value[digest_field] = wrapper._canonical_digest(
+            value, digest_field
+        )
+        artifact_path = tmp_path / f"{name}.json"
+        wrapper._write_exclusive(artifact_path, value)
+        return artifact_path, {
+            "path": str(artifact_path.resolve()),
+            "sha256": wrapper._sha256_file(artifact_path),
+            "canonical_sha256": value[digest_field],
+        }, value
+
+    process_exit_path, process_exit_binding, _ = artifact(
+        "controller_process_exit",
+        "controller_process_exit_sha256",
+        {"contract_type": "fixture_process_exit"},
+    )
+    claim_path, claim_binding, claim = artifact(
+        "observer_claim",
+        "observer_claim_sha256",
+        {
+            "contract_type": "safa_canonical_preflight_observer_claim_v1",
+            "phase": "preflight",
+            "policy_sha256": policy_sha256,
+            "observer_launch": observer_launch_binding,
+            "observer_session": wrapper.OBSERVER_SESSION,
+            "observer_pid": observer_process["pid"],
+            "observer_process": observer_process,
+        },
+    )
+    ready_path, ready_binding, _ = artifact(
+        "observer_ready",
+        "observer_ready_sha256",
+        {
+            "contract_type": "safa_canonical_preflight_observer_ready_v1",
+            "phase": "preflight",
+            "policy_sha256": policy_sha256,
+            "observer_claim": claim_binding,
+            "observer_claim_sha256": claim["observer_claim_sha256"],
+            "observer_launch": observer_launch_binding,
+            "observer_session": wrapper.OBSERVER_SESSION,
+            "observer_pid": observer_process["pid"],
+            "observer_process": observer_process,
+        },
+    )
+    terminal = {
+        "contract_type": "safa_canonical_preflight_observer_terminal_v1",
+        "policy_sha256": policy_sha256,
+        "status": "completed",
+        "failure": None,
+        "controller_process_exit": process_exit_binding,
+        "observer_claim": claim_binding,
+        "observer_ready": ready_binding,
+    }
+    terminal["observer_terminal_sha256"] = wrapper._canonical_digest(
+        terminal, "observer_terminal_sha256"
+    )
+    terminal_path = tmp_path / "observer_terminal.json"
+    wrapper._write_exclusive(terminal_path, terminal)
+    assert claim_path.is_file() and ready_path.is_file()
+    return (
+        wrapper,
+        terminal_path,
+        process_exit_path,
+        policy_sha256,
+        observer_launch_binding,
+        observer_process,
+    )
+
+
+def test_wrapper_completed_observer_terminal_with_full_evidence_passes(
+    tmp_path: Path,
+) -> None:
+    (
+        wrapper,
+        terminal_path,
+        process_exit_path,
+        policy_sha256,
+        observer_launch_binding,
+        observer_process,
+    ) = _completed_terminal_fixture(tmp_path)
+    value, binding = wrapper._read_observer_terminal(
+        terminal_path,
+        process_exit_path,
+        policy_sha256=policy_sha256,
+        observer_launch_binding=observer_launch_binding,
+        observer_process=observer_process,
+    )
+    assert value["status"] == "completed"
+    assert binding["path"] == str(terminal_path.resolve())
+
+
+@pytest.mark.parametrize(
+    ("evidence", "mutation"),
+    (
+        ("observer_claim", "drop"),
+        ("observer_ready", "drop"),
+        ("observer_claim", "null"),
+        ("observer_ready", "null"),
+        ("observer_claim", "file_missing"),
+        ("observer_ready", "file_missing"),
+    ),
+)
+def test_wrapper_completed_observer_terminal_requires_claim_and_ready(
+    tmp_path: Path,
+    evidence: str,
+    mutation: str,
+) -> None:
+    (
+        wrapper,
+        terminal_path,
+        process_exit_path,
+        policy_sha256,
+        observer_launch_binding,
+        observer_process,
+    ) = _completed_terminal_fixture(tmp_path)
+    terminal = json.loads(terminal_path.read_text(encoding="utf-8"))
+    evidence_path = (
+        None
+        if terminal.get(evidence) is None
+        else Path(terminal[evidence]["path"])
+    )
+    terminal_path.unlink()
+    if mutation == "drop":
+        terminal.pop(evidence)
+    elif mutation == "null":
+        terminal[evidence] = None
+    else:
+        assert evidence_path is not None
+        evidence_path.unlink()
+    terminal["observer_terminal_sha256"] = wrapper._canonical_digest(
+        terminal, "observer_terminal_sha256"
+    )
+    wrapper._write_exclusive(terminal_path, terminal)
+    with pytest.raises(RuntimeError):
+        wrapper._read_observer_terminal(
+            terminal_path,
+            process_exit_path,
+            policy_sha256=policy_sha256,
+            observer_launch_binding=observer_launch_binding,
+            observer_process=observer_process,
+        )
+
+
+def test_wrapper_late_completed_terminal_requires_full_evidence(
+    tmp_path: Path,
+) -> None:
+    (
+        wrapper,
+        terminal_path,
+        process_exit_path,
+        policy_sha256,
+        observer_launch_binding,
+        observer_process,
+    ) = _completed_terminal_fixture(tmp_path)
+    terminal = json.loads(terminal_path.read_text(encoding="utf-8"))
+    terminal_path.unlink()
+    terminal["observer_ready"] = None
+    terminal["observer_terminal_sha256"] = wrapper._canonical_digest(
+        terminal, "observer_terminal_sha256"
+    )
+    wrapper._write_exclusive(terminal_path, terminal)
+    with pytest.raises(RuntimeError):
+        wrapper._wait_observer_terminal(
+            terminal_path,
+            process_exit_path,
+            policy_sha256=policy_sha256,
+            observer_launch_binding=observer_launch_binding,
+            observer_process=observer_process,
+        )
+
+
+def test_wrapper_failed_terminal_without_ready_remains_valid(
+    tmp_path: Path,
+) -> None:
+    (
+        wrapper,
+        terminal_path,
+        process_exit_path,
+        policy_sha256,
+        observer_launch_binding,
+        observer_process,
+    ) = _completed_terminal_fixture(tmp_path)
+    terminal = json.loads(terminal_path.read_text(encoding="utf-8"))
+    terminal_path.unlink()
+    terminal["status"] = "failed"
+    terminal["failure"] = {"type": "FixtureFailure", "message": "failed"}
+    terminal["observer_claim"] = None
+    terminal["observer_ready"] = None
+    terminal["observer_terminal_sha256"] = wrapper._canonical_digest(
+        terminal, "observer_terminal_sha256"
+    )
+    wrapper._write_exclusive(terminal_path, terminal)
+    value, _ = wrapper._read_observer_terminal(
+        terminal_path,
+        process_exit_path,
+        policy_sha256=policy_sha256,
+        observer_launch_binding=observer_launch_binding,
+        observer_process=observer_process,
+    )
+    assert value["status"] == "failed"
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    (
+        "no server running on /tmp/tmux-1/default",
+        "can't find session: missing",
+        "can't find window: missing",
+        "can't find pane: missing",
+    ),
+)
+def test_wrapper_tmux_identity_classifies_only_explicit_absence(
+    monkeypatch: pytest.MonkeyPatch,
+    stderr: str,
+) -> None:
+    wrapper = _wrapper_module()
+    monkeypatch.setattr(
+        wrapper.subprocess,
+        "run",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            returncode=1, stdout="", stderr=stderr
+        ),
+    )
+    with pytest.raises(wrapper.TmuxTargetAbsent):
+        wrapper._tmux_identity("missing")
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stderr", "returncode"),
+    (
+        (
+            "s\t%1\t1\tpython\ns\t%2\t2\tpython\n",
+            "",
+            0,
+        ),
+        ("malformed\n", "", 0),
+        ("", "permission denied", 1),
+    ),
+)
+def test_wrapper_tmux_identity_non_absence_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: str,
+    stderr: str,
+    returncode: int,
+) -> None:
+    wrapper = _wrapper_module()
+    monkeypatch.setattr(
+        wrapper.subprocess,
+        "run",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            returncode=returncode, stdout=stdout, stderr=stderr
+        ),
+    )
+    with pytest.raises(RuntimeError) as failure:
+        wrapper._tmux_identity("s")
+    assert not isinstance(failure.value, wrapper.TmuxTargetAbsent)
+
+
+def _test_tmux_owner_seal(
+    tmux: Mapping[str, Any],
+    server: Mapping[str, Any],
+    *,
+    owner_nonce: str = "a" * 64,
+    server_start_ticks: int = 55,
+) -> dict[str, Any]:
+    return {
+        "server_pid": server["server_pid"],
+        "server_start_ticks": server_start_ticks,
+        "socket_path": server["socket_path"],
+        "socket_device": 1,
+        "socket_inode": 2,
+        "session": tmux["session"],
+        "pane": tmux["pane"],
+        "pane_pid": tmux["pane_pid"],
+        "owner_nonce": owner_nonce,
+    }
+
+
+def _write_preflight_observer_provenance_fixture(
+    module: Any,
+    policy: Mapping[str, Any],
+    paths: Mapping[str, Path],
+    *,
+    wrapper: Mapping[str, Any],
+    wrapper_path: Path,
+    observer_tmux: Mapping[str, Any],
+    tmux_server: Mapping[str, Any],
+    observer_process: Mapping[str, int],
+) -> tuple[dict[str, Any], Path]:
+    wrapper_binding = module._artifact_binding(
+        wrapper_path, wrapper["wrapper_claim_sha256"]
+    )
+    gate_ready_path = (
+        paths["preflight_control"] / "observer_gate_ready.json"
+    )
+    gate_release_path = (
+        paths["preflight_control"] / "observer_gate_release.json"
+    )
+    bootstrap_path = (
+        paths["preflight_control"] / "observer_bootstrap.json"
+    )
+    observer_command = module._expected_preflight_observer_command(
+        policy, paths
+    )
+    gate_ready = {
+        "schema_version": 1,
+        "contract_type": (
+            "safa_canonical_preflight_observer_gate_ready_v1"
+        ),
+        "policy_sha256": policy["policy_sha256"],
+        "wrapper_claim": wrapper_binding,
+        "observer_session": module.PREFLIGHT_OBSERVER_SESSION,
+        "owner_nonce": "a" * 64,
+        "process": dict(observer_process),
+        "gate_executable": sys.executable,
+        "gate_command": [sys.executable, "gate"],
+        "tmux": dict(observer_tmux),
+        "tmux_server": dict(tmux_server),
+        "release_path": str(gate_release_path.resolve()),
+        "bootstrap_path": str(bootstrap_path.resolve()),
+        "observer_command": observer_command,
+        "published_at": module._utc_now(),
+    }
+    gate_ready["observer_gate_ready_sha256"] = canonical_digest(
+        gate_ready, "observer_gate_ready_sha256"
+    )
+    write_exclusive_json(gate_ready_path, gate_ready)
+    gate_ready_binding = module._artifact_binding(
+        gate_ready_path, gate_ready["observer_gate_ready_sha256"]
+    )
+    gate_release = {
+        "schema_version": 1,
+        "contract_type": (
+            "safa_canonical_preflight_observer_gate_release_v1"
+        ),
+        "policy_sha256": policy["policy_sha256"],
+        "wrapper_claim": wrapper_binding,
+        "observer_gate_ready": gate_ready_binding,
+        "observer_session": module.PREFLIGHT_OBSERVER_SESSION,
+        "owner_nonce": "a" * 64,
+        "observer_command": observer_command,
+        "released_at": module._utc_now(),
+    }
+    gate_release["observer_gate_release_sha256"] = canonical_digest(
+        gate_release, "observer_gate_release_sha256"
+    )
+    write_exclusive_json(gate_release_path, gate_release)
+    bootstrap = {
+        "schema_version": 1,
+        "contract_type": (
+            "safa_canonical_preflight_observer_bootstrap_v1"
+        ),
+        "policy_sha256": policy["policy_sha256"],
+        "wrapper_claim": wrapper_binding,
+        "observer_session": module.PREFLIGHT_OBSERVER_SESSION,
+        "owner_nonce": "a" * 64,
+        "process": dict(observer_process),
+        "executable": sys.executable,
+        "command": observer_command,
+        "tmux": dict(observer_tmux),
+        "published_at": module._utc_now(),
+    }
+    bootstrap["observer_bootstrap_sha256"] = canonical_digest(
+        bootstrap, "observer_bootstrap_sha256"
+    )
+    write_exclusive_json(bootstrap_path, bootstrap)
+    launch = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_preflight_observer_launch_v3",
+        "policy_sha256": policy["policy_sha256"],
+        "wrapper_claim": wrapper_binding,
+        "wrapper_claim_sha256": wrapper["wrapper_claim_sha256"],
+        "observer_session": module.PREFLIGHT_OBSERVER_SESSION,
+        "command": observer_command,
+        "observer_gate_ready": gate_ready_binding,
+        "observer_gate_release": module._artifact_binding(
+            gate_release_path,
+            gate_release["observer_gate_release_sha256"],
+        ),
+        "status": "launched",
+        "failure": None,
+        "tmux": dict(observer_tmux),
+        "tmux_server": dict(tmux_server),
+        "tmux_owner_seal": _test_tmux_owner_seal(
+            observer_tmux, tmux_server, server_start_ticks=20
+        ),
+        "observer_bootstrap": module._artifact_binding(
+            bootstrap_path, bootstrap["observer_bootstrap_sha256"]
+        ),
+        "process": dict(observer_process),
+    }
+    launch["observer_launch_sha256"] = canonical_digest(
+        launch, "observer_launch_sha256"
+    )
+    launch_path = paths["preflight_control"] / "observer_launch.json"
+    write_exclusive_json(launch_path, launch)
+    return launch, launch_path
+
+
+def _write_preflight_process_start_fixture(
+    module: Any,
+    policy: Mapping[str, Any],
+    paths: Mapping[str, Path],
+    *,
+    pid: int = 100,
+) -> tuple[dict[str, Any], Path]:
+    process_start = {
+        "schema_version": 1,
+        "contract_type": (
+            "safa_canonical_preflight_controller_process_start_v1"
+        ),
+        "policy_sha256": policy["policy_sha256"],
+        "process": {"pid": pid, "pgid": pid, "start_ticks": 10},
+    }
+    process_start["controller_process_start_sha256"] = canonical_digest(
+        process_start, "controller_process_start_sha256"
+    )
+    path = paths["preflight_control"] / "controller_process_start.json"
+    write_exclusive_json(path, process_start)
+    return process_start, path
+
+
+def _write_preflight_process_exit_fixture(
+    module: Any,
+    policy: Mapping[str, Any],
+    paths: Mapping[str, Path],
+    *,
+    wrapper: Mapping[str, Any],
+    observer_launch: Mapping[str, Any],
+    observer_launch_path: Path,
+    process_start: Mapping[str, Any],
+    process_start_path: Path,
+    exit_code: int,
+    controller_terminal: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], Path]:
+    process_exit = {
+        "schema_version": 1,
+        "contract_type": (
+            "safa_canonical_preflight_controller_process_exit_v2"
+        ),
+        "policy_sha256": policy["policy_sha256"],
+        "wrapper_claim_sha256": wrapper["wrapper_claim_sha256"],
+        "observer_launch": module._artifact_binding(
+            observer_launch_path,
+            observer_launch["observer_launch_sha256"],
+        ),
+        "controller_process_start": module._artifact_binding(
+            process_start_path,
+            process_start["controller_process_start_sha256"],
+        ),
+        "observer_stop": None,
+        "controller_pid": process_start["process"]["pid"],
+        "command": module._expected_preflight_controller_command(
+            policy, paths
+        ),
+        "exit_code": exit_code,
+        "controller_terminal": (
+            None if controller_terminal is None else dict(controller_terminal)
+        ),
+        "signal": None,
+        "launch_failure": None,
+        "controller_process_log": None,
+        "controller_claim": None,
+        "completed_at": module._utc_now(),
+    }
+    process_exit["controller_process_exit_sha256"] = canonical_digest(
+        process_exit, "controller_process_exit_sha256"
+    )
+    path = paths["preflight_control"] / "controller_process_exit.json"
+    write_exclusive_json(path, process_exit)
+    return process_exit, path
+
+
+@pytest.mark.parametrize(
+    ("error", "absent_after", "expected"),
+    (
+        (ProcessLookupError(), True, "cleaned_detached_process_absent"),
+        (ProcessLookupError(), False, "raises"),
+        (PermissionError(), False, "raises"),
+    ),
+)
+def test_wrapper_killpg_error_classification(
+    monkeypatch: pytest.MonkeyPatch,
+    error: BaseException,
+    absent_after: bool,
+    expected: str,
+) -> None:
+    wrapper = _wrapper_module()
+    sealed = {"pid": 401, "pgid": 401, "start_ticks": 77}
+    state = {"kill_called": False}
+    monkeypatch.setattr(
+        wrapper,
+        "_tmux_identity",
+        lambda _session: (_ for _ in ()).throw(
+            wrapper.TmuxTargetAbsent("missing")
+        ),
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_tmux_server_identity",
+        lambda _target=None: (_ for _ in ()).throw(
+            wrapper.TmuxTargetAbsent("missing")
+        ),
+    )
+
+    def identity(_pid: int):
+        if state["kill_called"] and absent_after:
+            return None
+        return dict(sealed)
+
+    monkeypatch.setattr(wrapper, "_process_identity", identity)
+    monkeypatch.setattr(
+        wrapper,
+        "_process_identity_state",
+        lambda _pid: (dict(sealed), "S"),
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_read_process_stat",
+        lambda _pid: (
+            None
+            if state["kill_called"] and absent_after
+            else (dict(sealed), "S")
+        ),
+    )
+
+    def killpg(_pgid: int, _signal: int):
+        state["kill_called"] = True
+        raise error
+
+    monkeypatch.setattr(wrapper.os, "killpg", killpg)
+    tmux = {
+        "session": wrapper.OBSERVER_SESSION,
+        "pane": "%1",
+        "pane_pid": 401,
+        "pane_current_command": "python",
+    }
+    server = {"server_pid": 301, "socket_path": "/tmp/tmux.sock"}
+    if expected == "raises":
+        with pytest.raises(RuntimeError):
+            wrapper._terminate_bound_observer(
+                tmux,
+                server,
+                _test_tmux_owner_seal(tmux, server),
+                sealed,
+            )
+    else:
+        result = wrapper._terminate_bound_observer(
+            tmux,
+            server,
+            _test_tmux_owner_seal(tmux, server),
+            sealed,
+        )
+        assert result["status"] == expected
+        assert result["process_residual"] is False
+
+
+def test_wrapper_cleanup_permission_failure_is_durable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper = _wrapper_module()
+    config = tmp_path / "policy.json"
+    config.write_text("{}\n", encoding="utf-8")
+    policy_root = tmp_path / "campaign" / "by_policy" / ("6" * 64)
+    _prepare_wrapper_contract_inputs(wrapper, policy_root)
+    _patch_wrapper_tmux(wrapper, monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        wrapper,
+        "_terminate_bound_observer",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            PermissionError("fixture permission denied")
+        ),
+    )
+    value = wrapper.run_wrapped_controller(
+        repo_root=tmp_path,
+        policy_root=policy_root,
+        policy_sha256="6" * 64,
+        config=config,
+        observer_command=[sys.executable, "-c", "pass"],
+        command=[sys.executable, "-c", "raise SystemExit(0)"],
+    )
+    cleanup = load_json(
+        Path(value["observer_cleanup"]["path"]),
+        "durable permission cleanup",
+    )
+    assert value["exit_code"] != 0
+    assert cleanup["status"] == "cleanup_failed"
+    assert cleanup["failure"]["type"] == "PermissionError"
+    assert cleanup["session_residual"] is True
+    assert cleanup["process_residual"] is True
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("named_pane", "extra_server_field"),
+)
+def test_wrapper_public_tmux_identity_remains_four_field_opaque(
+    mutation: str,
+) -> None:
+    wrapper = _wrapper_module()
+    identity = {
+        "session": wrapper.OBSERVER_SESSION,
+        "pane": "%17",
+        "pane_pid": 401,
+        "pane_current_command": "python",
+    }
+    if mutation == "named_pane":
+        identity["pane"] = "monitor:0.0"
+    else:
+        identity["server_pid"] = 99
+    with pytest.raises(RuntimeError, match="public tmux identity"):
+        wrapper._validate_tmux_identity(
+            identity, wrapper.OBSERVER_SESSION
+        )
+
+
+def test_wrapper_kill_pane_check_to_kill_replacement_preserves_foreign(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper = _wrapper_module()
+    sealed_tmux = {
+        "session": wrapper.OBSERVER_SESSION,
+        "pane": "%17",
+        "pane_pid": 401,
+        "pane_current_command": "python",
+    }
+    sealed_server = {
+        "server_pid": 301,
+        "socket_path": "/tmp/tmux-test/default",
+    }
+    sealed_process = {"pid": 401, "pgid": 401, "start_ticks": 77}
+    sealed_owner = _test_tmux_owner_seal(
+        sealed_tmux, sealed_server, server_start_ticks=55
+    )
+    foreign_tmux = {
+        "session": wrapper.OBSERVER_SESSION,
+        "pane": "%18",
+        "pane_pid": 402,
+        "pane_current_command": "python",
+    }
+    state = {"replaced": False, "foreign_alive": True}
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        wrapper,
+        "_tmux_server_identity",
+        lambda _target=None: dict(sealed_server),
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_tmux_identity",
+        lambda _session: (
+            dict(foreign_tmux) if state["replaced"] else dict(sealed_tmux)
+        ),
+    )
+
+    def pane_identity(_pane: str):
+        if state["replaced"]:
+            raise wrapper.TmuxTargetAbsent("can't find pane: %17")
+        return dict(sealed_tmux)
+
+    monkeypatch.setattr(wrapper, "_tmux_pane_identity", pane_identity)
+    monkeypatch.setattr(
+        wrapper,
+        "_process_identity",
+        lambda _pid: (
+            None if state["replaced"] else dict(sealed_process)
+        ),
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_process_identity_state",
+        lambda _pid: (
+            None if state["replaced"] else (dict(sealed_process), "S")
+        ),
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_read_process_stat",
+        lambda _pid: (
+            None
+            if state["replaced"]
+            else (dict(sealed_process), "S")
+        ),
+    )
+
+    def conditional(owner):
+        assert dict(owner) == sealed_owner
+        commands.append(["conditional-kill"])
+        state["replaced"] = True
+        return (
+            "condition_rejected",
+            types.SimpleNamespace(
+                returncode=0,
+                stdout=wrapper.TMUX_CONDITIONAL_KILL_REJECTED,
+                stderr="",
+            ),
+        )
+
+    monkeypatch.setattr(wrapper, "_conditional_kill_tmux_owner", conditional)
+    result = wrapper._terminate_bound_observer(
+        sealed_tmux,
+        sealed_server,
+        sealed_owner,
+        sealed_process,
+    )
+    assert commands == [["conditional-kill"]]
+    assert state["foreign_alive"] is True
+    assert result["session_residual"] is False
+    assert result["process_residual"] is False
+    assert (
+        result["tmux_kill_failure"]["type"]
+        == "TmuxConditionalKillRejected"
+    )
+
+
+def test_wrapper_kill_pane_failure_with_live_seal_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper = _wrapper_module()
+    sealed_tmux = {
+        "session": wrapper.OBSERVER_SESSION,
+        "pane": "%21",
+        "pane_pid": 501,
+        "pane_current_command": "python",
+    }
+    sealed_server = {
+        "server_pid": 301,
+        "socket_path": "/tmp/tmux-test/default",
+    }
+    sealed_process = {"pid": 501, "pgid": 501, "start_ticks": 88}
+    sealed_owner = _test_tmux_owner_seal(sealed_tmux, sealed_server)
+    monkeypatch.setattr(
+        wrapper,
+        "_tmux_server_identity",
+        lambda _target=None: dict(sealed_server),
+    )
+    monkeypatch.setattr(
+        wrapper, "_tmux_identity", lambda _session: dict(sealed_tmux)
+    )
+    monkeypatch.setattr(
+        wrapper, "_tmux_pane_identity", lambda _pane: dict(sealed_tmux)
+    )
+    monkeypatch.setattr(
+        wrapper, "_process_identity", lambda _pid: dict(sealed_process)
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_process_identity_state",
+        lambda _pid: (dict(sealed_process), "S"),
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_conditional_kill_tmux_owner",
+        lambda _owner: (
+            "command_failed",
+            types.SimpleNamespace(
+            returncode=1,
+            stdout="",
+                stderr="permission denied",
+            ),
+        ),
+    )
+    with pytest.raises(RuntimeError, match="remained live"):
+        wrapper._terminate_bound_observer(
+            sealed_tmux,
+            sealed_server,
+            sealed_owner,
+            sealed_process,
+        )
+
+
+@pytest.mark.parametrize(
+    ("case", "live_identity", "expected_status"),
+    (
+        (
+            "exact_owner",
+            {
+                "server_pid": 301,
+                "pane": "%17",
+                "pane_pid": 401,
+                "owner_nonce": "a" * 64,
+            },
+            "executed",
+        ),
+        (
+            "same_server_pane_replacement",
+            {
+                "server_pid": 301,
+                "pane": "%18",
+                "pane_pid": 402,
+                "owner_nonce": "a" * 64,
+            },
+            "condition_rejected",
+        ),
+        (
+            "same_pane_id_process_replacement",
+            {
+                "server_pid": 301,
+                "pane": "%17",
+                "pane_pid": 402,
+                "owner_nonce": "a" * 64,
+            },
+            "condition_rejected",
+        ),
+        (
+            "replacement_server_reuses_pid_socket_name_and_pane",
+            {
+                "server_pid": 301,
+                "pane": "%17",
+                "pane_pid": 401,
+                "owner_nonce": "b" * 64,
+            },
+            "condition_rejected",
+        ),
+    ),
+)
+def test_wrapper_atomic_tmux_owner_kill_is_nonce_and_pane_bound(
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    live_identity: dict[str, Any],
+    expected_status: str,
+) -> None:
+    wrapper = _wrapper_module()
+    sealed_tmux = {
+        "session": wrapper.OBSERVER_SESSION,
+        "pane": "%17",
+        "pane_pid": 401,
+        "pane_current_command": "python",
+    }
+    sealed_server = {
+        "server_pid": 301,
+        "socket_path": "/tmp/tmux-test/default",
+    }
+    owner = _test_tmux_owner_seal(sealed_tmux, sealed_server)
+    calls: list[list[str]] = []
+    foreign_killed = {"value": False}
+    monkeypatch.setattr(
+        wrapper,
+        "_validate_tmux_owner_host_identity",
+        lambda actual: actual == owner
+        or (_ for _ in ()).throw(AssertionError("owner differs")),
+    )
+
+    def run(command: list[str], **kwargs):
+        calls.append(list(command))
+        assert kwargs == {"capture_output": True, "text": True}
+        assert command[:8] == [
+            "tmux",
+            "-S",
+            owner["socket_path"],
+            "if-shell",
+            "-t",
+            owner["pane"],
+            "-F",
+            command[7],
+        ]
+        condition = command[7]
+        assert f"#{{==:#{{pid}},{owner['server_pid']}}}" in condition
+        assert (
+            f"#{{==:#{{session_name}},{owner['session']}}}"
+            in condition
+        )
+        assert f"#{{==:#{{pane_id}},{owner['pane']}}}" in condition
+        assert f"#{{==:#{{pane_pid}},{owner['pane_pid']}}}" in condition
+        assert (
+            f"#{{==:#{{E:{wrapper.TMUX_OWNER_ENV}}},"
+            f"{owner['owner_nonce']}}}"
+        ) in condition
+        assert command[8] == f"kill-pane -t {owner['pane']}"
+        assert command[9] == (
+            "display-message -p "
+            f"{wrapper.TMUX_CONDITIONAL_KILL_REJECTED}"
+        )
+        exact = live_identity == {
+            "server_pid": owner["server_pid"],
+            "pane": owner["pane"],
+            "pane_pid": owner["pane_pid"],
+            "owner_nonce": owner["owner_nonce"],
+        }
+        if exact:
+            foreign_killed["value"] = True
+            return types.SimpleNamespace(
+                returncode=0, stdout="", stderr=""
+            )
+        return types.SimpleNamespace(
+            returncode=0,
+            stdout=wrapper.TMUX_CONDITIONAL_KILL_REJECTED + "\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(wrapper.subprocess, "run", run)
+    status, _ = wrapper._conditional_kill_tmux_owner(owner)
+    assert status == expected_status, case
+    assert len(calls) == 1
+    assert foreign_killed["value"] is (expected_status == "executed")
+
+
+def test_wrapper_remain_on_exit_replacement_is_rejected_without_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper = _wrapper_module()
+    sealed_tmux = {
+        "session": wrapper.OBSERVER_SESSION,
+        "pane": "%27",
+        "pane_pid": 501,
+        "pane_current_command": "python",
+    }
+    sealed_server = {
+        "server_pid": 401,
+        "socket_path": "/tmp/tmux-test/default",
+    }
+    owner = _test_tmux_owner_seal(sealed_tmux, sealed_server)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        wrapper,
+        "_validate_tmux_owner_host_identity",
+        lambda actual: actual == owner
+        or (_ for _ in ()).throw(AssertionError("owner differs")),
+    )
+
+    def run(command: list[str], **kwargs):
+        calls.append(list(command))
+        assert kwargs == {"capture_output": True, "text": True}
+        assert command[:7] == [
+            "tmux",
+            "-S",
+            owner["socket_path"],
+            "if-shell",
+            "-t",
+            owner["pane"],
+            "-F",
+        ]
+        condition = command[7]
+        assert (
+            f"#{{==:#{{session_name}},{owner['session']}}}"
+            in condition
+        )
+        assert (
+            f"#{{==:#{{E:{wrapper.TMUX_OWNER_ENV}}},"
+            f"{owner['owner_nonce']}}}"
+        ) in condition
+        assert command[8] == (
+            f"set-window-option -t {owner['pane']} "
+            "remain-on-exit on"
+        )
+        assert command[9] == (
+            "display-message -p "
+            f"{wrapper.TMUX_CONDITIONAL_REMAIN_REJECTED}"
+        )
+        return types.SimpleNamespace(
+            returncode=0,
+            stdout=wrapper.TMUX_CONDITIONAL_REMAIN_REJECTED + "\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(wrapper.subprocess, "run", run)
+    with pytest.raises(RuntimeError, match="owner condition rejected"):
+        wrapper._set_observer_remain_on_exit(owner)
+    assert len(calls) == 1
+    assert "set-window-option" not in calls[0][:8]
+
+
+@pytest.mark.parametrize("failure", ("server_start_ticks", "socket_inode"))
+def test_wrapper_tmux_owner_host_precheck_failure_issues_no_command(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    wrapper = _wrapper_module()
+    tmux = {
+        "session": wrapper.OBSERVER_SESSION,
+        "pane": "%17",
+        "pane_pid": 401,
+        "pane_current_command": "python",
+    }
+    server = {
+        "server_pid": 301,
+        "socket_path": "/tmp/tmux-test/default",
+    }
+    owner = _test_tmux_owner_seal(tmux, server)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        wrapper,
+        "_validate_tmux_owner_host_identity",
+        lambda _owner: (_ for _ in ()).throw(
+            RuntimeError(f"tmux owner {failure} differs")
+        ),
+    )
+    monkeypatch.setattr(
+        wrapper.subprocess,
+        "run",
+        lambda command, **_kwargs: calls.append(list(command)),
+    )
+    with pytest.raises(RuntimeError, match=failure):
+        wrapper._conditional_kill_tmux_owner(owner)
+    assert calls == []
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("tmux") is None,
+    reason="requires Linux /proc and tmux",
+)
+def test_wrapper_real_tmux_nonce_change_rejects_without_killing_pane(
+    tmp_path: Path,
+) -> None:
+    wrapper = _wrapper_module()
+    socket_path = tmp_path / "owner-test.sock"
+    session = "safa-owner-atomic-test"
+    old_nonce = "a" * 64
+    new_nonce = "b" * 64
+    try:
+        subprocess.run(
+            [
+                "tmux",
+                "-S",
+                str(socket_path),
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "-e",
+                f"{wrapper.TMUX_OWNER_ENV}={old_nonce}",
+                sys.executable,
+                "-c",
+                "import time;time.sleep(30)",
+            ],
+            check=True,
+        )
+        identity_row = subprocess.run(
+            [
+                "tmux",
+                "-S",
+                str(socket_path),
+                "display-message",
+                "-p",
+                "-t",
+                session,
+                "#{pid}\t#{pane_id}\t#{pane_pid}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip().split("\t")
+        socket_value = os.lstat(socket_path)
+        server_pid = int(identity_row[0])
+        server_process = wrapper._require_process_identity(
+            server_pid, "real tmux owner test server"
+        )
+        owner = {
+            "server_pid": server_pid,
+            "server_start_ticks": server_process["start_ticks"],
+            "socket_path": str(socket_path),
+            "socket_device": int(socket_value.st_dev),
+            "socket_inode": int(socket_value.st_ino),
+            "session": session,
+            "pane": identity_row[1],
+            "pane_pid": int(identity_row[2]),
+            "owner_nonce": old_nonce,
+        }
+        subprocess.run(
+            [
+                "tmux",
+                "-S",
+                str(socket_path),
+                "set-environment",
+                "-t",
+                session,
+                wrapper.TMUX_OWNER_ENV,
+                new_nonce,
+            ],
+            check=True,
+        )
+        status, command_result = wrapper._conditional_kill_tmux_owner(
+            owner
+        )
+        assert status == "condition_rejected"
+        assert command_result.returncode == 0
+        assert subprocess.run(
+            [
+                "tmux",
+                "-S",
+                str(socket_path),
+                "has-session",
+                "-t",
+                session,
+            ],
+            capture_output=True,
+            text=True,
+        ).returncode == 0
+    finally:
+        subprocess.run(
+            ["tmux", "-S", str(socket_path), "kill-server"],
+            capture_output=True,
+            text=True,
+        )
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("tmux") is None,
+    reason="requires Linux /proc and tmux",
+)
+def test_wrapper_real_tmux_replacement_rejects_remain_on_exit(
+    tmp_path: Path,
+) -> None:
+    wrapper = _wrapper_module()
+    socket_path = tmp_path / "remain-owner-test.sock"
+    session = "safa-remain-owner-atomic-test"
+    old_nonce = "a" * 64
+    new_nonce = "b" * 64
+    try:
+        subprocess.run(
+            [
+                "tmux",
+                "-S",
+                str(socket_path),
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "-e",
+                f"{wrapper.TMUX_OWNER_ENV}={old_nonce}",
+                sys.executable,
+                "-c",
+                "import time;time.sleep(30)",
+            ],
+            check=True,
+        )
+        identity_row = subprocess.run(
+            [
+                "tmux",
+                "-S",
+                str(socket_path),
+                "display-message",
+                "-p",
+                "-t",
+                session,
+                "#{pid}\t#{pane_id}\t#{pane_pid}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip().split("\t")
+        socket_value = os.lstat(socket_path)
+        server_pid = int(identity_row[0])
+        server_process = wrapper._require_process_identity(
+            server_pid, "real tmux remain owner server"
+        )
+        owner = {
+            "server_pid": server_pid,
+            "server_start_ticks": server_process["start_ticks"],
+            "socket_path": str(socket_path),
+            "socket_device": int(socket_value.st_dev),
+            "socket_inode": int(socket_value.st_ino),
+            "session": session,
+            "pane": identity_row[1],
+            "pane_pid": int(identity_row[2]),
+            "owner_nonce": old_nonce,
+        }
+        subprocess.run(
+            [
+                "tmux",
+                "-S",
+                str(socket_path),
+                "set-window-option",
+                "-t",
+                session,
+                "remain-on-exit",
+                "off",
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "tmux",
+                "-S",
+                str(socket_path),
+                "set-environment",
+                "-t",
+                session,
+                wrapper.TMUX_OWNER_ENV,
+                new_nonce,
+            ],
+            check=True,
+        )
+        with pytest.raises(RuntimeError, match="owner condition rejected"):
+            wrapper._set_observer_remain_on_exit(owner)
+        remain_value = subprocess.run(
+            [
+                "tmux",
+                "-S",
+                str(socket_path),
+                "show-window-options",
+                "-v",
+                "-t",
+                session,
+                "remain-on-exit",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert remain_value == "off"
+        assert subprocess.run(
+            [
+                "tmux",
+                "-S",
+                str(socket_path),
+                "has-session",
+                "-t",
+                session,
+            ],
+            capture_output=True,
+            text=True,
+        ).returncode == 0
+    finally:
+        subprocess.run(
+            ["tmux", "-S", str(socket_path), "kill-server"],
+            capture_output=True,
+            text=True,
+        )
+
+
+def test_wrapper_server_replacement_is_never_terminated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper = _wrapper_module()
+    sealed_tmux = {
+        "session": wrapper.OBSERVER_SESSION,
+        "pane": "%31",
+        "pane_pid": 601,
+        "pane_current_command": "python",
+    }
+    sealed_server = {
+        "server_pid": 301,
+        "socket_path": "/tmp/tmux-test/default",
+    }
+    foreign_server = {
+        "server_pid": 302,
+        "socket_path": "/tmp/tmux-test/default",
+    }
+    foreign_tmux = {
+        "session": wrapper.OBSERVER_SESSION,
+        "pane": "%32",
+        "pane_pid": 602,
+        "pane_current_command": "python",
+    }
+    sealed_process = {"pid": 601, "pgid": 601, "start_ticks": 99}
+    sealed_owner = _test_tmux_owner_seal(sealed_tmux, sealed_server)
+    monkeypatch.setattr(
+        wrapper,
+        "_tmux_server_identity",
+        lambda _target=None: dict(foreign_server),
+    )
+    monkeypatch.setattr(
+        wrapper, "_tmux_identity", lambda _session: dict(foreign_tmux)
+    )
+    monkeypatch.setattr(wrapper, "_process_identity", lambda _pid: None)
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        wrapper.subprocess,
+        "run",
+        lambda command, **_kwargs: commands.append(list(command)),
+    )
+    result = wrapper._terminate_bound_observer(
+        sealed_tmux,
+        sealed_server,
+        sealed_owner,
+        sealed_process,
+    )
+    assert commands == []
+    assert result["status"] == "identity_replaced_not_terminated"
+    assert result["observed_tmux"] == foreign_tmux
+    assert result["session_residual"] is False
+    assert result["process_residual"] is False
+
+
+def test_wrapper_records_native_stderr_and_sigkill_without_controller_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     wrapper = _wrapper_module()
     config = tmp_path / "policy.json"
     config.write_text("{}\n", encoding="utf-8")
     policy_root = tmp_path / "campaign" / "by_policy" / ("1" * 64)
+    _prepare_wrapper_contract_inputs(wrapper, policy_root)
+    _patch_wrapper_tmux(wrapper, monkeypatch, tmp_path)
     value = wrapper.run_wrapped_controller(
+        repo_root=tmp_path,
         policy_root=policy_root,
         policy_sha256="1" * 64,
         config=config,
+        observer_command=[sys.executable, "-c", "pass"],
         command=[
             sys.executable,
             "-c",
@@ -5414,16 +8682,20 @@ def test_wrapper_records_native_stderr_and_sigkill_without_controller_claim(
 
 
 def test_wrapper_records_pre_main_failure_without_controller_artifacts(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     wrapper = _wrapper_module()
     config = tmp_path / "policy.json"
     config.write_text("{bad policy}\n", encoding="utf-8")
     policy_root = tmp_path / "campaign" / "by_policy" / ("2" * 64)
+    _prepare_wrapper_contract_inputs(wrapper, policy_root)
+    _patch_wrapper_tmux(wrapper, monkeypatch, tmp_path)
     value = wrapper.run_wrapped_controller(
+        repo_root=tmp_path,
         policy_root=policy_root,
         policy_sha256="2" * 64,
         config=config,
+        observer_command=[sys.executable, "-c", "pass"],
         command=[
             sys.executable,
             "-c",
@@ -5470,9 +8742,14 @@ def test_current_policy_preflight_refuses_partial_result_reuse(
     )
     write_exclusive_json(paths["preflight_results"] / "partial.json", {"partial": True})
     monkeypatch.setenv("TMUX", "fixture")
+    monkeypatch.setattr(
+        module, "_assert_preflight_observer_live", lambda *_args: None
+    )
     guard = types.SimpleNamespace(raise_if_violated=lambda: None)
     with pytest.raises(CanonicalScreeningError, match="refuses result reuse"):
-        module.materialize_preflights(policy, paths, guard, "d" * 64)
+        module.materialize_preflights(
+            policy, paths, guard, "d" * 64, {"sha256": "e" * 64}
+        )
 
 
 def test_write_exclusive_json_rejects_overwrite(tmp_path: Path) -> None:
@@ -5760,6 +9037,1867 @@ def test_worker_revalidates_ready_files_before_cuda(
     controller_path.write_text("{}\n", encoding="utf-8")
     with pytest.raises(CanonicalScreeningError, match="file binding"):
         _assert_ready_barrier(request, policy)
+
+
+def test_cpu_preflight_request_manifest_binds_plan_and_request_files(
+    tmp_path: Path,
+) -> None:
+    module = _controller_module()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("candidate", "a" * 64)])
+    policy, _, _ = _policy(tmp_path, ledger)
+    paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
+    plan = build_checkpoint_plan(tmp_path, policy, paths["preflight_results"])
+    write_exclusive_json(paths["checkpoint_plan"], plan)
+    request_paths = module.write_preflight_requests(
+        plan, paths["preflight_requests"]
+    )
+    manifest = module._build_preflight_request_manifest(
+        policy, paths, plan, request_paths
+    )
+    assert manifest["request_count"] == 1
+    assert (
+        module._validate_preflight_request_manifest(
+            manifest, policy, paths
+        )
+        == manifest
+    )
+    request_path = request_paths[0]
+    request_path.write_bytes(request_path.read_bytes() + b" ")
+    with pytest.raises(
+        CanonicalScreeningError, match="file binding mismatch"
+    ):
+        module._validate_preflight_request_manifest(
+            manifest, policy, paths
+        )
+
+
+def test_cpu_preflight_monitor_dispatch_never_uses_gpu_control(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _controller_module()
+    called = []
+    monkeypatch.setattr(
+        module,
+        "_run_preflight_monitor",
+        lambda *_args: called.append("cpu") or {"samples": 1},
+    )
+    monkeypatch.setattr(
+        module,
+        "_run_gpu_monitor",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("GPU observer was called")
+        ),
+    )
+    assert module._run_monitor({}, {}, "preflight") == {"samples": 1}
+    assert called == ["cpu"]
+    with pytest.raises(
+        CanonicalScreeningError, match="target is invalid"
+    ):
+        module._run_monitor({}, {}, "not-a-phase")
+
+
+def test_preflight_artifact_progress_closes_all_193_requests(
+    tmp_path: Path,
+) -> None:
+    module = _controller_module()
+    paths = module._paths(tmp_path / "campaign", "1" * 64)
+    attempts = paths["preflight_control"] / "attempts"
+    for index in range(193):
+        stem = f"{index:064x}__raw"
+        write_exclusive_json(
+            attempts / f"{stem}.claim.json",
+            {"sequence": index + 1},
+        )
+        write_exclusive_json(
+            paths["preflight_results"] / f"{stem}.json",
+            {"valid": index % 2 == 0},
+        )
+        write_exclusive_json(
+            attempts / f"{stem}.terminal.json",
+            {
+                "status": "completed",
+                "valid": index % 2 == 0,
+            },
+        )
+    assert module._preflight_progress(paths, 193) == {
+        "request_count": 193,
+        "result_count": 193,
+        "attempt_claim_count": 193,
+        "attempt_terminal_count": 193,
+        "completed": 193,
+        "failed": 0,
+        "valid": 97,
+        "invalid": 96,
+        "pending": 0,
+    }
+
+
+def test_preflight_observer_early_exit_fails_ready_barrier(
+    tmp_path: Path,
+) -> None:
+    module = _controller_module()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("config", None)])
+    policy, _, _ = _policy(tmp_path, ledger)
+    paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
+    write_exclusive_json(
+        paths["preflight_control"] / "observer_terminal.json",
+        {
+            "contract_type": (
+                "safa_canonical_preflight_observer_terminal_v1"
+            ),
+            "failure": {
+                "type": "RuntimeError",
+                "message": "observer exited",
+            },
+        },
+    )
+    with pytest.raises(
+        CanonicalScreeningError, match="terminated before ready"
+    ):
+        module._wait_preflight_observer_ready(
+            policy,
+            paths,
+            {
+                "controller_ready_sha256": "a" * 64,
+                "request_count": 1,
+            },
+        )
+
+
+def test_preflight_tmux_is_wrapper_managed_without_external_monitor(
+    tmp_path: Path,
+) -> None:
+    module = _controller_module()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("config", None)])
+    policy, policy_path, _ = _policy(tmp_path, ledger)
+    commands = module._tmux_commands(
+        policy, policy_path, tmp_path / "campaign", "preflight"
+    )
+    assert commands["monitor"] == []
+    assert any(
+        item.endswith("run_canonical_preflight_wrapper.py")
+        for item in commands["controller"]
+    )
+
+
+def test_cpu_preflight_monitor_completes_without_gpu_control_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("candidate", "a" * 64)])
+    policy, policy_path, _ = _policy(tmp_path, ledger)
+    policy["policy_file"] = {
+        "path": str(policy_path.resolve()),
+        "sha256": hashlib.sha256(policy_path.read_bytes()).hexdigest(),
+    }
+    paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
+    plan = build_checkpoint_plan(tmp_path, policy, paths["preflight_results"])
+    write_exclusive_json(paths["checkpoint_plan"], plan)
+    request_paths = module.write_preflight_requests(
+        plan, paths["preflight_requests"]
+    )
+    manifest = module._build_preflight_request_manifest(
+        policy, paths, plan, request_paths
+    )
+    control = paths["preflight_control"]
+    sealed_pid = os.getpid()
+    sealed_process = {
+        "pid": sealed_pid,
+        "pgid": sealed_pid,
+        "start_ticks": 20,
+    }
+    controller_tmux = {
+        "session": module.PREFLIGHT_CONTROLLER_SESSION,
+        "pane": "%0",
+        "pane_pid": sealed_pid,
+        "pane_current_command": "python",
+    }
+    observer_tmux = {
+        **controller_tmux,
+        "session": module.PREFLIGHT_OBSERVER_SESSION,
+        "pane": "%1",
+    }
+    tmux_server = {
+        "server_pid": sealed_pid,
+        "socket_path": str((tmp_path / "tmux.sock").resolve()),
+    }
+    wrapper = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_preflight_wrapper_claim_v2",
+        "policy_sha256": policy["policy_sha256"],
+        "controller_session": module.PREFLIGHT_CONTROLLER_SESSION,
+        "observer_session": module.PREFLIGHT_OBSERVER_SESSION,
+        "controller_tmux": controller_tmux,
+        "controller_tmux_server": tmux_server,
+        "wrapper_process": sealed_process,
+    }
+    wrapper["wrapper_claim_sha256"] = canonical_digest(
+        wrapper, "wrapper_claim_sha256"
+    )
+    wrapper_path = control / "wrapper_claim.json"
+    write_exclusive_json(wrapper_path, wrapper)
+    observer_launch, observer_launch_path = (
+        _write_preflight_observer_provenance_fixture(
+            module,
+            policy,
+            paths,
+            wrapper=wrapper,
+            wrapper_path=wrapper_path,
+            observer_tmux=observer_tmux,
+            tmux_server=tmux_server,
+            observer_process=sealed_process,
+        )
+    )
+    process_start, process_start_path = (
+        _write_preflight_process_start_fixture(module, policy, paths)
+    )
+    controller_claim = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_preflight_controller_claim_v2",
+        "policy_sha256": policy["policy_sha256"],
+    }
+    controller_claim["controller_claim_sha256"] = canonical_digest(
+        controller_claim, "controller_claim_sha256"
+    )
+    controller_claim_path = control / "controller_claim.json"
+    write_exclusive_json(controller_claim_path, controller_claim)
+    admission = module._write_admission(
+        policy,
+        paths,
+        "preflight",
+        _admission_snapshot(policy),
+    )
+    controller_ready = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_preflight_controller_ready_v1",
+        "policy_sha256": policy["policy_sha256"],
+        "controller_session": module.PREFLIGHT_CONTROLLER_SESSION,
+        "observer_session": module.PREFLIGHT_OBSERVER_SESSION,
+        "request_count": 1,
+        "controller_pid": 100,
+        "controller_process": process_start["process"],
+        "controller_claim": module._artifact_binding(
+            controller_claim_path,
+            controller_claim["controller_claim_sha256"],
+        ),
+        "observer_launch": module._artifact_binding(
+            observer_launch_path,
+            observer_launch["observer_launch_sha256"],
+        ),
+        "controller_process_start": module._artifact_binding(
+            process_start_path,
+            process_start["controller_process_start_sha256"],
+        ),
+        "checkpoint_plan": module._artifact_binding(
+            paths["checkpoint_plan"], plan["checkpoint_plan_sha256"]
+        ),
+        "preflight_request_manifest": module._artifact_binding(
+            paths["preflight_request_manifest"],
+            manifest["preflight_request_manifest_sha256"],
+        ),
+        "startup_admission": admission,
+    }
+    controller_ready["controller_ready_sha256"] = canonical_digest(
+        controller_ready, "controller_ready_sha256"
+    )
+    controller_ready_path = control / "controller_ready.json"
+    write_exclusive_json(controller_ready_path, controller_ready)
+    request_stem = request_paths[0].stem
+    write_exclusive_json(
+        control / "attempts" / f"{request_stem}.claim.json",
+        {"sequence": 1},
+    )
+    write_exclusive_json(
+        paths["preflight_results"] / request_paths[0].name,
+        {"valid": True},
+    )
+    write_exclusive_json(
+        control / "attempts" / f"{request_stem}.terminal.json",
+        {"status": "completed", "valid": True},
+    )
+    progress = module._preflight_progress(paths, 1)
+    controller_terminal = {
+        "schema_version": 1,
+        "contract_type": (
+            "safa_canonical_preflight_controller_terminal_v2"
+        ),
+        "policy_sha256": policy["policy_sha256"],
+        "status": "completed",
+        "failure": None,
+        "progress": progress,
+    }
+    controller_terminal["controller_terminal_sha256"] = canonical_digest(
+        controller_terminal, "controller_terminal_sha256"
+    )
+    controller_terminal_path = control / "controller_terminal.json"
+    write_exclusive_json(controller_terminal_path, controller_terminal)
+    process_exit, _ = _write_preflight_process_exit_fixture(
+        module,
+        policy,
+        paths,
+        wrapper=wrapper,
+        observer_launch=observer_launch,
+        observer_launch_path=observer_launch_path,
+        process_start=process_start,
+        process_start_path=process_start_path,
+        exit_code=0,
+        controller_terminal={
+            "path": str(controller_terminal_path.resolve()),
+            "sha256": hashlib.sha256(
+                controller_terminal_path.read_bytes()
+            ).hexdigest(),
+        },
+    )
+
+    class FakeGuard:
+        def __init__(
+            self,
+            _policy: dict,
+            sample_path: Path,
+            _disk_path: Path,
+            authorized_gpu_registry: list[dict],
+        ) -> None:
+            self.sample_path = sample_path
+            self.policy_sha256 = _policy["policy_sha256"]
+            self.authorized_gpu_registry = authorized_gpu_registry
+
+        def start(self) -> None:
+            sample = {
+                "schema_version": 1,
+                "contract_type": (
+                    "safa_canonical_runtime_resource_window_v1"
+                ),
+                "policy_sha256": self.policy_sha256,
+                "sequence": 1,
+                "violated": False,
+            }
+            sample["resource_window_sha256"] = canonical_digest(
+                sample, "resource_window_sha256"
+            )
+            _write_jsonl(self.sample_path, [sample])
+
+        def wait_first_sample(self, _timeout: float) -> dict:
+            return module.load_jsonl(self.sample_path, "resource")[0]
+
+        def raise_if_violated(self) -> None:
+            return None
+
+        def stop(self) -> dict:
+            return {
+                "started": True,
+                "violated": False,
+                "violation_reason": None,
+                "thread_failure": None,
+            }
+
+    monkeypatch.setattr(
+        module, "_current_tmux_session", lambda *_args: "monitor"
+    )
+    monkeypatch.setattr(
+        module,
+        "_tmux_identity",
+        lambda session: {
+            "session": session,
+            "pane": "%0",
+            "pane_pid": sealed_pid,
+            "pane_current_command": "python",
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "_tmux_pane_identity",
+        lambda pane: (
+            dict(controller_tmux)
+            if pane == controller_tmux["pane"]
+            else dict(observer_tmux)
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "_tmux_server_identity",
+        lambda _target: dict(tmux_server),
+    )
+    monkeypatch.setattr(
+        module, "_validate_tmux_owner_seal", lambda *_args: None
+    )
+    monkeypatch.setattr(module, "_process_identity", lambda pid: {
+        "pid": pid,
+        "pgid": pid,
+        "start_ticks": 20,
+    })
+    monkeypatch.setattr(module, "RuntimeResourceGuard", FakeGuard)
+    monkeypatch.setattr(
+        module,
+        "_hold_preflight_observer_for_wrapper_close",
+        lambda: None,
+    )
+    result = module._run_preflight_monitor(policy, paths)
+    assert result["samples"] == 2
+    observer_terminal = load_json(
+        control / "observer_terminal.json", "observer terminal"
+    )
+    assert observer_terminal["status"] == "completed"
+    assert observer_terminal["controller_terminal"] is not None
+    assert observer_terminal["controller_process_exit"] is not None
+    assert not paths["gpu_control"].exists()
+
+
+@pytest.mark.parametrize("mutation", ["session", "pid"])
+def test_preflight_wrapper_wrong_session_or_pid_fails_closed(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    module = _controller_module()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("config", None)])
+    policy, policy_path, _ = _policy(tmp_path, ledger)
+    policy["policy_file"] = {
+        "path": str(policy_path.resolve()),
+        "sha256": hashlib.sha256(policy_path.read_bytes()).hexdigest(),
+    }
+    paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
+    parent_pid = os.getppid()
+    wrapper = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_preflight_wrapper_claim_v2",
+        "policy_sha256": policy["policy_sha256"],
+        "config": policy["policy_file"],
+        "checkpoint_plan": {},
+        "preflight_request_manifest": {},
+        "controller_session": (
+            "wrong"
+            if mutation == "session"
+            else module.PREFLIGHT_CONTROLLER_SESSION
+        ),
+        "controller_tmux": {
+            "session": module.PREFLIGHT_CONTROLLER_SESSION,
+            "pane": "%0",
+            "pane_pid": parent_pid,
+            "pane_current_command": "python",
+        },
+        "observer_session": module.PREFLIGHT_OBSERVER_SESSION,
+        "command": module._expected_preflight_controller_command(
+            policy, paths
+        ),
+        "observer_command": module._expected_preflight_observer_command(
+            policy, paths
+        ),
+        "wrapper_pid": parent_pid + (1 if mutation == "pid" else 0),
+        "wrapper_process": module._process_identity(parent_pid),
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "external_timeout_seconds": None,
+    }
+    wrapper["wrapper_claim_sha256"] = canonical_digest(
+        wrapper, "wrapper_claim_sha256"
+    )
+    write_exclusive_json(
+        paths["preflight_control"] / "wrapper_claim.json", wrapper
+    )
+    with pytest.raises(
+        CanonicalScreeningError, match="wrapper claim contract mismatch"
+    ):
+        module._validate_preflight_wrapper_provenance(policy, paths)
+
+
+def test_preflight_controller_exit_without_terminal_writes_failed_observer_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("config", None)])
+    policy, policy_path, _ = _policy(tmp_path, ledger)
+    policy["policy_file"] = {
+        "path": str(policy_path.resolve()),
+        "sha256": hashlib.sha256(policy_path.read_bytes()).hexdigest(),
+    }
+    paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
+    control = paths["preflight_control"]
+    sealed_pid = os.getpid()
+    sealed_process = {
+        "pid": sealed_pid,
+        "pgid": sealed_pid,
+        "start_ticks": 20,
+    }
+    tmux_server = {
+        "server_pid": sealed_pid,
+        "socket_path": str((tmp_path / "tmux.sock").resolve()),
+    }
+    wrapper = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_preflight_wrapper_claim_v2",
+        "policy_sha256": policy["policy_sha256"],
+        "controller_session": module.PREFLIGHT_CONTROLLER_SESSION,
+        "observer_session": module.PREFLIGHT_OBSERVER_SESSION,
+        "controller_tmux": {
+            "session": module.PREFLIGHT_CONTROLLER_SESSION,
+            "pane": "%0",
+            "pane_pid": sealed_pid,
+            "pane_current_command": "python",
+        },
+        "controller_tmux_server": tmux_server,
+        "wrapper_process": sealed_process,
+    }
+    wrapper["wrapper_claim_sha256"] = canonical_digest(
+        wrapper, "wrapper_claim_sha256"
+    )
+    wrapper_path = control / "wrapper_claim.json"
+    write_exclusive_json(wrapper_path, wrapper)
+    observer_tmux = {
+        "session": module.PREFLIGHT_OBSERVER_SESSION,
+        "pane": "%1",
+        "pane_pid": sealed_pid,
+        "pane_current_command": "python",
+    }
+    launch, launch_path = _write_preflight_observer_provenance_fixture(
+        module,
+        policy,
+        paths,
+        wrapper=wrapper,
+        wrapper_path=wrapper_path,
+        observer_tmux=observer_tmux,
+        tmux_server=tmux_server,
+        observer_process=sealed_process,
+    )
+    process_start, process_start_path = (
+        _write_preflight_process_start_fixture(module, policy, paths)
+    )
+    _write_preflight_process_exit_fixture(
+        module,
+        policy,
+        paths,
+        wrapper=wrapper,
+        observer_launch=launch,
+        observer_launch_path=launch_path,
+        process_start=process_start,
+        process_start_path=process_start_path,
+        exit_code=2,
+        controller_terminal=None,
+    )
+    monkeypatch.setattr(
+        module, "_current_tmux_session", lambda *_args: "monitor"
+    )
+    monkeypatch.setattr(
+        module,
+        "_process_identity",
+        lambda pid: {"pid": pid, "pgid": pid, "start_ticks": 20},
+    )
+    monkeypatch.setattr(
+        module,
+        "_tmux_identity",
+        lambda session: {
+            "session": session,
+            "pane": "%0",
+            "pane_pid": sealed_pid,
+            "pane_current_command": "python",
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "_tmux_pane_identity",
+        lambda pane: {
+            "session": (
+                module.PREFLIGHT_CONTROLLER_SESSION
+                if pane == "%0"
+                else module.PREFLIGHT_OBSERVER_SESSION
+            ),
+            "pane": pane,
+            "pane_pid": sealed_pid,
+            "pane_current_command": "python",
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "_tmux_server_identity",
+        lambda _target: dict(tmux_server),
+    )
+    monkeypatch.setattr(
+        module, "_validate_tmux_owner_seal", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        module,
+        "_hold_preflight_observer_for_wrapper_close",
+        lambda: None,
+    )
+    with pytest.raises(
+        CanonicalScreeningError, match="exited before ready"
+    ):
+        module._run_preflight_monitor(policy, paths)
+    terminal = load_json(
+        control / "observer_terminal.json", "observer terminal"
+    )
+    assert terminal["status"] == "failed"
+    assert terminal["controller_terminal"] is None
+
+
+def test_preflight_observer_provenance_timeout_writes_durable_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("config", None)])
+    policy, _, _ = _policy(tmp_path, ledger)
+    paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
+    times = iter([0.0, module.PREFLIGHT_BARRIER_TIMEOUT_SECONDS + 1.0])
+    monkeypatch.setattr(module.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        module, "_current_tmux_session", lambda *_args: "monitor"
+    )
+    monkeypatch.setattr(
+        module,
+        "_process_identity",
+        lambda pid: {"pid": pid, "pgid": pid, "start_ticks": 1},
+    )
+    monkeypatch.setattr(
+        module,
+        "_tmux_identity",
+        lambda session: {
+            "session": session,
+            "pane": "%0",
+            "pane_pid": os.getpid(),
+            "pane_current_command": "python",
+        },
+    )
+    with pytest.raises(
+        CanonicalScreeningError, match="provenance barrier timed out"
+    ):
+        module._run_preflight_monitor(policy, paths)
+    terminal = load_json(
+        paths["preflight_control"] / "observer_terminal.json",
+        "observer terminal",
+    )
+    assert terminal["status"] == "failed"
+    assert terminal["failure"]["type"] == "CanonicalScreeningError"
+
+
+def test_preflight_observer_resource_stop_hard_stops_controller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("config", None)])
+    policy, _, _ = _policy(tmp_path, ledger)
+    paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
+    monkeypatch.setattr(
+        module,
+        "_process_identity",
+        lambda pid: {"pid": pid, "pgid": pid, "start_ticks": 1},
+    )
+    monkeypatch.setattr(
+        module,
+        "_tmux_identity",
+        lambda session: {
+            "session": session,
+            "pane": "%0",
+            "pane_pid": os.getpid(),
+            "pane_current_command": "python",
+        },
+    )
+    stop = module._publish_preflight_observer_stop(
+        policy,
+        paths,
+        None,
+        {
+            "type": "CanonicalScreeningError",
+            "message": "RAM runtime hard stop: 90.00% >= 90%",
+        },
+    )
+    assert stop["contract_type"] == "safa_canonical_preflight_observer_stop_v2"
+    assert stop["observer_process"]["start_ticks"] == 1
+    assert stop["controller_process"] is None
+    assert stop["observer_stop_sha256"] == canonical_digest(
+        stop, "observer_stop_sha256"
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("tmux") is None,
+    reason="requires Linux /proc and tmux",
+)
+@pytest.mark.parametrize(
+    (
+        "observer_mode",
+        "controller_seconds",
+        "controller_exit",
+        "expected_exit",
+        "expected_cleanup",
+    ),
+    (
+        ("success", 0.2, 0, 0, True),
+        ("stop", 30.0, 0, 143, True),
+        ("timeout", 0.2, 0, 124, True),
+        ("failure", 0.1, 2, 2, True),
+    ),
+)
+def test_preflight_wrapper_real_tmux_subprocess_lifecycle(
+    tmp_path: Path,
+    observer_mode: str,
+    controller_seconds: float,
+    controller_exit: int,
+    expected_exit: int,
+    expected_cleanup: bool,
+) -> None:
+    wrapper = _wrapper_module()
+    repo_root = Path(__file__).parents[1]
+    helper = repo_root / "tests/helpers/preflight_lifecycle_helper.py"
+    policy_sha256 = hashlib.sha256(
+        f"integration:{observer_mode}".encode()
+    ).hexdigest()
+    policy_root = tmp_path / "campaign" / "by_policy" / policy_sha256
+    config = tmp_path / "policy.json"
+    config.write_text("{}\n", encoding="utf-8")
+    _prepare_wrapper_contract_inputs(wrapper, policy_root)
+    sessions = (
+        wrapper.CONTROLLER_SESSION,
+        wrapper.OBSERVER_SESSION,
+    )
+    for session in sessions:
+        assert (
+            subprocess.run(
+                ["tmux", "has-session", "-t", session],
+                capture_output=True,
+                text=True,
+            ).returncode
+            != 0
+        )
+    command = [
+        sys.executable,
+        str(helper),
+        "wrapper",
+        "--wrapper-module",
+        str(repo_root / "scripts/run_canonical_preflight_wrapper.py"),
+        "--repo-root",
+        str(repo_root),
+        "--policy-root",
+        str(policy_root),
+        "--policy",
+        policy_sha256,
+        "--config",
+        str(config),
+        "--observer-mode",
+        observer_mode,
+        "--controller-seconds",
+        str(controller_seconds),
+        "--controller-exit",
+        str(controller_exit),
+        "--terminal-timeout",
+        "1.0",
+    ]
+    started = time.monotonic()
+    try:
+        subprocess.run(
+            [
+                "tmux",
+                "new-session",
+                "-d",
+                    "-s",
+                    wrapper.CONTROLLER_SESSION,
+                    "-e",
+                    (
+                        f"{wrapper.OBSERVER_SESSION_ENV}="
+                        f"{wrapper.OBSERVER_SESSION}"
+                    ),
+                    "-c",
+                str(repo_root),
+                *command,
+            ],
+            check=True,
+        )
+        exit_path = policy_root / "preflight_control" / "wrapper_exit.json"
+        deadline = time.monotonic() + 30.0
+        while not exit_path.is_file():
+            if time.monotonic() >= deadline:
+                raise AssertionError("real wrapper lifecycle timed out")
+            time.sleep(0.05)
+        value = load_json(exit_path, "real wrapper exit")
+        assert value["contract_type"] == "safa_canonical_preflight_wrapper_exit_v4"
+        assert value["exit_code"] == expected_exit
+        assert (value["observer_cleanup"] is not None) is expected_cleanup
+        cleanup = load_json(
+            Path(value["observer_cleanup"]["path"]),
+            "real wrapper observer cleanup",
+        )
+        if observer_mode == "timeout":
+            assert cleanup["reason"] == "observer_terminal_timeout"
+        else:
+            assert cleanup["reason"] == "observer_terminal_consumed"
+            assert cleanup["status"] == "closed_terminal_observer"
+        assert cleanup["session_residual"] is False
+        assert cleanup["process_residual"] is False
+        launch = load_json(
+            policy_root / "preflight_control" / "observer_launch.json",
+            "real observer launch",
+        )
+        assert launch["tmux"]["pane_pid"] == launch["process"]["pid"]
+        assert launch["process"]["pgid"] == launch["process"]["pid"]
+        assert launch["process"]["start_ticks"] > 0
+        process_exit = load_json(
+            policy_root / "preflight_control" / "controller_process_exit.json",
+            "real process exit",
+        )
+        assert (
+            process_exit["contract_type"]
+            == "safa_canonical_preflight_controller_process_exit_v2"
+        )
+        if observer_mode == "stop":
+            assert process_exit["observer_stop"] is not None
+            assert time.monotonic() - started < 10.0
+    finally:
+        for session in sessions:
+            subprocess.run(
+                ["tmux", "kill-session", "-t", session],
+                capture_output=True,
+                text=True,
+            )
+        for session in sessions:
+            assert (
+                subprocess.run(
+                    ["tmux", "has-session", "-t", session],
+                    capture_output=True,
+                    text=True,
+                ).returncode
+                != 0
+            )
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("tmux") is None,
+    reason="requires Linux /proc and tmux",
+)
+@pytest.mark.parametrize(
+    "observer_mode",
+    (
+        "terminal_process_exit_null",
+        "terminal_process_exit_path",
+        "terminal_process_exit_sha",
+        "terminal_process_exit_canonical",
+        "terminal_malformed",
+        "terminal_validator_exception",
+    ),
+)
+def test_preflight_wrapper_terminal_validation_failure_closes_durably(
+    tmp_path: Path,
+    observer_mode: str,
+) -> None:
+    wrapper = _wrapper_module()
+    repo_root = Path(__file__).parents[1]
+    helper = repo_root / "tests/helpers/preflight_lifecycle_helper.py"
+    policy_sha256 = hashlib.sha256(
+        f"terminal-validation:{observer_mode}".encode()
+    ).hexdigest()
+    policy_root = tmp_path / "campaign" / "by_policy" / policy_sha256
+    config = tmp_path / "policy.json"
+    config.write_text("{}\n", encoding="utf-8")
+    _prepare_wrapper_contract_inputs(wrapper, policy_root)
+    sessions = (wrapper.CONTROLLER_SESSION, wrapper.OBSERVER_SESSION)
+    command = [
+        sys.executable,
+        str(helper),
+        "wrapper",
+        "--wrapper-module",
+        str(repo_root / "scripts/run_canonical_preflight_wrapper.py"),
+        "--repo-root",
+        str(repo_root),
+        "--policy-root",
+        str(policy_root),
+        "--policy",
+        policy_sha256,
+        "--config",
+        str(config),
+        "--observer-mode",
+        observer_mode,
+        "--controller-seconds",
+        "0.2",
+        "--controller-exit",
+        "0",
+        "--terminal-timeout",
+        "1.0",
+    ]
+    try:
+        subprocess.run(
+            [
+                "tmux",
+                "new-session",
+                "-d",
+                    "-s",
+                    wrapper.CONTROLLER_SESSION,
+                    "-e",
+                    (
+                        f"{wrapper.OBSERVER_SESSION_ENV}="
+                        f"{wrapper.OBSERVER_SESSION}"
+                    ),
+                    "-c",
+                str(repo_root),
+                *command,
+            ],
+            check=True,
+        )
+        wrapper_exit_path = (
+            policy_root / "preflight_control/wrapper_exit.json"
+        )
+        deadline = time.monotonic() + 20.0
+        while not wrapper_exit_path.is_file():
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    "terminal-validation closure timed out"
+                )
+            time.sleep(0.05)
+        wrapper_exit = load_json(
+            wrapper_exit_path, "terminal-validation wrapper exit"
+        )
+        assert wrapper_exit["exit_code"] != 0
+        assert wrapper_exit["controller_exit_code"] == 0
+        assert wrapper_exit["observer_terminal"] is None
+        assert (
+            wrapper_exit["observer_terminal_validation_failure"]
+            is not None
+        )
+        cleanup = load_json(
+            Path(wrapper_exit["observer_cleanup"]["path"]),
+            "terminal-validation cleanup",
+        )
+        assert cleanup["reason"] == "observer_terminal_validation_failed"
+        assert cleanup["observer_terminal_validation_failure"] is not None
+        assert cleanup["session_residual"] is False
+        assert cleanup["process_residual"] is False
+        assert not (
+            policy_root / "wrapper_fixture_error.log"
+        ).exists()
+    finally:
+        for session in sessions:
+            subprocess.run(
+                ["tmux", "kill-session", "-t", session],
+                capture_output=True,
+                text=True,
+            )
+        for session in sessions:
+            assert (
+                subprocess.run(
+                    ["tmux", "has-session", "-t", session],
+                    capture_output=True,
+                    text=True,
+                ).returncode
+                != 0
+            )
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("tmux") is None,
+    reason="requires Linux /proc and tmux",
+)
+@pytest.mark.parametrize(
+    ("observer_mode", "current_status", "expect_success", "expect_valid"),
+    (
+        ("snapshot_completed_to_failed", "failed", True, True),
+        ("snapshot_failed_to_completed", "completed", False, True),
+        ("snapshot_delete", None, True, True),
+        ("snapshot_exception_replacement", "failed", False, False),
+    ),
+)
+def test_preflight_wrapper_uses_first_strict_terminal_snapshot(
+    tmp_path: Path,
+    observer_mode: str,
+    current_status: str | None,
+    expect_success: bool,
+    expect_valid: bool,
+) -> None:
+    wrapper = _wrapper_module()
+    repo_root = Path(__file__).parents[1]
+    helper = repo_root / "tests/helpers/preflight_lifecycle_helper.py"
+    policy_sha256 = hashlib.sha256(
+        f"terminal-snapshot:{observer_mode}".encode()
+    ).hexdigest()
+    policy_root = tmp_path / "campaign" / "by_policy" / policy_sha256
+    config = tmp_path / "policy.json"
+    config.write_text("{}\n", encoding="utf-8")
+    _prepare_wrapper_contract_inputs(wrapper, policy_root)
+    sessions = (wrapper.CONTROLLER_SESSION, wrapper.OBSERVER_SESSION)
+    command = [
+        sys.executable,
+        str(helper),
+        "wrapper",
+        "--wrapper-module",
+        str(repo_root / "scripts/run_canonical_preflight_wrapper.py"),
+        "--repo-root",
+        str(repo_root),
+        "--policy-root",
+        str(policy_root),
+        "--policy",
+        policy_sha256,
+        "--config",
+        str(config),
+        "--observer-mode",
+        observer_mode,
+        "--controller-seconds",
+        "0.2",
+        "--controller-exit",
+        "0",
+        "--terminal-timeout",
+        "1.0",
+    ]
+    try:
+        subprocess.run(
+            [
+                "tmux",
+                "new-session",
+                "-d",
+                    "-s",
+                    wrapper.CONTROLLER_SESSION,
+                    "-e",
+                    (
+                        f"{wrapper.OBSERVER_SESSION_ENV}="
+                        f"{wrapper.OBSERVER_SESSION}"
+                    ),
+                    "-c",
+                str(repo_root),
+                *command,
+            ],
+            check=True,
+        )
+        wrapper_exit_path = (
+            policy_root / "preflight_control/wrapper_exit.json"
+        )
+        deadline = time.monotonic() + 20.0
+        while not wrapper_exit_path.is_file():
+            if time.monotonic() >= deadline:
+                raise AssertionError("terminal snapshot test timed out")
+            time.sleep(0.05)
+        wrapper_exit = load_json(
+            wrapper_exit_path, "terminal snapshot wrapper exit"
+        )
+        snapshot = wrapper_exit["observer_terminal_snapshot"]
+        assert snapshot is not None
+        assert (wrapper_exit["exit_code"] == 0) is expect_success
+        assert (
+            wrapper_exit["observer_terminal"] == snapshot
+        ) is expect_valid
+        cleanup = load_json(
+            Path(wrapper_exit["observer_cleanup"]["path"]),
+            "terminal snapshot cleanup",
+        )
+        assert cleanup["reason"] == (
+            "observer_terminal_consumed"
+            if expect_valid
+            else "observer_terminal_validation_failed"
+        )
+        terminal_path = (
+            policy_root / "preflight_control/observer_terminal.json"
+        )
+        assert terminal_path.exists() is (current_status is not None)
+        if current_status is not None:
+            current = load_json(
+                terminal_path, "replacement observer terminal"
+            )
+            assert current["status"] == current_status
+            assert hashlib.sha256(
+                terminal_path.read_bytes()
+            ).hexdigest() != snapshot["sha256"]
+        assert cleanup["session_residual"] is False
+        assert cleanup["process_residual"] is False
+    finally:
+        for session in sessions:
+            subprocess.run(
+                ["tmux", "kill-session", "-t", session],
+                capture_output=True,
+                text=True,
+            )
+        for session in sessions:
+            assert (
+                subprocess.run(
+                    ["tmux", "has-session", "-t", session],
+                    capture_output=True,
+                    text=True,
+                ).returncode
+                != 0
+            )
+
+
+def test_preflight_wrapper_has_no_post_validation_terminal_path_read() -> None:
+    source = inspect.getsource(_wrapper_module().run_wrapped_controller)
+    assert "observer_terminal[\"path\"]" not in source
+    assert ".read_text(" not in source
+    assert source.count("_wait_observer_terminal(") == 1
+    assert source.count("_read_observer_terminal(") == 1
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("tmux") is None,
+    reason="requires Linux /proc and tmux",
+)
+@pytest.mark.parametrize(
+    "mode",
+    (
+        "success",
+        "resource_stop",
+        "early_exit",
+        "terminal_timeout",
+        "late_terminal_race",
+        "late_terminal_foreign_replacement",
+        "proc_snapshot_absent",
+        "identity_replacement",
+        "process_exit_delay",
+        "process_exit_barrier_timeout",
+        "late_snapshot_replacement",
+        "late_snapshot_delete",
+    ),
+)
+def test_preflight_real_production_controller_observer_chain(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    module = _controller_module()
+    wrapper = _wrapper_module()
+    repo_root = Path(__file__).parents[1]
+    helper = repo_root / "tests/helpers/preflight_lifecycle_helper.py"
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"production-chain-checkpoint")
+    checkpoint_sha256 = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(
+        ledger,
+        [
+            _row(
+                "integration",
+                checkpoint_sha256,
+                path=str(checkpoint.resolve()),
+            )
+        ],
+    )
+    policy, policy_path, _ = _policy(tmp_path, ledger)
+    policy["resources"]["resource_poll_seconds"] = 1
+    policy["resources"]["cpu_window_seconds"] = 1
+    policy["policy_file"] = {
+        "path": str(policy_path.resolve()),
+        "sha256": hashlib.sha256(policy_path.read_bytes()).hexdigest(),
+    }
+    campaign_root = tmp_path / "campaign"
+    paths = module._paths(campaign_root, policy["policy_sha256"])
+    plan = build_checkpoint_plan(tmp_path, policy, paths["preflight_results"])
+    write_exclusive_json(paths["checkpoint_plan"], plan)
+    request_paths = module.write_preflight_requests(
+        plan, paths["preflight_requests"]
+    )
+    module._build_preflight_request_manifest(
+        policy, paths, plan, request_paths
+    )
+    strict = _strict_preflight(
+        checkpoint_sha256,
+        "raw",
+        policy["output_decoder_registry"],
+    )
+    terminal_timeout_seconds = (
+        0.05
+        if mode in {
+            "terminal_timeout",
+            "late_terminal_race",
+            "late_terminal_foreign_replacement",
+            "proc_snapshot_absent",
+            "late_snapshot_replacement",
+            "late_snapshot_delete",
+        }
+        else 2.0
+    )
+    process_termination_wait_seconds = 10.0
+    controller_start_exit_margin_seconds = 10.0
+    wrapper_completion_timeout_seconds = (
+        2.0 * process_termination_wait_seconds
+        + terminal_timeout_seconds
+        + controller_start_exit_margin_seconds
+    )
+    fixture_path = tmp_path / "production_fixture.json"
+    controller_command = [
+        sys.executable,
+        str(helper),
+        "production-role",
+        "--controller-module",
+        str(repo_root / "scripts/run_canonical_checkpoint_screening.py"),
+        "--fixture",
+        str(fixture_path),
+        "--role",
+        "controller",
+    ]
+    observer_command = [
+        sys.executable,
+        str(helper),
+        "production-role",
+        "--controller-module",
+        str(repo_root / "scripts/run_canonical_checkpoint_screening.py"),
+        "--fixture",
+        str(fixture_path),
+        "--role",
+        "observer",
+    ]
+    fixture_path.write_text(
+        json.dumps(
+            {
+                "policy": policy,
+                "campaign_root": str(campaign_root.resolve()),
+                "controller_command": controller_command,
+                "observer_command": observer_command,
+                "strict_preflight": strict,
+                "resource_stop": mode == "resource_stop",
+                "mode": mode,
+                "process_termination_wait": (
+                    process_termination_wait_seconds
+                ),
+                "checkpoint_delay": (
+                    0.2
+                    if mode in {
+                        "terminal_timeout",
+                        "late_terminal_race",
+                        "late_terminal_foreign_replacement",
+                        "proc_snapshot_absent",
+                        "late_snapshot_replacement",
+                        "late_snapshot_delete",
+                    }
+                    else 3.0
+                    if mode == "identity_replacement"
+                    else 0.0
+                ),
+                "terminal_timeout": terminal_timeout_seconds,
+                "barrier_timeout": 2.0,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    policy_root = paths["policy_root"]
+    sessions = (
+        wrapper.CONTROLLER_SESSION,
+        wrapper.OBSERVER_SESSION,
+    )
+    for session in sessions:
+        assert (
+            subprocess.run(
+                ["tmux", "has-session", "-t", session],
+                capture_output=True,
+                text=True,
+            ).returncode
+            != 0
+        )
+    wrapper_command = [
+        sys.executable,
+        str(helper),
+        "production-wrapper",
+        "--wrapper-module",
+        str(repo_root / "scripts/run_canonical_preflight_wrapper.py"),
+        "--repo-root",
+        str(repo_root),
+        "--policy-root",
+        str(policy_root),
+        "--policy",
+        policy["policy_sha256"],
+        "--config",
+        str(policy_path),
+        "--fixture",
+        str(fixture_path),
+    ]
+    started = time.monotonic()
+    replacement_identity: dict[str, Any] | None = None
+    try:
+        subprocess.run(
+            [
+                "tmux",
+                "new-session",
+                "-d",
+                "-s",
+                wrapper.CONTROLLER_SESSION,
+                "-e",
+                (
+                    f"{wrapper.OBSERVER_SESSION_ENV}="
+                    f"{wrapper.OBSERVER_SESSION}"
+                ),
+                "-c",
+                str(repo_root),
+                *wrapper_command,
+            ],
+            check=True,
+        )
+        if mode == "identity_replacement":
+            ready_path = (
+                policy_root / "preflight_control" / "observer_ready.json"
+            )
+            ready_deadline = time.monotonic() + 10.0
+            while not ready_path.is_file():
+                if time.monotonic() >= ready_deadline:
+                    raise AssertionError(
+                        "production observer ready barrier timed out"
+                    )
+                time.sleep(0.02)
+            subprocess.run(
+                [
+                    "tmux",
+                    "kill-session",
+                    "-t",
+                    wrapper.OBSERVER_SESSION,
+                ],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "tmux",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    wrapper.OBSERVER_SESSION,
+                    sys.executable,
+                    "-c",
+                    "import time;time.sleep(30)",
+                ],
+                check=True,
+            )
+            current = subprocess.run(
+                [
+                    "tmux",
+                    "list-panes",
+                    "-t",
+                    wrapper.OBSERVER_SESSION,
+                    "-F",
+                    "#{session_name}\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip().split("\t")
+            replacement_identity = {
+                "session": current[0],
+                "pane": current[1],
+                "pane_pid": int(current[2]),
+                "pane_current_command": current[3],
+            }
+        wrapper_exit_path = (
+            policy_root / "preflight_control" / "wrapper_exit.json"
+        )
+        deadline = (
+            time.monotonic() + wrapper_completion_timeout_seconds
+        )
+        while not wrapper_exit_path.is_file():
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    "production controller/observer chain timed out"
+                )
+            time.sleep(0.05)
+        wrapper_exit = load_json(
+            wrapper_exit_path, "production chain wrapper exit"
+        )
+        launch = load_json(
+            policy_root / "preflight_control" / "observer_launch.json",
+            "production chain observer launch",
+        )
+        gate_ready = load_json(
+            Path(launch["observer_gate_ready"]["path"]),
+            "production chain observer gate ready",
+        )
+        gate_release = load_json(
+            Path(launch["observer_gate_release"]["path"]),
+            "production chain observer gate release",
+        )
+        assert (
+            launch["contract_type"]
+            == "safa_canonical_preflight_observer_launch_v3"
+        )
+        assert gate_ready["process"] == launch["process"]
+        assert gate_ready["process"]["pid"] == gate_ready["process"]["pgid"]
+        assert gate_ready["tmux"] == launch["tmux"]
+        assert gate_ready["tmux_server"] == launch["tmux_server"]
+        assert (
+            gate_ready["owner_nonce"]
+            == launch["tmux_owner_seal"]["owner_nonce"]
+        )
+        assert gate_ready["observer_command"] == observer_command
+        assert gate_ready["gate_command"] != observer_command
+        assert gate_release["observer_gate_ready"] == (
+            launch["observer_gate_ready"]
+        )
+        assert gate_release["observer_command"] == observer_command
+        assert gate_release["owner_nonce"] == gate_ready["owner_nonce"]
+        try:
+            current_observer_process = wrapper._process_identity(
+                int(launch["process"]["pid"])
+            )
+        except (FileNotFoundError, ProcessLookupError):
+            current_observer_process = None
+        assert current_observer_process != launch["process"]
+        observer_terminal_path = (
+            policy_root / "preflight_control" / "observer_terminal.json"
+        )
+        observer_terminal = (
+            load_json(
+                observer_terminal_path,
+                "production chain observer terminal",
+            )
+            if observer_terminal_path.is_file()
+            else None
+        )
+        controller_terminal_path = (
+            policy_root / "preflight_control" / "controller_terminal.json"
+        )
+        if mode in {
+            "resource_stop",
+            "early_exit",
+            "terminal_timeout",
+            "late_terminal_race",
+            "late_terminal_foreign_replacement",
+            "proc_snapshot_absent",
+            "identity_replacement",
+            "process_exit_barrier_timeout",
+            "late_snapshot_replacement",
+            "late_snapshot_delete",
+        }:
+            assert wrapper_exit["exit_code"] != 0
+            if mode in {
+                "resource_stop",
+                "early_exit",
+                "process_exit_barrier_timeout",
+            }:
+                assert observer_terminal is not None
+                assert observer_terminal["status"] == "failed"
+                if mode != "process_exit_barrier_timeout":
+                    assert wrapper_exit["observer_stop"] is not None
+            elif mode not in {
+                "late_terminal_race",
+                "late_terminal_foreign_replacement",
+                "late_snapshot_replacement",
+                "late_snapshot_delete",
+            }:
+                assert observer_terminal is None
+            if mode in {
+                "terminal_timeout",
+                "proc_snapshot_absent",
+            }:
+                cleanup = load_json(
+                    Path(wrapper_exit["observer_cleanup"]["path"]),
+                    "production timeout cleanup",
+                )
+                assert cleanup["status"] in {
+                    "cleaned_process_killed",
+                    "cleaned_process_already_absent",
+                    "cleaned_process_absent",
+                    "cleaned_process_zombie",
+                    "cleaned_detached_process_killed",
+                    "cleaned_tmux_killed",
+                    "cleaned_tmux_already_absent",
+                    "cleaned_tmux_absent",
+                    "cleaned_tmux_zombie",
+                }
+                assert cleanup["session_residual"] is False
+                assert cleanup["process_residual"] is False
+                assert not observer_terminal_path.exists()
+                time.sleep(0.5)
+                assert not observer_terminal_path.exists()
+            if mode == "late_terminal_race":
+                assert observer_terminal is not None
+                assert observer_terminal["status"] == "completed"
+                assert wrapper_exit["observer_terminal"] is None
+                late_binding = wrapper_exit["late_observer_terminal"]
+                assert late_binding is not None
+                assert late_binding == {
+                    "path": str(observer_terminal_path.resolve()),
+                    "sha256": hashlib.sha256(
+                        observer_terminal_path.read_bytes()
+                    ).hexdigest(),
+                    "canonical_sha256": observer_terminal[
+                        "observer_terminal_sha256"
+                    ],
+                }
+                cleanup = load_json(
+                    Path(wrapper_exit["observer_cleanup"]["path"]),
+                    "production late-terminal cleanup",
+                )
+                assert cleanup["reason"] == "observer_terminal_timeout"
+                assert cleanup["late_observer_terminal"] == late_binding
+                assert cleanup["session_residual"] is False
+                assert cleanup["process_residual"] is False
+                assert wrapper_exit["observer_stop"] is None
+                race = load_json(
+                    policy_root
+                    / "preflight_control/late_terminal_race_window.json",
+                    "production late-terminal race window",
+                )
+                assert race["terminal_absent_after_wait"] is True
+                assert race["race_window_sha256"] == canonical_digest(
+                    race, "race_window_sha256"
+                )
+            if mode == "late_terminal_foreign_replacement":
+                assert observer_terminal is not None
+                assert observer_terminal["status"] == "completed"
+                assert wrapper_exit["observer_terminal"] is None
+                late_binding = wrapper_exit["late_observer_terminal"]
+                assert late_binding is not None
+                assert late_binding == {
+                    "path": str(observer_terminal_path.resolve()),
+                    "sha256": hashlib.sha256(
+                        observer_terminal_path.read_bytes()
+                    ).hexdigest(),
+                    "canonical_sha256": observer_terminal[
+                        "observer_terminal_sha256"
+                    ],
+                }
+                replacement = load_json(
+                    policy_root
+                    / (
+                        "preflight_control/"
+                        "late_terminal_foreign_replacement.json"
+                    ),
+                    "late-terminal foreign replacement",
+                )
+                assert replacement[
+                    "foreign_replacement_sha256"
+                ] == canonical_digest(
+                    replacement, "foreign_replacement_sha256"
+                )
+                assert replacement["observer_terminal"] == late_binding
+                replacement_identity = replacement["foreign_tmux"]
+                cleanup = load_json(
+                    Path(wrapper_exit["observer_cleanup"]["path"]),
+                    "production late-terminal foreign cleanup",
+                )
+                assert cleanup["reason"] == "observer_terminal_timeout"
+                assert cleanup["late_observer_terminal"] == late_binding
+                assert cleanup["session_residual"] is False
+                assert cleanup["process_residual"] is False
+                assert cleanup["foreign_session_residual"] is True
+                assert cleanup["foreign_pane_residual"] is True
+                assert cleanup["foreign_tmux"] == replacement_identity
+                assert (
+                    cleanup["foreign_tmux_server"]
+                    == replacement["foreign_tmux_server"]
+                )
+                assert wrapper_exit["late_observer_terminal"] == (
+                    cleanup["late_observer_terminal"]
+                )
+                assert wrapper_exit["exit_code"] != 0
+            if mode in {
+                "late_snapshot_replacement",
+                "late_snapshot_delete",
+            }:
+                late_snapshot = wrapper_exit[
+                    "late_observer_terminal_snapshot"
+                ]
+                assert late_snapshot is not None
+                assert wrapper_exit[
+                    "late_observer_terminal"
+                ] == late_snapshot
+                cleanup = load_json(
+                    Path(wrapper_exit["observer_cleanup"]["path"]),
+                    "late snapshot cleanup",
+                )
+                assert cleanup["reason"] == "observer_terminal_timeout"
+                assert cleanup[
+                    "late_observer_terminal_snapshot"
+                ] == late_snapshot
+                if mode == "late_snapshot_replacement":
+                    current = load_json(
+                        observer_terminal_path,
+                        "late replacement observer terminal",
+                    )
+                    assert current["status"] == "failed"
+                    assert hashlib.sha256(
+                        observer_terminal_path.read_bytes()
+                    ).hexdigest() != late_snapshot["sha256"]
+                else:
+                    assert not observer_terminal_path.exists()
+            if mode == "identity_replacement":
+                cleanup = load_json(
+                    Path(wrapper_exit["observer_cleanup"]["path"]),
+                    "production replacement cleanup",
+                )
+                assert cleanup["status"] == "identity_replaced_not_terminated"
+                assert replacement_identity is not None
+                assert cleanup["observed_tmux"] == replacement_identity
+                assert cleanup["process_residual"] is False
+            if mode == "process_exit_barrier_timeout":
+                barrier = load_json(
+                    policy_root
+                    / "preflight_control/process_exit_barrier.json",
+                    "production process-exit timeout barrier",
+                )
+                assert barrier[
+                    "controller_terminal_before_process_exit"
+                ] is True
+                assert barrier[
+                    "observer_terminal_before_process_exit"
+                ] is True
+                assert barrier["observer_status_before_process_exit"] == (
+                    "failed"
+                )
+                assert barrier[
+                    "process_exit_barrier_sha256"
+                ] == canonical_digest(
+                    barrier, "process_exit_barrier_sha256"
+                )
+                cleanup = load_json(
+                    Path(wrapper_exit["observer_cleanup"]["path"]),
+                    "process-exit timeout cleanup",
+                )
+                assert (
+                    cleanup["reason"]
+                    == "observer_terminal_validation_failed"
+                )
+                assert (
+                    wrapper_exit[
+                        "observer_terminal_validation_failure"
+                    ]
+                    is not None
+                )
+                assert cleanup["session_residual"] is False
+                assert cleanup["process_residual"] is False
+            assert (
+                time.monotonic() - started
+                < wrapper_completion_timeout_seconds
+            )
+        else:
+            assert wrapper_exit["exit_code"] == 0
+            assert wrapper_exit["observer_cleanup"] is not None
+            cleanup = load_json(
+                Path(wrapper_exit["observer_cleanup"]["path"]),
+                "production success cleanup",
+            )
+            assert cleanup["reason"] == "observer_terminal_consumed"
+            assert cleanup["status"] == "closed_terminal_observer"
+            assert cleanup["session_residual"] is False
+            assert cleanup["process_residual"] is False
+            assert observer_terminal is not None
+            assert observer_terminal["status"] == "completed"
+            controller_terminal = load_json(
+                controller_terminal_path,
+                "production chain controller terminal",
+            )
+            assert controller_terminal["status"] == "completed"
+            assert controller_terminal["progress"]["completed"] == 1
+            if mode == "process_exit_delay":
+                barrier = load_json(
+                    policy_root
+                    / "preflight_control/process_exit_barrier.json",
+                    "production process-exit barrier",
+                )
+                assert barrier[
+                    "controller_terminal_before_process_exit"
+                ] is True
+                assert barrier[
+                    "observer_terminal_before_process_exit"
+                ] is False
+                assert barrier[
+                    "process_exit_barrier_sha256"
+                ] == canonical_digest(
+                    barrier, "process_exit_barrier_sha256"
+                )
+    finally:
+        if replacement_identity is not None:
+            current = subprocess.run(
+                [
+                    "tmux",
+                    "list-panes",
+                    "-t",
+                    wrapper.OBSERVER_SESSION,
+                    "-F",
+                    "#{session_name}\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if current.returncode == 0:
+                row = current.stdout.strip().split("\t")
+                current_identity = {
+                    "session": row[0],
+                    "pane": row[1],
+                    "pane_pid": int(row[2]),
+                    "pane_current_command": row[3],
+                }
+                assert current_identity == replacement_identity
+                subprocess.run(
+                    [
+                        "tmux",
+                        "kill-pane",
+                        "-t",
+                        replacement_identity["pane"],
+                    ],
+                    check=True,
+                )
+        exit_deadline = time.monotonic() + 3.0
+        while (
+            subprocess.run(
+                [
+                    "tmux",
+                    "has-session",
+                    "-t",
+                    wrapper.CONTROLLER_SESSION,
+                ],
+                capture_output=True,
+                text=True,
+            ).returncode
+            == 0
+            and time.monotonic() < exit_deadline
+        ):
+            time.sleep(0.02)
+        for session in sessions:
+            assert (
+                subprocess.run(
+                    ["tmux", "has-session", "-t", session],
+                    capture_output=True,
+                    text=True,
+                ).returncode
+                != 0
+            )
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("tmux") is None,
+    reason="requires Linux /proc and tmux",
+)
+def test_preflight_real_production_observer_provenance_timeout(
+    tmp_path: Path,
+) -> None:
+    module = _controller_module()
+    wrapper = _wrapper_module()
+    repo_root = Path(__file__).parents[1]
+    helper = repo_root / "tests/helpers/preflight_lifecycle_helper.py"
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("config", None)])
+    policy, _, _ = _policy(tmp_path, ledger)
+    campaign_root = tmp_path / "campaign"
+    paths = module._paths(campaign_root, policy["policy_sha256"])
+    fixture_path = tmp_path / "provenance_fixture.json"
+    observer_command = [
+        sys.executable,
+        str(helper),
+        "production-role",
+        "--controller-module",
+        str(repo_root / "scripts/run_canonical_checkpoint_screening.py"),
+        "--fixture",
+        str(fixture_path),
+        "--role",
+        "observer",
+    ]
+    fixture_path.write_text(
+        json.dumps(
+            {
+                "policy": policy,
+                "campaign_root": str(campaign_root.resolve()),
+                "controller_command": [],
+                "observer_command": observer_command,
+                "strict_preflight": {},
+                "resource_stop": False,
+                "barrier_timeout": 0.5,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert (
+        subprocess.run(
+            ["tmux", "has-session", "-t", wrapper.OBSERVER_SESSION],
+            capture_output=True,
+            text=True,
+        ).returncode
+        != 0
+    )
+    subprocess.run(
+        [
+            "tmux",
+            "new-session",
+            "-d",
+            "-s",
+            wrapper.OBSERVER_SESSION,
+            "-e",
+            (
+                f"{wrapper.OBSERVER_SESSION_ENV}="
+                f"{wrapper.OBSERVER_SESSION}"
+            ),
+            "-c",
+            str(repo_root),
+            *observer_command,
+        ],
+        check=True,
+    )
+    launched = subprocess.run(
+        [
+            "tmux",
+            "list-panes",
+            "-t",
+            wrapper.OBSERVER_SESSION,
+            "-F",
+            "#{pane_pid}",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    try:
+        terminal_path = (
+            paths["preflight_control"] / "observer_terminal.json"
+        )
+        deadline = time.monotonic() + 10.0
+        while not terminal_path.is_file():
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    "production provenance timeout did not publish terminal"
+                )
+            time.sleep(0.02)
+        terminal = load_json(
+            terminal_path, "production provenance timeout terminal"
+        )
+        stop = load_json(
+            paths["preflight_control"] / "observer_stop.json",
+            "production provenance timeout stop",
+        )
+        assert terminal["status"] == "failed"
+        assert "provenance barrier timed out" in terminal["failure"]["message"]
+        assert stop["wrapper_claim"] is None
+        assert stop["observer_launch"] is None
+        assert stop["controller_process_start"] is None
+        exit_deadline = time.monotonic() + 5.0
+        while (
+            subprocess.run(
+                ["tmux", "has-session", "-t", wrapper.OBSERVER_SESSION],
+                capture_output=True,
+                text=True,
+            ).returncode
+            == 0
+        ):
+            if time.monotonic() >= exit_deadline:
+                raise AssertionError(
+                    "production provenance observer tmux did not exit"
+                )
+            time.sleep(0.02)
+    finally:
+        current = subprocess.run(
+            [
+                "tmux",
+                "list-panes",
+                "-t",
+                wrapper.OBSERVER_SESSION,
+                "-F",
+                "#{pane_pid}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if current.returncode == 0:
+            assert current.stdout.strip() == launched
+            subprocess.run(
+                [
+                    "tmux",
+                    "kill-session",
+                    "-t",
+                    wrapper.OBSERVER_SESSION,
+                ],
+                check=True,
+            )
+        assert (
+            subprocess.run(
+                ["tmux", "has-session", "-t", wrapper.OBSERVER_SESSION],
+                capture_output=True,
+                text=True,
+            ).returncode
+            != 0
+        )
 
 
 def test_controller_raw_import_executes_no_policy_bound_module() -> None:

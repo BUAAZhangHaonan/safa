@@ -14,11 +14,16 @@ import math
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import threading
 import time
 from typing import Any, Mapping, Sequence, TYPE_CHECKING
+
+
+TMUX_OWNER_ENV = "SAFA_OWNER_NONCE"
+TMUX_OWNER_NONCE_HEX_LENGTH = 64
 
 if TYPE_CHECKING:
     from safa.closeout.canonical_screening import (
@@ -93,6 +98,39 @@ PHASES = (
     "screen512",
     "monitor",
 )
+PREFLIGHT_CONTROLLER_SESSION = "safa-screening-preflight-controller"
+PREFLIGHT_OBSERVER_SESSION_PREFIX = "safa-screening-preflight-monitor"
+OBSERVER_SESSION_ENV = "SAFA_PREFLIGHT_OBSERVER_SESSION"
+_PREFLIGHT_OBSERVER_SESSION_FROM_ENV = os.environ.get(
+    OBSERVER_SESSION_ENV
+)
+if _PREFLIGHT_OBSERVER_SESSION_FROM_ENV is None:
+    PREFLIGHT_OBSERVER_SESSION = PREFLIGHT_OBSERVER_SESSION_PREFIX
+elif (
+    not _PREFLIGHT_OBSERVER_SESSION_FROM_ENV.startswith(
+        f"{PREFLIGHT_OBSERVER_SESSION_PREFIX}-"
+    )
+    or len(
+        _PREFLIGHT_OBSERVER_SESSION_FROM_ENV[
+            len(PREFLIGHT_OBSERVER_SESSION_PREFIX) + 1 :
+        ]
+    )
+    != 64
+    or any(
+        character not in "0123456789abcdef"
+        for character in _PREFLIGHT_OBSERVER_SESSION_FROM_ENV[
+            len(PREFLIGHT_OBSERVER_SESSION_PREFIX) + 1 :
+        ]
+    )
+):
+    raise RuntimeError("preflight observer session environment is invalid")
+else:
+    PREFLIGHT_OBSERVER_SESSION = _PREFLIGHT_OBSERVER_SESSION_FROM_ENV
+PREFLIGHT_BARRIER_TIMEOUT_SECONDS = 180.0
+OBSERVER_BOOTSTRAP_PATH_ENV = "SAFA_PREFLIGHT_OBSERVER_BOOTSTRAP_PATH"
+OBSERVER_BOOTSTRAP_POLICY_ENV = "SAFA_PREFLIGHT_OBSERVER_POLICY_SHA256"
+OBSERVER_BOOTSTRAP_WRAPPER_ENV = "SAFA_PREFLIGHT_WRAPPER_CLAIM"
+OBSERVER_BOOTSTRAP_NONCE_ENV = "SAFA_PREFLIGHT_OBSERVER_OWNER_NONCE"
 
 
 class ControllerBootstrapError(RuntimeError):
@@ -456,6 +494,11 @@ def _paths(campaign_root: Path, policy_sha256: str) -> dict[str, Path]:
         "policy_root": policy_root,
         "preflight_requests": policy_root / "checkpoint_preflight" / "requests",
         "preflight_results": policy_root / "checkpoint_preflight" / "results",
+        "preflight_request_manifest": (
+            policy_root
+            / "checkpoint_preflight"
+            / "preflight_request_manifest.json"
+        ),
         "checkpoint_plan": policy_root / "checkpoint_plan.json",
         "candidate_manifest": policy_root / "candidate_manifest.json",
         "run_requests": policy_root / "run_requests",
@@ -2108,6 +2151,1225 @@ def _assert_observer_live(
         )
 
 
+def _current_tmux_session(expected: str, label: str) -> str:
+    if "TMUX" not in os.environ:
+        raise CanonicalScreeningError(f"{label} must run inside tmux")
+    result = subprocess.run(
+        ["tmux", "display-message", "-p", "#S"],
+        capture_output=True,
+        text=True,
+    )
+    session = result.stdout.strip()
+    if result.returncode != 0 or session != expected:
+        raise CanonicalScreeningError(
+            f"{label} tmux session differs: {session!r}"
+        )
+    return session
+
+
+def _process_identity(pid: int) -> dict[str, int]:
+    raw_stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    closing = raw_stat.rfind(")")
+    if closing < 0:
+        raise CanonicalScreeningError(
+            f"process identity stat is malformed for PID {pid}"
+        )
+    fields = raw_stat[closing + 2 :].split()
+    if len(fields) < 20:
+        raise CanonicalScreeningError(
+            f"process identity is unavailable for PID {pid}"
+        )
+    try:
+        return {
+            "pid": pid,
+            "pgid": int(fields[2]),
+            "start_ticks": int(fields[19]),
+        }
+    except (IndexError, ValueError) as exc:
+        raise CanonicalScreeningError(
+            f"process identity stat is malformed for PID {pid}"
+        ) from exc
+
+
+def _tmux_identity(session: str) -> dict[str, Any]:
+    result = subprocess.run(
+        [
+            "tmux",
+            "list-panes",
+            "-t",
+            session,
+            "-F",
+            "#{session_name}\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    rows = [line.split("\t") for line in result.stdout.splitlines() if line]
+    if (
+        result.returncode != 0
+        or len(rows) != 1
+        or len(rows[0]) != 4
+        or rows[0][0] != session
+    ):
+        raise CanonicalScreeningError(
+            f"tmux identity differs for session {session}"
+        )
+    identity = {
+        "session": rows[0][0],
+        "pane": rows[0][1],
+        "pane_pid": int(rows[0][2]),
+        "pane_current_command": rows[0][3],
+    }
+    _validate_tmux_identity(identity, session)
+    return identity
+
+
+def _validate_tmux_identity(
+    identity: Mapping[str, Any], expected_session: str
+) -> None:
+    pane = identity.get("pane")
+    if (
+        set(identity)
+        != {"session", "pane", "pane_pid", "pane_current_command"}
+        or identity.get("session") != expected_session
+        or not isinstance(pane, str)
+        or not pane.startswith("%")
+        or not pane[1:].isdecimal()
+        or type(identity.get("pane_pid")) is not int
+        or int(identity["pane_pid"]) <= 1
+        or not isinstance(identity.get("pane_current_command"), str)
+        or not identity["pane_current_command"]
+    ):
+        raise CanonicalScreeningError(
+            f"invalid public tmux identity for session {expected_session}"
+        )
+
+
+def _tmux_pane_identity(pane: str) -> dict[str, Any]:
+    if (
+        not isinstance(pane, str)
+        or not pane.startswith("%")
+        or not pane[1:].isdecimal()
+    ):
+        raise CanonicalScreeningError(
+            "tmux pane target is not an opaque pane ID"
+        )
+    result = subprocess.run(
+        [
+            "tmux",
+            "list-panes",
+            "-t",
+            pane,
+            "-F",
+            "#{session_name}\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    rows = [line.split("\t") for line in result.stdout.splitlines() if line]
+    if (
+        result.returncode != 0
+        or len(rows) != 1
+        or len(rows[0]) != 4
+        or rows[0][1] != pane
+    ):
+        raise CanonicalScreeningError(
+            f"tmux identity differs for sealed pane {pane}"
+        )
+    identity = {
+        "session": rows[0][0],
+        "pane": rows[0][1],
+        "pane_pid": int(rows[0][2]),
+        "pane_current_command": rows[0][3],
+    }
+    _validate_tmux_identity(identity, identity["session"])
+    return identity
+
+
+def _tmux_server_identity(target: str) -> dict[str, Any]:
+    result = subprocess.run(
+        [
+            "tmux",
+            "display-message",
+            "-p",
+            "-t",
+            target,
+            "#{pid}\t#{socket_path}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    rows = [line.split("\t") for line in result.stdout.splitlines() if line]
+    if result.returncode != 0 or len(rows) != 1 or len(rows[0]) != 2:
+        raise CanonicalScreeningError(
+            f"tmux server identity differs for target {target}"
+        )
+    identity = {
+        "server_pid": int(rows[0][0]),
+        "socket_path": rows[0][1],
+    }
+    if (
+        set(identity) != {"server_pid", "socket_path"}
+        or type(identity["server_pid"]) is not int
+        or identity["server_pid"] <= 1
+        or not isinstance(identity["socket_path"], str)
+        or not Path(identity["socket_path"]).is_absolute()
+    ):
+        raise CanonicalScreeningError("tmux server identity is invalid")
+    return identity
+
+
+def _validate_tmux_owner_nonce(owner_nonce: object) -> str:
+    if (
+        not isinstance(owner_nonce, str)
+        or len(owner_nonce) != TMUX_OWNER_NONCE_HEX_LENGTH
+        or any(character not in "0123456789abcdef" for character in owner_nonce)
+    ):
+        raise CanonicalScreeningError("tmux owner nonce is invalid")
+    return owner_nonce
+
+
+def _validate_tmux_owner_seal(
+    owner_seal: Mapping[str, Any],
+    sealed_tmux: Mapping[str, Any],
+    sealed_tmux_server: Mapping[str, Any],
+) -> None:
+    expected_keys = {
+        "server_pid",
+        "server_start_ticks",
+        "socket_path",
+        "socket_device",
+        "socket_inode",
+        "session",
+        "pane",
+        "pane_pid",
+        "owner_nonce",
+    }
+    if (
+        set(owner_seal) != expected_keys
+        or owner_seal.get("server_pid")
+        != sealed_tmux_server.get("server_pid")
+        or owner_seal.get("socket_path")
+        != sealed_tmux_server.get("socket_path")
+        or owner_seal.get("session") != sealed_tmux.get("session")
+        or owner_seal.get("pane") != sealed_tmux.get("pane")
+        or owner_seal.get("pane_pid") != sealed_tmux.get("pane_pid")
+        or type(owner_seal.get("server_start_ticks")) is not int
+        or int(owner_seal["server_start_ticks"]) <= 0
+        or type(owner_seal.get("socket_device")) is not int
+        or type(owner_seal.get("socket_inode")) is not int
+    ):
+        raise CanonicalScreeningError("tmux owner seal is invalid")
+    owner_nonce = _validate_tmux_owner_nonce(
+        owner_seal.get("owner_nonce")
+    )
+    server_process = _process_identity(int(owner_seal["server_pid"]))
+    if (
+        server_process is None
+        or server_process["start_ticks"]
+        != owner_seal["server_start_ticks"]
+    ):
+        raise CanonicalScreeningError(
+            "tmux owner server process identity differs"
+        )
+    socket_path = Path(str(owner_seal["socket_path"]))
+    try:
+        socket_value = os.lstat(socket_path)
+    except FileNotFoundError as exc:
+        raise CanonicalScreeningError(
+            "tmux owner socket is absent"
+        ) from exc
+    if (
+        not stat.S_ISSOCK(socket_value.st_mode)
+        or int(socket_value.st_dev) != owner_seal["socket_device"]
+        or int(socket_value.st_ino) != owner_seal["socket_inode"]
+    ):
+        raise CanonicalScreeningError("tmux owner socket identity differs")
+    nonce_result = subprocess.run(
+        [
+            "tmux",
+            "-S",
+            str(socket_path),
+            "show-environment",
+            "-t",
+            str(owner_seal["session"]),
+            TMUX_OWNER_ENV,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if (
+        nonce_result.returncode != 0
+        or nonce_result.stderr.strip()
+        or nonce_result.stdout.splitlines()
+        != [f"{TMUX_OWNER_ENV}={owner_nonce}"]
+    ):
+        raise CanonicalScreeningError("tmux owner nonce differs")
+
+
+def _assert_tmux_process_identity(
+    session: str,
+    sealed_tmux: Mapping[str, Any],
+    sealed_tmux_server: Mapping[str, Any],
+    sealed_process: Mapping[str, int],
+    label: str,
+) -> None:
+    _validate_tmux_identity(sealed_tmux, session)
+    pane = str(sealed_tmux["pane"])
+    current_tmux_server = _tmux_server_identity(pane)
+    current_tmux = _tmux_pane_identity(pane)
+    try:
+        current_process = _process_identity(int(sealed_process["pid"]))
+    except (FileNotFoundError, ProcessLookupError) as exc:
+        raise CanonicalScreeningError(f"{label} process is absent") from exc
+    if (
+        current_tmux_server != dict(sealed_tmux_server)
+        or current_tmux != dict(sealed_tmux)
+        or current_tmux["pane_pid"] != sealed_process["pid"]
+        or sealed_process["pgid"] != sealed_process["pid"]
+        or current_process != dict(sealed_process)
+    ):
+        raise CanonicalScreeningError(
+            f"{label} tmux/process identity differs"
+        )
+
+
+def _publish_preflight_observer_bootstrap_from_environment() -> None:
+    raw_path = os.environ.get(OBSERVER_BOOTSTRAP_PATH_ENV)
+    if raw_path is None:
+        return
+    path = Path(raw_path)
+    policy_sha256 = os.environ.get(OBSERVER_BOOTSTRAP_POLICY_ENV)
+    raw_wrapper = os.environ.get(OBSERVER_BOOTSTRAP_WRAPPER_ENV)
+    owner_nonce = os.environ.get(OBSERVER_BOOTSTRAP_NONCE_ENV)
+    if (
+        not path.is_absolute()
+        or not isinstance(policy_sha256, str)
+        or len(policy_sha256) != 64
+        or raw_wrapper is None
+        or not isinstance(owner_nonce, str)
+        or len(owner_nonce) != TMUX_OWNER_NONCE_HEX_LENGTH
+        or any(character not in "0123456789abcdef" for character in owner_nonce)
+    ):
+        raise ControllerBootstrapError(
+            "preflight observer bootstrap environment is invalid"
+        )
+    try:
+        wrapper_binding = json.loads(raw_wrapper)
+    except json.JSONDecodeError as exc:
+        raise ControllerBootstrapError(
+            "preflight observer wrapper binding is invalid"
+        ) from exc
+    process = _process_identity(os.getpid())
+    tmux = _tmux_identity(PREFLIGHT_OBSERVER_SESSION)
+    try:
+        executable = os.readlink(f"/proc/{os.getpid()}/exe")
+        command = [
+            item.decode("utf-8")
+            for item in Path(f"/proc/{os.getpid()}/cmdline")
+            .read_bytes()
+            .split(b"\0")
+            if item
+        ]
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ControllerBootstrapError(
+            "preflight observer live process binding is unavailable"
+        ) from exc
+    if (
+        tmux["pane_pid"] != os.getpid()
+        or process["pgid"] != os.getpid()
+        or not Path(executable).is_absolute()
+        or not command
+    ):
+        raise ControllerBootstrapError(
+            "preflight observer live process binding differs"
+        )
+    value = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_preflight_observer_bootstrap_v1",
+        "policy_sha256": policy_sha256,
+        "wrapper_claim": wrapper_binding,
+        "observer_session": PREFLIGHT_OBSERVER_SESSION,
+        "owner_nonce": owner_nonce,
+        "process": process,
+        "executable": executable,
+        "command": command,
+        "tmux": tmux,
+        "published_at": _utc_now(),
+    }
+    value["observer_bootstrap_sha256"] = _stdlib_canonical_digest(
+        value, "observer_bootstrap_sha256"
+    )
+    _stdlib_publish_exclusive_json(path, value)
+
+
+def _build_preflight_request_manifest(
+    policy: Mapping[str, Any],
+    paths: Mapping[str, Path],
+    plan: Mapping[str, Any],
+    request_paths: Sequence[Path],
+) -> dict[str, Any]:
+    if len(request_paths) != plan["counts"]["preflight_requests"]:
+        raise CanonicalScreeningError(
+            "preflight request manifest count differs from checkpoint plan"
+        )
+    entries = []
+    for path in sorted(request_paths):
+        request = validate_preflight_request(
+            load_json(path, "prepared preflight request"), policy
+        )
+        entries.append(
+            {
+                "path": str(path.resolve()),
+                "sha256": sha256_file(path),
+                "preflight_request_sha256": request[
+                    "preflight_request_sha256"
+                ],
+                "checkpoint_sha256": request["checkpoint_sha256"],
+                "checkpoint_model": request["checkpoint_model"],
+            }
+        )
+    value = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_preflight_request_manifest_v1",
+        "campaign_id": policy["campaign_id"],
+        "policy_sha256": policy["policy_sha256"],
+        "checkpoint_plan": _artifact_binding(
+            paths["checkpoint_plan"], plan["checkpoint_plan_sha256"]
+        ),
+        "request_count": len(entries),
+        "requests": entries,
+    }
+    value["preflight_request_manifest_sha256"] = canonical_digest(
+        value, "preflight_request_manifest_sha256"
+    )
+    publish_exclusive_json(paths["preflight_request_manifest"], value)
+    return value
+
+
+def _validate_preflight_request_manifest(
+    value: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    paths: Mapping[str, Path],
+    *,
+    verify_request_files: bool = True,
+) -> dict[str, Any]:
+    manifest = dict(value)
+    if (
+        set(manifest)
+        != {
+            "schema_version",
+            "contract_type",
+            "campaign_id",
+            "policy_sha256",
+            "checkpoint_plan",
+            "request_count",
+            "requests",
+            "preflight_request_manifest_sha256",
+        }
+        or manifest.get("schema_version") != 1
+        or manifest.get("contract_type")
+        != "safa_canonical_preflight_request_manifest_v1"
+        or manifest.get("campaign_id") != policy["campaign_id"]
+        or manifest.get("policy_sha256") != policy["policy_sha256"]
+        or manifest.get("preflight_request_manifest_sha256")
+        != canonical_digest(
+            manifest, "preflight_request_manifest_sha256"
+        )
+    ):
+        raise CanonicalScreeningError(
+            "preflight request manifest contract mismatch"
+        )
+    plan_binding = manifest["checkpoint_plan"]
+    plan = _validate_json_artifact_binding(
+        plan_binding, "preflight manifest checkpoint plan", "checkpoint_plan_sha256"
+    )
+    if Path(plan_binding["path"]).resolve() != paths["checkpoint_plan"].resolve():
+        raise CanonicalScreeningError(
+            "preflight request manifest checkpoint plan path differs"
+        )
+    requests = manifest.get("requests")
+    if (
+        not isinstance(requests, list)
+        or manifest.get("request_count") != len(requests)
+        or len(requests) != plan["counts"]["preflight_requests"]
+        or len(requests) != plan["counts"]["distinct_checkpoint_sha256"]
+        or len(
+            {
+                (entry.get("checkpoint_sha256"), entry.get("checkpoint_model"))
+                for entry in requests
+                if isinstance(entry, Mapping)
+            }
+        )
+        != len(requests)
+        or [entry.get("path") for entry in requests]
+        != sorted(entry.get("path") for entry in requests)
+    ):
+        raise CanonicalScreeningError(
+            "preflight request manifest request set differs"
+        )
+    request_root = paths["preflight_requests"].resolve()
+    expected_paths = {
+        path.resolve() for path in request_root.glob("*.json")
+    }
+    bound_paths: set[Path] = set()
+    for entry in requests:
+        if (
+            not isinstance(entry, Mapping)
+            or set(entry)
+            != {
+                "path",
+                "sha256",
+                "preflight_request_sha256",
+                "checkpoint_sha256",
+                "checkpoint_model",
+            }
+        ):
+            raise CanonicalScreeningError(
+                "preflight request manifest entry fields differ"
+            )
+        path = Path(str(entry["path"])).resolve()
+        try:
+            path.relative_to(request_root)
+        except ValueError as exc:
+            raise CanonicalScreeningError(
+                "preflight request manifest path escapes request root"
+            ) from exc
+        bound_paths.add(path)
+        if verify_request_files:
+            if not path.is_file() or sha256_file(path) != entry["sha256"]:
+                raise CanonicalScreeningError(
+                    "preflight request manifest file binding mismatch"
+                )
+            request = validate_preflight_request(
+                load_json(path, "manifest preflight request"), policy
+            )
+            if (
+                request["preflight_request_sha256"]
+                != entry["preflight_request_sha256"]
+                or request["checkpoint_sha256"]
+                != entry["checkpoint_sha256"]
+                or request["checkpoint_model"] != entry["checkpoint_model"]
+            ):
+                raise CanonicalScreeningError(
+                    "preflight request manifest semantic binding mismatch"
+                )
+    if bound_paths != expected_paths:
+        raise CanonicalScreeningError(
+            "preflight request manifest filesystem set differs"
+        )
+    return manifest
+
+
+def _load_preflight_request_manifest(
+    policy: Mapping[str, Any], paths: Mapping[str, Path]
+) -> tuple[dict[str, Any], dict[str, str]]:
+    manifest = _validate_preflight_request_manifest(
+        load_json(
+            paths["preflight_request_manifest"],
+            "preflight request manifest",
+        ),
+        policy,
+        paths,
+    )
+    return manifest, _artifact_binding(
+        paths["preflight_request_manifest"],
+        manifest["preflight_request_manifest_sha256"],
+    )
+
+
+def _expected_preflight_controller_command(
+    policy: Mapping[str, Any], paths: Mapping[str, Path]
+) -> list[str]:
+    return [
+        str(policy["python"]),
+        "-u",
+        str(Path(__file__).resolve()),
+        "--config",
+        str(Path(policy["policy_file"]["path"]).resolve()),
+        "--campaign-root",
+        str(paths["root"].resolve()),
+        "--phase",
+        "preflight",
+        "--execute",
+    ]
+
+
+def _expected_preflight_observer_command(
+    policy: Mapping[str, Any], paths: Mapping[str, Path]
+) -> list[str]:
+    return [
+        str(policy["python"]),
+        "-u",
+        str(Path(__file__).resolve()),
+        "--config",
+        str(Path(policy["policy_file"]["path"]).resolve()),
+        "--campaign-root",
+        str(paths["root"].resolve()),
+        "--phase",
+        "monitor",
+        "--monitor-target",
+        "preflight",
+        "--execute",
+    ]
+
+
+def _validate_preflight_wrapper_provenance(
+    policy: Mapping[str, Any], paths: Mapping[str, Path]
+) -> tuple[
+    dict[str, Any],
+    dict[str, str],
+    dict[str, Any],
+    dict[str, str],
+    dict[str, str],
+    dict[str, str],
+]:
+    control = paths["preflight_control"]
+    wrapper_path = control / "wrapper_claim.json"
+    wrapper = load_json(wrapper_path, "CPU preflight wrapper claim")
+    expected_command = _expected_preflight_controller_command(policy, paths)
+    expected_observer_command = _expected_preflight_observer_command(
+        policy, paths
+    )
+    if (
+        set(wrapper)
+        != {
+            "schema_version",
+            "contract_type",
+            "policy_sha256",
+            "config",
+            "checkpoint_plan",
+            "preflight_request_manifest",
+            "controller_session",
+            "controller_tmux",
+            "controller_tmux_server",
+            "observer_session",
+            "command",
+            "observer_command",
+            "wrapper_pid",
+            "wrapper_process",
+            "started_at",
+            "external_timeout_seconds",
+            "wrapper_claim_sha256",
+        }
+        or wrapper.get("schema_version") != 1
+        or wrapper.get("contract_type")
+        != "safa_canonical_preflight_wrapper_claim_v2"
+        or wrapper.get("policy_sha256") != policy["policy_sha256"]
+        or wrapper.get("config") != policy["policy_file"]
+        or wrapper.get("controller_session") != PREFLIGHT_CONTROLLER_SESSION
+        or wrapper.get("observer_session") != PREFLIGHT_OBSERVER_SESSION
+        or wrapper.get("command") != expected_command
+        or wrapper.get("observer_command") != expected_observer_command
+        or wrapper.get("wrapper_pid") != os.getppid()
+        or wrapper.get("wrapper_process") != _process_identity(os.getppid())
+        or wrapper.get("controller_tmux", {}).get("session")
+        != PREFLIGHT_CONTROLLER_SESSION
+        or wrapper.get("controller_tmux", {}).get("pane_pid")
+        != os.getppid()
+        or wrapper.get("external_timeout_seconds") is not None
+        or wrapper.get("wrapper_claim_sha256")
+        != canonical_digest(wrapper, "wrapper_claim_sha256")
+    ):
+        raise CanonicalScreeningError(
+            "CPU preflight wrapper claim contract mismatch"
+        )
+    _assert_tmux_process_identity(
+        PREFLIGHT_CONTROLLER_SESSION,
+        wrapper["controller_tmux"],
+        wrapper["controller_tmux_server"],
+        wrapper["wrapper_process"],
+        "CPU preflight controller-bound wrapper",
+    )
+    _validate_json_artifact_binding(
+        wrapper["checkpoint_plan"],
+        "CPU preflight wrapper checkpoint plan",
+        "checkpoint_plan_sha256",
+    )
+    if Path(wrapper["checkpoint_plan"]["path"]).resolve() != paths[
+        "checkpoint_plan"
+    ].resolve():
+        raise CanonicalScreeningError(
+            "CPU preflight wrapper checkpoint plan path differs"
+        )
+    manifest = _validate_json_artifact_binding(
+        wrapper["preflight_request_manifest"],
+        "CPU preflight wrapper request manifest",
+        "preflight_request_manifest_sha256",
+    )
+    manifest = _validate_preflight_request_manifest(
+        manifest, policy, paths
+    )
+    if Path(wrapper["preflight_request_manifest"]["path"]).resolve() != paths[
+        "preflight_request_manifest"
+    ].resolve():
+        raise CanonicalScreeningError(
+            "CPU preflight wrapper request manifest path differs"
+        )
+    observer_launch_path = control / "observer_launch.json"
+    observer_launch = load_json(
+        observer_launch_path, "CPU preflight observer launch"
+    )
+    if (
+        set(observer_launch)
+        != {
+            "schema_version",
+            "contract_type",
+            "policy_sha256",
+            "wrapper_claim",
+            "wrapper_claim_sha256",
+            "observer_session",
+            "command",
+            "observer_gate_ready",
+            "observer_gate_release",
+            "observer_bootstrap",
+            "tmux",
+            "tmux_server",
+            "tmux_owner_seal",
+            "process",
+            "status",
+            "failure",
+            "completed_at",
+            "observer_launch_sha256",
+        }
+        or observer_launch.get("contract_type")
+        != "safa_canonical_preflight_observer_launch_v3"
+        or observer_launch.get("policy_sha256")
+        != policy["policy_sha256"]
+        or observer_launch.get("wrapper_claim")
+        != _artifact_binding(
+            wrapper_path, wrapper["wrapper_claim_sha256"]
+        )
+        or observer_launch.get("wrapper_claim_sha256")
+        != wrapper["wrapper_claim_sha256"]
+        or observer_launch.get("observer_session")
+        != PREFLIGHT_OBSERVER_SESSION
+        or observer_launch.get("command") != expected_observer_command
+        or observer_launch.get("observer_gate_ready") is None
+        or observer_launch.get("observer_gate_release") is None
+        or observer_launch.get("status") != "launched"
+        or observer_launch.get("failure") is not None
+        or observer_launch.get("tmux", {}).get("session")
+        != PREFLIGHT_OBSERVER_SESSION
+        or observer_launch.get("tmux", {}).get("pane_pid")
+        != observer_launch.get("process", {}).get("pid")
+        or observer_launch.get("process", {}).get("pgid")
+        != observer_launch.get("process", {}).get("pid")
+        or observer_launch.get("observer_launch_sha256")
+        != canonical_digest(
+            observer_launch, "observer_launch_sha256"
+        )
+    ):
+        raise CanonicalScreeningError(
+            "CPU preflight observer launch contract mismatch"
+        )
+    _assert_tmux_process_identity(
+        PREFLIGHT_OBSERVER_SESSION,
+        observer_launch["tmux"],
+        observer_launch["tmux_server"],
+        observer_launch["process"],
+        "CPU preflight launched observer",
+    )
+    _validate_tmux_owner_seal(
+        observer_launch["tmux_owner_seal"],
+        observer_launch["tmux"],
+        observer_launch["tmux_server"],
+    )
+    gate_ready = _validate_json_artifact_binding(
+        observer_launch["observer_gate_ready"],
+        "CPU preflight observer gate ready",
+        "observer_gate_ready_sha256",
+    )
+    gate_release = _validate_json_artifact_binding(
+        observer_launch["observer_gate_release"],
+        "CPU preflight observer gate release",
+        "observer_gate_release_sha256",
+    )
+    if (
+        Path(observer_launch["observer_gate_ready"]["path"]).resolve()
+        != (control / "observer_gate_ready.json").resolve()
+        or Path(
+            observer_launch["observer_gate_release"]["path"]
+        ).resolve()
+        != (control / "observer_gate_release.json").resolve()
+        or gate_ready.get("contract_type")
+        != "safa_canonical_preflight_observer_gate_ready_v1"
+        or gate_release.get("contract_type")
+        != "safa_canonical_preflight_observer_gate_release_v1"
+        or gate_ready.get("policy_sha256")
+        != policy["policy_sha256"]
+        or gate_release.get("policy_sha256")
+        != policy["policy_sha256"]
+        or gate_ready.get("wrapper_claim")
+        != observer_launch["wrapper_claim"]
+        or gate_release.get("wrapper_claim")
+        != observer_launch["wrapper_claim"]
+        or gate_ready.get("observer_session")
+        != PREFLIGHT_OBSERVER_SESSION
+        or gate_release.get("observer_session")
+        != PREFLIGHT_OBSERVER_SESSION
+        or gate_ready.get("observer_command")
+        != expected_observer_command
+        or gate_release.get("observer_command")
+        != expected_observer_command
+        or gate_release.get("observer_gate_ready")
+        != observer_launch["observer_gate_ready"]
+    ):
+        raise CanonicalScreeningError(
+            "CPU preflight observer gate binding differs"
+        )
+    observer_bootstrap = _validate_json_artifact_binding(
+        observer_launch["observer_bootstrap"],
+        "CPU preflight observer bootstrap",
+        "observer_bootstrap_sha256",
+    )
+    if (
+        Path(observer_launch["observer_bootstrap"]["path"]).resolve()
+        != (control / "observer_bootstrap.json").resolve()
+        or observer_bootstrap.get("process")
+        != observer_launch["process"]
+        or observer_bootstrap.get("tmux") != observer_launch["tmux"]
+        or observer_bootstrap.get("wrapper_claim")
+        != observer_launch["wrapper_claim"]
+    ):
+        raise CanonicalScreeningError(
+            "CPU preflight observer bootstrap binding differs"
+        )
+    process_start_path = control / "controller_process_start.json"
+    deadline = time.monotonic() + PREFLIGHT_BARRIER_TIMEOUT_SECONDS
+    while not process_start_path.is_file():
+        if time.monotonic() >= deadline:
+            raise CanonicalScreeningError(
+                "CPU preflight controller process start barrier timed out"
+            )
+        time.sleep(0.01)
+    process_start = load_json(
+        process_start_path, "CPU preflight controller process start"
+    )
+    if (
+        process_start.get("contract_type")
+        != "safa_canonical_preflight_controller_process_start_v1"
+        or process_start.get("policy_sha256") != policy["policy_sha256"]
+        or process_start.get("wrapper_claim")
+        != _artifact_binding(
+            wrapper_path, wrapper["wrapper_claim_sha256"]
+        )
+        or process_start.get("observer_launch")
+        != _artifact_binding(
+            observer_launch_path,
+            observer_launch["observer_launch_sha256"],
+        )
+        or process_start.get("command") != expected_command
+        or process_start.get("process") != _process_identity(os.getpid())
+        or process_start.get("controller_process_start_sha256")
+        != canonical_digest(
+            process_start, "controller_process_start_sha256"
+        )
+    ):
+        raise CanonicalScreeningError(
+            "CPU preflight controller process start contract mismatch"
+        )
+    return (
+        wrapper,
+        _artifact_binding(wrapper_path, wrapper["wrapper_claim_sha256"]),
+        manifest,
+        dict(wrapper["preflight_request_manifest"]),
+        _artifact_binding(
+            observer_launch_path,
+            observer_launch["observer_launch_sha256"],
+        ),
+        _artifact_binding(
+            process_start_path,
+            process_start["controller_process_start_sha256"],
+        ),
+    )
+
+
+def _preflight_progress(
+    paths: Mapping[str, Path], request_count: int
+) -> dict[str, int]:
+    result_count = (
+        len(list(paths["preflight_results"].glob("*.json")))
+        if paths["preflight_results"].exists()
+        else 0
+    )
+    attempts = paths["preflight_control"] / "attempts"
+    claim_count = (
+        len(list(attempts.glob("*.claim.json"))) if attempts.exists() else 0
+    )
+    terminals = (
+        [load_json(path, "preflight attempt terminal") for path in sorted(
+            attempts.glob("*.terminal.json")
+        )]
+        if attempts.exists()
+        else []
+    )
+    completed = sum(row.get("status") == "completed" for row in terminals)
+    failed = sum(row.get("status") == "failed" for row in terminals)
+    valid = sum(
+        row.get("status") == "completed" and row.get("valid") is True
+        for row in terminals
+    )
+    invalid = sum(
+        row.get("status") == "completed" and row.get("valid") is False
+        for row in terminals
+    )
+    terminal_count = len(terminals)
+    if (
+        min(
+            request_count,
+            result_count,
+            claim_count,
+            terminal_count,
+            completed,
+            failed,
+            valid,
+            invalid,
+        )
+        < 0
+        or result_count > request_count
+        or claim_count > request_count
+        or terminal_count > claim_count
+        or completed + failed != terminal_count
+        or valid + invalid != completed
+        or result_count != completed
+    ):
+        raise CanonicalScreeningError(
+            "CPU preflight artifact progress is inconsistent"
+        )
+    return {
+        "request_count": request_count,
+        "result_count": result_count,
+        "attempt_claim_count": claim_count,
+        "attempt_terminal_count": terminal_count,
+        "completed": completed,
+        "failed": failed,
+        "valid": valid,
+        "invalid": invalid,
+        "pending": request_count - terminal_count,
+    }
+
+
+def _write_preflight_controller_claim(
+    policy: Mapping[str, Any],
+    paths: Mapping[str, Path],
+    wrapper_binding: Mapping[str, str],
+    observer_launch_binding: Mapping[str, str],
+    process_start_binding: Mapping[str, str],
+    plan_binding: Mapping[str, str],
+    request_manifest_binding: Mapping[str, str],
+    startup_admission: Mapping[str, str],
+    request_count: int,
+) -> tuple[dict[str, Any], Path]:
+    value = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_preflight_controller_claim_v2",
+        "campaign_id": policy["campaign_id"],
+        "policy_sha256": policy["policy_sha256"],
+        "supersedes_policy_sha256": policy["supersedes_policy_sha256"],
+        "wrapper_claim": dict(wrapper_binding),
+        "observer_launch": dict(observer_launch_binding),
+        "controller_process_start": dict(process_start_binding),
+        "checkpoint_plan": dict(plan_binding),
+        "preflight_request_manifest": dict(request_manifest_binding),
+        "startup_admission": dict(startup_admission),
+        "request_count": request_count,
+        "controller_session": _current_tmux_session(
+            PREFLIGHT_CONTROLLER_SESSION, "CPU preflight controller"
+        ),
+        "observer_session": PREFLIGHT_OBSERVER_SESSION,
+        "controller_pid": os.getpid(),
+        "controller_process": _process_identity(os.getpid()),
+        "started_at": _utc_now(),
+        "external_timeout_seconds": None,
+    }
+    value["controller_claim_sha256"] = canonical_digest(
+        value, "controller_claim_sha256"
+    )
+    path = paths["preflight_control"] / "controller_claim.json"
+    publish_exclusive_json(path, value)
+    return value, path
+
+
+def _write_preflight_controller_ready(
+    policy: Mapping[str, Any],
+    paths: Mapping[str, Path],
+    claim: Mapping[str, Any],
+    claim_path: Path,
+    first_guard_sample: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, str]]:
+    guard_path = paths["preflight_control"] / "runtime_resource_windows.jsonl"
+    value = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_preflight_controller_ready_v1",
+        "campaign_id": policy["campaign_id"],
+        "policy_sha256": policy["policy_sha256"],
+        "controller_claim_sha256": claim["controller_claim_sha256"],
+        "controller_claim": _artifact_binding(
+            claim_path, claim["controller_claim_sha256"]
+        ),
+        "wrapper_claim": dict(claim["wrapper_claim"]),
+        "observer_launch": dict(claim["observer_launch"]),
+        "controller_process_start": dict(
+            claim["controller_process_start"]
+        ),
+        "checkpoint_plan": dict(claim["checkpoint_plan"]),
+        "preflight_request_manifest": dict(
+            claim["preflight_request_manifest"]
+        ),
+        "startup_admission": dict(claim["startup_admission"]),
+        "request_count": claim["request_count"],
+        "controller_session": claim["controller_session"],
+        "observer_session": claim["observer_session"],
+        "controller_pid": claim["controller_pid"],
+        "controller_process": dict(claim["controller_process"]),
+        "first_resource_window": _artifact_binding(
+            guard_path, first_guard_sample["resource_window_sha256"]
+        ),
+        "first_resource_window_sha256": first_guard_sample[
+            "resource_window_sha256"
+        ],
+        "ready_at": _utc_now(),
+    }
+    value["controller_ready_sha256"] = canonical_digest(
+        value, "controller_ready_sha256"
+    )
+    path = paths["preflight_control"] / "controller_ready.json"
+    publish_exclusive_json(path, value)
+    return value, _artifact_binding(
+        path, value["controller_ready_sha256"]
+    )
+
+
+def _validate_preflight_controller_ready(
+    value: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    paths: Mapping[str, Path],
+) -> dict[str, Any]:
+    ready = dict(value)
+    if (
+        ready.get("contract_type")
+        != "safa_canonical_preflight_controller_ready_v1"
+        or ready.get("policy_sha256") != policy["policy_sha256"]
+        or ready.get("controller_session") != PREFLIGHT_CONTROLLER_SESSION
+        or ready.get("observer_session") != PREFLIGHT_OBSERVER_SESSION
+        or ready.get("controller_ready_sha256")
+        != canonical_digest(ready, "controller_ready_sha256")
+        or type(ready.get("request_count")) is not int
+        or ready["request_count"] <= 0
+    ):
+        raise CanonicalScreeningError(
+            "CPU preflight controller ready contract mismatch"
+        )
+    _validate_json_artifact_binding(
+        ready["controller_claim"],
+        "CPU preflight controller claim",
+        "controller_claim_sha256",
+    )
+    _validate_json_artifact_binding(
+        ready["observer_launch"],
+        "CPU preflight observer launch",
+        "observer_launch_sha256",
+    )
+    _validate_json_artifact_binding(
+        ready["controller_process_start"],
+        "CPU preflight controller process start",
+        "controller_process_start_sha256",
+    )
+    _validate_json_artifact_binding(
+        ready["checkpoint_plan"],
+        "CPU preflight ready checkpoint plan",
+        "checkpoint_plan_sha256",
+    )
+    manifest = _validate_json_artifact_binding(
+        ready["preflight_request_manifest"],
+        "CPU preflight ready request manifest",
+        "preflight_request_manifest_sha256",
+    )
+    manifest = _validate_preflight_request_manifest(
+        manifest, policy, paths
+    )
+    if ready["request_count"] != manifest["request_count"]:
+        raise CanonicalScreeningError(
+            "CPU preflight controller ready request count differs"
+        )
+    process_start = _validate_json_artifact_binding(
+        ready["controller_process_start"],
+        "CPU preflight ready controller process start",
+        "controller_process_start_sha256",
+    )
+    if (
+        ready.get("controller_pid") != process_start["process"]["pid"]
+        or ready.get("controller_process") != process_start["process"]
+    ):
+        raise CanonicalScreeningError(
+            "CPU preflight controller ready process binding differs"
+        )
+    return ready
+
+
+def _wait_preflight_observer_ready(
+    policy: Mapping[str, Any],
+    paths: Mapping[str, Path],
+    controller_ready: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, str]]:
+    path = paths["preflight_control"] / "observer_ready.json"
+    terminal_path = paths["preflight_control"] / "observer_terminal.json"
+    deadline = time.monotonic() + PREFLIGHT_BARRIER_TIMEOUT_SECONDS
+    while not path.is_file():
+        if terminal_path.is_file():
+            terminal = load_json(
+                terminal_path, "CPU preflight observer early terminal"
+            )
+            raise CanonicalScreeningError(
+                "CPU preflight observer terminated before ready: "
+                f"{terminal.get('failure')}"
+            )
+        if time.monotonic() >= deadline:
+            raise CanonicalScreeningError(
+                "CPU preflight observer ready barrier timed out"
+            )
+        time.sleep(0.1)
+    ready = load_json(path, "CPU preflight observer ready")
+    if (
+        ready.get("contract_type")
+        != "safa_canonical_preflight_observer_ready_v1"
+        or ready.get("policy_sha256") != policy["policy_sha256"]
+        or ready.get("controller_ready_sha256")
+        != controller_ready["controller_ready_sha256"]
+        or ready.get("request_count") != controller_ready["request_count"]
+        or ready.get("observer_session") != PREFLIGHT_OBSERVER_SESSION
+        or ready.get("observer_launch")
+        != controller_ready["observer_launch"]
+        or ready.get("controller_process_start")
+        != controller_ready["controller_process_start"]
+        or ready.get("observer_pid")
+        != ready.get("observer_process", {}).get("pid")
+        or ready.get("observer_tmux", {}).get("pane_pid")
+        != ready.get("observer_pid")
+        or ready.get("observer_ready_sha256")
+        != canonical_digest(ready, "observer_ready_sha256")
+    ):
+        raise CanonicalScreeningError(
+            "CPU preflight observer ready contract mismatch"
+        )
+    launch = _validate_json_artifact_binding(
+        ready["observer_launch"],
+        "CPU preflight observer ready launch",
+        "observer_launch_sha256",
+    )
+    if (
+        ready["observer_process"] != launch["process"]
+        or ready["observer_tmux"] != launch["tmux"]
+    ):
+        raise CanonicalScreeningError(
+            "CPU preflight observer ready identity binding differs"
+        )
+    _assert_tmux_process_identity(
+        PREFLIGHT_OBSERVER_SESSION,
+        ready["observer_tmux"],
+        launch["tmux_server"],
+        ready["observer_process"],
+        "CPU preflight ready observer",
+    )
+    return ready, _artifact_binding(path, ready["observer_ready_sha256"])
+
+
+def _assert_preflight_observer_live(
+    policy: Mapping[str, Any],
+    paths: Mapping[str, Path],
+    observer_ready: Mapping[str, Any],
+) -> None:
+    control = paths["preflight_control"]
+    ready_path = control / "observer_ready.json"
+    if (
+        not ready_path.is_file()
+        or sha256_file(ready_path) != observer_ready["sha256"]
+    ):
+        raise CanonicalScreeningError(
+            "CPU preflight observer ready changed after release"
+        )
+    ready = _validate_json_artifact_binding(
+        observer_ready,
+        "CPU preflight observer ready",
+        "observer_ready_sha256",
+    )
+    launch = _validate_json_artifact_binding(
+        ready["observer_launch"],
+        "CPU preflight live observer launch",
+        "observer_launch_sha256",
+    )
+    if (
+        ready["observer_process"] != launch["process"]
+        or ready["observer_tmux"] != launch["tmux"]
+    ):
+        raise CanonicalScreeningError(
+            "CPU preflight live observer sealed identity differs"
+        )
+    _assert_tmux_process_identity(
+        PREFLIGHT_OBSERVER_SESSION,
+        ready["observer_tmux"],
+        launch["tmux_server"],
+        ready["observer_process"],
+        "CPU preflight live observer",
+    )
+    stop_path = control / "observer_stop.json"
+    if stop_path.is_file():
+        stop = _validate_preflight_observer_stop(
+            load_json(stop_path, "CPU preflight observer stop"),
+            policy,
+            paths,
+        )
+        raise CanonicalScreeningError(
+            "CPU preflight observer requested hard stop: "
+            f"{stop.get('failure')}"
+        )
+    terminal_path = control / "observer_terminal.json"
+    if terminal_path.is_file():
+        terminal = load_json(terminal_path, "CPU preflight observer terminal")
+        raise CanonicalScreeningError(
+            "CPU preflight observer terminated before controller: "
+            f"status={terminal.get('status')}, failure={terminal.get('failure')}"
+        )
+    rows = load_jsonl(
+        paths["logs"] / "preflight__observer.jsonl",
+        "CPU preflight observer progress samples",
+    )
+    if not rows:
+        raise CanonicalScreeningError(
+            "CPU preflight observer progress heartbeat is absent"
+        )
+    latest = rows[-1]
+    if (
+        latest.get("contract_type")
+        != "safa_canonical_preflight_observer_sample_v1"
+        or latest.get("policy_sha256") != policy["policy_sha256"]
+        or latest.get("observer_sample_sha256")
+        != canonical_digest(latest, "observer_sample_sha256")
+        or latest.get("observer_process") != ready["observer_process"]
+        or latest.get("observer_tmux") != ready["observer_tmux"]
+    ):
+        raise CanonicalScreeningError(
+            "CPU preflight observer progress contract mismatch"
+        )
+    _assert_tmux_process_identity(
+        PREFLIGHT_OBSERVER_SESSION,
+        latest["observer_tmux"],
+        launch["tmux_server"],
+        latest["observer_process"],
+        "CPU preflight heartbeat observer",
+    )
+    observed = datetime.fromisoformat(str(latest["observed_at"]))
+    age = (datetime.now(timezone.utc) - observed).total_seconds()
+    limit = max(
+        30.0, 3.0 * float(policy["resources"]["resource_poll_seconds"])
+    )
+    if age < 0 or age > limit:
+        raise CanonicalScreeningError(
+            f"CPU preflight observer heartbeat is stale: {age:.2f}s"
+        )
+
+
 def _load_preflight_request(
     path: Path, policy: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -2121,6 +3383,7 @@ def materialize_preflights(
     paths: Mapping[str, Path],
     resource_guard: RuntimeResourceGuard,
     startup_admission_sha256: str,
+    observer_ready: Mapping[str, Any],
 ) -> dict[str, int]:
     if "TMUX" not in os.environ:
         raise CanonicalScreeningError("CPU checkpoint preflight must run inside tmux")
@@ -2138,6 +3401,7 @@ def materialize_preflights(
     attempt_root = paths["preflight_control"] / "attempts"
     for sequence, request_path in enumerate(requests, start=1):
         resource_guard.raise_if_violated()
+        _assert_preflight_observer_live(policy, paths, observer_ready)
         request = _load_preflight_request(request_path, policy)
         result_path = paths["preflight_results"] / request_path.name
         claim = {
@@ -2219,6 +3483,7 @@ def materialize_preflights(
             raise
         _append_monitor_sample(policy, paths, "preflight")
         resource_guard.raise_if_violated()
+        _assert_preflight_observer_live(policy, paths, observer_ready)
     _append_monitor_sample(policy, paths, "preflight", terminal=True)
     return {
         "request_count": len(requests),
@@ -2232,51 +3497,96 @@ def materialize_preflights(
 def _execute_preflight_controller(
     policy: Mapping[str, Any], paths: Mapping[str, Path]
 ) -> dict[str, Any]:
-    if "TMUX" not in os.environ:
-        raise CanonicalScreeningError("CPU checkpoint preflight must run inside tmux")
-    startup_snapshot = assert_cpu_resource_admission(policy, paths["root"])
+    _current_tmux_session(
+        PREFLIGHT_CONTROLLER_SESSION, "CPU preflight controller"
+    )
+    (
+        wrapper,
+        wrapper_binding,
+        request_manifest,
+        request_manifest_binding,
+        observer_launch_binding,
+        process_start_binding,
+    ) = _validate_preflight_wrapper_provenance(policy, paths)
+    request_count = int(request_manifest["request_count"])
+    if request_count != len(list(paths["preflight_requests"].glob("*.json"))):
+        raise CanonicalScreeningError(
+            "CPU preflight request count differs before admission"
+        )
+    startup_snapshot = assert_resource_admission(
+        policy, paths["root"], require_idle_gpus=True
+    )
     startup_admission = _write_admission(
-        policy, paths, "preflight_cpu_startup", startup_snapshot
+        policy, paths, "preflight", startup_snapshot
     )
     control = paths["preflight_control"]
-    claim = {
-        "schema_version": 1,
-        "contract_type": "safa_canonical_preflight_controller_claim_v1",
-        "campaign_id": policy["campaign_id"],
-        "policy_sha256": policy["policy_sha256"],
-        "supersedes_policy_sha256": policy["supersedes_policy_sha256"],
-        "startup_admission": startup_admission,
-        "request_count": len(list(paths["preflight_requests"].glob("*.json"))),
-        "controller_pid": os.getpid(),
-        "started_at": _utc_now(),
-        "external_timeout_seconds": None,
-    }
-    claim["controller_claim_sha256"] = hashlib.sha256(
-        canonical_json(claim)
-    ).hexdigest()
-    claim_path = control / "controller_claim.json"
+    claim, claim_path = _write_preflight_controller_claim(
+        policy,
+        paths,
+        wrapper_binding,
+        observer_launch_binding,
+        process_start_binding,
+        wrapper["checkpoint_plan"],
+        request_manifest_binding,
+        startup_admission,
+        request_count,
+    )
     terminal_path = control / "controller_terminal.json"
     summary_path = control / "controller_summary.json"
     log_path = control / "controller.log"
-    write_exclusive_json(claim_path, claim)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     summary: dict[str, Any] | None = None
     caught: BaseException | None = None
+    controller_ready_binding: dict[str, str] | None = None
+    observer_ready_binding: dict[str, str] | None = None
     resource_guard = RuntimeResourceGuard(
         policy,
         control / "runtime_resource_windows.jsonl",
         paths["root"].parent,
+        authorized_gpu_registry=startup_snapshot["authorized_gpu_registry"],
     )
     with log_path.open("x", encoding="utf-8", buffering=1) as log_handle:
         with redirect_stdout(log_handle), redirect_stderr(log_handle):
             try:
                 resource_guard.start()
-                print(canonical_json({"event": "controller_started", **claim}).decode(), end="")
+                first_guard_sample = resource_guard.wait_first_sample(
+                    2.0 * float(policy["resources"]["resource_poll_seconds"])
+                    + 5.0
+                )
+                controller_ready, controller_ready_binding = (
+                    _write_preflight_controller_ready(
+                        policy,
+                        paths,
+                        claim,
+                        claim_path,
+                        first_guard_sample,
+                    )
+                )
+                observer_ready, observer_ready_binding = (
+                    _wait_preflight_observer_ready(
+                        policy, paths, controller_ready
+                    )
+                )
+                _assert_preflight_observer_live(
+                    policy, paths, observer_ready_binding
+                )
+                print(
+                    canonical_json(
+                        {
+                            "event": "controller_started",
+                            "claim": claim,
+                            "controller_ready": controller_ready_binding,
+                            "observer_ready": observer_ready_binding,
+                        }
+                    ).decode(),
+                    end="",
+                )
                 materialized = materialize_preflights(
                     policy,
                     paths,
                     resource_guard,
                     startup_admission["canonical_sha256"],
+                    observer_ready_binding,
                 )
                 refreshed = build_checkpoint_plan(
                     REPO_ROOT, policy, paths["preflight_results"]
@@ -2330,23 +3640,29 @@ def _execute_preflight_controller(
                         str(resource_guard_summary["violation_reason"])
                     )
                     summary = None
-                result_count = len(list(paths["preflight_results"].glob("*.json")))
-                attempt_claim_count = len(
-                    list((control / "attempts").glob("*.claim.json"))
-                )
-                attempt_terminal_count = len(
-                    list((control / "attempts").glob("*.terminal.json"))
+                progress = _preflight_progress(paths, request_count)
+                observer_samples_path = (
+                    paths["logs"] / "preflight__observer.jsonl"
                 )
                 terminal = {
                     "schema_version": 1,
-                    "contract_type": "safa_canonical_preflight_controller_terminal_v1",
+                    "contract_type": "safa_canonical_preflight_controller_terminal_v2",
+                    "campaign_id": policy["campaign_id"],
                     "policy_sha256": policy["policy_sha256"],
                     "controller_claim_sha256": claim["controller_claim_sha256"],
+                    "controller_claim": _artifact_binding(
+                        claim_path, claim["controller_claim_sha256"]
+                    ),
+                    "wrapper_claim": wrapper_binding,
+                    "observer_launch": observer_launch_binding,
+                    "controller_process_start": process_start_binding,
+                    "checkpoint_plan": dict(wrapper["checkpoint_plan"]),
+                    "preflight_request_manifest": request_manifest_binding,
+                    "startup_admission": startup_admission,
+                    "controller_ready": controller_ready_binding,
+                    "observer_ready": observer_ready_binding,
                     "status": "completed" if caught is None else "failed",
-                    "result_count": result_count,
-                    "pending_count": claim["request_count"] - result_count,
-                    "attempt_claim_count": attempt_claim_count,
-                    "attempt_terminal_count": attempt_terminal_count,
+                    "progress": progress,
                     "runtime_resource_guard": resource_guard_summary,
                     "controller_monitor_samples": (
                         {
@@ -2362,6 +3678,14 @@ def _execute_preflight_controller(
                         ).is_file()
                         else None
                     ),
+                    "observer_progress_samples": (
+                        {
+                            "path": str(observer_samples_path.resolve()),
+                            "sha256": sha256_file(observer_samples_path),
+                        }
+                        if observer_samples_path.is_file()
+                        else None
+                    ),
                     "failure": (
                         None
                         if caught is None
@@ -2369,26 +3693,34 @@ def _execute_preflight_controller(
                     ),
                     "completed_at": _utc_now(),
                 }
-                terminal["controller_terminal_sha256"] = hashlib.sha256(
-                    canonical_json(terminal)
-                ).hexdigest()
-                write_exclusive_json(terminal_path, terminal)
+                terminal["controller_terminal_sha256"] = canonical_digest(
+                    terminal, "controller_terminal_sha256"
+                )
+                publish_exclusive_json(terminal_path, terminal)
                 if summary is not None:
                     summary_value = {
                         "schema_version": 1,
-                        "contract_type": "safa_canonical_preflight_controller_summary_v1",
+                        "contract_type": "safa_canonical_preflight_controller_summary_v2",
                         "policy_sha256": policy["policy_sha256"],
                         "controller_claim_sha256": claim["controller_claim_sha256"],
                         "controller_terminal_sha256": terminal[
                             "controller_terminal_sha256"
                         ],
+                        "controller_ready": controller_ready_binding,
+                        "observer_ready": observer_ready_binding,
+                        "preflight_request_manifest": request_manifest_binding,
                         **summary,
                     }
-                    summary_value["controller_summary_sha256"] = hashlib.sha256(
-                        canonical_json(summary_value)
-                    ).hexdigest()
-                    write_exclusive_json(summary_path, summary_value)
-                print(canonical_json({"event": "controller_terminal", **terminal}).decode(), end="")
+                    summary_value["controller_summary_sha256"] = canonical_digest(
+                        summary_value, "controller_summary_sha256"
+                    )
+                    publish_exclusive_json(summary_path, summary_value)
+                print(
+                    canonical_json(
+                        {"event": "controller_terminal", **terminal}
+                    ).decode(),
+                    end="",
+                )
     if caught is not None:
         raise caught
     if summary is None:
@@ -2661,7 +3993,6 @@ def _tmux_commands(
     policy: Mapping[str, Any], config: Path, campaign_root: Path, phase: str
 ) -> dict[str, list[str]]:
     python = str(policy["python"])
-    script = str(Path(__file__).resolve())
     if phase == "preflight":
         controller = [
             "tmux",
@@ -2684,28 +4015,7 @@ def _tmux_commands(
             "--python",
             python,
         ]
-        monitor = [
-            "tmux",
-            "new-session",
-            "-d",
-            "-s",
-            "safa-screening-preflight-monitor",
-            " ".join(
-                [
-                    python,
-                    script,
-                    "--config",
-                    str(config.resolve()),
-                    "--campaign-root",
-                    str(campaign_root.resolve()),
-                    "--phase",
-                    "monitor",
-                    "--monitor-target",
-                    "preflight",
-                    "--execute",
-                ]
-            ),
-        ]
+        monitor = []
     else:
         controller = [
             "tmux",
@@ -2734,7 +4044,887 @@ def _tmux_commands(
     return {"controller": controller, "monitor": monitor}
 
 
-def _run_monitor(
+def _preflight_observer_sample(
+    policy: Mapping[str, Any],
+    paths: Mapping[str, Path],
+    request_count: int,
+    observer_pid: int,
+    resource_sample_path: Path,
+    sequence: int,
+    sealed_observer_tmux: Mapping[str, Any],
+    sealed_observer_tmux_server: Mapping[str, Any],
+    sealed_observer_process: Mapping[str, int],
+    sealed_controller_tmux: Mapping[str, Any],
+    sealed_controller_tmux_server: Mapping[str, Any],
+    sealed_wrapper_process: Mapping[str, int],
+    *,
+    terminal: bool,
+) -> dict[str, Any]:
+    _assert_tmux_process_identity(
+        PREFLIGHT_OBSERVER_SESSION,
+        sealed_observer_tmux,
+        sealed_observer_tmux_server,
+        sealed_observer_process,
+        "CPU preflight sampling observer",
+    )
+    _assert_tmux_process_identity(
+        PREFLIGHT_CONTROLLER_SESSION,
+        sealed_controller_tmux,
+        sealed_controller_tmux_server,
+        sealed_wrapper_process,
+        "CPU preflight sampling wrapper",
+    )
+    resource_rows = load_jsonl(
+        resource_sample_path, "CPU preflight observer resource samples"
+    )
+    if not resource_rows:
+        raise CanonicalScreeningError(
+            "CPU preflight observer resource sample is absent"
+        )
+    latest_resource = resource_rows[-1]
+    if (
+        latest_resource.get("contract_type")
+        != "safa_canonical_runtime_resource_window_v1"
+        or latest_resource.get("policy_sha256") != policy["policy_sha256"]
+        or latest_resource.get("resource_window_sha256")
+        != canonical_digest(
+            latest_resource, "resource_window_sha256"
+        )
+    ):
+        raise CanonicalScreeningError(
+            "CPU preflight observer resource sample contract mismatch"
+        )
+    log_rows = []
+    for path in (
+        paths["preflight_control"] / "controller_process.log",
+        paths["preflight_control"] / "controller.log",
+    ):
+        if path.is_file():
+            stat = path.stat()
+            log_rows.append(
+                {
+                    "path": str(path.resolve()),
+                    "size_bytes": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                    "sha256": sha256_file(path),
+                }
+            )
+    value = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_preflight_observer_sample_v1",
+        "campaign_id": policy["campaign_id"],
+        "phase": "preflight",
+        "policy_sha256": policy["policy_sha256"],
+        "sequence": sequence,
+        "terminal": terminal,
+        "observer_session": PREFLIGHT_OBSERVER_SESSION,
+        "observer_pid": observer_pid,
+        "observer_process": dict(sealed_observer_process),
+        "observer_tmux": dict(sealed_observer_tmux),
+        "controller_tmux": dict(sealed_controller_tmux),
+        "observed_at": _utc_now(),
+        "resource_window": latest_resource,
+        "resource_samples": {
+            "path": str(resource_sample_path.resolve()),
+            "sha256": sha256_file(resource_sample_path),
+        },
+        "progress": _preflight_progress(paths, request_count),
+        "logs": log_rows,
+    }
+    value["observer_sample_sha256"] = canonical_digest(
+        value, "observer_sample_sha256"
+    )
+    return value
+
+
+def _publish_preflight_observer_stop(
+    policy: Mapping[str, Any],
+    paths: Mapping[str, Path],
+    observer_claim_binding: Mapping[str, str] | None,
+    failure: Mapping[str, str],
+) -> dict[str, Any]:
+    path = paths["preflight_control"] / "observer_stop.json"
+    if path.is_file():
+        return load_json(path, "CPU preflight observer stop")
+    def optional_json_binding(
+        artifact_path: Path, digest_field: str
+    ) -> dict[str, str] | None:
+        if not artifact_path.is_file():
+            return None
+        artifact = load_json(artifact_path, "CPU preflight stop dependency")
+        canonical = artifact.get(digest_field)
+        if canonical != canonical_digest(artifact, digest_field):
+            raise CanonicalScreeningError(
+                "CPU preflight stop dependency digest differs"
+            )
+        return _artifact_binding(artifact_path, canonical)
+
+    wrapper_binding = optional_json_binding(
+        paths["preflight_control"] / "wrapper_claim.json",
+        "wrapper_claim_sha256",
+    )
+    launch_binding = optional_json_binding(
+        paths["preflight_control"] / "observer_launch.json",
+        "observer_launch_sha256",
+    )
+    process_start_binding = optional_json_binding(
+        paths["preflight_control"] / "controller_process_start.json",
+        "controller_process_start_sha256",
+    )
+    controller_ready_binding = optional_json_binding(
+        paths["preflight_control"] / "controller_ready.json",
+        "controller_ready_sha256",
+    )
+    observer_ready_binding = optional_json_binding(
+        paths["preflight_control"] / "observer_ready.json",
+        "observer_ready_sha256",
+    )
+    process_start = (
+        None
+        if process_start_binding is None
+        else load_json(
+            Path(process_start_binding["path"]),
+            "CPU preflight stop controller process start",
+        )
+    )
+    observer_process = _process_identity(os.getpid())
+    observer_tmux = _tmux_identity(PREFLIGHT_OBSERVER_SESSION)
+    if observer_tmux["pane_pid"] != observer_process["pid"]:
+        raise CanonicalScreeningError(
+            "CPU preflight stop observer pane/PID binding differs"
+        )
+    value = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_preflight_observer_stop_v2",
+        "campaign_id": policy["campaign_id"],
+        "policy_sha256": policy["policy_sha256"],
+        "wrapper_claim": wrapper_binding,
+        "observer_launch": launch_binding,
+        "observer_claim": None if observer_claim_binding is None else dict(observer_claim_binding),
+        "observer_ready": observer_ready_binding,
+        "controller_process_start": process_start_binding,
+        "controller_ready": controller_ready_binding,
+        "observer_session": PREFLIGHT_OBSERVER_SESSION,
+        "observer_pid": os.getpid(),
+        "observer_process": observer_process,
+        "observer_tmux": observer_tmux,
+        "controller_process": (
+            None if process_start is None else process_start["process"]
+        ),
+        "failure": dict(failure),
+        "requested_at": _utc_now(),
+    }
+    value["observer_stop_sha256"] = canonical_digest(
+        value, "observer_stop_sha256"
+    )
+    publish_exclusive_json(path, value)
+    return value
+
+
+def _validate_preflight_observer_stop(
+    value: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    paths: Mapping[str, Path],
+) -> dict[str, Any]:
+    stop = dict(value)
+    if (
+        set(stop)
+        != {
+            "schema_version",
+            "contract_type",
+            "campaign_id",
+            "policy_sha256",
+            "wrapper_claim",
+            "observer_launch",
+            "observer_claim",
+            "observer_ready",
+            "controller_process_start",
+            "controller_ready",
+            "observer_session",
+            "observer_pid",
+            "observer_process",
+            "observer_tmux",
+            "controller_process",
+            "failure",
+            "requested_at",
+            "observer_stop_sha256",
+        }
+        or stop.get("schema_version") != 1
+        or stop.get("contract_type")
+        != "safa_canonical_preflight_observer_stop_v2"
+        or stop.get("campaign_id") != policy["campaign_id"]
+        or stop.get("policy_sha256") != policy["policy_sha256"]
+        or stop.get("observer_session") != PREFLIGHT_OBSERVER_SESSION
+        or stop.get("observer_pid")
+        != stop.get("observer_process", {}).get("pid")
+        or stop.get("observer_tmux", {}).get("pane_pid")
+        != stop.get("observer_pid")
+        or not isinstance(stop.get("failure"), Mapping)
+        or stop.get("observer_stop_sha256")
+        != canonical_digest(stop, "observer_stop_sha256")
+    ):
+        raise CanonicalScreeningError(
+            "CPU preflight observer stop contract mismatch"
+        )
+    required = {
+        "wrapper_claim": "wrapper_claim_sha256",
+        "observer_launch": "observer_launch_sha256",
+        "controller_process_start": "controller_process_start_sha256",
+    }
+    for field, digest_field in required.items():
+        binding = stop.get(field)
+        if not isinstance(binding, Mapping):
+            raise CanonicalScreeningError(
+                f"CPU preflight observer stop {field} is absent"
+            )
+        _validate_json_artifact_binding(
+            binding, f"CPU preflight stop {field}", digest_field
+        )
+    launch = _validate_json_artifact_binding(
+        stop["observer_launch"],
+        "CPU preflight stop observer launch",
+        "observer_launch_sha256",
+    )
+    if (
+        stop["observer_tmux"] != launch["tmux"]
+        or stop["observer_process"] != launch["process"]
+    ):
+        raise CanonicalScreeningError(
+            "CPU preflight observer stop launch identity differs"
+        )
+    _assert_tmux_process_identity(
+        PREFLIGHT_OBSERVER_SESSION,
+        stop["observer_tmux"],
+        launch["tmux_server"],
+        stop["observer_process"],
+        "CPU preflight stopped observer",
+    )
+    process_start = _validate_json_artifact_binding(
+        stop["controller_process_start"],
+        "CPU preflight stop controller process",
+        "controller_process_start_sha256",
+    )
+    if stop["controller_process"] != process_start["process"]:
+        raise CanonicalScreeningError(
+            "CPU preflight observer stop controller identity differs"
+        )
+    return stop
+
+
+def _validate_preflight_controller_terminal(
+    value: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    request_count: int,
+) -> dict[str, Any]:
+    terminal = dict(value)
+    if (
+        terminal.get("contract_type")
+        != "safa_canonical_preflight_controller_terminal_v2"
+        or terminal.get("policy_sha256") != policy["policy_sha256"]
+        or terminal.get("status") not in {"completed", "failed"}
+        or terminal.get("controller_terminal_sha256")
+        != canonical_digest(terminal, "controller_terminal_sha256")
+        or not isinstance(terminal.get("progress"), Mapping)
+        or terminal["progress"].get("request_count") != request_count
+        or (
+            terminal["status"] == "completed"
+            and (
+                terminal.get("failure") is not None
+                or terminal["progress"].get("pending") != 0
+                or terminal["progress"].get("failed") != 0
+            )
+        )
+        or (
+            terminal["status"] == "failed"
+            and not isinstance(terminal.get("failure"), Mapping)
+        )
+    ):
+        raise CanonicalScreeningError(
+            "CPU preflight controller terminal contract mismatch"
+        )
+    return terminal
+
+
+def _validate_preflight_process_exit(
+    value: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    paths: Mapping[str, Path],
+    wrapper_claim_sha256: str,
+) -> dict[str, Any]:
+    process_exit = dict(value)
+    if (
+        process_exit.get("contract_type")
+        != "safa_canonical_preflight_controller_process_exit_v2"
+        or process_exit.get("policy_sha256") != policy["policy_sha256"]
+        or process_exit.get("wrapper_claim_sha256")
+        != wrapper_claim_sha256
+        or process_exit.get("controller_process_exit_sha256")
+        != canonical_digest(
+            process_exit, "controller_process_exit_sha256"
+        )
+        or type(process_exit.get("exit_code")) is not int
+        or process_exit.get("command")
+        != _expected_preflight_controller_command(policy, paths)
+        or process_exit.get("observer_launch")
+        is None
+        or process_exit.get("controller_process_start")
+        is None
+    ):
+        raise CanonicalScreeningError(
+            "CPU preflight controller process exit contract mismatch"
+        )
+    launch = _validate_json_artifact_binding(
+        process_exit["observer_launch"],
+        "CPU preflight process exit observer launch",
+        "observer_launch_sha256",
+    )
+    process_start = _validate_json_artifact_binding(
+        process_exit["controller_process_start"],
+        "CPU preflight process exit controller start",
+        "controller_process_start_sha256",
+    )
+    if (
+        launch.get("contract_type")
+        != "safa_canonical_preflight_observer_launch_v3"
+        or process_exit.get("controller_pid")
+        != process_start["process"]["pid"]
+    ):
+        raise CanonicalScreeningError(
+            "CPU preflight process exit identity binding differs"
+        )
+    if process_exit.get("observer_stop") is not None:
+        _validate_preflight_observer_stop(
+            _validate_json_artifact_binding(
+                process_exit["observer_stop"],
+                "CPU preflight process exit observer stop",
+                "observer_stop_sha256",
+            ),
+            policy,
+            paths,
+        )
+    return process_exit
+
+
+def _hold_preflight_observer_for_wrapper_close() -> None:
+    while True:
+        time.sleep(1.0)
+
+
+def _run_preflight_monitor(
+    policy: Mapping[str, Any],
+    paths: Mapping[str, Path],
+) -> dict[str, Any]:
+    _current_tmux_session(
+        PREFLIGHT_OBSERVER_SESSION, "CPU preflight observer"
+    )
+    control = paths["preflight_control"]
+    terminal_path = control / "observer_terminal.json"
+    claim_path = control / "observer_claim.json"
+    ready_path = control / "observer_ready.json"
+    progress_path = paths["logs"] / "preflight__observer.jsonl"
+    resource_path = control / "observer_resource_windows.jsonl"
+    process_exit_path = control / "controller_process_exit.json"
+    controller_terminal_path = control / "controller_terminal.json"
+    observer_pid = os.getpid()
+    claim: dict[str, Any] | None = None
+    claim_binding: dict[str, str] | None = None
+    ready_binding: dict[str, str] | None = None
+    controller_terminal_binding: dict[str, str] | None = None
+    process_exit_binding: dict[str, str] | None = None
+    observer_stop_binding: dict[str, str] | None = None
+    resource_guard: RuntimeResourceGuard | None = None
+    resource_guard_summary: dict[str, Any] | None = None
+    samples = 0
+    status = "failed"
+    failure: dict[str, str] | None = None
+    request_count = 0
+    wrapper_claim_sha256: str | None = None
+    try:
+        deadline = time.monotonic() + PREFLIGHT_BARRIER_TIMEOUT_SECONDS
+        wrapper_path = control / "wrapper_claim.json"
+        while not wrapper_path.is_file():
+            if time.monotonic() >= deadline:
+                raise CanonicalScreeningError(
+                    "CPU preflight wrapper provenance barrier timed out"
+                )
+            time.sleep(0.1)
+        wrapper = load_json(wrapper_path, "CPU preflight wrapper claim")
+        if (
+            wrapper.get("contract_type")
+            != "safa_canonical_preflight_wrapper_claim_v2"
+            or wrapper.get("policy_sha256") != policy["policy_sha256"]
+            or wrapper.get("observer_session") != PREFLIGHT_OBSERVER_SESSION
+            or wrapper.get("controller_session")
+            != PREFLIGHT_CONTROLLER_SESSION
+            or wrapper.get("wrapper_claim_sha256")
+            != canonical_digest(wrapper, "wrapper_claim_sha256")
+        ):
+            raise CanonicalScreeningError(
+                "CPU preflight observer wrapper provenance mismatch"
+            )
+        _assert_tmux_process_identity(
+            PREFLIGHT_CONTROLLER_SESSION,
+            wrapper["controller_tmux"],
+            wrapper["controller_tmux_server"],
+            wrapper["wrapper_process"],
+            "CPU preflight observer-bound wrapper",
+        )
+        wrapper_claim_sha256 = wrapper["wrapper_claim_sha256"]
+        wrapper_binding = _artifact_binding(
+            wrapper_path, wrapper_claim_sha256
+        )
+        observer_launch_path = control / "observer_launch.json"
+        while not observer_launch_path.is_file():
+            if time.monotonic() >= deadline:
+                raise CanonicalScreeningError(
+                    "CPU preflight observer launch barrier timed out"
+                )
+            time.sleep(0.01)
+        observer_launch = _validate_json_artifact_binding(
+            _artifact_binding(
+                observer_launch_path,
+                load_json(
+                    observer_launch_path,
+                    "CPU preflight observer launch",
+                )["observer_launch_sha256"],
+            ),
+            "CPU preflight observer launch",
+            "observer_launch_sha256",
+        )
+        if (
+            observer_launch.get("contract_type")
+            != "safa_canonical_preflight_observer_launch_v3"
+            or
+            observer_launch.get("policy_sha256")
+            != policy["policy_sha256"]
+            or observer_launch.get("wrapper_claim")
+            != wrapper_binding
+            or observer_launch.get("command")
+            != _expected_preflight_observer_command(policy, paths)
+            or observer_launch.get("status") != "launched"
+            or observer_launch.get("failure") is not None
+            or observer_launch.get("observer_session")
+            != PREFLIGHT_OBSERVER_SESSION
+            or observer_launch.get("tmux", {}).get("pane_pid")
+            != observer_launch.get("process", {}).get("pid")
+            or observer_launch.get("process") != _process_identity(observer_pid)
+            or observer_launch.get("tmux")
+            != _tmux_pane_identity(observer_launch["tmux"]["pane"])
+            or observer_launch.get("tmux_server")
+            != _tmux_server_identity(observer_launch["tmux"]["pane"])
+        ):
+            raise CanonicalScreeningError(
+                "CPU preflight observer launch provenance mismatch"
+            )
+        _assert_tmux_process_identity(
+            PREFLIGHT_OBSERVER_SESSION,
+            observer_launch["tmux"],
+            observer_launch["tmux_server"],
+            observer_launch["process"],
+            "CPU preflight launched observer",
+        )
+        _validate_tmux_owner_seal(
+            observer_launch["tmux_owner_seal"],
+            observer_launch["tmux"],
+            observer_launch["tmux_server"],
+        )
+        gate_ready = _validate_json_artifact_binding(
+            observer_launch["observer_gate_ready"],
+            "CPU preflight observer gate ready",
+            "observer_gate_ready_sha256",
+        )
+        gate_release = _validate_json_artifact_binding(
+            observer_launch["observer_gate_release"],
+            "CPU preflight observer gate release",
+            "observer_gate_release_sha256",
+        )
+        if (
+            gate_ready.get("contract_type")
+            != "safa_canonical_preflight_observer_gate_ready_v1"
+            or gate_release.get("contract_type")
+            != "safa_canonical_preflight_observer_gate_release_v1"
+            or gate_ready.get("process")
+            != observer_launch["process"]
+            or gate_ready.get("tmux") != observer_launch["tmux"]
+            or gate_ready.get("tmux_server")
+            != observer_launch["tmux_server"]
+            or gate_release.get("observer_gate_ready")
+            != observer_launch["observer_gate_ready"]
+            or gate_release.get("observer_command")
+            != _expected_preflight_observer_command(policy, paths)
+        ):
+            raise CanonicalScreeningError(
+                "CPU preflight observer gate provenance mismatch"
+            )
+        observer_bootstrap = _validate_json_artifact_binding(
+            observer_launch["observer_bootstrap"],
+            "CPU preflight observer bootstrap",
+            "observer_bootstrap_sha256",
+        )
+        if (
+            observer_bootstrap.get("process")
+            != observer_launch["process"]
+            or observer_bootstrap.get("tmux") != observer_launch["tmux"]
+            or observer_bootstrap.get("wrapper_claim")
+            != observer_launch["wrapper_claim"]
+        ):
+            raise CanonicalScreeningError(
+                "CPU preflight observer bootstrap binding differs"
+            )
+        controller_ready_path = control / "controller_ready.json"
+        while not controller_ready_path.is_file():
+            if process_exit_path.is_file():
+                raise CanonicalScreeningError(
+                    "CPU preflight controller exited before ready"
+                )
+            if controller_terminal_path.is_file():
+                raise CanonicalScreeningError(
+                    "CPU preflight controller terminated before ready"
+                )
+            if time.monotonic() >= deadline:
+                raise CanonicalScreeningError(
+                    "CPU preflight controller ready barrier timed out"
+                )
+            time.sleep(0.1)
+        controller_ready = _validate_preflight_controller_ready(
+            load_json(
+                controller_ready_path,
+                "CPU preflight controller ready",
+            ),
+            policy,
+            paths,
+        )
+        if (
+            controller_ready["observer_launch"]
+            != _artifact_binding(
+                observer_launch_path,
+                observer_launch["observer_launch_sha256"],
+            )
+        ):
+            raise CanonicalScreeningError(
+                "CPU preflight controller ready launch binding differs"
+            )
+        request_count = int(controller_ready["request_count"])
+        admission = _validate_json_artifact_binding(
+            controller_ready["startup_admission"],
+            "CPU preflight startup admission",
+            "admission_sha256",
+        )
+        snapshot = admission.get("snapshot")
+        if (
+            not isinstance(snapshot, Mapping)
+            or snapshot.get("compute_processes") != []
+            or not isinstance(
+                snapshot.get("authorized_gpu_registry"), list
+            )
+        ):
+            raise CanonicalScreeningError(
+                "CPU preflight startup admission is not idle-GPU bound"
+            )
+        claim = {
+            "schema_version": 1,
+            "contract_type": "safa_canonical_preflight_observer_claim_v1",
+            "campaign_id": policy["campaign_id"],
+            "phase": "preflight",
+            "policy_sha256": policy["policy_sha256"],
+            "wrapper_claim": wrapper_binding,
+            "observer_launch": dict(
+                controller_ready["observer_launch"]
+            ),
+            "controller_process_start": dict(
+                controller_ready["controller_process_start"]
+            ),
+            "controller_ready": _artifact_binding(
+                controller_ready_path,
+                controller_ready["controller_ready_sha256"],
+            ),
+            "checkpoint_plan": dict(
+                controller_ready["checkpoint_plan"]
+            ),
+            "preflight_request_manifest": dict(
+                controller_ready["preflight_request_manifest"]
+            ),
+            "startup_admission": dict(
+                controller_ready["startup_admission"]
+            ),
+            "request_count": request_count,
+            "controller_session": PREFLIGHT_CONTROLLER_SESSION,
+            "observer_session": PREFLIGHT_OBSERVER_SESSION,
+            "observer_pid": observer_pid,
+            "observer_process": _process_identity(observer_pid),
+            "observer_tmux": dict(observer_launch["tmux"]),
+            "started_at": _utc_now(),
+        }
+        claim["observer_claim_sha256"] = canonical_digest(
+            claim, "observer_claim_sha256"
+        )
+        publish_exclusive_json(claim_path, claim)
+        claim_binding = _artifact_binding(
+            claim_path, claim["observer_claim_sha256"]
+        )
+        resource_guard = RuntimeResourceGuard(
+            policy,
+            resource_path,
+            paths["root"].parent,
+            authorized_gpu_registry=snapshot["authorized_gpu_registry"],
+        )
+        resource_guard.start()
+        first_resource = resource_guard.wait_first_sample(
+            2.0 * float(policy["resources"]["resource_poll_seconds"])
+            + 5.0
+        )
+        first_sample = _preflight_observer_sample(
+            policy,
+            paths,
+            request_count,
+            observer_pid,
+            resource_path,
+            1,
+            observer_launch["tmux"],
+            observer_launch["tmux_server"],
+            observer_launch["process"],
+            wrapper["controller_tmux"],
+            wrapper["controller_tmux_server"],
+            wrapper["wrapper_process"],
+            terminal=False,
+        )
+        _append_jsonl(progress_path, first_sample)
+        samples = 1
+        ready = {
+            "schema_version": 1,
+            "contract_type": "safa_canonical_preflight_observer_ready_v1",
+            "campaign_id": policy["campaign_id"],
+            "phase": "preflight",
+            "policy_sha256": policy["policy_sha256"],
+            "observer_claim_sha256": claim[
+                "observer_claim_sha256"
+            ],
+            "observer_claim": claim_binding,
+            "controller_ready_sha256": controller_ready[
+                "controller_ready_sha256"
+            ],
+            "controller_ready": claim["controller_ready"],
+            "observer_launch": claim["observer_launch"],
+            "controller_process_start": claim[
+                "controller_process_start"
+            ],
+            "checkpoint_plan": claim["checkpoint_plan"],
+            "preflight_request_manifest": claim[
+                "preflight_request_manifest"
+            ],
+            "startup_admission": claim["startup_admission"],
+            "request_count": request_count,
+            "controller_session": PREFLIGHT_CONTROLLER_SESSION,
+            "observer_session": PREFLIGHT_OBSERVER_SESSION,
+            "observer_pid": observer_pid,
+            "observer_process": claim["observer_process"],
+            "observer_tmux": claim["observer_tmux"],
+            "first_resource_window_sha256": first_resource[
+                "resource_window_sha256"
+            ],
+            "first_observer_sample_sha256": first_sample[
+                "observer_sample_sha256"
+            ],
+            "ready_at": _utc_now(),
+        }
+        ready["observer_ready_sha256"] = canonical_digest(
+            ready, "observer_ready_sha256"
+        )
+        publish_exclusive_json(ready_path, ready)
+        ready_binding = _artifact_binding(
+            ready_path, ready["observer_ready_sha256"]
+        )
+        while not controller_terminal_path.is_file():
+            if process_exit_path.is_file():
+                raise CanonicalScreeningError(
+                    "CPU preflight controller exited without terminal"
+                )
+            if (
+                subprocess.run(
+                    [
+                        "tmux",
+                        "has-session",
+                        "-t",
+                        PREFLIGHT_CONTROLLER_SESSION,
+                    ],
+                    capture_output=True,
+                    text=True,
+                ).returncode
+                != 0
+            ):
+                raise CanonicalScreeningError(
+                    "CPU preflight controller tmux exited without terminal"
+                )
+            time.sleep(
+                float(policy["resources"]["resource_poll_seconds"])
+            )
+            resource_guard.raise_if_violated()
+            sample = _preflight_observer_sample(
+                policy,
+                paths,
+                request_count,
+                observer_pid,
+                resource_path,
+                samples + 1,
+                observer_launch["tmux"],
+                observer_launch["tmux_server"],
+                observer_launch["process"],
+                wrapper["controller_tmux"],
+                wrapper["controller_tmux_server"],
+                wrapper["wrapper_process"],
+                terminal=False,
+            )
+            _append_jsonl(progress_path, sample)
+            samples += 1
+        controller_terminal = _validate_preflight_controller_terminal(
+            load_json(
+                controller_terminal_path,
+                "CPU preflight controller terminal",
+            ),
+            policy,
+            request_count,
+        )
+        controller_terminal_binding = _artifact_binding(
+            controller_terminal_path,
+            controller_terminal["controller_terminal_sha256"],
+        )
+        exit_deadline = time.monotonic() + PREFLIGHT_BARRIER_TIMEOUT_SECONDS
+        while not process_exit_path.is_file():
+            if time.monotonic() >= exit_deadline:
+                raise CanonicalScreeningError(
+                    "CPU preflight controller process exit barrier timed out"
+                )
+            time.sleep(0.1)
+        process_exit = _validate_preflight_process_exit(
+            load_json(
+                process_exit_path,
+                "CPU preflight controller process exit",
+            ),
+            policy,
+            paths,
+            wrapper_claim_sha256,
+        )
+        process_exit_binding = _artifact_binding(
+            process_exit_path,
+            process_exit["controller_process_exit_sha256"],
+        )
+        if (
+            (controller_terminal["status"] == "completed")
+            != (process_exit["exit_code"] == 0)
+            or process_exit["controller_terminal"] is None
+        ):
+            raise CanonicalScreeningError(
+                "CPU preflight terminal and process exit differ"
+            )
+        resource_guard.raise_if_violated()
+        terminal_sample = _preflight_observer_sample(
+            policy,
+            paths,
+            request_count,
+            observer_pid,
+            resource_path,
+            samples + 1,
+            observer_launch["tmux"],
+            observer_launch["tmux_server"],
+            observer_launch["process"],
+            wrapper["controller_tmux"],
+            wrapper["controller_tmux_server"],
+            wrapper["wrapper_process"],
+            terminal=True,
+        )
+        _append_jsonl(progress_path, terminal_sample)
+        samples += 1
+        status = "completed"
+    except BaseException as exc:
+        failure = {"type": type(exc).__name__, "message": str(exc)}
+        stop = _publish_preflight_observer_stop(
+            policy, paths, claim_binding, failure
+        )
+        observer_stop_binding = _artifact_binding(
+            control / "observer_stop.json",
+            stop["observer_stop_sha256"],
+        )
+        if wrapper_claim_sha256 is not None:
+            stop_deadline = (
+                time.monotonic() + PREFLIGHT_BARRIER_TIMEOUT_SECONDS
+            )
+            while (
+                not process_exit_path.is_file()
+                and time.monotonic() < stop_deadline
+            ):
+                time.sleep(0.1)
+            if controller_terminal_path.is_file():
+                raw_terminal = load_json(
+                    controller_terminal_path,
+                    "CPU preflight failed controller terminal",
+                )
+                if (
+                    raw_terminal.get("controller_terminal_sha256")
+                    == canonical_digest(
+                        raw_terminal, "controller_terminal_sha256"
+                    )
+                ):
+                    controller_terminal_binding = _artifact_binding(
+                        controller_terminal_path,
+                        raw_terminal["controller_terminal_sha256"],
+                    )
+            if process_exit_path.is_file():
+                process_exit = _validate_preflight_process_exit(
+                    load_json(
+                        process_exit_path,
+                        "CPU preflight failed process exit",
+                    ),
+                    policy,
+                    paths,
+                    wrapper_claim_sha256,
+                )
+                process_exit_binding = _artifact_binding(
+                    process_exit_path,
+                    process_exit["controller_process_exit_sha256"],
+                )
+        raise
+    finally:
+        if resource_guard is not None:
+            resource_guard_summary = resource_guard.stop()
+        terminal = {
+            "schema_version": 1,
+            "contract_type": "safa_canonical_preflight_observer_terminal_v1",
+            "campaign_id": policy["campaign_id"],
+            "phase": "preflight",
+            "policy_sha256": policy["policy_sha256"],
+            "observer_claim": claim_binding,
+            "observer_ready": ready_binding,
+            "status": status,
+            "failure": failure,
+            "samples": samples,
+            "progress_samples": (
+                {
+                    "path": str(progress_path.resolve()),
+                    "sha256": sha256_file(progress_path),
+                }
+                if progress_path.is_file()
+                else None
+            ),
+            "resource_guard": resource_guard_summary,
+            "controller_terminal": controller_terminal_binding,
+            "controller_process_exit": process_exit_binding,
+            "observer_stop": observer_stop_binding,
+            "completed_at": _utc_now(),
+        }
+        terminal["observer_terminal_sha256"] = canonical_digest(
+            terminal, "observer_terminal_sha256"
+        )
+        publish_exclusive_json(terminal_path, terminal)
+        if wrapper_claim_sha256 is not None:
+            _hold_preflight_observer_for_wrapper_close()
+    return {
+        "path": str(progress_path.resolve()),
+        "sha256": sha256_file(progress_path),
+        "samples": samples,
+    }
+
+
+def _run_gpu_monitor(
     policy: Mapping[str, Any],
     paths: Mapping[str, Path],
     target: str,
@@ -2967,6 +5157,20 @@ def _run_monitor(
         )
         publish_exclusive_json(terminal_path, terminal)
     return {"path": str(path.resolve()), "sha256": sha256_file(path), "samples": samples}
+
+
+def _run_monitor(
+    policy: Mapping[str, Any],
+    paths: Mapping[str, Path],
+    target: str,
+) -> dict[str, Any]:
+    if target == "preflight":
+        return _run_preflight_monitor(policy, paths)
+    if target not in {"smoke8", "screen512"}:
+        raise CanonicalScreeningError(
+            "resource monitor target is invalid"
+        )
+    return _run_gpu_monitor(policy, paths, target)
 
 
 def _swap_pages() -> tuple[int, int]:
@@ -4345,6 +6549,7 @@ def _run_gpu_phase(
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    _publish_preflight_observer_bootstrap_from_environment()
     config = _root(args.config)
     campaign_root = _root(args.campaign_root)
     try:
@@ -4478,11 +6683,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         request_paths = write_preflight_requests(
             plan, paths["preflight_requests"]
         )
+        request_manifest = _build_preflight_request_manifest(
+            policy, paths, plan, request_paths
+        )
         print(
             json.dumps(
                 {
                     "checkpoint_plan": str(paths["checkpoint_plan"]),
                     "preflight_requests": len(request_paths),
+                    "preflight_request_manifest": {
+                        "path": str(
+                            paths["preflight_request_manifest"].resolve()
+                        ),
+                        "sha256": sha256_file(
+                            paths["preflight_request_manifest"]
+                        ),
+                        "canonical_sha256": request_manifest[
+                            "preflight_request_manifest_sha256"
+                        ],
+                    },
                     "counts": plan["counts"],
                 },
                 sort_keys=True,
