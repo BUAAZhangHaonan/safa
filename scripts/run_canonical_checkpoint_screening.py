@@ -102,6 +102,8 @@ def _paths(campaign_root: Path, policy_sha256: str) -> dict[str, Path]:
         "admissions": policy_root / "admissions",
         "summaries": policy_root / "summaries",
         "preflight_control": policy_root / "preflight_control",
+        "gpu_control": policy_root / "gpu_control",
+        "request_intents": policy_root / "request_intents",
     }
 
 
@@ -445,6 +447,7 @@ class RuntimeResourceGuard:
         self._lock = threading.Lock()
         self._thread_failure: BaseException | None = None
         self._started = False
+        self._first_sample = threading.Event()
 
     def start(self) -> None:
         self._thread.start()
@@ -554,10 +557,36 @@ class RuntimeResourceGuard:
                     canonical_json(sample)
                 ).hexdigest()
                 _append_jsonl(self.sample_path, sample)
+                self._first_sample.set()
                 previous_swap = current_swap
         except BaseException as exc:
             with self._lock:
                 self._thread_failure = exc
+            self._first_sample.set()
+
+    def wait_first_sample(self, timeout_seconds: float) -> dict[str, Any]:
+        if not self._started:
+            raise CanonicalScreeningError("runtime resource guard is not started")
+        if not self._first_sample.wait(timeout_seconds):
+            raise CanonicalScreeningError(
+                "runtime resource guard first sample timed out"
+            )
+        self.raise_if_violated()
+        rows = load_jsonl(self.sample_path, "runtime resource guard samples")
+        first = rows[0]
+        if (
+            first.get("contract_type")
+            != "safa_canonical_runtime_resource_window_v1"
+            or first.get("policy_sha256") != self.policy_sha256
+            or first.get("sequence") != 1
+            or first.get("violated") is not False
+            or first.get("resource_window_sha256")
+            != canonical_digest(first, "resource_window_sha256")
+        ):
+            raise CanonicalScreeningError(
+                "runtime resource guard first sample contract mismatch"
+            )
+        return first
 
     def raise_if_violated(self) -> None:
         with self._lock:
@@ -632,6 +661,498 @@ def _write_admission(
         "sha256": sha256_file(path),
         "canonical_sha256": value["admission_sha256"],
     }
+
+
+def _artifact_binding(path: Path, canonical_sha256: str) -> dict[str, str]:
+    if not path.is_file():
+        raise CanonicalScreeningError(f"bound artifact does not exist: {path}")
+    return {
+        "path": str(path.resolve()),
+        "sha256": sha256_file(path),
+        "canonical_sha256": canonical_sha256,
+    }
+
+
+def _validate_json_artifact_binding(
+    binding: Mapping[str, Any], label: str, digest_field: str
+) -> dict[str, Any]:
+    if set(binding) != {"path", "sha256", "canonical_sha256"}:
+        raise CanonicalScreeningError(f"{label} binding fields differ")
+    path = Path(str(binding["path"])).resolve()
+    if not path.is_file() or sha256_file(path) != binding["sha256"]:
+        raise CanonicalScreeningError(f"{label} file binding mismatch")
+    value = load_json(path, label)
+    if (
+        value.get(digest_field) != binding["canonical_sha256"]
+        or canonical_digest(value, digest_field) != binding["canonical_sha256"]
+    ):
+        raise CanonicalScreeningError(f"{label} canonical binding mismatch")
+    return value
+
+
+def _gpu_phase_control(paths: Mapping[str, Path], phase: str) -> Path:
+    if phase not in {"smoke8", "screen512"}:
+        raise CanonicalScreeningError("GPU control phase is invalid")
+    return paths["gpu_control"] / phase
+
+
+def _write_gpu_controller_claim(
+    policy: Mapping[str, Any],
+    paths: Mapping[str, Path],
+    phase: str,
+) -> tuple[dict[str, Any], Path]:
+    claim = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_gpu_controller_claim_v1",
+        "campaign_id": policy["campaign_id"],
+        "phase": phase,
+        "policy_sha256": policy["policy_sha256"],
+        "controller_pid": os.getpid(),
+        "started_at": _utc_now(),
+    }
+    claim["controller_claim_sha256"] = canonical_digest(
+        claim, "controller_claim_sha256"
+    )
+    path = _gpu_phase_control(paths, phase) / "controller_claim.json"
+    write_exclusive_json(path, claim)
+    return claim, path
+
+
+def _write_gpu_controller_terminal(
+    policy: Mapping[str, Any],
+    paths: Mapping[str, Path],
+    phase: str,
+    claim: Mapping[str, Any],
+    *,
+    status: str,
+    stage: str,
+    failure: Mapping[str, Any] | None,
+    controller_ready: Mapping[str, str] | None,
+    observer_ready: Mapping[str, str] | None,
+    runtime_resource_guard: Mapping[str, Any] | None,
+) -> Path:
+    if status not in {"completed", "failed"}:
+        raise CanonicalScreeningError("GPU controller terminal status is invalid")
+    terminal = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_gpu_controller_terminal_v1",
+        "campaign_id": policy["campaign_id"],
+        "phase": phase,
+        "policy_sha256": policy["policy_sha256"],
+        "controller_claim_sha256": claim["controller_claim_sha256"],
+        "status": status,
+        "stage": stage,
+        "failure": None if failure is None else dict(failure),
+        "controller_ready": controller_ready,
+        "observer_ready": observer_ready,
+        "runtime_resource_guard": (
+            None if runtime_resource_guard is None else dict(runtime_resource_guard)
+        ),
+        "completed_at": _utc_now(),
+    }
+    terminal["controller_terminal_sha256"] = canonical_digest(
+        terminal, "controller_terminal_sha256"
+    )
+    path = _gpu_phase_control(paths, phase) / "controller_terminal.json"
+    write_exclusive_json(path, terminal)
+    return path
+
+
+def _write_request_intent_manifest(
+    policy: Mapping[str, Any],
+    paths: Mapping[str, Path],
+    phase: str,
+    replicates: Sequence[str],
+    candidate_manifest: Mapping[str, Any],
+    admission: Mapping[str, Any],
+) -> tuple[dict[str, Any], Path]:
+    rows = []
+    for replicate in replicates:
+        for candidate in candidate_manifest["candidates"]:
+            rows.append(
+                {
+                    "sequence": len(rows) + 1,
+                    "candidate_id": candidate["candidate_id"],
+                    "checkpoint_sha256": candidate["checkpoint_sha256"],
+                    "checkpoint_model": candidate["checkpoint_model"],
+                    "mode": phase,
+                    "replicate": replicate,
+                    "sample_count": 8 if phase == "smoke8" else 512,
+                    "seed": 4549,
+                    "batch_size": 2,
+                    "admission_sha256": admission["canonical_sha256"],
+                }
+            )
+    value = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_run_request_intent_manifest_v1",
+        "campaign_id": policy["campaign_id"],
+        "phase": phase,
+        "replicates": list(replicates),
+        "policy_sha256": policy["policy_sha256"],
+        "admission_sha256": admission["canonical_sha256"],
+        "candidate_manifest_sha256": candidate_manifest[
+            "candidate_manifest_sha256"
+        ],
+        "request_count": len(rows),
+        "requests": rows,
+    }
+    value["request_intent_manifest_sha256"] = canonical_digest(
+        value, "request_intent_manifest_sha256"
+    )
+    path = (
+        paths["request_intents"]
+        / phase
+        / "request_intent_manifest.json"
+    )
+    write_exclusive_json(path, value)
+    return value, path
+
+
+def _validate_final_requests_against_intents(
+    request_paths: Sequence[Path],
+    intent_manifest: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    controller_ready: Mapping[str, Any],
+    observer_ready: Mapping[str, Any],
+) -> None:
+    intents = {
+        (row["candidate_id"], row["replicate"]): row
+        for row in intent_manifest["requests"]
+    }
+    if len(intents) != intent_manifest["request_count"]:
+        raise CanonicalScreeningError(
+            "immutable request intents contain duplicate logical requests"
+        )
+    observed: set[tuple[str, str]] = set()
+    for request_path in request_paths:
+        request = validate_run_request(
+            load_json(request_path, "barrier-bound run request"), policy
+        )
+        key = (request["candidate"]["candidate_id"], request["replicate"])
+        intent = intents.get(key)
+        if intent is None or key in observed:
+            raise CanonicalScreeningError(
+                "final run request set differs from immutable intents"
+            )
+        observed.add(key)
+        if (
+            request["candidate"]["checkpoint_sha256"]
+            != intent["checkpoint_sha256"]
+            or request["candidate"]["checkpoint_model"]
+            != intent["checkpoint_model"]
+            or request["mode"] != intent["mode"]
+            or request["sample_count"] != intent["sample_count"]
+            or request["seed"] != intent["seed"]
+            or request["batch_size"] != intent["batch_size"]
+            or request["admission"]["canonical_sha256"]
+            != intent["admission_sha256"]
+            or request["controller_ready"] != controller_ready
+            or request["observer_ready"] != observer_ready
+        ):
+            raise CanonicalScreeningError(
+                "final run request fields differ from immutable intent"
+            )
+    if observed != set(intents):
+        raise CanonicalScreeningError(
+            "final run request coverage differs from immutable intents"
+        )
+
+
+def _validate_monitor_sample(
+    sample: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    phase: str,
+    admission: Mapping[str, Any],
+    *,
+    terminal: bool,
+) -> dict[str, Any]:
+    value = dict(sample)
+    if (
+        value.get("contract_type")
+        != "safa_canonical_resource_monitor_sample_v1"
+        or value.get("policy_sha256") != policy["policy_sha256"]
+        or value.get("phase") != phase
+        or value.get("terminal") is not terminal
+        or value.get("monitor_sample_sha256")
+        != canonical_digest(value, "monitor_sample_sha256")
+        or value.get("gpu_binding", {}).get("admission_sha256")
+        != admission["canonical_sha256"]
+    ):
+        raise CanonicalScreeningError("resource monitor sample contract mismatch")
+    return value
+
+
+def _write_gpu_resource_recheck(
+    policy: Mapping[str, Any],
+    paths: Mapping[str, Path],
+    phase: str,
+    admission: Mapping[str, Any],
+    first_guard_sample: Mapping[str, Any],
+) -> tuple[dict[str, Any], Path]:
+    snapshot = assert_resource_admission(
+        policy, paths["root"], require_idle_gpus=True
+    )
+    admission_value = load_json(Path(str(admission["path"])), "resource admission")
+    original = admission_value["snapshot"]
+    if (
+        snapshot["authorized_gpu_registry"]
+        != original["authorized_gpu_registry"]
+        or snapshot["compute_processes"] != []
+        or any(gpu["temperature_c"] > 85 for gpu in snapshot["gpus"])
+        or first_guard_sample.get("violated") is not False
+        or first_guard_sample.get("swap_consecutive_io") != 0
+    ):
+        raise CanonicalScreeningError("GPU resource recheck differs from admission")
+    value = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_gpu_resource_recheck_v1",
+        "campaign_id": policy["campaign_id"],
+        "phase": phase,
+        "policy_sha256": policy["policy_sha256"],
+        "admission_sha256": admission["canonical_sha256"],
+        "snapshot": snapshot,
+        "first_guard_sample_sha256": first_guard_sample[
+            "resource_window_sha256"
+        ],
+        "completed_at": _utc_now(),
+    }
+    value["resource_recheck_sha256"] = canonical_digest(
+        value, "resource_recheck_sha256"
+    )
+    path = _gpu_phase_control(paths, phase) / "resource_recheck.json"
+    write_exclusive_json(path, value)
+    return value, path
+
+
+def _write_controller_ready(
+    policy: Mapping[str, Any],
+    paths: Mapping[str, Path],
+    phase: str,
+    claim: Mapping[str, Any],
+    admission: Mapping[str, Any],
+    intent_manifest: Mapping[str, Any],
+    intent_path: Path,
+    internal_monitor_sample: Mapping[str, Any],
+    internal_monitor_path: Path,
+    first_guard_sample: Mapping[str, Any],
+    guard_path: Path,
+    recheck: Mapping[str, Any],
+    recheck_path: Path,
+    claim_path: Path,
+) -> tuple[dict[str, Any], Path, dict[str, str]]:
+    value = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_gpu_controller_ready_v1",
+        "campaign_id": policy["campaign_id"],
+        "phase": phase,
+        "policy_sha256": policy["policy_sha256"],
+        "admission_sha256": admission["canonical_sha256"],
+        "controller_claim_sha256": claim["controller_claim_sha256"],
+        "controller_claim": _artifact_binding(
+            claim_path, claim["controller_claim_sha256"]
+        ),
+        "admission": dict(admission),
+        "request_count": intent_manifest["request_count"],
+        "request_intent_manifest": _artifact_binding(
+            intent_path, intent_manifest["request_intent_manifest_sha256"]
+        ),
+        "internal_monitor": _artifact_binding(
+            internal_monitor_path,
+            internal_monitor_sample["monitor_sample_sha256"],
+        ),
+        "runtime_guard_first_sample": _artifact_binding(
+            guard_path, first_guard_sample["resource_window_sha256"]
+        ),
+        "resource_recheck": _artifact_binding(
+            recheck_path, recheck["resource_recheck_sha256"]
+        ),
+        "ready_at": _utc_now(),
+    }
+    value["controller_ready_sha256"] = canonical_digest(
+        value, "controller_ready_sha256"
+    )
+    path = _gpu_phase_control(paths, phase) / "controller_ready.json"
+    write_exclusive_json(path, value)
+    binding = _artifact_binding(path, value["controller_ready_sha256"])
+    return value, path, binding
+
+
+def _validate_controller_ready(
+    ready: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    phase: str,
+    admission: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    value = dict(ready)
+    if (
+        value.get("contract_type") != "safa_canonical_gpu_controller_ready_v1"
+        or value.get("campaign_id") != policy["campaign_id"]
+        or value.get("phase") != phase
+        or value.get("policy_sha256") != policy["policy_sha256"]
+        or value.get("controller_ready_sha256")
+        != canonical_digest(value, "controller_ready_sha256")
+        or value.get("request_count") != (386 if phase == "smoke8" else 193)
+        or (
+            admission is not None
+            and value.get("admission_sha256") != admission["canonical_sha256"]
+        )
+    ):
+        raise CanonicalScreeningError("controller ready contract mismatch")
+    for field, digest_field in {
+        "controller_claim": "controller_claim_sha256",
+        "admission": "admission_sha256",
+        "request_intent_manifest": "request_intent_manifest_sha256",
+        "internal_monitor": "monitor_sample_sha256",
+        "runtime_guard_first_sample": "resource_window_sha256",
+        "resource_recheck": "resource_recheck_sha256",
+    }.items():
+        if not isinstance(value.get(field), Mapping):
+            raise CanonicalScreeningError(
+                f"controller ready omits {field} binding"
+            )
+        _validate_json_artifact_binding(
+            value[field], f"controller ready {field}", digest_field
+        )
+    if (
+        value["controller_claim"]["canonical_sha256"]
+        != value["controller_claim_sha256"]
+        or value["admission"]["canonical_sha256"]
+        != value["admission_sha256"]
+    ):
+        raise CanonicalScreeningError("controller ready primary binding mismatch")
+    return value
+
+
+def _validate_observer_ready(
+    ready: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    phase: str,
+    controller_ready: Mapping[str, Any],
+    admission: Mapping[str, Any],
+) -> dict[str, Any]:
+    value = dict(ready)
+    if (
+        value.get("contract_type") != "safa_canonical_gpu_observer_ready_v1"
+        or value.get("campaign_id") != policy["campaign_id"]
+        or value.get("phase") != phase
+        or value.get("policy_sha256") != policy["policy_sha256"]
+        or value.get("admission_sha256") != admission["canonical_sha256"]
+        or value.get("controller_ready_sha256")
+        != controller_ready["controller_ready_sha256"]
+        or value.get("observer_ready_sha256")
+        != canonical_digest(value, "observer_ready_sha256")
+    ):
+        raise CanonicalScreeningError("observer ready contract mismatch")
+    for field, digest_field in {
+        "observer_claim": "observer_claim_sha256",
+        "controller_ready": "controller_ready_sha256",
+        "admission": "admission_sha256",
+        "first_observer_sample": "monitor_sample_sha256",
+    }.items():
+        if not isinstance(value.get(field), Mapping):
+            raise CanonicalScreeningError(
+                f"observer ready omits {field} binding"
+            )
+        _validate_json_artifact_binding(
+            value[field], f"observer ready {field}", digest_field
+        )
+    if (
+        value["observer_claim"]["canonical_sha256"]
+        != value["observer_claim_sha256"]
+        or value["controller_ready"]["canonical_sha256"]
+        != value["controller_ready_sha256"]
+        or value["admission"]["canonical_sha256"]
+        != value["admission_sha256"]
+    ):
+        raise CanonicalScreeningError("observer ready primary binding mismatch")
+    return value
+
+
+def _wait_observer_ready(
+    policy: Mapping[str, Any],
+    paths: Mapping[str, Path],
+    phase: str,
+    controller_ready: Mapping[str, Any],
+    admission: Mapping[str, Any],
+    *,
+    timeout_seconds: float,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    path = _gpu_phase_control(paths, phase) / "observer_ready.json"
+    deadline = time.monotonic() + timeout_seconds
+    while not path.is_file():
+        if time.monotonic() >= deadline:
+            raise CanonicalScreeningError("observer ready barrier timed out")
+        time.sleep(0.1)
+    value = _validate_observer_ready(
+        load_json(path, "observer ready"),
+        policy,
+        phase,
+        controller_ready,
+        admission,
+    )
+    return value, _artifact_binding(path, value["observer_ready_sha256"])
+
+
+def _assert_observer_live(
+    policy: Mapping[str, Any],
+    paths: Mapping[str, Path],
+    phase: str,
+    observer_ready: Mapping[str, Any],
+) -> None:
+    ready_path = Path(str(observer_ready["path"])).resolve()
+    if (
+        not ready_path.is_file()
+        or sha256_file(ready_path) != observer_ready["sha256"]
+    ):
+        raise CanonicalScreeningError("observer ready file changed after release")
+    ready = load_json(ready_path, "observer ready liveness binding")
+    observer_path = paths["logs"] / f"{phase}__observer.jsonl"
+    rows = load_jsonl(observer_path, "observer heartbeat samples")
+    if not rows:
+        raise CanonicalScreeningError("external observer heartbeat is absent")
+    latest = _validate_monitor_sample(
+        rows[-1],
+        policy,
+        phase,
+        ready["admission"],
+        terminal=False,
+    )
+    try:
+        completed_at = datetime.fromisoformat(str(latest["observed_at"]))
+    except (KeyError, ValueError) as exc:
+        raise CanonicalScreeningError(
+            "external observer heartbeat timestamp is invalid"
+        ) from exc
+    heartbeat_age = (datetime.now(timezone.utc) - completed_at).total_seconds()
+    heartbeat_limit = max(
+        30.0, 3.0 * float(policy["resources"]["resource_poll_seconds"])
+    )
+    if heartbeat_age < 0 or heartbeat_age > heartbeat_limit:
+        raise CanonicalScreeningError(
+            "external observer heartbeat is stale: "
+            f"age={heartbeat_age:.2f}s, limit={heartbeat_limit:.2f}s"
+        )
+    terminal_path = _gpu_phase_control(paths, phase) / "observer_terminal.json"
+    if terminal_path.exists():
+        terminal = load_json(terminal_path, "observer terminal")
+        raise CanonicalScreeningError(
+            "external observer terminated before controller: "
+            f"status={terminal.get('status')}, failure={terminal.get('failure')}"
+        )
+    session = f"safa-screening-{phase}-monitor"
+    alive = (
+        subprocess.run(
+            ["tmux", "has-session", "-t", session],
+            capture_output=True,
+            text=True,
+        ).returncode
+        == 0
+    )
+    if not alive:
+        raise CanonicalScreeningError(
+            "external observer tmux died after ready release"
+        )
 
 
 def _load_preflight_request(
@@ -930,6 +1451,8 @@ def _write_run_requests(
     mode: str,
     replicate: str,
     admission: Mapping[str, Any],
+    controller_ready: Mapping[str, Any],
+    observer_ready: Mapping[str, Any],
 ) -> list[Path]:
     request_root = paths["run_requests"] / f"{mode}_{replicate}"
     written: list[Path] = []
@@ -943,6 +1466,8 @@ def _write_run_requests(
         replicate,
         paths["runs"],
         admission,
+        controller_ready,
+        observer_ready,
     ):
         validate_run_request(request, policy)
         path = request_root / f"{request['candidate']['candidate_id']}.json"
@@ -1184,19 +1709,6 @@ def _tmux_commands(
 ) -> dict[str, list[str]]:
     python = str(policy["python"])
     script = str(Path(__file__).resolve())
-    controller_invocation = " ".join(
-        [
-            python,
-            script,
-            "--config",
-            str(config.resolve()),
-            "--campaign-root",
-            str(campaign_root.resolve()),
-            "--phase",
-            phase,
-            "--execute",
-        ]
-    )
     if phase == "preflight":
         controller = [
             "tmux",
@@ -1219,6 +1731,28 @@ def _tmux_commands(
             "--python",
             python,
         ]
+        monitor = [
+            "tmux",
+            "new-session",
+            "-d",
+            "-s",
+            "safa-screening-preflight-monitor",
+            " ".join(
+                [
+                    python,
+                    script,
+                    "--config",
+                    str(config.resolve()),
+                    "--campaign-root",
+                    str(campaign_root.resolve()),
+                    "--phase",
+                    "monitor",
+                    "--monitor-target",
+                    "preflight",
+                    "--execute",
+                ]
+            ),
+        ]
     else:
         controller = [
             "tmux",
@@ -1226,30 +1760,24 @@ def _tmux_commands(
             "-d",
             "-s",
             f"safa-screening-{phase}-controller",
-            controller_invocation,
+            "-c",
+            str(REPO_ROOT),
+            python,
+            str(REPO_ROOT / "scripts/run_canonical_gpu_wrapper.py"),
+            "--repo-root",
+            str(REPO_ROOT),
+            "--config",
+            str(config.resolve()),
+            "--campaign-root",
+            str(campaign_root.resolve()),
+            "--policy-sha256",
+            str(policy["policy_sha256"]),
+            "--phase",
+            phase,
+            "--python",
+            python,
         ]
-    monitor = [
-        "tmux",
-        "new-session",
-        "-d",
-        "-s",
-        f"safa-screening-{phase}-monitor",
-        " ".join(
-            [
-                python,
-                script,
-                "--config",
-                str(config.resolve()),
-                "--campaign-root",
-                str(campaign_root.resolve()),
-                "--phase",
-                "monitor",
-                "--monitor-target",
-                phase,
-                "--execute",
-            ]
-        ),
-    ]
+        monitor = []
     return {"controller": controller, "monitor": monitor}
 
 
@@ -1261,20 +1789,179 @@ def _run_monitor(
     if "TMUX" not in os.environ:
         raise CanonicalScreeningError("resource monitor must run inside tmux")
     controller_session = f"safa-screening-{target}-controller"
+    control = _gpu_phase_control(paths, target)
+    claim = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_gpu_observer_claim_v1",
+        "campaign_id": policy["campaign_id"],
+        "phase": target,
+        "policy_sha256": policy["policy_sha256"],
+        "observer_pid": os.getpid(),
+        "started_at": _utc_now(),
+    }
+    claim["observer_claim_sha256"] = canonical_digest(
+        claim, "observer_claim_sha256"
+    )
+    claim_path = control / "observer_claim.json"
+    write_exclusive_json(claim_path, claim)
     path = paths["logs"] / f"{target}__observer.jsonl"
+    terminal_path = control / "observer_terminal.json"
     samples = 0
-    while True:
+    status = "failed"
+    failure: dict[str, str] | None = None
+    ready_binding: dict[str, str] | None = None
+    try:
         exists = subprocess.run(
             ["tmux", "has-session", "-t", controller_session],
             capture_output=True,
             text=True,
         ).returncode == 0
-        sample = _monitor_sample(policy, paths, target, terminal=not exists)
-        _append_jsonl(path, sample)
-        samples += 1
         if not exists:
-            break
-        time.sleep(30)
+            raise CanonicalScreeningError(
+                "observer refuses to start without the controller session"
+            )
+        admission_paths = sorted(paths["admissions"].glob(f"{target}__*.json"))
+        if len(admission_paths) != 1:
+            raise CanonicalScreeningError(
+                "observer requires exactly one current-phase admission"
+            )
+        admission_path = admission_paths[0]
+        admission_value = load_json(admission_path, "observer admission")
+        admission = _artifact_binding(
+            admission_path, admission_value["admission_sha256"]
+        )
+        controller_ready_path = control / "controller_ready.json"
+        controller_ready = _validate_controller_ready(
+            load_json(controller_ready_path, "controller ready"),
+            policy,
+            target,
+            admission,
+        )
+        first = _validate_monitor_sample(
+            _monitor_sample(
+                policy,
+                paths,
+                target,
+                terminal=False,
+                admission=admission,
+            ),
+            policy,
+            target,
+            admission,
+            terminal=False,
+        )
+        _append_jsonl(path, first)
+        samples += 1
+        first_sample_path = control / "observer_first_sample.json"
+        write_exclusive_json(first_sample_path, first)
+        ready = {
+            "schema_version": 1,
+            "contract_type": "safa_canonical_gpu_observer_ready_v1",
+            "campaign_id": policy["campaign_id"],
+            "phase": target,
+            "policy_sha256": policy["policy_sha256"],
+            "admission_sha256": admission["canonical_sha256"],
+            "controller_ready_sha256": controller_ready[
+                "controller_ready_sha256"
+            ],
+            "observer_claim_sha256": claim["observer_claim_sha256"],
+            "observer_claim": _artifact_binding(
+                claim_path, claim["observer_claim_sha256"]
+            ),
+            "controller_ready": _artifact_binding(
+                controller_ready_path,
+                controller_ready["controller_ready_sha256"],
+            ),
+            "admission": dict(admission),
+            "first_observer_sample": _artifact_binding(
+                first_sample_path, first["monitor_sample_sha256"]
+            ),
+            "ready_at": _utc_now(),
+        }
+        ready["observer_ready_sha256"] = canonical_digest(
+            ready, "observer_ready_sha256"
+        )
+        ready_path = control / "observer_ready.json"
+        write_exclusive_json(ready_path, ready)
+        ready_binding = _artifact_binding(
+            ready_path, ready["observer_ready_sha256"]
+        )
+        controller_terminal_path = control / "controller_terminal.json"
+        controller_process_exit_path = control / "controller_process_exit.json"
+        while True:
+            time.sleep(float(policy["resources"]["resource_poll_seconds"]))
+            controller_alive = subprocess.run(
+                ["tmux", "has-session", "-t", controller_session],
+                capture_output=True,
+                text=True,
+            ).returncode == 0
+            terminal_exists = controller_terminal_path.is_file()
+            process_exited = controller_process_exit_path.is_file()
+            if not controller_alive and not terminal_exists:
+                raise CanonicalScreeningError(
+                    "controller disappeared without a durable terminal"
+                )
+            if process_exited and not terminal_exists:
+                raise CanonicalScreeningError(
+                    "controller process exited without a durable terminal"
+                )
+            if terminal_exists:
+                controller_terminal = load_json(
+                    controller_terminal_path, "GPU controller terminal"
+                )
+                if (
+                    controller_terminal.get("contract_type")
+                    != "safa_canonical_gpu_controller_terminal_v1"
+                    or controller_terminal.get("policy_sha256")
+                    != policy["policy_sha256"]
+                    or controller_terminal.get("phase") != target
+                    or controller_terminal.get("controller_terminal_sha256")
+                    != canonical_digest(
+                        controller_terminal, "controller_terminal_sha256"
+                    )
+                ):
+                    raise CanonicalScreeningError(
+                        "observer controller terminal contract mismatch"
+                    )
+            sample = _validate_monitor_sample(
+                _monitor_sample(
+                    policy,
+                    paths,
+                    target,
+                    terminal=terminal_exists,
+                    admission=admission,
+                ),
+                policy,
+                target,
+                admission,
+                terminal=terminal_exists,
+            )
+            _append_jsonl(path, sample)
+            samples += 1
+            if terminal_exists:
+                break
+        status = "completed"
+    except BaseException as exc:
+        failure = {"type": type(exc).__name__, "message": str(exc)}
+        raise
+    finally:
+        terminal = {
+            "schema_version": 1,
+            "contract_type": "safa_canonical_gpu_observer_terminal_v1",
+            "campaign_id": policy["campaign_id"],
+            "phase": target,
+            "policy_sha256": policy["policy_sha256"],
+            "observer_claim_sha256": claim["observer_claim_sha256"],
+            "status": status,
+            "failure": failure,
+            "observer_ready": ready_binding,
+            "samples": samples,
+            "completed_at": _utc_now(),
+        }
+        terminal["observer_terminal_sha256"] = canonical_digest(
+            terminal, "observer_terminal_sha256"
+        )
+        write_exclusive_json(terminal_path, terminal)
     return {"path": str(path.resolve()), "sha256": sha256_file(path), "samples": samples}
 
 
@@ -1304,25 +1991,36 @@ def _append_jsonl(path: Path, value: Mapping[str, Any]) -> None:
 
 
 def _artifact_progress(paths: Mapping[str, Path], phase: str) -> dict[str, int]:
-    roots = {
-        "request_files": paths["run_requests"],
-        "result_files": paths["runs"],
-        "generated_png": paths["runs"],
-        "preflight_requests": paths["preflight_requests"],
-        "preflight_results": paths["preflight_results"],
-    }
-    patterns = {
-        "request_files": "*.json",
-        "result_files": "result.json",
-        "generated_png": "*.png",
-        "preflight_requests": "*.json",
-        "preflight_results": "*.json",
-    }
-    return {
-        name: (
-            sum(1 for _ in root.rglob(patterns[name])) if root.exists() else 0
+    replicates = ("primary", "repeat") if phase == "smoke8" else ("primary",)
+    request_roots = [
+        paths["run_requests"] / f"{phase}_{replicate}" for replicate in replicates
+    ]
+    run_roots = [
+        paths["runs"] / f"{phase}_{replicate}" for replicate in replicates
+    ]
+
+    def count(roots: Sequence[Path], pattern: str) -> int:
+        return sum(
+            1
+            for root in roots
+            if root.exists()
+            for _ in root.rglob(pattern)
         )
-        for name, root in roots.items()
+
+    return {
+        "request_files": count(request_roots, "*.json"),
+        "result_files": count(run_roots, "result.json"),
+        "generated_png": count(run_roots, "*.png"),
+        "preflight_requests": (
+            sum(1 for _ in paths["preflight_requests"].glob("*.json"))
+            if paths["preflight_requests"].exists()
+            else 0
+        ),
+        "preflight_results": (
+            sum(1 for _ in paths["preflight_results"].glob("*.json"))
+            if paths["preflight_results"].exists()
+            else 0
+        ),
     }
 
 
@@ -1400,7 +2098,7 @@ def _monitor_sample(
                     "sha256": sha256_file(path),
                 }
             )
-    return {
+    sample = {
         "schema_version": 1,
         "contract_type": "safa_canonical_resource_monitor_sample_v1",
         "observed_at": _utc_now(),
@@ -1417,6 +2115,10 @@ def _monitor_sample(
         "logs": log_rows,
         "artifacts": _artifact_progress(paths, phase),
     }
+    sample["monitor_sample_sha256"] = canonical_digest(
+        sample, "monitor_sample_sha256"
+    )
+    return sample
 
 
 def _append_monitor_sample(
@@ -1570,6 +2272,174 @@ def _worker_environment(gpu_uuid: str) -> dict[str, str]:
     }
 
 
+def _prepare_gpu_ready_barrier(
+    policy: Mapping[str, Any],
+    config: Path,
+    paths: Mapping[str, Path],
+    phase: str,
+) -> dict[str, Any]:
+    claim, claim_path = _write_gpu_controller_claim(policy, paths, phase)
+    stage = "controller_claim"
+    admission: dict[str, Any] | None = None
+    resource_guard: RuntimeResourceGuard | None = None
+    monitor_path: Path | None = None
+    controller_ready_binding: dict[str, str] | None = None
+    observer_ready_binding: dict[str, str] | None = None
+    try:
+        stage = "startup_admission"
+        admission_snapshot = assert_resource_admission(
+            policy, paths["root"], require_idle_gpus=True
+        )
+        admission = _write_admission(policy, paths, phase, admission_snapshot)
+        stage = "manifest_and_smoke_validation"
+        candidate_manifest = load_json(
+            _candidate_manifest_path(paths, policy), "candidate manifest"
+        )
+        plan_path = Path(str(candidate_manifest["checkpoint_plan"]["path"]))
+        plan = validate_checkpoint_plan(
+            load_json(plan_path, "checkpoint plan"),
+            repo_root=REPO_ROOT,
+            policy=policy,
+            preflight_root=paths["preflight_results"],
+        )
+        validate_candidate_manifest(
+            candidate_manifest,
+            policy=policy,
+            plan=plan,
+            plan_path=plan_path,
+            repo_root=REPO_ROOT,
+            preflight_root=paths["preflight_results"],
+        )
+        if phase == "screen512":
+            _require_smoke_success(policy, candidate_manifest, paths)
+        replicates = ("primary", "repeat") if phase == "smoke8" else ("primary",)
+        stage = "request_intents"
+        intent, intent_path = _write_request_intent_manifest(
+            policy,
+            paths,
+            phase,
+            replicates,
+            candidate_manifest,
+            admission,
+        )
+        stage = "internal_monitor_first_sample"
+        monitor_path = _append_monitor_sample(
+            policy, paths, phase, admission=admission
+        )
+        internal_sample = _validate_monitor_sample(
+            load_jsonl(monitor_path, "internal monitor samples")[0],
+            policy,
+            phase,
+            admission,
+            terminal=False,
+        )
+        internal_sample_path = (
+            _gpu_phase_control(paths, phase) / "internal_monitor_first_sample.json"
+        )
+        write_exclusive_json(internal_sample_path, internal_sample)
+        stage = "runtime_guard_first_sample"
+        guard_path = paths["logs"] / f"{phase}__runtime_resource_windows.jsonl"
+        resource_guard = RuntimeResourceGuard(
+            policy, guard_path, paths["root"].parent
+        )
+        resource_guard.start()
+        first_guard = resource_guard.wait_first_sample(
+            max(30.0, 3.0 * resource_guard.poll_seconds)
+        )
+        first_guard_path = (
+            _gpu_phase_control(paths, phase) / "runtime_guard_first_sample.json"
+        )
+        write_exclusive_json(first_guard_path, first_guard)
+        stage = "resource_recheck"
+        recheck, recheck_path = _write_gpu_resource_recheck(
+            policy, paths, phase, admission, first_guard
+        )
+        stage = "controller_ready"
+        controller_ready, _, controller_ready_binding = _write_controller_ready(
+            policy,
+            paths,
+            phase,
+            claim,
+            admission,
+            intent,
+            intent_path,
+            internal_sample,
+            internal_sample_path,
+            first_guard,
+            first_guard_path,
+            recheck,
+            recheck_path,
+            claim_path,
+        )
+        stage = "observer_ready"
+        observer_ready, observer_ready_binding = _wait_observer_ready(
+            policy,
+            paths,
+            phase,
+            controller_ready,
+            admission,
+            timeout_seconds=180.0,
+        )
+        stage = "final_run_requests"
+        requests: list[Path] = []
+        for replicate in replicates:
+            requests.extend(
+                _write_run_requests(
+                    policy,
+                    config,
+                    candidate_manifest,
+                    paths,
+                    phase,
+                    replicate,
+                    admission,
+                    controller_ready_binding,
+                    observer_ready_binding,
+                )
+            )
+        if len(requests) != intent["request_count"]:
+            raise CanonicalScreeningError(
+                "final run request count differs from immutable intents"
+            )
+        _validate_final_requests_against_intents(
+            requests,
+            intent,
+            policy,
+            controller_ready_binding,
+            observer_ready_binding,
+        )
+        return {
+            "claim": claim,
+            "claim_path": claim_path,
+            "admission_snapshot": admission_snapshot,
+            "admission": admission,
+            "candidate_manifest": candidate_manifest,
+            "requests": requests,
+            "resource_guard": resource_guard,
+            "monitor_path": monitor_path,
+            "controller_ready": controller_ready_binding,
+            "observer_ready": observer_ready_binding,
+        }
+    except BaseException as exc:
+        guard_summary = resource_guard.stop() if resource_guard is not None else None
+        if monitor_path is not None and admission is not None:
+            _append_monitor_sample(
+                policy, paths, phase, terminal=True, admission=admission
+            )
+        _write_gpu_controller_terminal(
+            policy,
+            paths,
+            phase,
+            claim,
+            status="failed",
+            stage=stage,
+            failure={"type": type(exc).__name__, "message": str(exc)},
+            controller_ready=controller_ready_binding,
+            observer_ready=observer_ready_binding,
+            runtime_resource_guard=guard_summary,
+        )
+        raise
+
+
 def _run_gpu_phase(
     policy: Mapping[str, Any],
     config: Path,
@@ -1578,48 +2448,17 @@ def _run_gpu_phase(
 ) -> dict[str, Any]:
     if "TMUX" not in os.environ:
         raise CanonicalScreeningError("GPU screening controller must run inside tmux")
-    admission_snapshot = assert_resource_admission(
-        policy, paths["root"], require_idle_gpus=True
+    barrier = _prepare_gpu_ready_barrier(policy, config, paths, phase)
+    _assert_observer_live(
+        policy, paths, phase, barrier["observer_ready"]
     )
-    admission = _write_admission(policy, paths, phase, admission_snapshot)
+    admission_snapshot = barrier["admission_snapshot"]
+    admission = barrier["admission"]
     gpu_uuid_by_index = {
         row["physical_gpu_index"]: row["physical_gpu_uuid"]
         for row in admission_snapshot["authorized_gpu_registry"]
     }
-    candidate_manifest = load_json(
-        _candidate_manifest_path(paths, policy), "candidate manifest"
-    )
-    plan_path = Path(str(candidate_manifest["checkpoint_plan"]["path"]))
-    plan = validate_checkpoint_plan(
-        load_json(plan_path, "checkpoint plan"),
-        repo_root=REPO_ROOT,
-        policy=policy,
-        preflight_root=paths["preflight_results"],
-    )
-    validate_candidate_manifest(
-        candidate_manifest,
-        policy=policy,
-        plan=plan,
-        plan_path=plan_path,
-        repo_root=REPO_ROOT,
-        preflight_root=paths["preflight_results"],
-    )
-    if phase == "screen512":
-        _require_smoke_success(policy, candidate_manifest, paths)
-    requests: list[Path] = []
-    replicates = ("primary", "repeat") if phase == "smoke8" else ("primary",)
-    for replicate in replicates:
-        requests.extend(
-            _write_run_requests(
-                policy,
-                config,
-                candidate_manifest,
-                paths,
-                phase,
-                replicate,
-                admission,
-            )
-        )
+    requests = list(barrier["requests"])
     gpus = list(policy["resources"]["physical_gpus"])
     capacity = int(policy["resources"]["workers_per_gpu"])
     slots = [(gpu, slot) for gpu in gpus for slot in range(capacity)]
@@ -1631,18 +2470,14 @@ def _run_gpu_phase(
     request_queue = deque(requests)
     stop_reason: str | None = None
     unexpected: BaseException | None = None
-    monitor_path = _append_monitor_sample(
-        policy, paths, phase, admission=admission
-    )
-    resource_guard = RuntimeResourceGuard(
-        policy,
-        paths["logs"] / f"{phase}__runtime_resource_windows.jsonl",
-        paths["root"].parent,
-    )
+    monitor_path = barrier["monitor_path"]
+    resource_guard = barrier["resource_guard"]
     try:
-        resource_guard.start()
         while request_queue or active:
             resource_guard.raise_if_violated()
+            _assert_observer_live(
+                policy, paths, phase, barrier["observer_ready"]
+            )
             while request_queue and slot_pool.free_count:
                 request = request_queue.popleft()
                 gpu, slot_index = slot_pool.acquire()
@@ -1745,6 +2580,15 @@ def _run_gpu_phase(
         _append_monitor_sample(
             policy, paths, phase, terminal=True, admission=admission
         )
+    if not failures and unexpected is None:
+        try:
+            _assert_observer_live(
+                policy, paths, phase, barrier["observer_ready"]
+            )
+        except BaseException as exc:
+            failures.append(f"{type(exc).__name__}: {exc}")
+            unexpected = exc
+            stop_reason = "observer_final_gate"
     if failures:
         stop = {
             "phase": phase,
@@ -1763,6 +2607,25 @@ def _run_gpu_phase(
         ).hexdigest()
         write_exclusive_json(
             paths["summaries"] / f"{phase}__failed.json", stop
+        )
+        _write_gpu_controller_terminal(
+            policy,
+            paths,
+            phase,
+            barrier["claim"],
+            status="failed",
+            stage=stop_reason or "worker_execution",
+            failure={
+                "type": (
+                    type(unexpected).__name__
+                    if unexpected is not None
+                    else "CanonicalScreeningError"
+                ),
+                "message": " | ".join(failures),
+            },
+            controller_ready=barrier["controller_ready"],
+            observer_ready=barrier["observer_ready"],
+            runtime_resource_guard=resource_guard_summary,
         )
         raise CanonicalScreeningError(
             "GPU screening failed without retry or batch change: " + " | ".join(failures)
@@ -1823,6 +2686,18 @@ def _run_gpu_phase(
     ).hexdigest()
     write_exclusive_json(
         paths["summaries"] / f"{phase}__completed.json", summary
+    )
+    _write_gpu_controller_terminal(
+        policy,
+        paths,
+        phase,
+        barrier["claim"],
+        status="completed",
+        stage="completed",
+        failure=None,
+        controller_ready=barrier["controller_ready"],
+        observer_ready=barrier["observer_ready"],
+        runtime_resource_guard=resource_guard_summary,
     )
     return summary
 

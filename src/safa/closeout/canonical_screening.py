@@ -28,6 +28,8 @@ CANDIDATE_MANIFEST_CONTRACT = "safa_canonical_screening_candidate_manifest_v1"
 RUN_REQUEST_CONTRACT = "safa_canonical_screening_run_request_v1"
 RUN_CLAIM_CONTRACT = "safa_canonical_screening_run_claim_v1"
 RUN_RESULT_CONTRACT = "safa_canonical_screening_run_result_v1"
+CONTROLLER_READY_CONTRACT = "safa_canonical_gpu_controller_ready_v1"
+OBSERVER_READY_CONTRACT = "safa_canonical_gpu_observer_ready_v1"
 SCHEMA_VERSION = 1
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 RUN_MODES = {"smoke8": 8, "screen512": 512}
@@ -2684,6 +2686,208 @@ def _validate_4d_supersession_evidence(
     }
 
 
+def _validate_5dbb_supersession_evidence(
+    repo_root: Path, raw_supersedes: Mapping[str, Any]
+) -> dict[str, Any]:
+    supersedes = _require_mapping(raw_supersedes, "5dbb supersession evidence")
+    _require_exact_keys(
+        supersedes,
+        {
+            "policy_sha256",
+            "classification",
+            "supersession_reason",
+            "scientific_result_reuse",
+            "successor_execution",
+            "ram_budget_source_policy_sha256",
+            "counts",
+            "evidence_root",
+            "files",
+            "execution_audit",
+        },
+        "5dbb supersession evidence",
+    )
+    policy_sha = (
+        "5dbb82fdb1c89d8f7afd463a2f0b40743f42abd7b0f07dcefab144a32787c7af"
+    )
+    if {
+        key: supersedes[key]
+        for key in (
+            "policy_sha256",
+            "classification",
+            "supersession_reason",
+            "scientific_result_reuse",
+            "successor_execution",
+            "ram_budget_source_policy_sha256",
+        )
+    } != {
+        "policy_sha256": policy_sha,
+        "classification": (
+            "completed_preflight_and_smoke8_scientific_success_"
+            "execution_barrier_incomplete_superseded"
+        ),
+        "supersession_reason": (
+            "gpu_ready_barrier_and_phase_local_accounting_upgrade"
+        ),
+        "scientific_result_reuse": "forbidden",
+        "successor_execution": "fresh_full_193_preflight_and_smoke8",
+        "ram_budget_source_policy_sha256": (
+            "4d0345b6fc29cc8ec50ddc0255188a466ae78edae2e472fed9deda461cf76cbc"
+        ),
+    }:
+        raise CanonicalScreeningError("5dbb supersession status differs")
+    expected_counts = {
+        "preflight_request_count": 193,
+        "preflight_result_count": 193,
+        "preflight_valid_count": 193,
+        "run_request_count": 386,
+        "run_result_count": 386,
+        "run_claim_count": 386,
+        "per_sample_count": 386,
+        "generated_png_count": 3088,
+        "screen512_request_count": 0,
+    }
+    if supersedes["counts"] != expected_counts:
+        raise CanonicalScreeningError("5dbb evidence counts differ")
+    relative_root = (
+        "artifacts/closeout/historical-canonical-512-v1/by_policy/" + policy_sha
+    )
+    evidence_root = repo_root.resolve() / relative_root
+    evidence = _require_mapping(supersedes["evidence_root"], "5dbb evidence root")
+    _require_tree_without_symlinks(evidence_root, "5dbb evidence root")
+    if (
+        evidence
+        != {
+            "path": relative_root,
+            "digest": (
+                "929210949ed4518f6585cd90eb306b9eb856cfae0821cbcdaab86b371ed66978"
+            ),
+            "digest_algorithm": "sha256_relative_posix_nul_content_nul_v1",
+        }
+        or sha256_directory_tree(evidence_root) != evidence["digest"]
+    ):
+        raise CanonicalScreeningError("5dbb evidence root differs")
+    expected_paths = {
+        "preflight_controller_summary": (
+            relative_root + "/preflight_control/controller_summary.json"
+        ),
+        "preflight_controller_terminal": (
+            relative_root + "/preflight_control/controller_terminal.json"
+        ),
+        "final_plan": (
+            "artifacts/closeout/historical-canonical-512-v1/"
+            "checkpoint_plan_final__5dbb82fdb1c89d8f.json"
+        ),
+        "candidate_manifest": (
+            "artifacts/closeout/historical-canonical-512-v1/"
+            "candidate_manifest__5dbb82fdb1c89d8f.json"
+        ),
+        "smoke_summary": relative_root + "/summaries/smoke8__completed.json",
+        "smoke_admission": (
+            relative_root
+            + "/admissions/smoke8__"
+            "88c500a7256e8f923adf070cc1bdd4271fbedd23d5d71e925e720d35dd4c6870.json"
+        ),
+        "smoke_monitor": relative_root + "/logs/smoke8__monitor.jsonl",
+        "smoke_runtime_guard": (
+            relative_root + "/logs/smoke8__runtime_resource_windows.jsonl"
+        ),
+    }
+    files = _require_mapping(supersedes["files"], "5dbb evidence files")
+    _require_exact_keys(files, set(expected_paths), "5dbb evidence files")
+    if any(files[name].get("path") != path for name, path in expected_paths.items()):
+        raise CanonicalScreeningError("5dbb evidence file identity differs")
+    bound = {
+        name: _validate_bound_file(repo_root, files[name], f"5dbb {name}")
+        for name in expected_paths
+    }
+    preflight_summary = load_json(
+        Path(bound["preflight_controller_summary"]["path"]),
+        "5dbb preflight summary",
+    )
+    preflight_terminal = load_json(
+        Path(bound["preflight_controller_terminal"]["path"]),
+        "5dbb preflight terminal",
+    )
+    plan = load_json(Path(bound["final_plan"]["path"]), "5dbb final plan")
+    manifest = load_json(
+        Path(bound["candidate_manifest"]["path"]), "5dbb candidate manifest"
+    )
+    smoke = load_json(Path(bound["smoke_summary"]["path"]), "5dbb smoke summary")
+    if (
+        preflight_summary.get("policy_sha256") != policy_sha
+        or preflight_summary.get("preflight")
+        != {
+            "completed": 193,
+            "invalid": 0,
+            "request_count": 193,
+            "reused": 0,
+            "valid": 193,
+        }
+        or preflight_terminal.get("status") != "completed"
+        or preflight_terminal.get("failure") is not None
+        or preflight_terminal.get("result_count") != 193
+        or plan.get("checkpoint_plan_sha256")
+        != "ae7de6d768a52915f33ce01b46f60369c22df541e16b166b3df9380c4f9e6f24"
+        or manifest.get("candidate_manifest_sha256")
+        != "c9ee09a9deced912b491e474fc6eff088dfb696b96ce9cbbd8b719f616fabf3c"
+        or manifest.get("candidate_count") != 193
+        or smoke.get("phase") != "smoke8"
+        or smoke.get("request_count") != 386
+        or smoke.get("failures") != []
+        or smoke.get("capability_completion")
+        != {
+            "latent": {"completed_count": 374, "request_count": 374},
+            "pixel": {"completed_count": 12, "request_count": 12},
+        }
+    ):
+        raise CanonicalScreeningError("5dbb terminal semantics differ")
+    observed_counts = {
+        "preflight_request_count": len(
+            list((evidence_root / "checkpoint_preflight/requests").glob("*.json"))
+        ),
+        "preflight_result_count": len(
+            list((evidence_root / "checkpoint_preflight/results").glob("*.json"))
+        ),
+        "preflight_valid_count": preflight_summary["preflight"]["valid"],
+        "run_request_count": len(
+            list((evidence_root / "run_requests").glob("*/*.json"))
+        ),
+        "run_result_count": len(list((evidence_root / "runs").glob("*/*/result.json"))),
+        "run_claim_count": len(list((evidence_root / "runs").glob("*/*/claim.json"))),
+        "per_sample_count": len(
+            list((evidence_root / "runs").glob("*/*/per_sample.jsonl"))
+        ),
+        "generated_png_count": len(
+            list((evidence_root / "runs").glob("*/*/generated/*.png"))
+        ),
+        "screen512_request_count": len(
+            list((evidence_root / "run_requests/screen512_primary").glob("*.json"))
+        ),
+    }
+    if observed_counts != expected_counts:
+        raise CanonicalScreeningError("5dbb filesystem counts differ")
+    audit = supersedes["execution_audit"]
+    if audit != {
+        "smoke_scientific_contract": "completed_and_deterministic",
+        "external_observer_claim": "absent",
+        "external_observer_ready": "absent",
+        "external_observer_samples": "absent",
+        "execution_compliance": "p1_failed",
+        "screen512": "never_started",
+    }:
+        raise CanonicalScreeningError("5dbb execution audit differs")
+    for relative in (
+        "gpu_control/smoke8/observer_claim.json",
+        "gpu_control/smoke8/observer_ready.json",
+        "logs/smoke8__observer.jsonl",
+    ):
+        if (evidence_root / relative).exists():
+            raise CanonicalScreeningError(
+                "5dbb external observer absence evidence differs"
+            )
+    return dict(supersedes)
+
+
 def validate_supersession_evidence(
     repo_root: Path, raw_supersedes: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -2729,6 +2933,11 @@ def validate_supersession_evidence(
         == "4d0345b6fc29cc8ec50ddc0255188a466ae78edae2e472fed9deda461cf76cbc"
     ):
         return _validate_4d_supersession_evidence(repo_root, supersedes)
+    if (
+        supersedes.get("policy_sha256")
+        == "5dbb82fdb1c89d8f7afd463a2f0b40743f42abd7b0f07dcefab144a32787c7af"
+    ):
+        return _validate_5dbb_supersession_evidence(repo_root, supersedes)
     if (
         supersedes.get("policy_sha256")
         == "ea7ae71fd662526b9a45bf3cc6d283884aefc380b292c8f273169a35f42ffc28"
@@ -3585,6 +3794,10 @@ def validate_policy(
                 "probe-required resource policy must not preregister a RAM budget"
             )
     else:
+        ram_budget_predecessor = bound_supersedes.get(
+            "ram_budget_source_policy_sha256",
+            bound_supersedes["policy_sha256"],
+        )
         expected_keys = {
             "physical_gpus",
             "workers_per_gpu",
@@ -3616,9 +3829,7 @@ def validate_policy(
                 root,
                 resources["ram_slot_budget_source"],
                 declared_budget_bytes=resources["ram_slot_budget_bytes"],
-                expected_predecessor_policy_sha256=bound_supersedes[
-                    "policy_sha256"
-                ],
+                expected_predecessor_policy_sha256=ram_budget_predecessor,
             ),
         }
 
@@ -3668,25 +3879,32 @@ def validate_policy(
     )
 
     implementations = _require_mapping(raw["implementations"], "implementations")
-    _require_exact_keys(
-        implementations,
-        {
-            "checkpoint_preflight",
-            "arcface_evaluator",
-            "e0_loader",
-            "canonical_quality",
-            "screening_contracts",
-            "screening_worker",
-            "controller",
-            "ram_probe_launcher",
-            "preflight_wrapper",
-            "generator_sampling",
-            "meanflow_sampling",
-            "latent_codec",
-            "output_contract",
-        },
-        "implementations",
-    )
+    implementation_keys = {
+        "checkpoint_preflight",
+        "arcface_evaluator",
+        "e0_loader",
+        "canonical_quality",
+        "screening_contracts",
+        "screening_worker",
+        "controller",
+        "ram_probe_launcher",
+        "preflight_wrapper",
+        "generator_sampling",
+        "meanflow_sampling",
+        "latent_codec",
+        "output_contract",
+    }
+    if set(implementations) not in (
+        implementation_keys,
+        implementation_keys | {"gpu_wrapper"},
+    ):
+        raise CanonicalScreeningError("implementations keys differ")
+    if (
+        raw["supersedes"].get("policy_sha256")
+        == "5dbb82fdb1c89d8f7afd463a2f0b40743f42abd7b0f07dcefab144a32787c7af"
+        and "gpu_wrapper" not in implementations
+    ):
+        raise CanonicalScreeningError("successor policy omits GPU wrapper binding")
     implementations = {
         name: _validate_bound_file(root, value, f"{name} implementation")
         for name, value in implementations.items()
@@ -4349,6 +4567,8 @@ def build_run_request(
     replicate: str,
     output_root: Path,
     admission: Mapping[str, Any],
+    controller_ready: Mapping[str, Any],
+    observer_ready: Mapping[str, Any],
 ) -> dict[str, Any]:
     if mode not in RUN_MODES:
         raise CanonicalScreeningError(f"unknown screening mode: {mode}")
@@ -4390,6 +4610,8 @@ def build_run_request(
         },
         "implementations": dict(policy["implementations"]),
         "admission": dict(admission),
+        "controller_ready": dict(controller_ready),
+        "observer_ready": dict(observer_ready),
         "authorized_gpu_registry": list(
             admission_snapshot["authorized_gpu_registry"]
         ),
@@ -4446,6 +4668,8 @@ def validate_run_request(
         "policy",
         "implementations",
         "admission",
+        "controller_ready",
+        "observer_ready",
         "authorized_gpu_registry",
         "ram_reservation",
         "candidate_manifest",
@@ -4533,6 +4757,48 @@ def validate_run_request(
         or admission_value.get("policy_sha256") != policy["policy_sha256"]
     ):
         raise CanonicalScreeningError("run request admission contract mismatch")
+    ready_values: dict[str, dict[str, Any]] = {}
+    for field, contract_type, digest_field in (
+        (
+            "controller_ready",
+            CONTROLLER_READY_CONTRACT,
+            "controller_ready_sha256",
+        ),
+        (
+            "observer_ready",
+            OBSERVER_READY_CONTRACT,
+            "observer_ready_sha256",
+        ),
+    ):
+        binding = _require_mapping(value[field], f"{field} binding")
+        _require_exact_keys(
+            binding,
+            {"path", "sha256", "canonical_sha256"},
+            f"{field} binding",
+        )
+        for digest_name in ("sha256", "canonical_sha256"):
+            _require_sha256(binding[digest_name], f"{field} {digest_name}")
+        path = Path(str(binding["path"])).resolve()
+        if not path.is_file() or sha256_file(path) != binding["sha256"]:
+            raise CanonicalScreeningError(f"run request {field} file binding mismatch")
+        ready = load_json(path, field)
+        if (
+            ready.get("contract_type") != contract_type
+            or ready.get("policy_sha256") != policy["policy_sha256"]
+            or ready.get("phase") != value["mode"]
+            or ready.get("admission_sha256") != admission["canonical_sha256"]
+            or ready.get(digest_field) != binding["canonical_sha256"]
+            or canonical_digest(ready, digest_field) != binding["canonical_sha256"]
+        ):
+            raise CanonicalScreeningError(f"run request {field} contract mismatch")
+        ready_values[field] = ready
+    if (
+        ready_values["observer_ready"].get("controller_ready_sha256")
+        != value["controller_ready"]["canonical_sha256"]
+    ):
+        raise CanonicalScreeningError(
+            "run request observer/controller ready binding mismatch"
+        )
     snapshot = _require_mapping(
         admission_value.get("snapshot"), "resource admission snapshot"
     )
@@ -4637,6 +4903,8 @@ def build_run_claim(
         "contract_type": RUN_CLAIM_CONTRACT,
         "run_request_sha256": request["run_request_sha256"],
         "admission_sha256": request["admission"]["canonical_sha256"],
+        "controller_ready_sha256": request["controller_ready"]["canonical_sha256"],
+        "observer_ready_sha256": request["observer_ready"]["canonical_sha256"],
         "physical_gpu_index": gpu_index,
         "physical_gpu_uuid": gpu_uuid,
         "logical_cuda_index": 0,
@@ -4666,6 +4934,8 @@ def validate_run_claim(
             "contract_type",
             "run_request_sha256",
             "admission_sha256",
+            "controller_ready_sha256",
+            "observer_ready_sha256",
             "physical_gpu_index",
             "physical_gpu_uuid",
             "logical_cuda_index",
@@ -4684,6 +4954,10 @@ def validate_run_claim(
         or value["run_request_sha256"] != validated_request["run_request_sha256"]
         or value["admission_sha256"]
         != validated_request["admission"]["canonical_sha256"]
+        or value["controller_ready_sha256"]
+        != validated_request["controller_ready"]["canonical_sha256"]
+        or value["observer_ready_sha256"]
+        != validated_request["observer_ready"]["canonical_sha256"]
         or value["physical_gpu_index"]
         not in policy["resources"]["physical_gpus"]
         or type(value["worker_pid"]) is not int
@@ -4735,6 +5009,8 @@ def build_run_result(
         "contract_type": RUN_RESULT_CONTRACT,
         "run_request_sha256": request["run_request_sha256"],
         "run_claim_sha256": claim["run_claim_sha256"],
+        "controller_ready_sha256": claim["controller_ready_sha256"],
+        "observer_ready_sha256": claim["observer_ready_sha256"],
         "device_binding": {
             "physical_gpu_index": claim["physical_gpu_index"],
             "physical_gpu_uuid": claim["physical_gpu_uuid"],
@@ -4768,6 +5044,8 @@ def validate_run_result(
             "contract_type",
             "run_request_sha256",
             "run_claim_sha256",
+            "controller_ready_sha256",
+            "observer_ready_sha256",
             "device_binding",
             "ram_slot_budget_bytes",
             "status",
@@ -4783,6 +5061,10 @@ def validate_run_result(
         or value["contract_type"] != RUN_RESULT_CONTRACT
         or value["run_request_sha256"] != validated_request["run_request_sha256"]
         or value["run_claim_sha256"] != validated_claim["run_claim_sha256"]
+        or value["controller_ready_sha256"]
+        != validated_claim["controller_ready_sha256"]
+        or value["observer_ready_sha256"]
+        != validated_claim["observer_ready_sha256"]
         or value["device_binding"]
         != {
             "physical_gpu_index": validated_claim["physical_gpu_index"],
@@ -4907,6 +5189,8 @@ def iter_run_requests(
     replicate: str,
     output_root: Path,
     admission: Mapping[str, Any],
+    controller_ready: Mapping[str, Any],
+    observer_ready: Mapping[str, Any],
 ) -> Iterable[dict[str, Any]]:
     for candidate in candidate_manifest.get("candidates", []):
         yield build_run_request(
@@ -4919,4 +5203,6 @@ def iter_run_requests(
             replicate,
             output_root,
             admission,
+            controller_ready,
+            observer_ready,
         )

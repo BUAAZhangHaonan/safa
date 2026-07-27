@@ -42,6 +42,7 @@ from safa.closeout.canonical_screening import (
     write_exclusive_json,
 )
 from safa.closeout.canonical_screening_worker import (
+    _assert_ready_barrier,
     _assert_runtime_cuda_binding,
     _load_arcface_contract,
     _load_source_pixel_batch,
@@ -72,6 +73,15 @@ def _controller_module():
 def _wrapper_module():
     path = Path(__file__).parents[1] / "scripts" / "run_canonical_preflight_wrapper.py"
     spec = importlib.util.spec_from_file_location("canonical_wrapper_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _gpu_wrapper_module():
+    path = Path(__file__).parents[1] / "scripts" / "run_canonical_gpu_wrapper.py"
+    spec = importlib.util.spec_from_file_location("canonical_gpu_wrapper_test", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -583,6 +593,9 @@ def test_candidate_manifest_exactly_binds_validated_plan(tmp_path: Path) -> None
 def _run_fixture(tmp_path: Path, mode: str = "smoke8", replicate: str = "primary"):
     policy, manifest, manifest_path, policy_path, admission, _ = _manifest_fixture(tmp_path)
     candidate = manifest["candidates"][0]
+    controller_ready, observer_ready = _ready_bindings(
+        tmp_path, policy, admission, mode
+    )
     request = build_run_request(
         policy,
         policy_path,
@@ -593,8 +606,51 @@ def _run_fixture(tmp_path: Path, mode: str = "smoke8", replicate: str = "primary
         replicate,
         tmp_path / "runs",
         admission,
+        controller_ready,
+        observer_ready,
     )
     return policy, request
+
+
+def _ready_bindings(
+    tmp_path: Path, policy: dict, admission: dict, mode: str
+) -> tuple[dict, dict]:
+    controller = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_gpu_controller_ready_v1",
+        "campaign_id": policy["campaign_id"],
+        "phase": mode,
+        "policy_sha256": policy["policy_sha256"],
+        "admission_sha256": admission["canonical_sha256"],
+    }
+    controller["controller_ready_sha256"] = canonical_digest(
+        controller, "controller_ready_sha256"
+    )
+    controller_path = tmp_path / "ready" / mode / "controller_ready.json"
+    write_exclusive_json(controller_path, controller)
+    controller_binding = {
+        **_bound(controller_path),
+        "canonical_sha256": controller["controller_ready_sha256"],
+    }
+    observer = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_gpu_observer_ready_v1",
+        "campaign_id": policy["campaign_id"],
+        "phase": mode,
+        "policy_sha256": policy["policy_sha256"],
+        "admission_sha256": admission["canonical_sha256"],
+        "controller_ready_sha256": controller["controller_ready_sha256"],
+    }
+    observer["observer_ready_sha256"] = canonical_digest(
+        observer, "observer_ready_sha256"
+    )
+    observer_path = tmp_path / "ready" / mode / "observer_ready.json"
+    write_exclusive_json(observer_path, observer)
+    observer_binding = {
+        **_bound(observer_path),
+        "canonical_sha256": observer["observer_ready_sha256"],
+    }
+    return controller_binding, observer_binding
 
 
 def _evidence(policy: dict, request: dict) -> dict:
@@ -2207,6 +2263,9 @@ def test_screen512_gate_requires_exact_primary_repeat_smoke(
     )
     paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
     candidate = manifest["candidates"][0]
+    controller_ready, observer_ready = _ready_bindings(
+        tmp_path, policy, admission, "smoke8"
+    )
     baseline_rows = {}
     baseline_results = {}
     for replicate in ("primary", "repeat"):
@@ -2220,6 +2279,8 @@ def test_screen512_gate_requires_exact_primary_repeat_smoke(
             replicate,
             paths["runs"],
             admission,
+            controller_ready,
+            observer_ready,
         )
         request_path = (
             paths["run_requests"]
@@ -3087,7 +3148,7 @@ def test_worker_rejects_truncated_arcface_probe_request() -> None:
         )
 
 
-def test_current_policy_binds_4d_preflight_successful_probe_and_arcface() -> None:
+def test_current_policy_binds_5dbb_preflight_smoke_and_execution_audit() -> None:
     root = Path(__file__).parents[1]
     policy_path = root / "configs/closeout/canonical_screening_512_v1.json"
 
@@ -3095,32 +3156,31 @@ def test_current_policy_binds_4d_preflight_successful_probe_and_arcface() -> Non
 
     supersedes = policy["supersedes"]
     assert supersedes["policy_sha256"] == (
-        "4d0345b6fc29cc8ec50ddc0255188a466ae78edae2e472fed9deda461cf76cbc"
+        "5dbb82fdb1c89d8f7afd463a2f0b40743f42abd7b0f07dcefab144a32787c7af"
     )
     assert supersedes["classification"] == (
-        "completed_preflight_and_successful_resource_only_probe_superseded"
+        "completed_preflight_and_smoke8_scientific_success_"
+        "execution_barrier_incomplete_superseded"
     )
-    assert supersedes["preflight"]["request_count"] == 193
-    assert supersedes["preflight"]["result_count"] == 193
-    assert supersedes["preflight"]["valid_count"] == 193
-    assert supersedes["preflight"]["invalid_count"] == 0
-    assert supersedes["preflight"]["reused_count"] == 0
-    probe = supersedes["successful_ram_probe"]
-    assert probe["classification"] == "successful_resource_measurement_only"
-    assert probe["controller_terminal"] == "absent_by_contract"
-    assert probe["resource_measurement_only"] is True
-    assert probe["scientific_result_reuse"] == "forbidden"
-    assert probe["retry_count"] == 0
-    assert probe["artifact_seal"]["file_count"] == 28
-    assert len(
-        [
-            name
-            for name in probe["artifact_seal"]["files"]
-            if name.endswith(".png")
-        ]
-    ) == 16
+    assert supersedes["counts"]["preflight_request_count"] == 193
+    assert supersedes["counts"]["preflight_result_count"] == 193
+    assert supersedes["counts"]["preflight_valid_count"] == 193
+    assert supersedes["counts"]["run_request_count"] == 386
+    assert supersedes["counts"]["run_result_count"] == 386
+    assert supersedes["counts"]["generated_png_count"] == 3088
+    assert supersedes["counts"]["screen512_request_count"] == 0
+    assert supersedes["execution_audit"]["execution_compliance"] == "p1_failed"
+    assert supersedes["execution_audit"]["external_observer_ready"] == "absent"
+    assert supersedes["execution_audit"]["screen512"] == "never_started"
     assert supersedes["scientific_result_reuse"] == "forbidden"
-    assert supersedes["successor_execution"] == "fresh_full_193_preflight"
+    assert (
+        supersedes["successor_execution"]
+        == "fresh_full_193_preflight_and_smoke8"
+    )
+    assert supersedes["ram_budget_source_policy_sha256"] == (
+        "4d0345b6fc29cc8ec50ddc0255188a466ae78edae2e472fed9deda461cf76cbc"
+    )
+    assert "gpu_wrapper" in policy["implementations"]
 
 
 @pytest.mark.parametrize(
@@ -3130,13 +3190,12 @@ def test_current_policy_binds_4d_preflight_successful_probe_and_arcface() -> Non
         ("reuse", "status differs"),
         ("root_digest", "evidence root differs"),
         ("preflight_path_alias", "file identity differs"),
-        ("probe_root_digest", "artifact tree differs"),
-        ("probe_file_sha", "file differs"),
-        ("controller_terminal", "artifact tree differs"),
-        ("resource_only", "probe semantics differ"),
+        ("observer_audit", "execution audit differs"),
+        ("successor", "status differs"),
+        ("ram_lineage", "status differs"),
     ],
 )
-def test_4d_supersession_tampering_fails_closed(
+def test_5dbb_supersession_tampering_fails_closed(
     mutation: str,
     match: str,
 ) -> None:
@@ -3147,29 +3206,21 @@ def test_4d_supersession_tampering_fails_closed(
     )
     supersedes = json.loads(json.dumps(raw["supersedes"]))
     if mutation == "request_count":
-        supersedes["preflight"]["request_count"] = 192
+        supersedes["counts"]["run_request_count"] = 385
     elif mutation == "reuse":
         supersedes["scientific_result_reuse"] = "allowed"
     elif mutation == "root_digest":
-        supersedes["preflight"]["evidence_root"]["digest"] = "0" * 64
+        supersedes["evidence_root"]["digest"] = "0" * 64
     elif mutation == "preflight_path_alias":
-        supersedes["preflight"]["final_plan"]["path"] = supersedes[
-            "preflight"
-        ]["candidate_manifest"]["path"]
-    elif mutation == "probe_root_digest":
-        supersedes["successful_ram_probe"]["artifact_seal"]["root"][
-            "digest"
-        ] = "0" * 64
-    elif mutation == "probe_file_sha":
-        supersedes["successful_ram_probe"]["artifact_seal"]["files"][
-            "admission.json"
-        ] = "0" * 64
-    elif mutation == "controller_terminal":
-        supersedes["successful_ram_probe"]["artifact_seal"][
-            "controller_terminal"
-        ] = "present"
-    elif mutation == "resource_only":
-        supersedes["successful_ram_probe"]["resource_measurement_only"] = False
+        supersedes["files"]["final_plan"]["path"] = supersedes["files"][
+            "candidate_manifest"
+        ]["path"]
+    elif mutation == "observer_audit":
+        supersedes["execution_audit"]["external_observer_ready"] = "present"
+    elif mutation == "successor":
+        supersedes["successor_execution"] = "fresh_full_193_preflight"
+    elif mutation == "ram_lineage":
+        supersedes["ram_budget_source_policy_sha256"] = "0" * 64
     else:
         raise AssertionError(mutation)
 
@@ -3427,3 +3478,541 @@ def test_write_exclusive_json_rejects_overwrite(tmp_path: Path) -> None:
     write_exclusive_json(path, {"value": 1})
     with pytest.raises(FileExistsError):
         write_exclusive_json(path, {"value": 2})
+
+
+def test_gpu_pre_ready_admission_failure_writes_terminal_without_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    policy = {"campaign_id": "fixture", "policy_sha256": "1" * 64}
+    paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
+    monkeypatch.setattr(
+        module,
+        "assert_resource_admission",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            CanonicalScreeningError("fixture admission race")
+        ),
+    )
+    with pytest.raises(CanonicalScreeningError, match="admission race"):
+        module._prepare_gpu_ready_barrier(
+            policy, tmp_path / "policy.json", paths, "screen512"
+        )
+    terminal = load_json(
+        paths["gpu_control"] / "screen512" / "controller_terminal.json",
+        "GPU terminal",
+    )
+    assert terminal["status"] == "failed"
+    assert terminal["stage"] == "startup_admission"
+    assert not paths["run_requests"].exists()
+
+
+def test_observer_ready_timeout_is_bounded_and_writes_no_requests(
+    tmp_path: Path,
+) -> None:
+    module = _controller_module()
+    policy = {"campaign_id": "fixture", "policy_sha256": "2" * 64}
+    paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
+    with pytest.raises(CanonicalScreeningError, match="timed out"):
+        module._wait_observer_ready(
+            policy,
+            paths,
+            "screen512",
+            {"controller_ready_sha256": "3" * 64},
+            {"canonical_sha256": "4" * 64},
+            timeout_seconds=0.01,
+        )
+    assert not paths["run_requests"].exists()
+
+
+def test_duplicate_observer_claim_fails_exclusively(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    policy = {"campaign_id": "fixture", "policy_sha256": "5" * 64}
+    paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
+    claim_path = (
+        paths["gpu_control"] / "smoke8" / "observer_claim.json"
+    )
+    write_exclusive_json(claim_path, {"occupied": True})
+    monkeypatch.setenv("TMUX", "fixture")
+    with pytest.raises(FileExistsError):
+        module._run_monitor(policy, paths, "smoke8")
+
+
+def test_gpu_resource_recheck_rejects_uuid_registry_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    policy = {"campaign_id": "fixture", "policy_sha256": "6" * 64}
+    paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
+    original_snapshot = {
+        "authorized_gpu_registry": [
+            {"physical_gpu_index": 0, "physical_gpu_uuid": _gpu_uuid(0)}
+        ],
+        "compute_processes": [],
+        "gpus": [{"temperature_c": 40}],
+    }
+    admission_value = {
+        "policy_sha256": policy["policy_sha256"],
+        "snapshot": original_snapshot,
+    }
+    admission_value["admission_sha256"] = canonical_digest(
+        admission_value, "admission_sha256"
+    )
+    admission_path = tmp_path / "admission.json"
+    write_exclusive_json(admission_path, admission_value)
+    admission = {
+        **_bound(admission_path),
+        "canonical_sha256": admission_value["admission_sha256"],
+    }
+    raced_snapshot = json.loads(json.dumps(original_snapshot))
+    raced_snapshot["authorized_gpu_registry"][0]["physical_gpu_uuid"] = _gpu_uuid(1)
+    monkeypatch.setattr(
+        module,
+        "assert_resource_admission",
+        lambda *_args, **_kwargs: raced_snapshot,
+    )
+    with pytest.raises(CanonicalScreeningError, match="differs"):
+        module._write_gpu_resource_recheck(
+            policy,
+            paths,
+            "screen512",
+            admission,
+            {
+                "violated": False,
+                "swap_consecutive_io": 0,
+                "resource_window_sha256": "7" * 64,
+            },
+        )
+
+
+def test_final_request_set_rejects_partial_intent_coverage(
+    tmp_path: Path,
+) -> None:
+    module = _controller_module()
+    policy, request = _run_fixture(tmp_path)
+    request_path = tmp_path / "request.json"
+    write_exclusive_json(request_path, request)
+    candidate = request["candidate"]
+    base = {
+        "checkpoint_sha256": candidate["checkpoint_sha256"],
+        "checkpoint_model": candidate["checkpoint_model"],
+        "mode": "smoke8",
+        "sample_count": 8,
+        "seed": 4549,
+        "batch_size": 2,
+        "admission_sha256": request["admission"]["canonical_sha256"],
+    }
+    intents = {
+        "request_count": 2,
+        "requests": [
+            {
+                **base,
+                "candidate_id": candidate["candidate_id"],
+                "replicate": "primary",
+            },
+            {
+                **base,
+                "candidate_id": "missing-candidate",
+                "replicate": "repeat",
+            },
+        ],
+    }
+    with pytest.raises(CanonicalScreeningError, match="coverage"):
+        module._validate_final_requests_against_intents(
+            [request_path],
+            intents,
+            policy,
+            request["controller_ready"],
+            request["observer_ready"],
+        )
+
+
+def test_runtime_guard_first_sample_exposes_monitor_thread_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("config", None)])
+    policy, _, _ = _policy(tmp_path, ledger)
+    monkeypatch.setattr(
+        module,
+        "_cpu_times",
+        lambda: (_ for _ in ()).throw(RuntimeError("fixture thread failure")),
+    )
+    guard = module.RuntimeResourceGuard(
+        policy, tmp_path / "guard.jsonl", tmp_path
+    )
+    guard.start()
+    try:
+        with pytest.raises(CanonicalScreeningError, match="thread failure"):
+            guard.wait_first_sample(1.0)
+    finally:
+        summary = guard.stop()
+    assert summary["thread_failure"]["type"] == "RuntimeError"
+
+
+def test_worker_revalidates_ready_files_before_cuda(
+    tmp_path: Path,
+) -> None:
+    policy, request = _run_fixture(tmp_path)
+    controller_path = Path(request["controller_ready"]["path"])
+    controller_path.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(CanonicalScreeningError, match="file binding"):
+        _assert_ready_barrier(request, policy)
+
+
+def test_gpu_wrapper_records_sigkill_before_controller_claim(
+    tmp_path: Path,
+) -> None:
+    wrapper = _gpu_wrapper_module()
+    config = tmp_path / "policy.json"
+    config.write_text("{}\n", encoding="utf-8")
+    policy_root = tmp_path / "campaign" / "by_policy" / ("8" * 64)
+    value = wrapper.run_wrapped_controller(
+        repo_root=tmp_path,
+        policy_root=policy_root,
+        policy_sha256="8" * 64,
+        config=config,
+        campaign_root=tmp_path / "campaign",
+        phase="screen512",
+        python=sys.executable,
+        command=[
+            sys.executable,
+            "-c",
+            "import os,signal;os.kill(os.getpid(),signal.SIGKILL)",
+        ],
+    )
+    assert value["exit_code"] == 137
+    assert value["signal"] == 9
+    assert value["controller_claim"] is None
+    assert value["controller_terminal"] is None
+    assert load_json(
+        policy_root / "gpu_control/screen512/wrapper_exit.json",
+        "GPU wrapper exit",
+    ) == value
+
+
+def test_gpu_wrapper_validates_observer_terminal_barrier(
+    tmp_path: Path,
+) -> None:
+    wrapper = _gpu_wrapper_module()
+    ready = {
+        "contract_type": "safa_canonical_gpu_observer_ready_v1",
+        "policy_sha256": "9" * 64,
+        "phase": "screen512",
+    }
+    ready["observer_ready_sha256"] = wrapper._canonical_digest(
+        ready, "observer_ready_sha256"
+    )
+    ready_path = tmp_path / "observer_ready.json"
+    wrapper._write_exclusive(ready_path, ready)
+    terminal = {
+        "contract_type": "safa_canonical_gpu_observer_terminal_v1",
+        "policy_sha256": "9" * 64,
+        "phase": "screen512",
+        "status": "completed",
+        "failure": None,
+        "observer_ready": {
+            "path": str(ready_path.resolve()),
+            "sha256": wrapper._sha256_file(ready_path),
+            "canonical_sha256": ready["observer_ready_sha256"],
+        },
+    }
+    terminal["observer_terminal_sha256"] = wrapper._canonical_digest(
+        terminal, "observer_terminal_sha256"
+    )
+    path = tmp_path / "observer_terminal.json"
+    wrapper._write_exclusive(path, terminal)
+    assert (
+        wrapper._wait_observer_terminal(
+            path, "9" * 64, "screen512", timeout_seconds=0.1
+        )
+        == terminal
+    )
+    failed = dict(terminal)
+    failed["status"] = "failed"
+    failed["failure"] = {"type": "RuntimeError", "message": "fixture"}
+    failed["observer_terminal_sha256"] = wrapper._canonical_digest(
+        failed, "observer_terminal_sha256"
+    )
+    failed_path = tmp_path / "failed_observer_terminal.json"
+    wrapper._write_exclusive(failed_path, failed)
+    with pytest.raises(RuntimeError, match="observer terminal contract"):
+        wrapper._wait_observer_terminal(
+            failed_path, "9" * 64, "screen512", timeout_seconds=0.1
+        )
+
+
+def test_gpu_tmux_command_uses_durable_wrapper_and_managed_observer(
+    tmp_path: Path,
+) -> None:
+    module = _controller_module()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("config", None)])
+    policy, policy_path, _ = _policy(tmp_path, ledger)
+    commands = module._tmux_commands(
+        policy, policy_path, tmp_path / "campaign", "screen512"
+    )
+    assert "run_canonical_gpu_wrapper.py" in " ".join(commands["controller"])
+    assert commands["monitor"] == []
+
+
+def test_controller_rejects_observer_death_after_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    policy, request = _run_fixture(tmp_path)
+    paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
+    ready = load_json(Path(request["observer_ready"]["path"]), "observer ready")
+    ready["admission"] = request["admission"]
+    ready["observer_ready_sha256"] = canonical_digest(
+        ready, "observer_ready_sha256"
+    )
+    ready_path = tmp_path / "observer_liveness_ready.json"
+    write_exclusive_json(ready_path, ready)
+    ready_binding = {
+        **_bound(ready_path),
+        "canonical_sha256": ready["observer_ready_sha256"],
+    }
+    admission_value = load_json(
+        Path(request["admission"]["path"]), "liveness admission"
+    )
+    monkeypatch.setattr(
+        module,
+        "_gpu_snapshot",
+        lambda: [
+            {
+                "index": row["physical_gpu_index"],
+                "uuid": row["physical_gpu_uuid"],
+            }
+            for row in admission_value["snapshot"]["authorized_gpu_registry"]
+        ],
+    )
+    monkeypatch.setattr(module, "_cpu_load_percent", lambda: 1.0)
+    monkeypatch.setattr(module, "_memory_percent", lambda: 2.0)
+    monkeypatch.setattr(module, "_disk_percent", lambda *_args: 3.0)
+    monkeypatch.setattr(module, "_swap_pages", lambda: (0, 0))
+    monkeypatch.setattr(module, "_gpu_compute_processes", lambda: [])
+    heartbeat = module._monitor_sample(
+        policy,
+        paths,
+        "smoke8",
+        terminal=False,
+        admission=request["admission"],
+    )
+    assert "observed_at" in heartbeat
+    assert "completed_at" not in heartbeat
+    _write_jsonl(paths["logs"] / "smoke8__observer.jsonl", [heartbeat])
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: types.SimpleNamespace(returncode=1),
+    )
+    with pytest.raises(CanonicalScreeningError, match="observer tmux died"):
+        module._assert_observer_live(
+            policy, paths, "smoke8", ready_binding
+        )
+
+
+def test_controller_has_final_observer_liveness_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("config", None)])
+    policy, policy_path, _ = _policy(tmp_path, ledger)
+    paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
+    monitor_path = tmp_path / "monitor.jsonl"
+    monitor_path.write_text("{}\n", encoding="utf-8")
+    guard = types.SimpleNamespace(
+        raise_if_violated=lambda: None,
+        stop=lambda: {
+            "violation_reason": None,
+            "thread_failure": None,
+        },
+    )
+    registry = [
+        {
+            "physical_gpu_index": index,
+            "physical_gpu_uuid": _gpu_uuid(index),
+        }
+        for index in range(4)
+    ]
+    monkeypatch.setenv("TMUX", "fixture")
+    monkeypatch.setattr(
+        module,
+        "_prepare_gpu_ready_barrier",
+        lambda *_args: {
+            "admission_snapshot": {"authorized_gpu_registry": registry},
+            "admission": {"canonical_sha256": "a" * 64},
+            "requests": [],
+            "resource_guard": guard,
+            "monitor_path": monitor_path,
+            "observer_ready": {"path": "fixture"},
+            "controller_ready": {"path": "fixture"},
+            "claim": {"controller_claim_sha256": "b" * 64},
+        },
+    )
+    monkeypatch.setattr(
+        module, "_append_monitor_sample", lambda *_args, **_kwargs: monitor_path
+    )
+    monkeypatch.setattr(
+        module, "_write_gpu_controller_terminal", lambda *_args, **_kwargs: None
+    )
+    calls = 0
+
+    def check_observer(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise CanonicalScreeningError("fixture final observer death")
+
+    monkeypatch.setattr(module, "_assert_observer_live", check_observer)
+    with pytest.raises(CanonicalScreeningError, match="final observer death"):
+        module._run_gpu_phase(policy, policy_path, paths, "screen512")
+    assert calls == 2
+
+
+def test_gpu_ready_barrier_positive_contract_chain(
+    tmp_path: Path,
+) -> None:
+    module = _controller_module()
+    policy, manifest, manifest_path, policy_path, admission, _ = _manifest_fixture(
+        tmp_path
+    )
+    paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
+    claim, claim_path = module._write_gpu_controller_claim(
+        policy, paths, "smoke8"
+    )
+    candidates = []
+    template = manifest["candidates"][0]
+    for index in range(193):
+        candidates.append(
+            {
+                "candidate_id": f"candidate-{index:03d}",
+                "checkpoint_sha256": f"{index:064x}",
+                "checkpoint_model": template["checkpoint_model"],
+            }
+        )
+    intent, intent_path = module._write_request_intent_manifest(
+        policy,
+        paths,
+        "smoke8",
+        ("primary", "repeat"),
+        {
+            "candidate_manifest_sha256": manifest["candidate_manifest_sha256"],
+            "candidates": candidates,
+        },
+        admission,
+    )
+
+    def write_artifact(
+        name: str, digest_field: str, value: dict
+    ) -> tuple[dict, Path]:
+        value[digest_field] = canonical_digest(value, digest_field)
+        path = tmp_path / "barrier" / f"{name}.json"
+        write_exclusive_json(path, value)
+        return value, path
+
+    internal, internal_path = write_artifact(
+        "internal",
+        "monitor_sample_sha256",
+        {"kind": "internal", "policy_sha256": policy["policy_sha256"]},
+    )
+    guard, guard_path = write_artifact(
+        "guard",
+        "resource_window_sha256",
+        {"kind": "guard", "policy_sha256": policy["policy_sha256"]},
+    )
+    recheck, recheck_path = write_artifact(
+        "recheck",
+        "resource_recheck_sha256",
+        {"kind": "recheck", "policy_sha256": policy["policy_sha256"]},
+    )
+    controller, controller_path, controller_binding = (
+        module._write_controller_ready(
+            policy,
+            paths,
+            "smoke8",
+            claim,
+            admission,
+            intent,
+            intent_path,
+            internal,
+            internal_path,
+            guard,
+            guard_path,
+            recheck,
+            recheck_path,
+            claim_path,
+        )
+    )
+    assert (
+        module._validate_controller_ready(
+            controller, policy, "smoke8", admission
+        )
+        == controller
+    )
+    observer_claim, observer_claim_path = write_artifact(
+        "observer_claim",
+        "observer_claim_sha256",
+        {"kind": "observer_claim", "policy_sha256": policy["policy_sha256"]},
+    )
+    observer_sample, observer_sample_path = write_artifact(
+        "observer_sample",
+        "monitor_sample_sha256",
+        {"kind": "observer_sample", "policy_sha256": policy["policy_sha256"]},
+    )
+    observer = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_gpu_observer_ready_v1",
+        "campaign_id": policy["campaign_id"],
+        "phase": "smoke8",
+        "policy_sha256": policy["policy_sha256"],
+        "admission_sha256": admission["canonical_sha256"],
+        "controller_ready_sha256": controller["controller_ready_sha256"],
+        "observer_claim_sha256": observer_claim["observer_claim_sha256"],
+        "observer_claim": module._artifact_binding(
+            observer_claim_path, observer_claim["observer_claim_sha256"]
+        ),
+        "controller_ready": controller_binding,
+        "admission": admission,
+        "first_observer_sample": module._artifact_binding(
+            observer_sample_path, observer_sample["monitor_sample_sha256"]
+        ),
+    }
+    observer["observer_ready_sha256"] = canonical_digest(
+        observer, "observer_ready_sha256"
+    )
+    observer_path = (
+        paths["gpu_control"] / "smoke8" / "observer_ready.json"
+    )
+    write_exclusive_json(observer_path, observer)
+    observer_binding = module._artifact_binding(
+        observer_path, observer["observer_ready_sha256"]
+    )
+    assert (
+        module._validate_observer_ready(
+            observer, policy, "smoke8", controller, admission
+        )
+        == observer
+    )
+    request = build_run_request(
+        policy,
+        policy_path,
+        manifest,
+        manifest_path,
+        manifest["candidates"][0],
+        "smoke8",
+        "primary",
+        tmp_path / "runs",
+        admission,
+        controller_binding,
+        observer_binding,
+    )
+    assert validate_run_request(request, policy) == request
+    _assert_ready_barrier(request, policy)
+    internal_path.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(CanonicalScreeningError, match="file binding"):
+        _assert_ready_barrier(request, policy)

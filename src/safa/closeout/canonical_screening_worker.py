@@ -15,6 +15,7 @@ from safa.closeout.canonical_screening import (
     CanonicalScreeningError,
     build_run_claim,
     build_run_result,
+    canonical_digest,
     canonicalize_nvidia_gpu_uuid,
     canonical_json,
     load_json,
@@ -54,6 +55,107 @@ def _request_repo_root(request: Mapping[str, Any]) -> Path:
             "screening worker binding is not under a SAFA repository"
         )
     return root
+
+
+def _assert_ready_barrier(
+    request: Mapping[str, Any], policy: Mapping[str, Any]
+) -> None:
+    controller_binding = request["controller_ready"]
+    observer_binding = request["observer_ready"]
+    controller_path = _assert_bound_file(
+        controller_binding, "controller ready"
+    )
+    observer_path = _assert_bound_file(observer_binding, "observer ready")
+    controller = load_json(controller_path, "controller ready")
+    observer = load_json(observer_path, "observer ready")
+    admission_sha256 = request["admission"]["canonical_sha256"]
+    if (
+        controller.get("contract_type")
+        != "safa_canonical_gpu_controller_ready_v1"
+        or controller.get("policy_sha256") != policy["policy_sha256"]
+        or controller.get("phase") != request["mode"]
+        or controller.get("admission_sha256") != admission_sha256
+        or controller.get("controller_ready_sha256")
+        != controller_binding["canonical_sha256"]
+        or canonical_digest(controller, "controller_ready_sha256")
+        != controller_binding["canonical_sha256"]
+    ):
+        raise CanonicalScreeningError("worker controller ready binding mismatch")
+    if (
+        observer.get("contract_type")
+        != "safa_canonical_gpu_observer_ready_v1"
+        or observer.get("policy_sha256") != policy["policy_sha256"]
+        or observer.get("phase") != request["mode"]
+        or observer.get("admission_sha256") != admission_sha256
+        or observer.get("controller_ready_sha256")
+        != controller_binding["canonical_sha256"]
+        or observer.get("observer_ready_sha256")
+        != observer_binding["canonical_sha256"]
+        or canonical_digest(observer, "observer_ready_sha256")
+        != observer_binding["canonical_sha256"]
+    ):
+        raise CanonicalScreeningError("worker observer ready binding mismatch")
+    for field, digest_field in {
+        "controller_claim": "controller_claim_sha256",
+        "admission": "admission_sha256",
+        "request_intent_manifest": "request_intent_manifest_sha256",
+        "internal_monitor": "monitor_sample_sha256",
+        "runtime_guard_first_sample": "resource_window_sha256",
+        "resource_recheck": "resource_recheck_sha256",
+    }.items():
+        binding = controller.get(field)
+        if not isinstance(binding, Mapping):
+            raise CanonicalScreeningError(
+                f"worker controller ready omits {field} binding"
+            )
+        artifact_path = _assert_bound_file(
+            binding, f"controller ready {field}"
+        )
+        artifact = load_json(artifact_path, f"controller ready {field}")
+        if (
+            artifact.get(digest_field) != binding.get("canonical_sha256")
+            or canonical_digest(artifact, digest_field)
+            != binding.get("canonical_sha256")
+        ):
+            raise CanonicalScreeningError(
+                f"worker controller ready {field} canonical mismatch"
+            )
+    for field, digest_field in {
+        "observer_claim": "observer_claim_sha256",
+        "controller_ready": "controller_ready_sha256",
+        "admission": "admission_sha256",
+        "first_observer_sample": "monitor_sample_sha256",
+    }.items():
+        binding = observer.get(field)
+        if not isinstance(binding, Mapping):
+            raise CanonicalScreeningError(
+                f"worker observer ready omits {field} binding"
+            )
+        artifact_path = _assert_bound_file(
+            binding, f"observer ready {field}"
+        )
+        artifact = load_json(artifact_path, f"observer ready {field}")
+        if (
+            artifact.get(digest_field) != binding.get("canonical_sha256")
+            or canonical_digest(artifact, digest_field)
+            != binding.get("canonical_sha256")
+        ):
+            raise CanonicalScreeningError(
+                f"worker observer ready {field} canonical mismatch"
+            )
+    if (
+        controller["controller_claim"]["canonical_sha256"]
+        != controller.get("controller_claim_sha256")
+        or controller["admission"]["canonical_sha256"]
+        != controller.get("admission_sha256")
+        or observer["observer_claim"]["canonical_sha256"]
+        != observer.get("observer_claim_sha256")
+        or observer["controller_ready"]["canonical_sha256"]
+        != observer.get("controller_ready_sha256")
+        or observer["admission"]["canonical_sha256"]
+        != observer.get("admission_sha256")
+    ):
+        raise CanonicalScreeningError("worker ready primary binding mismatch")
 
 
 def _ordered_manifest_ids(binding: Mapping[str, Any]) -> list[str]:
@@ -622,6 +724,7 @@ def execute_screening_request(
         verify_historical_output_evidence=False,
     ) != dict(policy):
         raise CanonicalScreeningError("worker policy differs from current validated policy")
+    _assert_ready_barrier(request, policy)
     cuda_binding = _assert_runtime_cuda_binding(request, gpu_index, gpu_uuid)
     output_dir = Path(str(request["output_dir"])).resolve()
     output_dir.mkdir(parents=True, exist_ok=False)
