@@ -47,21 +47,30 @@ def _sha256_file(path: Path) -> str:
 def _write_exclusive(path: Path, value: Mapping[str, Any]) -> None:
     content = _canonical_json(dict(value))
     path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(
+        f".{path.name}.publish-{os.getpid()}-{time.time_ns()}"
+    )
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags, 0o644)
-    complete = False
+    descriptor = os.open(temporary, flags, 0o644)
     try:
         view = memoryview(content)
         while view:
             view = view[os.write(descriptor, view) :]
         os.fsync(descriptor)
-        complete = True
-    finally:
         os.close(descriptor)
-        if not complete:
-            path.unlink(missing_ok=True)
+        descriptor = -1
+        os.link(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
 
 
 def _optional_binding(path: Path) -> dict[str, str] | None:
@@ -183,7 +192,7 @@ def _launch_observer(
     }
 
 
-def run_wrapped_controller(
+def _run_wrapped_controller_impl(
     *,
     repo_root: Path,
     policy_root: Path,
@@ -218,6 +227,45 @@ def run_wrapped_controller(
         claim, "wrapper_claim_sha256"
     )
     _write_exclusive(wrapper_claim_path, claim)
+    try:
+        observer_launch = _launch_observer(
+            repo_root=repo_root,
+            python=python,
+            config=config,
+            campaign_root=campaign_root,
+            phase=phase,
+        )
+        observer_launch["status"] = "launched"
+        observer_launch["failure"] = None
+    except BaseException as exc:
+        observer_launch = {
+            "session": f"safa-screening-{phase}-monitor",
+            "command": [],
+            "launched_at": None,
+            "status": "failed",
+            "failure": {
+                "type": type(exc).__name__,
+                "message": str(exc),
+            },
+        }
+    observer_launch.update(
+        {
+            "schema_version": 1,
+            "contract_type": "safa_canonical_gpu_observer_launch_v2",
+            "policy_sha256": policy_sha256,
+            "phase": phase,
+            "wrapper_claim": {
+                "path": str(wrapper_claim_path.resolve()),
+                "sha256": _sha256_file(wrapper_claim_path),
+                "canonical_sha256": claim["wrapper_claim_sha256"],
+            },
+            "wrapper_claim_sha256": claim["wrapper_claim_sha256"],
+        }
+    )
+    observer_launch["observer_launch_sha256"] = _canonical_digest(
+        observer_launch, "observer_launch_sha256"
+    )
+    _write_exclusive(observer_launch_path, observer_launch)
     process_log_path.parent.mkdir(parents=True, exist_ok=True)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
@@ -226,8 +274,9 @@ def run_wrapped_controller(
     process: subprocess.Popen[bytes] | None = None
     return_code = 125
     launch_failure: dict[str, str] | None = None
-    observer_launch: dict[str, Any] | None = None
     try:
+        if observer_launch["status"] != "launched":
+            raise RuntimeError("observer launch failed before controller release")
         descriptor = os.open(process_log_path, flags, 0o644)
         process = subprocess.Popen(
             list(command),
@@ -236,64 +285,6 @@ def run_wrapped_controller(
             stderr=descriptor,
             close_fds=True,
         )
-        ready_path = control / "controller_ready.json"
-        while process.poll() is None:
-            try:
-                ready = _load_valid_controller_ready(
-                    ready_path, policy_sha256, phase
-                )
-            except BaseException as exc:
-                observer_launch = {
-                    "status": "failed",
-                    "failure": {
-                        "type": type(exc).__name__,
-                        "message": str(exc),
-                    },
-                    "launched_at": None,
-                    "controller_ready_sha256": None,
-                    "policy_sha256": policy_sha256,
-                    "phase": phase,
-                    "contract_type": "safa_canonical_gpu_observer_launch_v1",
-                }
-                observer_launch["observer_launch_sha256"] = _canonical_digest(
-                    observer_launch, "observer_launch_sha256"
-                )
-                _write_exclusive(observer_launch_path, observer_launch)
-                break
-            if ready is not None:
-                try:
-                    observer_launch = _launch_observer(
-                        repo_root=repo_root,
-                        python=python,
-                        config=config,
-                        campaign_root=campaign_root,
-                        phase=phase,
-                    )
-                    observer_launch["status"] = "launched"
-                    observer_launch["failure"] = None
-                except BaseException as exc:
-                    observer_launch = {
-                        "status": "failed",
-                        "failure": {
-                            "type": type(exc).__name__,
-                            "message": str(exc),
-                        },
-                        "launched_at": None,
-                    }
-                observer_launch["controller_ready_sha256"] = ready[
-                    "controller_ready_sha256"
-                ]
-                observer_launch["policy_sha256"] = policy_sha256
-                observer_launch["phase"] = phase
-                observer_launch["contract_type"] = (
-                    "safa_canonical_gpu_observer_launch_v1"
-                )
-                observer_launch["observer_launch_sha256"] = _canonical_digest(
-                    observer_launch, "observer_launch_sha256"
-                )
-                _write_exclusive(observer_launch_path, observer_launch)
-                break
-            time.sleep(0.1)
         return_code = process.wait()
     except BaseException as exc:
         launch_failure = {"type": type(exc).__name__, "message": str(exc)}
@@ -367,6 +358,118 @@ def run_wrapped_controller(
     )
     _write_exclusive(wrapper_exit_path, value)
     return value
+
+
+def run_wrapped_controller(
+    *,
+    repo_root: Path,
+    policy_root: Path,
+    policy_sha256: str,
+    config: Path,
+    campaign_root: Path,
+    phase: str,
+    python: str,
+    command: Sequence[str],
+) -> dict[str, Any]:
+    control = policy_root.resolve() / "gpu_control" / phase
+    terminal_path = control / "wrapper_terminal.json"
+    result: dict[str, Any] | None = None
+    failure: BaseException | None = None
+    started_at = _utc_now()
+    try:
+        result = _run_wrapped_controller_impl(
+            repo_root=repo_root,
+            policy_root=policy_root,
+            policy_sha256=policy_sha256,
+            config=config,
+            campaign_root=campaign_root,
+            phase=phase,
+            python=python,
+            command=command,
+        )
+        return result
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        cleanup_failure: dict[str, str] | None = None
+        if failure is not None:
+            completed = subprocess.run(
+                [
+                    "tmux",
+                    "kill-session",
+                    "-t",
+                    f"safa-screening-{phase}-monitor",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if completed.returncode not in {0, 1}:
+                cleanup_failure = {
+                    "type": "ObserverCleanupError",
+                    "message": (
+                        completed.stderr.strip()
+                        or completed.stdout.strip()
+                        or f"exit_code={completed.returncode}"
+                    ),
+                }
+        terminal = {
+            "schema_version": 1,
+            "contract_type": "safa_canonical_gpu_wrapper_terminal_v1",
+            "policy_sha256": policy_sha256,
+            "phase": phase,
+            "config": {
+                "path": str(config.resolve()),
+                "sha256": (
+                    _sha256_file(config) if config.is_file() else None
+                ),
+            },
+            "command": list(command),
+            "status": (
+                "completed"
+                if result is not None and result.get("exit_code") == 0
+                else "failed"
+            ),
+            "failure": (
+                (
+                    None
+                    if result is not None and result.get("exit_code") == 0
+                    else {
+                        "type": "ControllerExit",
+                        "message": (
+                            f"controller exit_code={result.get('exit_code')}"
+                        ),
+                    }
+                )
+                if failure is None
+                else {
+                    "type": type(failure).__name__,
+                    "message": str(failure),
+                }
+            ),
+            "cleanup_failure": cleanup_failure,
+            "wrapper_claim": _optional_binding(
+                control / "wrapper_claim.json"
+            ),
+            "observer_launch": _optional_binding(
+                control / "observer_launch.json"
+            ),
+            "controller_process_exit": _optional_binding(
+                control / "controller_process_exit.json"
+            ),
+            "controller_terminal": _optional_binding(
+                control / "controller_terminal.json"
+            ),
+            "wrapper_exit": _optional_binding(
+                control / "wrapper_exit.json"
+            ),
+            "started_at": started_at,
+            "completed_at": _utc_now(),
+        }
+        terminal["wrapper_terminal_sha256"] = _canonical_digest(
+            terminal, "wrapper_terminal_sha256"
+        )
+        _write_exclusive(terminal_path, terminal)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:

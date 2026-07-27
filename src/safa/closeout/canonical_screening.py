@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
+import threading
+import time
 from typing import Any, Iterable, Mapping, Sequence
 
 from safa.closeout.generator_output_contract import (
@@ -30,6 +34,34 @@ RUN_CLAIM_CONTRACT = "safa_canonical_screening_run_claim_v1"
 RUN_RESULT_CONTRACT = "safa_canonical_screening_run_result_v1"
 CONTROLLER_READY_CONTRACT = "safa_canonical_gpu_controller_ready_v1"
 OBSERVER_READY_CONTRACT = "safa_canonical_gpu_observer_ready_v1"
+FINAL_RELEASE_ADMISSION_CONTRACT = (
+    "safa_canonical_gpu_final_release_admission_v1"
+)
+WORKER_READY_CONTRACT = "safa_canonical_worker_pre_cuda_ready_v2"
+WORKER_RELEASE_CONTRACT = "safa_canonical_worker_cuda_release_v2"
+CONTROLLER_LAUNCH_REHASH_CONTRACT = (
+    "safa_canonical_controller_launch_rehash_v2"
+)
+WORKER_PRE_CUDA_VERIFICATION_ORDER = (
+    "policy_config",
+    "implementations",
+    "run_request",
+    "candidate_manifest",
+    "checkpoint_plan",
+    "checkpoint",
+    "data_and_evaluators",
+    "final_release",
+    "ready_barrier",
+)
+WORKER_EXTERNAL_GPU_RACE_CONTRACT = {
+    "external_process_exclusion_guarantee": False,
+    "scope": "controller_worker_processes_only",
+    "residual_race": (
+        "GPU process and resource snapshots are point-in-time observations; "
+        "an unrelated external process can start after the final snapshot."
+    ),
+    "compute_mode_changed": False,
+}
 SCHEMA_VERSION = 1
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 RUN_MODES = {"smoke8": 8, "screen512": 512}
@@ -177,6 +209,59 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def hash_asset_directory_content(
+    path: Path, expected_digest: str
+) -> dict[str, Any]:
+    """Read and hash every asset byte; stat metadata and caches are not trusted."""
+    if not SHA256_RE.fullmatch(expected_digest):
+        raise CanonicalScreeningError("asset expected digest is invalid")
+    asset = path.resolve()
+    if asset.is_symlink() or not asset.is_dir():
+        raise CanonicalScreeningError(
+            f"asset directory is missing or symlinked: {asset}"
+        )
+    files = sorted(
+        item for item in asset.rglob("*") if item.is_file() or item.is_symlink()
+    )
+    if not files:
+        raise CanonicalScreeningError(
+            f"asset directory contains no files: {asset}"
+        )
+    started_at = datetime.now(timezone.utc).isoformat()
+    started = time.perf_counter()
+    total_bytes = 0
+    digest = hashlib.sha256()
+    for file_path in files:
+        if file_path.is_symlink():
+            raise CanonicalScreeningError(
+                f"asset directory contains a symlink: {file_path}"
+            )
+        digest.update(file_path.relative_to(asset).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        with file_path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                total_bytes += len(chunk)
+                digest.update(chunk)
+        digest.update(b"\0")
+    observed_digest = digest.hexdigest()
+    completed_at = datetime.now(timezone.utc).isoformat()
+    if observed_digest != expected_digest:
+        raise CanonicalScreeningError("asset directory content digest differs")
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "contract_type": "safa_canonical_asset_content_verification_v1",
+        "path": str(asset),
+        "digest_algorithm": "sha256_relative_posix_nul_content_nul_v1",
+        "expected_digest": expected_digest,
+        "observed_digest": observed_digest,
+        "file_count": len(files),
+        "total_bytes": total_bytes,
+        "elapsed_seconds": time.perf_counter() - started,
+        "started_at": started_at,
+        "completed_at": completed_at,
+    }
+
+
 def sha256_directory_tree(path: Path) -> str:
     """Hash every regular file by relative POSIX path and content."""
     root = path.resolve()
@@ -291,6 +376,46 @@ def write_exclusive_json(path: Path, value: Mapping[str, Any]) -> None:
         os.close(descriptor)
         if not complete:
             path.unlink(missing_ok=True)
+
+
+def publish_exclusive_json(path: Path, value: Mapping[str, Any]) -> None:
+    """Atomically publish a complete cross-process JSON contract once."""
+    content = canonical_json(value)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / (
+        f".{path.name}.publish.{os.getpid()}.{threading.get_ident()}."
+        f"{time.time_ns()}"
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(temporary, flags, 0o644)
+    linked = False
+    try:
+        view = memoryview(content)
+        while view:
+            view = view[os.write(descriptor, view) :]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.link(temporary, path)
+        linked = True
+        directory_flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            directory_flags |= os.O_DIRECTORY
+        directory_descriptor = os.open(path.parent, directory_flags)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+        if not linked and path.exists():
+            raise CanonicalScreeningError(
+                "atomic JSON publish failed after final path appeared"
+            )
 
 
 def load_json(path: Path, label: str) -> dict[str, Any]:
@@ -2951,6 +3076,7 @@ def _validate_output_decoder_registry(
     raw_registry: Mapping[str, Any],
     *,
     verify_historical_evidence: bool,
+    asset_verification_audit: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     try:
         registry = validate_decoder_registry(raw_registry)
@@ -3121,23 +3247,12 @@ def _validate_output_decoder_registry(
     ).resolve()
     if cache_path != expected_cache_path:
         raise CanonicalScreeningError("latent asset digest cache binding differs")
-    if verify_historical_evidence:
-        from safa.closeout.generator_output_contract import digest_asset_directory
-
-        if digest_asset_directory(directory_path) != directory["digest"]:
-            raise CanonicalScreeningError("latent decoder directory digest differs")
-    else:
-        from safa.evaluation.meanflow_guidance_runner import cached_asset_digest
-
-        if (
-            cached_asset_digest(
-                directory_path,
-                directory["digest"],
-                cache_path,
-            )
-            != directory["digest"]
-        ):
-            raise CanonicalScreeningError("latent cached asset digest differs")
+    if verify_historical_evidence or asset_verification_audit is not None:
+        content_verification = hash_asset_directory_content(
+            directory_path, directory["digest"]
+        )
+        if asset_verification_audit is not None:
+            asset_verification_audit.append(content_verification)
     bound_latent["asset_digest_cache"] = {"path": str(cache_path)}
     environment = _require_mapping(latent["environment"], "decoder environment")
     _require_exact_keys(
@@ -3616,6 +3731,7 @@ def validate_policy(
     *,
     verify_historical_output_evidence: bool = True,
     policy_identity_path: Path | None = None,
+    asset_verification_audit: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     root = repo_root.resolve()
     identity_path = (
@@ -3876,6 +3992,7 @@ def validate_policy(
         root,
         raw["output_decoder_registry"],
         verify_historical_evidence=verify_historical_output_evidence,
+        asset_verification_audit=asset_verification_audit,
     )
 
     implementations = _require_mapping(raw["implementations"], "implementations")
@@ -4799,6 +4916,62 @@ def validate_run_request(
         raise CanonicalScreeningError(
             "run request observer/controller ready binding mismatch"
         )
+    for ready_name in ("controller_ready", "observer_ready"):
+        ready = ready_values[ready_name]
+        for field, digest_field, contract_type in (
+            (
+                "wrapper_claim",
+                "wrapper_claim_sha256",
+                "safa_canonical_gpu_wrapper_claim_v1",
+            ),
+            (
+                "observer_launch",
+                "observer_launch_sha256",
+                "safa_canonical_gpu_observer_launch_v2",
+            ),
+        ):
+            nested = _require_mapping(
+                ready.get(field), f"{ready_name} {field} binding"
+            )
+            _require_exact_keys(
+                nested,
+                {"path", "sha256", "canonical_sha256"},
+                f"{ready_name} {field} binding",
+            )
+            nested_path = Path(str(nested["path"])).resolve()
+            if (
+                not nested_path.is_file()
+                or sha256_file(nested_path) != nested["sha256"]
+            ):
+                raise CanonicalScreeningError(
+                    f"run request {ready_name} {field} file mismatch"
+                )
+            artifact = load_json(
+                nested_path, f"{ready_name} {field}"
+            )
+            if (
+                artifact.get("contract_type") != contract_type
+                or artifact.get("policy_sha256") != policy["policy_sha256"]
+                or artifact.get("phase") != value["mode"]
+                or artifact.get(digest_field)
+                != nested["canonical_sha256"]
+                or canonical_digest(artifact, digest_field)
+                != nested["canonical_sha256"]
+                or ready.get(digest_field)
+                != nested["canonical_sha256"]
+            ):
+                raise CanonicalScreeningError(
+                    f"run request {ready_name} {field} contract mismatch"
+                )
+    if (
+        ready_values["controller_ready"]["wrapper_claim"]
+        != ready_values["observer_ready"]["wrapper_claim"]
+        or ready_values["controller_ready"]["observer_launch"]
+        != ready_values["observer_ready"]["observer_launch"]
+    ):
+        raise CanonicalScreeningError(
+            "run request ready wrapper provenance differs"
+        )
     snapshot = _require_mapping(
         admission_value.get("snapshot"), "resource admission snapshot"
     )
@@ -4883,9 +5056,1089 @@ def validate_run_request(
     return value
 
 
+def validate_final_release_admission(
+    binding: Mapping[str, Any],
+    request: Mapping[str, Any],
+    policy: Mapping[str, Any],
+) -> dict[str, Any]:
+    validated_request = validate_run_request(request, policy)
+    ready_values = {
+        name: load_json(
+            Path(str(validated_request[name]["path"])).resolve(), name
+        )
+        for name in ("controller_ready", "observer_ready")
+    }
+    bound = _require_mapping(binding, "final release admission binding")
+    _require_exact_keys(
+        bound,
+        {"path", "sha256", "canonical_sha256"},
+        "final release admission binding",
+    )
+    path = Path(str(bound["path"])).resolve()
+    if not path.is_file() or sha256_file(path) != bound["sha256"]:
+        raise CanonicalScreeningError(
+            "final release admission file binding mismatch"
+        )
+    value = load_json(path, "final release admission")
+    required = {
+        "schema_version",
+        "contract_type",
+        "campaign_id",
+        "phase",
+        "policy_sha256",
+        "initial_admission_sha256",
+        "controller_ready_sha256",
+        "observer_ready_sha256",
+        "wrapper_claim",
+        "wrapper_claim_sha256",
+        "observer_launch",
+        "observer_launch_sha256",
+        "authorized_gpu_registry",
+        "request_count",
+        "requests",
+        "snapshot",
+        "released_at",
+        "final_release_admission_sha256",
+    }
+    _require_exact_keys(value, required, "final release admission")
+    requests = value["requests"]
+    if not isinstance(requests, list):
+        raise CanonicalScreeningError(
+            "final release admission requests must be a list"
+        )
+    matching = [
+        row
+        for row in requests
+        if isinstance(row, Mapping)
+        and row.get("canonical_sha256")
+        == validated_request["run_request_sha256"]
+    ]
+    if len(matching) != 1:
+        raise CanonicalScreeningError(
+            "final release admission does not uniquely bind run request"
+        )
+    matched = matching[0]
+    matched_path = Path(str(matched.get("path", ""))).resolve()
+    if (
+        set(matched) != {"path", "sha256", "canonical_sha256"}
+        or not matched_path.is_file()
+        or sha256_file(matched_path) != matched["sha256"]
+        or load_json(matched_path, "final release run request")
+        != validated_request
+    ):
+        raise CanonicalScreeningError(
+            "final release admission run request binding mismatch"
+        )
+    snapshot = _require_mapping(
+        value["snapshot"], "final release admission snapshot"
+    )
+    if (
+        value["schema_version"] != SCHEMA_VERSION
+        or value["contract_type"] != FINAL_RELEASE_ADMISSION_CONTRACT
+        or value["campaign_id"] != policy["campaign_id"]
+        or value["phase"] != validated_request["mode"]
+        or value["policy_sha256"] != policy["policy_sha256"]
+        or value["initial_admission_sha256"]
+        != validated_request["admission"]["canonical_sha256"]
+        or value["controller_ready_sha256"]
+        != validated_request["controller_ready"]["canonical_sha256"]
+        or value["observer_ready_sha256"]
+        != validated_request["observer_ready"]["canonical_sha256"]
+        or value["wrapper_claim"]
+        != ready_values["controller_ready"]["wrapper_claim"]
+        or value["wrapper_claim"]
+        != ready_values["observer_ready"]["wrapper_claim"]
+        or value["wrapper_claim_sha256"]
+        != value["wrapper_claim"]["canonical_sha256"]
+        or value["observer_launch"]
+        != ready_values["controller_ready"]["observer_launch"]
+        or value["observer_launch"]
+        != ready_values["observer_ready"]["observer_launch"]
+        or value["observer_launch_sha256"]
+        != value["observer_launch"]["canonical_sha256"]
+        or value["authorized_gpu_registry"]
+        != validated_request["authorized_gpu_registry"]
+        or snapshot.get("authorized_gpu_registry")
+        != validated_request["authorized_gpu_registry"]
+        or snapshot.get("compute_processes") != []
+        or value["request_count"] != len(requests)
+        or value["final_release_admission_sha256"]
+        != bound["canonical_sha256"]
+        or canonical_digest(
+            value, "final_release_admission_sha256"
+        )
+        != bound["canonical_sha256"]
+    ):
+        raise CanonicalScreeningError(
+            "final release admission contract mismatch"
+        )
+    return value
+
+
+def _load_handshake_artifact(
+    binding: Mapping[str, Any],
+    *,
+    label: str,
+    digest_field: str,
+    contract_type: str,
+) -> dict[str, Any]:
+    bound = _require_mapping(binding, f"{label} binding")
+    _require_exact_keys(
+        bound,
+        {"path", "sha256", "canonical_sha256"},
+        f"{label} binding",
+    )
+    path = Path(str(bound["path"])).resolve()
+    _require_sha256(bound["sha256"], f"{label} file SHA256")
+    _require_sha256(
+        bound["canonical_sha256"], f"{label} canonical SHA256"
+    )
+    if not path.is_file() or sha256_file(path) != bound["sha256"]:
+        raise CanonicalScreeningError(f"{label} file binding mismatch")
+    value = load_json(path, label)
+    if (
+        value.get("schema_version") != SCHEMA_VERSION
+        or value.get("contract_type") != contract_type
+        or value.get(digest_field) != bound["canonical_sha256"]
+        or canonical_digest(value, digest_field)
+        != bound["canonical_sha256"]
+    ):
+        raise CanonicalScreeningError(f"{label} canonical binding mismatch")
+    return value
+
+
+def _validate_worker_rehashed_bindings(
+    raw_bindings: Mapping[str, Any],
+    request: Mapping[str, Any],
+    policy: Mapping[str, Any],
+) -> dict[str, Any]:
+    bindings = dict(
+        _require_mapping(raw_bindings, "worker rehashed bindings")
+    )
+    required = {
+        "config",
+        "implementations",
+        "request",
+        "candidate_manifest",
+        "checkpoint_plan",
+        "checkpoint",
+        "data_and_evaluators",
+        "final_release",
+        "controller_ready",
+        "observer_ready",
+    }
+    _require_exact_keys(bindings, required, "worker rehashed bindings")
+
+    def exact_file_binding(
+        value: Any,
+        expected: Mapping[str, Any],
+        label: str,
+        *,
+        canonical: bool,
+    ) -> dict[str, Any]:
+        binding = dict(_require_mapping(value, label))
+        fields = {"path", "sha256", "canonical_sha256"} if canonical else {
+            "path",
+            "sha256",
+        }
+        _require_exact_keys(binding, fields, label)
+        path = Path(str(binding["path"])).resolve()
+        expected_path = Path(str(expected["path"])).resolve()
+        if (
+            path != expected_path
+            or binding["sha256"] != expected["sha256"]
+            or (canonical and binding["canonical_sha256"] != expected["canonical_sha256"])
+            or not path.is_file()
+            or sha256_file(path) != binding["sha256"]
+        ):
+            raise CanonicalScreeningError(f"{label} differs")
+        return binding
+
+    exact_file_binding(
+        bindings["config"],
+        request["policy"],
+        "worker rehashed config",
+        canonical=False,
+    )
+    implementations = dict(
+        _require_mapping(
+            bindings["implementations"],
+            "worker rehashed implementations",
+        )
+    )
+    if set(implementations) != set(request["implementations"]):
+        raise CanonicalScreeningError(
+            "worker rehashed implementation set differs"
+        )
+    normalized_implementations = {}
+    for name, expected in request["implementations"].items():
+        normalized_implementations[name] = exact_file_binding(
+            implementations[name],
+            expected,
+            f"worker rehashed {name} implementation",
+            canonical=False,
+        )
+    request_binding = exact_file_binding(
+        bindings["request"],
+        {
+            "path": bindings["request"]["path"],
+            "sha256": bindings["request"]["sha256"],
+            "canonical_sha256": request["run_request_sha256"],
+        },
+        "worker rehashed request",
+        canonical=True,
+    )
+    if (
+        request_binding["canonical_sha256"]
+        != request["run_request_sha256"]
+        or load_json(
+            Path(str(request_binding["path"])),
+            "worker rehashed run request",
+        )
+        != dict(request)
+    ):
+        raise CanonicalScreeningError("worker rehashed request differs")
+    candidate_manifest = exact_file_binding(
+        bindings["candidate_manifest"],
+        request["candidate_manifest"],
+        "worker rehashed candidate manifest",
+        canonical=True,
+    )
+    manifest_value = load_json(
+        Path(str(candidate_manifest["path"])),
+        "worker rehashed candidate manifest",
+    )
+    checkpoint_plan_expected = _require_mapping(
+        manifest_value.get("checkpoint_plan"),
+        "worker rehashed checkpoint plan expected binding",
+    )
+    checkpoint_plan = exact_file_binding(
+        bindings["checkpoint_plan"],
+        checkpoint_plan_expected,
+        "worker rehashed checkpoint plan",
+        canonical=True,
+    )
+    checkpoint = exact_file_binding(
+        bindings["checkpoint"],
+        {
+            "path": request["candidate"]["checkpoint_path"],
+            "sha256": request["candidate"]["checkpoint_sha256"],
+        },
+        "worker rehashed checkpoint",
+        canonical=False,
+    )
+    data_and_evaluators = dict(
+        _require_mapping(
+            bindings["data_and_evaluators"],
+            "worker rehashed data and evaluators",
+        )
+    )
+    data_fields = {
+        "sample_manifest",
+        "source_index",
+        "features",
+        "e0",
+        "edev",
+        "quality_script",
+        "pixel_protocol_config",
+        "arcface",
+    }
+    _require_exact_keys(
+        data_and_evaluators,
+        data_fields,
+        "worker rehashed data and evaluators",
+    )
+    if data_and_evaluators != {
+        name: request[name] for name in data_fields
+    }:
+        raise CanonicalScreeningError(
+            "worker rehashed data/evaluator bindings differ"
+        )
+    final_release = dict(
+        _require_mapping(
+            bindings["final_release"], "worker rehashed final release"
+        )
+    )
+    validate_final_release_admission(final_release, request, policy)
+    if (
+        bindings["controller_ready"] != request["controller_ready"]
+        or bindings["observer_ready"] != request["observer_ready"]
+    ):
+        raise CanonicalScreeningError(
+            "worker rehashed ready barrier bindings differ"
+        )
+    return {
+        "config": dict(bindings["config"]),
+        "implementations": normalized_implementations,
+        "request": request_binding,
+        "candidate_manifest": candidate_manifest,
+        "checkpoint_plan": checkpoint_plan,
+        "checkpoint": checkpoint,
+        "data_and_evaluators": data_and_evaluators,
+        "final_release": final_release,
+        "controller_ready": dict(bindings["controller_ready"]),
+        "observer_ready": dict(bindings["observer_ready"]),
+    }
+
+
+def _validate_controller_resource_snapshot(
+    raw_snapshot: Mapping[str, Any],
+    request: Mapping[str, Any],
+    policy: Mapping[str, Any],
+) -> dict[str, Any]:
+    snapshot = dict(
+        _require_mapping(raw_snapshot, "controller resource snapshot")
+    )
+    _require_exact_keys(
+        snapshot,
+        {
+            "observed_at",
+            "cpu_load_percent",
+            "memory_percent",
+            "disk_percent",
+            "swap_pages",
+            "gpus",
+            "authorized_gpu_registry",
+            "ram_reservation",
+            "compute_processes",
+        },
+        "controller resource snapshot",
+    )
+    for field, limit in (
+        ("cpu_load_percent", policy["resources"]["cpu_admission_percent"]),
+        ("memory_percent", policy["resources"]["ram_admission_percent"]),
+        ("disk_percent", policy["resources"]["disk_admission_percent"]),
+    ):
+        value = snapshot[field]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+            or float(value) >= float(limit)
+        ):
+            raise CanonicalScreeningError(
+                f"controller resource snapshot {field} differs"
+            )
+    if snapshot["authorized_gpu_registry"] != request[
+        "authorized_gpu_registry"
+    ]:
+        raise CanonicalScreeningError(
+            "controller resource GPU registry differs"
+        )
+    gpus = snapshot["gpus"]
+    if (
+        not isinstance(gpus, list)
+        or [row.get("index") for row in gpus]
+        != policy["resources"]["physical_gpus"]
+        or [
+            {
+                "physical_gpu_index": row.get("index"),
+                "physical_gpu_uuid": row.get("uuid"),
+            }
+            for row in gpus
+        ]
+        != request["authorized_gpu_registry"]
+    ):
+        raise CanonicalScreeningError(
+            "controller resource GPU snapshot differs"
+        )
+    if (
+        not isinstance(snapshot["compute_processes"], list)
+        or not isinstance(snapshot["ram_reservation"], Mapping)
+        or set(_require_mapping(snapshot["swap_pages"], "resource swap pages"))
+        != {"in", "out"}
+    ):
+        raise CanonicalScreeningError(
+            "controller resource snapshot structure differs"
+        )
+    return snapshot
+
+
+def _validate_asset_content_verification(
+    raw_verification: Mapping[str, Any],
+    policy: Mapping[str, Any],
+) -> dict[str, Any]:
+    verification = dict(
+        _require_mapping(
+            raw_verification, "asset content verification"
+        )
+    )
+    _require_exact_keys(
+        verification,
+        {
+            "schema_version",
+            "contract_type",
+            "path",
+            "digest_algorithm",
+            "expected_digest",
+            "observed_digest",
+            "file_count",
+            "total_bytes",
+            "elapsed_seconds",
+            "started_at",
+            "completed_at",
+        },
+        "asset content verification",
+    )
+    directory = policy["output_decoder_registry"]["latent"]["directory"]
+    elapsed = verification["elapsed_seconds"]
+    if (
+        verification["schema_version"] != SCHEMA_VERSION
+        or verification["contract_type"]
+        != "safa_canonical_asset_content_verification_v1"
+        or Path(str(verification["path"])).resolve()
+        != Path(str(directory["path"])).resolve()
+        or verification["digest_algorithm"]
+        != "sha256_relative_posix_nul_content_nul_v1"
+        or verification["expected_digest"] != directory["digest"]
+        or verification["observed_digest"] != directory["digest"]
+        or type(verification["file_count"]) is not int
+        or verification["file_count"] <= 0
+        or type(verification["total_bytes"]) is not int
+        or verification["total_bytes"] <= 0
+        or isinstance(elapsed, bool)
+        or not isinstance(elapsed, (int, float))
+        or not math.isfinite(float(elapsed))
+        or float(elapsed) < 0.0
+        or not isinstance(verification["started_at"], str)
+        or not verification["started_at"]
+        or not isinstance(verification["completed_at"], str)
+        or not verification["completed_at"]
+    ):
+        raise CanonicalScreeningError(
+            "asset content verification contract mismatch"
+        )
+    return verification
+
+
+def _validate_runtime_resource_snapshot(
+    raw_snapshot: Mapping[str, Any],
+    request: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    worker_pid: int,
+) -> dict[str, Any]:
+    snapshot = dict(
+        _require_mapping(raw_snapshot, "runtime guard resource snapshot")
+    )
+    _require_exact_keys(
+        snapshot,
+        {
+            "schema_version",
+            "contract_type",
+            "policy_sha256",
+            "observed_at",
+            "runtime_gpu_registry",
+            "compute_processes",
+            "unknown_compute_processes",
+            "cpu_load_percent",
+            "memory_percent",
+            "disk_percent",
+            "swap_pages_before",
+            "swap_pages_after",
+            "swap_io_delta",
+            "swap_consecutive_io",
+            "gpu",
+            "active_worker_pids",
+            "hard_limits",
+            "guard_thread_failure",
+            "guard_violation_reason",
+        },
+        "runtime guard resource snapshot",
+    )
+    expected_limits = {
+        "cpu_percent": policy["resources"]["cpu_hard_limit_percent"],
+        "ram_percent": policy["resources"]["ram_hard_limit_percent"],
+        "disk_percent": policy["resources"]["disk_hard_limit_percent"],
+        "gpu_memory_percent": 90.0,
+        "gpu_temperature_c": 85,
+        "gpu_free_mib": int(
+            policy["resources"]["gpu_headroom_bytes"]
+        ) // 1024**2,
+        "swap_io_delta_pages": 0,
+        "swap_consecutive_io": 0,
+    }
+    if (
+        snapshot["schema_version"] != SCHEMA_VERSION
+        or snapshot["contract_type"]
+        != "safa_canonical_worker_release_resource_snapshot_v2"
+        or snapshot["policy_sha256"] != policy["policy_sha256"]
+        or not isinstance(snapshot["observed_at"], str)
+        or not snapshot["observed_at"]
+        or snapshot["hard_limits"] != expected_limits
+        or snapshot["guard_thread_failure"] is not None
+        or snapshot["guard_violation_reason"] is not None
+        or snapshot["runtime_gpu_registry"]
+        != request["authorized_gpu_registry"]
+        or snapshot["unknown_compute_processes"] != []
+        or not isinstance(snapshot["compute_processes"], list)
+        or not isinstance(snapshot["gpu"], list)
+        or not isinstance(snapshot["active_worker_pids"], list)
+        or worker_pid not in snapshot["active_worker_pids"]
+        or any(
+            type(pid) is not int or pid <= 0
+            for pid in snapshot["active_worker_pids"]
+        )
+    ):
+        raise CanonicalScreeningError(
+            "runtime guard resource snapshot differs"
+        )
+    for field, limit in (
+        ("cpu_load_percent", policy["resources"]["cpu_hard_limit_percent"]),
+        ("memory_percent", policy["resources"]["ram_hard_limit_percent"]),
+        ("disk_percent", policy["resources"]["disk_hard_limit_percent"]),
+    ):
+        value = snapshot[field]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+            or float(value) >= float(limit)
+        ):
+            raise CanonicalScreeningError(
+                f"runtime guard resource {field} differs"
+            )
+    for field in ("swap_pages_before", "swap_pages_after", "swap_io_delta"):
+        value = dict(
+            _require_mapping(
+                snapshot[field], f"runtime guard resource {field}"
+            )
+        )
+        _require_exact_keys(
+            value, {"in", "out"}, f"runtime guard resource {field}"
+        )
+        if any(type(count) is not int or count < 0 for count in value.values()):
+            raise CanonicalScreeningError(
+                f"runtime guard resource {field} differs"
+            )
+    if (
+        snapshot["swap_io_delta"] != {"in": 0, "out": 0}
+        or snapshot["swap_pages_after"] != snapshot["swap_pages_before"]
+        or snapshot["swap_consecutive_io"] != 0
+    ):
+        raise CanonicalScreeningError(
+            "runtime guard release swap state differs"
+        )
+    gpu_rows = snapshot["gpu"]
+    if (
+        [
+            {
+                "physical_gpu_index": row.get("index"),
+                "physical_gpu_uuid": row.get("uuid"),
+            }
+            for row in gpu_rows
+        ]
+        != request["authorized_gpu_registry"]
+    ):
+        raise CanonicalScreeningError(
+            "runtime guard release GPU registry differs"
+        )
+    allowed_gpu_uuids = {
+        row["physical_gpu_uuid"]
+        for row in request["authorized_gpu_registry"]
+    }
+    for row in snapshot["runtime_gpu_registry"]:
+        _require_exact_keys(
+            _require_mapping(row, "runtime guard GPU registry row"),
+            {"physical_gpu_index", "physical_gpu_uuid"},
+            "runtime guard GPU registry row",
+        )
+    for row in snapshot["compute_processes"]:
+        process = _require_mapping(
+            row, "runtime guard compute process row"
+        )
+        _require_exact_keys(
+            process,
+            {"gpu_uuid", "pid", "process_name", "used_memory_mib"},
+            "runtime guard compute process row",
+        )
+        if (
+            process["gpu_uuid"] not in allowed_gpu_uuids
+            or type(process["pid"]) is not int
+            or process["pid"] <= 0
+            or not isinstance(process["process_name"], str)
+            or not process["process_name"]
+            or not isinstance(process["used_memory_mib"], str)
+            or not process["used_memory_mib"]
+        ):
+            raise CanonicalScreeningError(
+                "runtime guard compute process row differs"
+            )
+    for row in gpu_rows:
+        _require_exact_keys(
+            _require_mapping(row, "runtime guard GPU resource row"),
+            {
+                "index",
+                "uuid",
+                "memory_total_mib",
+                "memory_used_mib",
+                "memory_free_mib",
+                "temperature_c",
+            },
+            "runtime guard GPU resource row",
+        )
+        total = row.get("memory_total_mib")
+        used = row.get("memory_used_mib")
+        free = row.get("memory_free_mib")
+        temperature = row.get("temperature_c")
+        if (
+            type(total) is not int
+            or total <= 0
+            or type(used) is not int
+            or used < 0
+            or used > total
+            or type(free) is not int
+            or free < 0
+            or free > total
+            or used + free != total
+            or type(temperature) is not int
+            or temperature > 85
+            or 100.0 * used / total >= 90.0
+            or free < expected_limits["gpu_free_mib"]
+        ):
+            raise CanonicalScreeningError(
+                "runtime guard release GPU resource state differs"
+            )
+    return snapshot
+
+
+def validate_worker_ready_value(
+    raw_value: Mapping[str, Any],
+    request: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    *,
+    expected_worker_pid: int | None = None,
+    expected_gpu_index: int | None = None,
+    expected_gpu_uuid: str | None = None,
+) -> dict[str, Any]:
+    value = dict(_require_mapping(raw_value, "worker ready"))
+    required = {
+        "schema_version",
+        "contract_type",
+        "policy_sha256",
+        "phase",
+        "worker_pid",
+        "gpu_index",
+        "gpu_uuid",
+        "run_request_sha256",
+        "request",
+        "final_release",
+        "verification_order",
+        "rehashed_bindings",
+        "rehashed_bindings_sha256",
+        "controller_claim",
+        "screening_worker_sha256",
+        "controller_implementation_sha256",
+        "cuda_visible_devices",
+        "heavy_modules_absent",
+        "loaded_heavy_modules",
+        "asset_content_verification",
+        "external_gpu_race_contract",
+        "ready_at",
+        "worker_ready_sha256",
+    }
+    _require_exact_keys(value, required, "worker ready")
+    worker_pid = value["worker_pid"]
+    gpu_index = value["gpu_index"]
+    gpu_uuid = value["gpu_uuid"]
+    registry = {
+        row["physical_gpu_index"]: row["physical_gpu_uuid"]
+        for row in request["authorized_gpu_registry"]
+    }
+    rehashed = _validate_worker_rehashed_bindings(
+        value["rehashed_bindings"], request, policy
+    )
+    _validate_asset_content_verification(
+        value["asset_content_verification"], policy
+    )
+    if (
+        value["schema_version"] != SCHEMA_VERSION
+        or value["contract_type"] != WORKER_READY_CONTRACT
+        or value["policy_sha256"] != policy["policy_sha256"]
+        or value["phase"] != request["mode"]
+        or type(worker_pid) is not int
+        or worker_pid <= 0
+        or (expected_worker_pid is not None and worker_pid != expected_worker_pid)
+        or type(gpu_index) is not int
+        or gpu_index not in registry
+        or (
+            expected_gpu_index is not None
+            and gpu_index != expected_gpu_index
+        )
+        or gpu_uuid != registry[gpu_index]
+        or (
+            expected_gpu_uuid is not None
+            and gpu_uuid != expected_gpu_uuid
+        )
+        or value["cuda_visible_devices"] != gpu_uuid
+        or value["run_request_sha256"] != request["run_request_sha256"]
+        or value["request"] != rehashed["request"]
+        or value["final_release"] != rehashed["final_release"]
+        or value["verification_order"]
+        != list(WORKER_PRE_CUDA_VERIFICATION_ORDER)
+        or value["rehashed_bindings_sha256"]
+        != hashlib.sha256(canonical_json(rehashed)).hexdigest()
+        or value["screening_worker_sha256"]
+        != request["implementations"]["screening_worker"]["sha256"]
+        or value["controller_implementation_sha256"]
+        != request["implementations"]["controller"]["sha256"]
+        or value["heavy_modules_absent"] is not True
+        or value["loaded_heavy_modules"] != []
+        or value["external_gpu_race_contract"]
+        != WORKER_EXTERNAL_GPU_RACE_CONTRACT
+        or not isinstance(value["ready_at"], str)
+        or not value["ready_at"]
+        or value["worker_ready_sha256"]
+        != canonical_digest(value, "worker_ready_sha256")
+    ):
+        raise CanonicalScreeningError("worker ready contract mismatch")
+    _load_handshake_artifact(
+        value["controller_claim"],
+        label="worker ready controller claim",
+        digest_field="controller_claim_sha256",
+        contract_type="safa_canonical_gpu_controller_claim_v1",
+    )
+    controller_ready = load_json(
+        Path(str(request["controller_ready"]["path"])),
+        "worker ready controller barrier",
+    )
+    if value["controller_claim"] != controller_ready.get(
+        "controller_claim"
+    ):
+        raise CanonicalScreeningError(
+            "worker ready controller claim binding differs"
+        )
+    return value
+
+
+def validate_controller_launch_rehash_value(
+    raw_value: Mapping[str, Any],
+    request: Mapping[str, Any],
+    policy: Mapping[str, Any],
+) -> dict[str, Any]:
+    value = dict(
+        _require_mapping(raw_value, "controller launch rehash")
+    )
+    required = {
+        "schema_version",
+        "contract_type",
+        "policy_sha256",
+        "run_request_sha256",
+        "worker_pid",
+        "gpu_index",
+        "gpu_uuid",
+        "worker_ready",
+        "verification_order",
+        "rehashed_bindings",
+        "rehashed_bindings_sha256",
+        "resource_snapshot",
+        "asset_content_verification",
+        "external_gpu_race_contract",
+        "validated_at",
+        "controller_launch_rehash_sha256",
+    }
+    _require_exact_keys(value, required, "controller launch rehash")
+    ready = _load_handshake_artifact(
+        value["worker_ready"],
+        label="controller launch worker ready",
+        digest_field="worker_ready_sha256",
+        contract_type=WORKER_READY_CONTRACT,
+    )
+    validate_worker_ready_value(
+        ready,
+        request,
+        policy,
+        expected_worker_pid=value["worker_pid"],
+        expected_gpu_index=value["gpu_index"],
+        expected_gpu_uuid=value["gpu_uuid"],
+    )
+    rehashed = _validate_worker_rehashed_bindings(
+        value["rehashed_bindings"], request, policy
+    )
+    _validate_controller_resource_snapshot(
+        value["resource_snapshot"], request, policy
+    )
+    _validate_asset_content_verification(
+        value["asset_content_verification"], policy
+    )
+    if (
+        value["schema_version"] != SCHEMA_VERSION
+        or value["contract_type"] != CONTROLLER_LAUNCH_REHASH_CONTRACT
+        or value["policy_sha256"] != policy["policy_sha256"]
+        or value["run_request_sha256"] != request["run_request_sha256"]
+        or value["verification_order"]
+        != list(WORKER_PRE_CUDA_VERIFICATION_ORDER)
+        or value["rehashed_bindings"] != ready["rehashed_bindings"]
+        or value["rehashed_bindings_sha256"]
+        != hashlib.sha256(canonical_json(rehashed)).hexdigest()
+        or value["rehashed_bindings_sha256"]
+        != ready["rehashed_bindings_sha256"]
+        or value["external_gpu_race_contract"]
+        != WORKER_EXTERNAL_GPU_RACE_CONTRACT
+        or not isinstance(value["validated_at"], str)
+        or not value["validated_at"]
+        or value["controller_launch_rehash_sha256"]
+        != canonical_digest(
+            value, "controller_launch_rehash_sha256"
+        )
+    ):
+        raise CanonicalScreeningError(
+            "controller launch rehash contract mismatch"
+        )
+    return value
+
+
+def validate_worker_release_value(
+    raw_value: Mapping[str, Any],
+    request: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    *,
+    expected_worker_pid: int | None = None,
+) -> dict[str, Any]:
+    value = dict(_require_mapping(raw_value, "worker release"))
+    required = {
+        "schema_version",
+        "contract_type",
+        "policy_sha256",
+        "phase",
+        "worker_pid",
+        "run_request_sha256",
+        "worker_ready",
+        "controller_launch_rehash",
+        "resource_snapshot",
+        "external_gpu_race_contract",
+        "released_at",
+        "worker_release_sha256",
+    }
+    _require_exact_keys(value, required, "worker release")
+    worker_pid = value["worker_pid"]
+    ready = _load_handshake_artifact(
+        value["worker_ready"],
+        label="worker release ready",
+        digest_field="worker_ready_sha256",
+        contract_type=WORKER_READY_CONTRACT,
+    )
+    validate_worker_ready_value(
+        ready,
+        request,
+        policy,
+        expected_worker_pid=worker_pid,
+    )
+    controller_rehash = _load_handshake_artifact(
+        value["controller_launch_rehash"],
+        label="worker release controller launch rehash",
+        digest_field="controller_launch_rehash_sha256",
+        contract_type=CONTROLLER_LAUNCH_REHASH_CONTRACT,
+    )
+    validate_controller_launch_rehash_value(
+        controller_rehash, request, policy
+    )
+    resource_snapshot = dict(
+        _require_mapping(
+            value["resource_snapshot"], "worker release resource snapshot"
+        )
+    )
+    _require_exact_keys(
+        resource_snapshot,
+        {"admission", "runtime_guard"},
+        "worker release resource snapshot",
+    )
+    _validate_runtime_resource_snapshot(
+        resource_snapshot["runtime_guard"],
+        request,
+        policy,
+        worker_pid,
+    )
+    if (
+        value["schema_version"] != SCHEMA_VERSION
+        or value["contract_type"] != WORKER_RELEASE_CONTRACT
+        or value["policy_sha256"] != policy["policy_sha256"]
+        or value["phase"] != request["mode"]
+        or type(worker_pid) is not int
+        or worker_pid <= 0
+        or (expected_worker_pid is not None and worker_pid != expected_worker_pid)
+        or value["run_request_sha256"] != request["run_request_sha256"]
+        or controller_rehash["worker_pid"] != worker_pid
+        or controller_rehash["worker_ready"] != value["worker_ready"]
+        or resource_snapshot["admission"]
+        != controller_rehash["resource_snapshot"]
+        or value["external_gpu_race_contract"]
+        != WORKER_EXTERNAL_GPU_RACE_CONTRACT
+        or value["external_gpu_race_contract"]
+        != controller_rehash["external_gpu_race_contract"]
+        or not isinstance(value["released_at"], str)
+        or not value["released_at"]
+        or value["worker_release_sha256"]
+        != canonical_digest(value, "worker_release_sha256")
+    ):
+        raise CanonicalScreeningError(
+            "worker release contract mismatch"
+        )
+    return value
+
+
+def validate_worker_terminal_value(
+    raw_value: Mapping[str, Any],
+    request_path: Path,
+    policy: Mapping[str, Any],
+    *,
+    expected_worker_pid: int | None = None,
+    require_completed: bool = False,
+) -> dict[str, Any]:
+    value = dict(_require_mapping(raw_value, "worker terminal"))
+    _require_exact_keys(
+        value,
+        {
+            "schema_version",
+            "contract_type",
+            "policy_sha256",
+            "worker_pid",
+            "request",
+            "claim",
+            "result",
+            "worker_ready",
+            "worker_release",
+            "status",
+            "failure",
+            "started_at",
+            "completed_at",
+            "worker_terminal_sha256",
+        },
+        "worker terminal",
+    )
+    request = _load_handshake_artifact(
+        value["request"],
+        label="worker terminal request",
+        digest_field="run_request_sha256",
+        contract_type=RUN_REQUEST_CONTRACT,
+    )
+    validate_run_request(request, policy)
+    if Path(str(value["request"]["path"])).resolve() != request_path.resolve():
+        raise CanonicalScreeningError(
+            "worker terminal request path differs"
+        )
+    worker_pid = value["worker_pid"]
+    claim = _load_handshake_artifact(
+        value["claim"],
+        label="worker terminal claim",
+        digest_field="run_claim_sha256",
+        contract_type=RUN_CLAIM_CONTRACT,
+    )
+    validate_run_claim(claim, request, policy)
+    result = _load_handshake_artifact(
+        value["result"],
+        label="worker terminal result",
+        digest_field="run_result_sha256",
+        contract_type=RUN_RESULT_CONTRACT,
+    )
+    validate_run_result(result, request, claim, policy)
+    ready = _load_handshake_artifact(
+        value["worker_ready"],
+        label="worker terminal ready",
+        digest_field="worker_ready_sha256",
+        contract_type=WORKER_READY_CONTRACT,
+    )
+    validate_worker_ready_value(
+        ready, request, policy, expected_worker_pid=worker_pid
+    )
+    release = _load_handshake_artifact(
+        value["worker_release"],
+        label="worker terminal release",
+        digest_field="worker_release_sha256",
+        contract_type=WORKER_RELEASE_CONTRACT,
+    )
+    validate_worker_release_value(
+        release, request, policy, expected_worker_pid=worker_pid
+    )
+    if (
+        value["schema_version"] != SCHEMA_VERSION
+        or value["contract_type"] != "safa_canonical_worker_terminal_v1"
+        or value["policy_sha256"] != policy["policy_sha256"]
+        or type(worker_pid) is not int
+        or worker_pid <= 0
+        or (
+            expected_worker_pid is not None
+            and worker_pid != expected_worker_pid
+        )
+        or value["request"]["canonical_sha256"]
+        != request["run_request_sha256"]
+        or value["claim"]["canonical_sha256"]
+        != claim["run_claim_sha256"]
+        or value["result"]["canonical_sha256"]
+        != result["run_result_sha256"]
+        or value["worker_ready"] != claim["worker_ready"]
+        or value["worker_release"] != claim["worker_release"]
+        or value["status"] not in {"completed", "failed"}
+        or value["status"] != result["status"]
+        or (value["status"] == "completed" and value["failure"] is not None)
+        or (
+            value["status"] == "failed"
+            and not isinstance(value["failure"], Mapping)
+        )
+        or not isinstance(value["started_at"], str)
+        or not value["started_at"]
+        or not isinstance(value["completed_at"], str)
+        or not value["completed_at"]
+        or (
+            require_completed
+            and (
+                value["status"] != "completed"
+                or result["status"] != "completed"
+            )
+        )
+        or value["worker_terminal_sha256"]
+        != canonical_digest(value, "worker_terminal_sha256")
+    ):
+        raise CanonicalScreeningError(
+            "worker terminal contract mismatch"
+        )
+    return value
+
+
+def _validate_worker_handshake_bindings(
+    worker_ready: Mapping[str, Any],
+    worker_release: Mapping[str, Any],
+    request: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    worker_pid: int,
+) -> None:
+    ready_value = _load_handshake_artifact(
+        worker_ready,
+        label="worker ready",
+        digest_field="worker_ready_sha256",
+        contract_type=WORKER_READY_CONTRACT,
+    )
+    validate_worker_ready_value(
+        ready_value,
+        request,
+        policy,
+        expected_worker_pid=worker_pid,
+    )
+    release_value = _load_handshake_artifact(
+        worker_release,
+        label="worker release",
+        digest_field="worker_release_sha256",
+        contract_type=WORKER_RELEASE_CONTRACT,
+    )
+    validate_worker_release_value(
+        release_value,
+        request,
+        policy,
+        expected_worker_pid=worker_pid,
+    )
+    if release_value["worker_ready"] != dict(worker_ready):
+        raise CanonicalScreeningError(
+            "worker release does not bind worker ready"
+        )
+
+
 def build_run_claim(
     request: Mapping[str, Any],
     policy: Mapping[str, Any],
+    final_release_admission: Mapping[str, Any],
+    worker_ready: Mapping[str, Any],
+    worker_release: Mapping[str, Any],
     gpu_index: int,
     gpu_uuid: str,
     runtime_cuda_uuid: str,
@@ -4894,10 +6147,16 @@ def build_run_claim(
     started_at: str,
 ) -> dict[str, Any]:
     validate_run_request(request, policy)
+    validated_release = validate_final_release_admission(
+        final_release_admission, request, policy
+    )
     if gpu_index not in {0, 1, 2, 3}:
         raise CanonicalScreeningError("screening GPU must be one of 0..3")
     if type(worker_pid) is not int or worker_pid <= 0:
         raise CanonicalScreeningError("worker PID must be positive")
+    _validate_worker_handshake_bindings(
+        worker_ready, worker_release, request, policy, worker_pid
+    )
     claim = {
         "schema_version": SCHEMA_VERSION,
         "contract_type": RUN_CLAIM_CONTRACT,
@@ -4905,6 +6164,14 @@ def build_run_claim(
         "admission_sha256": request["admission"]["canonical_sha256"],
         "controller_ready_sha256": request["controller_ready"]["canonical_sha256"],
         "observer_ready_sha256": request["observer_ready"]["canonical_sha256"],
+        "final_release_admission": dict(final_release_admission),
+        "final_release_admission_sha256": validated_release[
+            "final_release_admission_sha256"
+        ],
+        "worker_ready": dict(worker_ready),
+        "worker_ready_sha256": worker_ready["canonical_sha256"],
+        "worker_release": dict(worker_release),
+        "worker_release_sha256": worker_release["canonical_sha256"],
         "physical_gpu_index": gpu_index,
         "physical_gpu_uuid": gpu_uuid,
         "logical_cuda_index": 0,
@@ -4936,6 +6203,12 @@ def validate_run_claim(
             "admission_sha256",
             "controller_ready_sha256",
             "observer_ready_sha256",
+            "final_release_admission",
+            "final_release_admission_sha256",
+            "worker_ready",
+            "worker_ready_sha256",
+            "worker_release",
+            "worker_release_sha256",
             "physical_gpu_index",
             "physical_gpu_uuid",
             "logical_cuda_index",
@@ -4958,12 +6231,27 @@ def validate_run_claim(
         != validated_request["controller_ready"]["canonical_sha256"]
         or value["observer_ready_sha256"]
         != validated_request["observer_ready"]["canonical_sha256"]
+        or value["final_release_admission_sha256"]
+        != validate_final_release_admission(
+            value["final_release_admission"], validated_request, policy
+        )["final_release_admission_sha256"]
+        or value["worker_ready_sha256"]
+        != value["worker_ready"]["canonical_sha256"]
+        or value["worker_release_sha256"]
+        != value["worker_release"]["canonical_sha256"]
         or value["physical_gpu_index"]
         not in policy["resources"]["physical_gpus"]
         or type(value["worker_pid"]) is not int
         or value["worker_pid"] <= 0
     ):
         raise CanonicalScreeningError("run claim binding mismatch")
+    _validate_worker_handshake_bindings(
+        value["worker_ready"],
+        value["worker_release"],
+        validated_request,
+        policy,
+        value["worker_pid"],
+    )
     registry = {
         row["physical_gpu_index"]: row["physical_gpu_uuid"]
         for row in validated_request["authorized_gpu_registry"]
@@ -5011,6 +6299,11 @@ def build_run_result(
         "run_claim_sha256": claim["run_claim_sha256"],
         "controller_ready_sha256": claim["controller_ready_sha256"],
         "observer_ready_sha256": claim["observer_ready_sha256"],
+        "final_release_admission_sha256": claim[
+            "final_release_admission_sha256"
+        ],
+        "worker_ready_sha256": claim["worker_ready_sha256"],
+        "worker_release_sha256": claim["worker_release_sha256"],
         "device_binding": {
             "physical_gpu_index": claim["physical_gpu_index"],
             "physical_gpu_uuid": claim["physical_gpu_uuid"],
@@ -5046,6 +6339,9 @@ def validate_run_result(
             "run_claim_sha256",
             "controller_ready_sha256",
             "observer_ready_sha256",
+            "final_release_admission_sha256",
+            "worker_ready_sha256",
+            "worker_release_sha256",
             "device_binding",
             "ram_slot_budget_bytes",
             "status",
@@ -5065,6 +6361,12 @@ def validate_run_result(
         != validated_claim["controller_ready_sha256"]
         or value["observer_ready_sha256"]
         != validated_claim["observer_ready_sha256"]
+        or value["final_release_admission_sha256"]
+        != validated_claim["final_release_admission_sha256"]
+        or value["worker_ready_sha256"]
+        != validated_claim["worker_ready_sha256"]
+        or value["worker_release_sha256"]
+        != validated_claim["worker_release_sha256"]
         or value["device_binding"]
         != {
             "physical_gpu_index": validated_claim["physical_gpu_index"],

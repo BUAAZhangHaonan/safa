@@ -91,12 +91,33 @@ def test_full_contract_binds_frozen_v3_winner_and_batch2() -> None:
     supersession = historical[
         "smoke_supersession"
     ]
-    assert supersession["contract_sha256"] == smoke.build_full_smoke_supersession_contract(
+    historical_smoke = json.loads(
+        (REPO_ROOT / supersession["path"]).read_text(encoding="utf-8")
+    )
+    assert supersession["contract_sha256"] == (
+        "ff8152dd8529bae94c0f81668477299fa9f03303fb22dae73c9d479217485df1"
+    )
+    assert historical_smoke["smoke_supersession_sha256"] == supersession[
+        "contract_sha256"
+    ]
+    assert historical_smoke["worker"]["implementation_sha256"] == (
+        "57e083fa6c910d268e2b90fc1aae4bd0d3a8143a67146822c2626bce7612cfd3"
+    )
+    assert historical_smoke["execution"]["v2_execution_count"] == 0
+    current_smoke = smoke.build_full_smoke_supersession_contract(
         repo_root=REPO_ROOT
-    )["smoke_supersession_sha256"]
-    failed_v1 = smoke.build_full_smoke_supersession_contract(
-        repo_root=REPO_ROOT
-    )["failed_v1"]
+    )
+    assert current_smoke["smoke_supersession_sha256"] == (
+        "0b4108daef264addd84145a86e79bd5ea9aeaeba88f359edf4d00dd302763ccf"
+    )
+    assert current_smoke["worker"]["implementation_sha256"] == (
+        "dd734b51c630a4d11e9d5b6dea7953d25471cdb71f682d77e791bab47b50c0dd"
+    )
+    assert (
+        current_smoke["smoke_supersession_sha256"]
+        != historical_smoke["smoke_supersession_sha256"]
+    )
+    failed_v1 = current_smoke["failed_v1"]
     assert "terminal_observation" in failed_v1
     assert failed_v1["expected_absent_outputs"] == {
         "arcface_worker_result": (

@@ -3,15 +3,22 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import types
 
 import pytest
 
 from safa.closeout.canonical_screening import (
     CanonicalScreeningError,
+    CONTROLLER_LAUNCH_REHASH_CONTRACT,
+    WORKER_EXTERNAL_GPU_RACE_CONTRACT,
+    WORKER_PRE_CUDA_VERIFICATION_ORDER,
+    WORKER_READY_CONTRACT,
+    WORKER_RELEASE_CONTRACT,
     _require_no_repo_path_component_symlinks,
     _require_tree_without_symlinks,
     _validate_6b_failed_probe_root_identity,
@@ -27,16 +34,23 @@ from safa.closeout.canonical_screening import (
     canonical_gpu_registry,
     canonicalize_nvidia_gpu_uuid,
     canonical_json,
+    hash_asset_directory_content,
     load_json,
+    publish_exclusive_json,
     ram_probe_admission_evidence_digest,
     ram_probe_contract_digest,
     ram_probe_execution_digest,
+    sha256_file,
     validate_arcface_execution_probe_binding,
     validate_candidate_manifest,
     validate_checkpoint_plan,
     validate_preflight_result,
     validate_run_request,
     validate_run_result,
+    validate_controller_launch_rehash_value,
+    validate_worker_ready_value,
+    validate_worker_release_value,
+    validate_worker_terminal_value,
     validate_supersession_evidence,
     validate_policy,
     write_exclusive_json,
@@ -47,8 +61,11 @@ from safa.closeout.canonical_screening_worker import (
     _load_arcface_contract,
     _load_source_pixel_batch,
     _representation_cosines,
+    _wait_worker_release,
     _write_validated_run_result,
+    execute_screening_request,
 )
+import safa.closeout.canonical_screening_worker as screening_worker_module
 from safa.closeout.canonical_quality import evaluate_locked_kid
 from safa.closeout.generator_output_contract import (
     bind_output_contract,
@@ -61,12 +78,22 @@ def _gpu_uuid(index: int) -> str:
     return f"GPU-0000000{index}-0000-0000-0000-00000000000{index}"
 
 
-def _controller_module():
+def _raw_controller_module():
     path = Path(__file__).parents[1] / "scripts" / "run_canonical_checkpoint_screening.py"
     spec = importlib.util.spec_from_file_location("canonical_controller_test", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return module
+
+
+def _controller_module():
+    module = _raw_controller_module()
+    module._install_verified_contract_api(
+        Path(__file__).parents[1]
+        / "configs/closeout/canonical_screening_512_v1.json",
+        verify_historical_output_evidence=False,
+    )
     return module
 
 
@@ -179,6 +206,49 @@ def _decoder_registry(tmp_path: Path) -> dict:
     return registry
 
 
+def test_asset_content_hash_rejects_same_size_restored_time_and_forged_cache(
+    tmp_path: Path,
+) -> None:
+    asset = tmp_path / "vae"
+    asset.mkdir()
+    weights = asset / "weights.bin"
+    weights.write_bytes(b"AAAA")
+    expected = hashlib.sha256(
+        b"weights.bin\0" + b"AAAA" + b"\0"
+    ).hexdigest()
+    verification = hash_asset_directory_content(asset, expected)
+    original_mtime_ns = weights.stat().st_mtime_ns
+    weights.write_bytes(b"BBBB")
+    os.utime(weights, ns=(original_mtime_ns, original_mtime_ns))
+    current = weights.stat()
+    forged_cache = {
+        "forged": {
+            "path": str(asset.resolve()),
+            "expected_digest": expected,
+            "stat_fingerprint": [
+                {
+                    "relative": "weights.bin",
+                    "device": int(current.st_dev),
+                    "inode": int(current.st_ino),
+                    "size": int(current.st_size),
+                    "mtime_ns": int(current.st_mtime_ns),
+                    "ctime_ns": int(current.st_ctime_ns),
+                }
+            ],
+            "digest": expected,
+        }
+    }
+    (tmp_path / "forged-cache.json").write_text(
+        json.dumps(forged_cache), encoding="utf-8"
+    )
+    assert verification["total_bytes"] == 4
+    with pytest.raises(
+        CanonicalScreeningError,
+        match="asset directory content digest differs",
+    ):
+        hash_asset_directory_content(asset, expected)
+
+
 def _pixel_output_contract(checkpoint_sha256: str, registry: dict) -> dict:
     capability = resolve_checkpoint_output_capability(
         {
@@ -198,6 +268,23 @@ def _pixel_output_contract(checkpoint_sha256: str, registry: dict) -> dict:
         checkpoint_sha256,
     )
     return bind_output_contract(capability, registry)
+
+
+def _asset_content_verification(policy: dict) -> dict:
+    directory = policy["output_decoder_registry"]["latent"]["directory"]
+    return {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_asset_content_verification_v1",
+        "path": directory["path"],
+        "digest_algorithm": "sha256_relative_posix_nul_content_nul_v1",
+        "expected_digest": directory["digest"],
+        "observed_digest": directory["digest"],
+        "file_count": 2,
+        "total_bytes": 2,
+        "elapsed_seconds": 0.01,
+        "started_at": "2026-07-27T00:00:00+00:00",
+        "completed_at": "2026-07-27T00:00:00+00:00",
+    }
 
 
 def _policy(tmp_path: Path, ledger: Path) -> tuple[dict, Path, dict]:
@@ -317,6 +404,17 @@ def _policy(tmp_path: Path, ledger: Path) -> tuple[dict, Path, dict]:
 
 
 def _admission_snapshot(policy: dict) -> dict:
+    slot_count = (
+        len(policy["resources"]["physical_gpus"])
+        * int(policy["resources"]["workers_per_gpu"])
+    )
+    slot_budget_bytes = int(
+        policy["resources"]["ram_slot_budget_bytes"]
+    )
+    reserved_bytes = slot_count * slot_budget_bytes
+    memory_total_bytes = max(100000, reserved_bytes * 10)
+    memory_used_bytes = memory_total_bytes // 10
+    projected_used_bytes = memory_used_bytes + reserved_bytes
     return {
         "gpus": [],
         "authorized_gpu_registry": [
@@ -327,14 +425,18 @@ def _admission_snapshot(policy: dict) -> dict:
             for index in range(4)
         ],
         "ram_reservation": {
-            "slot_count": 8,
-            "slot_budget_bytes": 1100,
-            "reserved_bytes": 8800,
-            "memory_total_bytes": 100000,
-            "memory_used_bytes": 10000,
-            "projected_used_bytes": 18800,
-            "projected_used_percent": 18.8,
-            "admission_limit_percent": 85,
+            "slot_count": slot_count,
+            "slot_budget_bytes": slot_budget_bytes,
+            "reserved_bytes": reserved_bytes,
+            "memory_total_bytes": memory_total_bytes,
+            "memory_used_bytes": memory_used_bytes,
+            "projected_used_bytes": projected_used_bytes,
+            "projected_used_percent": (
+                100.0 * projected_used_bytes / memory_total_bytes
+            ),
+            "admission_limit_percent": policy["resources"][
+                "ram_admission_percent"
+            ],
             "budget_source": policy["resources"]["ram_slot_budget_source"],
         },
     }
@@ -432,8 +534,19 @@ def _complete_plan(tmp_path: Path, rows: list[dict]) -> tuple[dict, dict, Path]:
 
 
 def _manifest_fixture(tmp_path: Path) -> tuple[dict, dict, Path, Path, dict, dict]:
+    checkpoint = tmp_path / "artifacts" / "candidate.pt"
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint.write_bytes(b"canonical-screening-fixture-checkpoint")
+    checkpoint_sha256 = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
     plan, policy, result_root = _complete_plan(
-        tmp_path, [_row("candidate", "8" * 64)]
+        tmp_path,
+        [
+            _row(
+                "candidate",
+                checkpoint_sha256,
+                path=str(checkpoint.resolve()),
+            )
+        ],
     )
     plan_path = tmp_path / "plan.json"
     write_exclusive_json(plan_path, plan)
@@ -612,9 +725,355 @@ def _run_fixture(tmp_path: Path, mode: str = "smoke8", replicate: str = "primary
     return policy, request
 
 
+def _real_policy_run_fixture(
+    tmp_path: Path,
+    module,
+) -> tuple[dict, Path, dict, Path]:
+    repo_root = Path(__file__).parents[1].resolve()
+    config = (
+        repo_root
+        / "configs/closeout/canonical_screening_512_v1.json"
+    )
+    policy = validate_policy(
+        repo_root,
+        config,
+        verify_historical_output_evidence=False,
+    )
+    preflight_root = tmp_path / "real-policy-preflight"
+    pending = build_checkpoint_plan(repo_root, policy, preflight_root)
+    available = []
+    for request in pending["preflight_requests"]:
+        raw_path = Path(str(request["checkpoint_path"]))
+        checkpoint_path = (
+            raw_path if raw_path.is_absolute() else repo_root / raw_path
+        ).resolve()
+        if checkpoint_path.is_file():
+            available.append(
+                (checkpoint_path.stat().st_size, checkpoint_path, request)
+            )
+    for _, checkpoint_path, preflight_request in sorted(
+        available, key=lambda item: (item[0], str(item[1]))
+    ):
+        if sha256_file(checkpoint_path) == preflight_request[
+            "checkpoint_sha256"
+        ]:
+            break
+    else:
+        raise AssertionError(
+            "real policy has no SHA-exact checkpoint for CPU integration"
+        )
+    selected_sha256 = preflight_request["checkpoint_sha256"]
+    for item in pending["preflight_requests"]:
+        selected = item["checkpoint_sha256"] == selected_sha256
+        strict = _strict_preflight(
+            item["checkpoint_sha256"],
+            item["checkpoint_model"],
+            policy["output_decoder_registry"],
+            status="valid" if selected else "invalid",
+        )
+        strict["checkpoint_path"] = (
+            str(checkpoint_path)
+            if selected
+            else str(item["checkpoint_path"])
+        )
+        preflight_result = build_preflight_result(
+            item, policy, strict
+        )
+        write_exclusive_json(
+            preflight_root
+            / (
+                f"{item['checkpoint_sha256']}__"
+                f"{item['checkpoint_model']}.json"
+            ),
+            preflight_result,
+        )
+    plan = build_checkpoint_plan(repo_root, policy, preflight_root)
+    assert plan["counts"]["eligible_candidates"] == 1
+    plan_path = tmp_path / "real-policy-plan.json"
+    write_exclusive_json(plan_path, plan)
+    manifest = build_candidate_manifest(
+        policy,
+        plan,
+        plan_path=plan_path,
+        repo_root=repo_root,
+        preflight_root=preflight_root,
+    )
+    manifest_path = tmp_path / "real-policy-manifest.json"
+    write_exclusive_json(manifest_path, manifest)
+    admission_value = {
+        "contract_type": "safa_canonical_resource_admission_v1",
+        "policy_sha256": policy["policy_sha256"],
+        "snapshot": _admission_snapshot(policy),
+    }
+    admission_value["admission_sha256"] = canonical_digest(
+        admission_value, "admission_sha256"
+    )
+    admission_path = tmp_path / "real-policy-admission.json"
+    write_exclusive_json(admission_path, admission_value)
+    admission = {
+        **_bound(admission_path),
+        "canonical_sha256": admission_value["admission_sha256"],
+    }
+    controller_ready, observer_ready = _production_ready_bindings(
+        tmp_path, module, policy, manifest, admission
+    )
+    request = build_run_request(
+        policy,
+        config,
+        manifest,
+        manifest_path,
+        manifest["candidates"][0],
+        "smoke8",
+        "primary",
+        tmp_path / "real-policy-runs",
+        admission,
+        controller_ready,
+        observer_ready,
+    )
+    request_path = tmp_path / "real-policy-run-request.json"
+    write_exclusive_json(request_path, request)
+    return policy, config, request, request_path
+
+
+def _production_ready_bindings(
+    tmp_path: Path,
+    module,
+    policy: dict,
+    manifest: dict,
+    admission: dict,
+) -> tuple[dict, dict]:
+    paths = module._paths(
+        tmp_path / "real-ready-campaign", policy["policy_sha256"]
+    )
+    wrapper, observer_launch = _wrapper_bindings(
+        tmp_path, policy, "smoke8"
+    )
+    claim, claim_path = module._write_gpu_controller_claim(
+        policy, paths, "smoke8", wrapper, observer_launch
+    )
+    intent, intent_path = module._write_request_intent_manifest(
+        policy,
+        paths,
+        "smoke8",
+        ("primary", "repeat"),
+        manifest,
+        admission,
+    )
+
+    def artifact(name: str, digest_field: str) -> tuple[dict, Path]:
+        value = {
+            "kind": name,
+            "policy_sha256": policy["policy_sha256"],
+        }
+        value[digest_field] = canonical_digest(value, digest_field)
+        path = tmp_path / "real-ready-artifacts" / f"{name}.json"
+        write_exclusive_json(path, value)
+        return value, path
+
+    internal, internal_path = artifact(
+        "internal", "monitor_sample_sha256"
+    )
+    first_guard, first_guard_path = artifact(
+        "runtime_guard", "resource_window_sha256"
+    )
+    recheck, recheck_path = artifact(
+        "resource_recheck", "resource_recheck_sha256"
+    )
+    controller, _, controller_binding = module._write_controller_ready(
+        policy,
+        paths,
+        "smoke8",
+        claim,
+        admission,
+        intent,
+        intent_path,
+        internal,
+        internal_path,
+        first_guard,
+        first_guard_path,
+        recheck,
+        recheck_path,
+        claim_path,
+    )
+    observer_claim, observer_claim_path = artifact(
+        "observer_claim", "observer_claim_sha256"
+    )
+    observer_sample, observer_sample_path = artifact(
+        "observer_sample", "monitor_sample_sha256"
+    )
+    observer = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_gpu_observer_ready_v1",
+        "campaign_id": policy["campaign_id"],
+        "phase": "smoke8",
+        "policy_sha256": policy["policy_sha256"],
+        "admission_sha256": admission["canonical_sha256"],
+        "controller_ready_sha256": controller[
+            "controller_ready_sha256"
+        ],
+        "observer_claim_sha256": observer_claim[
+            "observer_claim_sha256"
+        ],
+        "wrapper_claim_sha256": wrapper["canonical_sha256"],
+        "observer_launch_sha256": observer_launch[
+            "canonical_sha256"
+        ],
+        "observer_claim": module._artifact_binding(
+            observer_claim_path,
+            observer_claim["observer_claim_sha256"],
+        ),
+        "wrapper_claim": wrapper,
+        "observer_launch": observer_launch,
+        "controller_ready": controller_binding,
+        "admission": admission,
+        "first_observer_sample": module._artifact_binding(
+            observer_sample_path,
+            observer_sample["monitor_sample_sha256"],
+        ),
+    }
+    observer["observer_ready_sha256"] = canonical_digest(
+        observer, "observer_ready_sha256"
+    )
+    observer_path = (
+        paths["gpu_control"] / "smoke8" / "observer_ready.json"
+    )
+    write_exclusive_json(observer_path, observer)
+    observer_binding = module._artifact_binding(
+        observer_path, observer["observer_ready_sha256"]
+    )
+    module._validate_observer_ready(
+        observer, policy, "smoke8", controller, admission
+    )
+    return controller_binding, observer_binding
+
+
+def _final_release_for_single_request(
+    tmp_path: Path,
+    policy: dict,
+    request: dict,
+    request_path: Path,
+) -> dict:
+    controller_ready = load_json(
+        Path(request["controller_ready"]["path"]),
+        "real pre-CUDA controller ready",
+    )
+    release = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_gpu_final_release_admission_v1",
+        "campaign_id": policy["campaign_id"],
+        "phase": request["mode"],
+        "policy_sha256": policy["policy_sha256"],
+        "initial_admission_sha256": request["admission"][
+            "canonical_sha256"
+        ],
+        "controller_ready_sha256": request["controller_ready"][
+            "canonical_sha256"
+        ],
+        "observer_ready_sha256": request["observer_ready"][
+            "canonical_sha256"
+        ],
+        "wrapper_claim": controller_ready["wrapper_claim"],
+        "wrapper_claim_sha256": controller_ready[
+            "wrapper_claim_sha256"
+        ],
+        "observer_launch": controller_ready["observer_launch"],
+        "observer_launch_sha256": controller_ready[
+            "observer_launch_sha256"
+        ],
+        "authorized_gpu_registry": request[
+            "authorized_gpu_registry"
+        ],
+        "request_count": 1,
+        "requests": [
+            {
+                **_bound(request_path),
+                "canonical_sha256": request["run_request_sha256"],
+            }
+        ],
+        "snapshot": {
+            "authorized_gpu_registry": request[
+                "authorized_gpu_registry"
+            ],
+            "compute_processes": [],
+        },
+        "released_at": "2026-07-27T00:00:00+00:00",
+    }
+    release["final_release_admission_sha256"] = canonical_digest(
+        release, "final_release_admission_sha256"
+    )
+    release_path = tmp_path / "real-policy-final-release.json"
+    write_exclusive_json(release_path, release)
+    return {
+        **_bound(release_path),
+        "canonical_sha256": release[
+            "final_release_admission_sha256"
+        ],
+    }
+
+
 def _ready_bindings(
     tmp_path: Path, policy: dict, admission: dict, mode: str
 ) -> tuple[dict, dict]:
+    wrapper_claim = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_gpu_wrapper_claim_v1",
+        "policy_sha256": policy["policy_sha256"],
+        "phase": mode,
+    }
+    wrapper_claim["wrapper_claim_sha256"] = canonical_digest(
+        wrapper_claim, "wrapper_claim_sha256"
+    )
+    wrapper_claim_path = tmp_path / "ready" / mode / "wrapper_claim.json"
+    write_exclusive_json(wrapper_claim_path, wrapper_claim)
+    wrapper_binding = {
+        **_bound(wrapper_claim_path),
+        "canonical_sha256": wrapper_claim["wrapper_claim_sha256"],
+    }
+    observer_launch = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_gpu_observer_launch_v2",
+        "policy_sha256": policy["policy_sha256"],
+        "phase": mode,
+        "status": "launched",
+        "failure": None,
+        "wrapper_claim": wrapper_binding,
+        "wrapper_claim_sha256": wrapper_claim["wrapper_claim_sha256"],
+    }
+    observer_launch["observer_launch_sha256"] = canonical_digest(
+        observer_launch, "observer_launch_sha256"
+    )
+    observer_launch_path = (
+        tmp_path / "ready" / mode / "observer_launch.json"
+    )
+    write_exclusive_json(observer_launch_path, observer_launch)
+    observer_launch_binding = {
+        **_bound(observer_launch_path),
+        "canonical_sha256": observer_launch["observer_launch_sha256"],
+    }
+    controller_claim = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_gpu_controller_claim_v1",
+        "campaign_id": policy["campaign_id"],
+        "phase": mode,
+        "policy_sha256": policy["policy_sha256"],
+        "wrapper_claim": wrapper_binding,
+        "observer_launch": observer_launch_binding,
+        "controller_pid": 77,
+        "started_at": "2026-07-27T00:00:00+00:00",
+    }
+    controller_claim["controller_claim_sha256"] = canonical_digest(
+        controller_claim, "controller_claim_sha256"
+    )
+    controller_claim_path = (
+        tmp_path / "ready" / mode / "controller_claim.json"
+    )
+    write_exclusive_json(controller_claim_path, controller_claim)
+    controller_claim_binding = {
+        **_bound(controller_claim_path),
+        "canonical_sha256": controller_claim[
+            "controller_claim_sha256"
+        ],
+    }
     controller = {
         "schema_version": 1,
         "contract_type": "safa_canonical_gpu_controller_ready_v1",
@@ -622,6 +1081,16 @@ def _ready_bindings(
         "phase": mode,
         "policy_sha256": policy["policy_sha256"],
         "admission_sha256": admission["canonical_sha256"],
+        "controller_claim": controller_claim_binding,
+        "controller_claim_sha256": controller_claim[
+            "controller_claim_sha256"
+        ],
+        "wrapper_claim": wrapper_binding,
+        "wrapper_claim_sha256": wrapper_claim["wrapper_claim_sha256"],
+        "observer_launch": observer_launch_binding,
+        "observer_launch_sha256": observer_launch[
+            "observer_launch_sha256"
+        ],
     }
     controller["controller_ready_sha256"] = canonical_digest(
         controller, "controller_ready_sha256"
@@ -640,6 +1109,12 @@ def _ready_bindings(
         "policy_sha256": policy["policy_sha256"],
         "admission_sha256": admission["canonical_sha256"],
         "controller_ready_sha256": controller["controller_ready_sha256"],
+        "wrapper_claim": wrapper_binding,
+        "wrapper_claim_sha256": wrapper_claim["wrapper_claim_sha256"],
+        "observer_launch": observer_launch_binding,
+        "observer_launch_sha256": observer_launch[
+            "observer_launch_sha256"
+        ],
     }
     observer["observer_ready_sha256"] = canonical_digest(
         observer, "observer_ready_sha256"
@@ -651,6 +1126,51 @@ def _ready_bindings(
         "canonical_sha256": observer["observer_ready_sha256"],
     }
     return controller_binding, observer_binding
+
+
+def _wrapper_bindings(
+    tmp_path: Path, policy: dict, mode: str
+) -> tuple[dict, dict]:
+    wrapper = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_gpu_wrapper_claim_v1",
+        "policy_sha256": policy["policy_sha256"],
+        "phase": mode,
+    }
+    wrapper["wrapper_claim_sha256"] = canonical_digest(
+        wrapper, "wrapper_claim_sha256"
+    )
+    wrapper_path = tmp_path / "wrapper" / mode / "wrapper_claim.json"
+    write_exclusive_json(wrapper_path, wrapper)
+    wrapper_binding = {
+        **_bound(wrapper_path),
+        "canonical_sha256": wrapper["wrapper_claim_sha256"],
+    }
+    launch = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_gpu_observer_launch_v2",
+        "policy_sha256": policy["policy_sha256"],
+        "phase": mode,
+        "status": "launched",
+        "failure": None,
+        "wrapper_claim": wrapper_binding,
+        "wrapper_claim_sha256": wrapper["wrapper_claim_sha256"],
+        "command": ["controller", "--monitor-target", mode, "--execute"],
+    }
+    launch["observer_launch_sha256"] = canonical_digest(
+        launch, "observer_launch_sha256"
+    )
+    launch_path = tmp_path / "wrapper" / mode / "observer_launch.json"
+    write_exclusive_json(launch_path, launch)
+    return wrapper_binding, {
+        **_bound(launch_path),
+        "canonical_sha256": launch["observer_launch_sha256"],
+    }
+
+
+def _mock_controller_claim(path: Path, claim: dict) -> tuple[dict, Path]:
+    write_exclusive_json(path, claim)
+    return claim, path
 
 
 def _evidence(policy: dict, request: dict) -> dict:
@@ -688,15 +1208,330 @@ def _evidence(policy: dict, request: dict) -> dict:
     }
 
 
+def _handshake_fixture(
+    policy: dict,
+    request: dict,
+    gpu_index: int = 0,
+    worker_pid: int = 123,
+) -> dict:
+    gpu_uuid = request["authorized_gpu_registry"][gpu_index][
+        "physical_gpu_uuid"
+    ]
+    request_path = (
+        Path(request["policy"]["path"]).parent
+        / "release_requests"
+        / f"{request['mode']}-{request['replicate']}.json"
+    )
+    write_exclusive_json(request_path, request)
+    release = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_gpu_final_release_admission_v1",
+        "campaign_id": policy["campaign_id"],
+        "phase": request["mode"],
+        "policy_sha256": policy["policy_sha256"],
+        "initial_admission_sha256": request["admission"][
+            "canonical_sha256"
+        ],
+        "controller_ready_sha256": request["controller_ready"][
+            "canonical_sha256"
+        ],
+        "observer_ready_sha256": request["observer_ready"][
+            "canonical_sha256"
+        ],
+        "wrapper_claim": load_json(
+            Path(request["controller_ready"]["path"]), "controller ready"
+        )["wrapper_claim"],
+        "wrapper_claim_sha256": load_json(
+            Path(request["controller_ready"]["path"]), "controller ready"
+        )["wrapper_claim_sha256"],
+        "observer_launch": load_json(
+            Path(request["controller_ready"]["path"]), "controller ready"
+        )["observer_launch"],
+        "observer_launch_sha256": load_json(
+            Path(request["controller_ready"]["path"]), "controller ready"
+        )["observer_launch_sha256"],
+        "authorized_gpu_registry": request["authorized_gpu_registry"],
+        "request_count": 1,
+        "requests": [
+            {
+                **_bound(request_path),
+                "canonical_sha256": request["run_request_sha256"],
+            }
+        ],
+        "snapshot": {
+            "authorized_gpu_registry": request["authorized_gpu_registry"],
+            "compute_processes": [],
+        },
+        "released_at": "2026-07-26T00:00:00+00:00",
+    }
+    release["final_release_admission_sha256"] = canonical_digest(
+        release, "final_release_admission_sha256"
+    )
+    release_path = (
+        Path(request["policy"]["path"]).parent
+        / "release_requests"
+        / f"{request['mode']}-{request['replicate']}-release.json"
+    )
+    write_exclusive_json(release_path, release)
+    release_binding = {
+        **_bound(release_path),
+        "canonical_sha256": release["final_release_admission_sha256"],
+    }
+    manifest = load_json(
+        Path(request["candidate_manifest"]["path"]),
+        "handshake candidate manifest",
+    )
+    checkpoint_path = Path(request["candidate"]["checkpoint_path"]).resolve()
+    rehashed_bindings = {
+        "config": {
+            "path": str(Path(request["policy"]["path"]).resolve()),
+            "sha256": request["policy"]["sha256"],
+        },
+        "implementations": {
+            name: {
+                "path": str(Path(binding["path"]).resolve()),
+                "sha256": binding["sha256"],
+            }
+            for name, binding in request["implementations"].items()
+        },
+        "request": {
+            "path": str(request_path.resolve()),
+            "sha256": hashlib.sha256(request_path.read_bytes()).hexdigest(),
+            "canonical_sha256": request["run_request_sha256"],
+        },
+        "candidate_manifest": dict(request["candidate_manifest"]),
+        "checkpoint_plan": dict(manifest["checkpoint_plan"]),
+        "checkpoint": {
+            "path": str(checkpoint_path),
+            "sha256": hashlib.sha256(checkpoint_path.read_bytes()).hexdigest(),
+        },
+        "data_and_evaluators": {
+            name: request[name]
+            for name in (
+                "sample_manifest",
+                "source_index",
+                "features",
+                "e0",
+                "edev",
+                "quality_script",
+                "pixel_protocol_config",
+                "arcface",
+            )
+        },
+        "final_release": dict(release_binding),
+        "controller_ready": dict(request["controller_ready"]),
+        "observer_ready": dict(request["observer_ready"]),
+    }
+    controller_ready = load_json(
+        Path(request["controller_ready"]["path"]),
+        "handshake controller ready",
+    )
+    worker_ready = {
+        "schema_version": 1,
+        "contract_type": WORKER_READY_CONTRACT,
+        "policy_sha256": policy["policy_sha256"],
+        "phase": request["mode"],
+        "worker_pid": worker_pid,
+        "gpu_index": gpu_index,
+        "gpu_uuid": gpu_uuid,
+        "run_request_sha256": request["run_request_sha256"],
+        "request": rehashed_bindings["request"],
+        "final_release": release_binding,
+        "verification_order": list(WORKER_PRE_CUDA_VERIFICATION_ORDER),
+        "rehashed_bindings": rehashed_bindings,
+        "rehashed_bindings_sha256": hashlib.sha256(
+            canonical_json(rehashed_bindings)
+        ).hexdigest(),
+        "controller_claim": controller_ready["controller_claim"],
+        "screening_worker_sha256": request["implementations"][
+            "screening_worker"
+        ]["sha256"],
+        "controller_implementation_sha256": request["implementations"][
+            "controller"
+        ]["sha256"],
+        "cuda_visible_devices": gpu_uuid,
+        "heavy_modules_absent": True,
+        "loaded_heavy_modules": [],
+        "asset_content_verification": _asset_content_verification(policy),
+        "external_gpu_race_contract": WORKER_EXTERNAL_GPU_RACE_CONTRACT,
+        "ready_at": "2026-07-27T00:00:01+00:00",
+    }
+    worker_ready["worker_ready_sha256"] = canonical_digest(
+        worker_ready, "worker_ready_sha256"
+    )
+    worker_ready_path = (
+        Path(request["policy"]["path"]).parent
+        / "release_requests"
+        / f"{request['mode']}-{request['replicate']}-worker-ready.json"
+    )
+    write_exclusive_json(worker_ready_path, worker_ready)
+    worker_ready_binding = {
+        **_bound(worker_ready_path),
+        "canonical_sha256": worker_ready["worker_ready_sha256"],
+    }
+    gpus = [
+        {
+            "index": row["physical_gpu_index"],
+            "uuid": row["physical_gpu_uuid"],
+            "memory_total_mib": 24576,
+            "memory_used_mib": 3,
+            "memory_free_mib": 24573,
+            "temperature_c": 35,
+        }
+        for row in request["authorized_gpu_registry"]
+    ]
+    controller_resource_snapshot = {
+        "observed_at": "2026-07-27T00:00:02+00:00",
+        "cpu_load_percent": 1.0,
+        "memory_percent": 2.0,
+        "disk_percent": 3.0,
+        "swap_pages": {"in": 0, "out": 0},
+        "gpus": gpus,
+        "authorized_gpu_registry": request["authorized_gpu_registry"],
+        "ram_reservation": {"validated": True},
+        "compute_processes": [],
+    }
+    controller_rehash = {
+        "schema_version": 1,
+        "contract_type": CONTROLLER_LAUNCH_REHASH_CONTRACT,
+        "policy_sha256": policy["policy_sha256"],
+        "run_request_sha256": request["run_request_sha256"],
+        "worker_pid": worker_pid,
+        "gpu_index": gpu_index,
+        "gpu_uuid": gpu_uuid,
+        "worker_ready": worker_ready_binding,
+        "verification_order": list(WORKER_PRE_CUDA_VERIFICATION_ORDER),
+        "rehashed_bindings": rehashed_bindings,
+        "rehashed_bindings_sha256": worker_ready[
+            "rehashed_bindings_sha256"
+        ],
+        "resource_snapshot": controller_resource_snapshot,
+        "asset_content_verification": _asset_content_verification(policy),
+        "external_gpu_race_contract": WORKER_EXTERNAL_GPU_RACE_CONTRACT,
+        "validated_at": "2026-07-27T00:00:02+00:00",
+    }
+    controller_rehash["controller_launch_rehash_sha256"] = canonical_digest(
+        controller_rehash, "controller_launch_rehash_sha256"
+    )
+    controller_rehash_path = (
+        Path(request["policy"]["path"]).parent
+        / "release_requests"
+        / f"{request['mode']}-{request['replicate']}-controller-rehash.json"
+    )
+    write_exclusive_json(controller_rehash_path, controller_rehash)
+    controller_rehash_binding = {
+        **_bound(controller_rehash_path),
+        "canonical_sha256": controller_rehash[
+            "controller_launch_rehash_sha256"
+        ],
+    }
+    worker_release = {
+        "schema_version": 1,
+        "contract_type": WORKER_RELEASE_CONTRACT,
+        "policy_sha256": policy["policy_sha256"],
+        "phase": request["mode"],
+        "worker_pid": worker_pid,
+        "run_request_sha256": request["run_request_sha256"],
+        "worker_ready": worker_ready_binding,
+        "controller_launch_rehash": controller_rehash_binding,
+        "resource_snapshot": {
+            "admission": controller_resource_snapshot,
+            "runtime_guard": {
+                "schema_version": 1,
+                "contract_type":
+                    "safa_canonical_worker_release_resource_snapshot_v2",
+                "policy_sha256": policy["policy_sha256"],
+                "observed_at": "2026-07-27T00:00:03+00:00",
+                "runtime_gpu_registry": request[
+                    "authorized_gpu_registry"
+                ],
+                "compute_processes": [],
+                "unknown_compute_processes": [],
+                "cpu_load_percent": 1.0,
+                "memory_percent": 2.0,
+                "disk_percent": 3.0,
+                "swap_pages_before": {"in": 0, "out": 0},
+                "swap_pages_after": {"in": 0, "out": 0},
+                "swap_io_delta": {"in": 0, "out": 0},
+                "swap_consecutive_io": 0,
+                "gpu": gpus,
+                "active_worker_pids": [worker_pid],
+                "hard_limits": {
+                    "cpu_percent": 90,
+                    "ram_percent": 90,
+                    "disk_percent": 90,
+                    "gpu_memory_percent": 90.0,
+                    "gpu_temperature_c": 85,
+                    "gpu_free_mib": 2048,
+                    "swap_io_delta_pages": 0,
+                    "swap_consecutive_io": 0,
+                },
+                "guard_thread_failure": None,
+                "guard_violation_reason": None,
+            },
+        },
+        "external_gpu_race_contract": WORKER_EXTERNAL_GPU_RACE_CONTRACT,
+        "released_at": "2026-07-27T00:00:03+00:00",
+    }
+    worker_release["worker_release_sha256"] = canonical_digest(
+        worker_release, "worker_release_sha256"
+    )
+    worker_release_path = (
+        Path(request["policy"]["path"]).parent
+        / "release_requests"
+        / f"{request['mode']}-{request['replicate']}-worker-release.json"
+    )
+    write_exclusive_json(worker_release_path, worker_release)
+    worker_release_binding = {
+        **_bound(worker_release_path),
+        "canonical_sha256": worker_release["worker_release_sha256"],
+    }
+    validate_worker_ready_value(
+        worker_ready,
+        request,
+        policy,
+        expected_worker_pid=worker_pid,
+        expected_gpu_index=gpu_index,
+        expected_gpu_uuid=gpu_uuid,
+    )
+    validate_controller_launch_rehash_value(
+        controller_rehash, request, policy
+    )
+    validate_worker_release_value(
+        worker_release,
+        request,
+        policy,
+        expected_worker_pid=worker_pid,
+    )
+    return {
+        "final_release": release_binding,
+        "worker_ready": worker_ready,
+        "worker_ready_binding": worker_ready_binding,
+        "controller_rehash": controller_rehash,
+        "controller_rehash_binding": controller_rehash_binding,
+        "worker_release": worker_release,
+        "worker_release_binding": worker_release_binding,
+    }
+
+
 def _run_claim(
     policy: dict, request: dict, gpu_index: int = 0, worker_pid: int = 123
 ) -> dict:
     gpu_uuid = request["authorized_gpu_registry"][gpu_index][
         "physical_gpu_uuid"
     ]
+    handshake = _handshake_fixture(
+        policy,
+        request,
+        gpu_index=gpu_index,
+        worker_pid=worker_pid,
+    )
     return build_run_claim(
         request,
         policy,
+        handshake["final_release"],
+        handshake["worker_ready_binding"],
+        handshake["worker_release_binding"],
         gpu_index,
         gpu_uuid,
         gpu_uuid,
@@ -704,6 +1539,156 @@ def _run_claim(
         worker_pid,
         "2026-07-26T00:00:00+00:00",
     )
+
+
+def _completed_worker_terminal_fixture(
+    policy: dict, request: dict, worker_pid: int = 123
+) -> dict:
+    handshake = _handshake_fixture(
+        policy, request, worker_pid=worker_pid
+    )
+    gpu_uuid = request["authorized_gpu_registry"][0][
+        "physical_gpu_uuid"
+    ]
+    claim = build_run_claim(
+        request,
+        policy,
+        handshake["final_release"],
+        handshake["worker_ready_binding"],
+        handshake["worker_release_binding"],
+        0,
+        gpu_uuid,
+        gpu_uuid,
+        gpu_uuid,
+        worker_pid,
+        "2026-07-26T00:00:00+00:00",
+    )
+    output_dir = Path(request["output_dir"]).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    claim_path = output_dir / "claim.json"
+    write_exclusive_json(claim_path, claim)
+    result = build_run_result(
+        request,
+        claim,
+        policy,
+        status="completed",
+        completed_at="2026-07-26T00:01:00+00:00",
+        evidence=_evidence(policy, request),
+    )
+    result_path = output_dir / "result.json"
+    write_exclusive_json(result_path, result)
+    request_path = Path(
+        handshake["worker_ready"]["request"]["path"]
+    ).resolve()
+    terminal = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_worker_terminal_v1",
+        "policy_sha256": policy["policy_sha256"],
+        "worker_pid": worker_pid,
+        "request": {
+            **_bound(request_path),
+            "canonical_sha256": request["run_request_sha256"],
+        },
+        "claim": {
+            **_bound(claim_path),
+            "canonical_sha256": claim["run_claim_sha256"],
+        },
+        "result": {
+            **_bound(result_path),
+            "canonical_sha256": result["run_result_sha256"],
+        },
+        "worker_ready": handshake["worker_ready_binding"],
+        "worker_release": handshake["worker_release_binding"],
+        "status": "completed",
+        "failure": None,
+        "started_at": "2026-07-26T00:00:00+00:00",
+        "completed_at": "2026-07-26T00:01:00+00:00",
+    }
+    terminal["worker_terminal_sha256"] = canonical_digest(
+        terminal, "worker_terminal_sha256"
+    )
+    terminal_path = (
+        Path(handshake["worker_ready_binding"]["path"]).parent
+        / "worker_terminal.json"
+    )
+    write_exclusive_json(terminal_path, terminal)
+    return {
+        "request_path": request_path,
+        "claim_path": claim_path,
+        "result_path": result_path,
+        "terminal_path": terminal_path,
+        "claim": claim,
+        "result": result,
+        "terminal": terminal,
+    }
+
+
+@pytest.mark.parametrize(
+    "target",
+    (
+        "request",
+        "claim",
+        "result",
+        "terminal",
+        "missing_claim",
+        "missing_result",
+        "missing_terminal",
+    ),
+)
+def test_completion_rejects_post_exit_artifact_tamper(
+    tmp_path: Path, target: str
+) -> None:
+    module = _controller_module()
+    policy, request = _run_fixture(tmp_path)
+    artifacts = _completed_worker_terminal_fixture(policy, request)
+    validate_worker_terminal_value(
+        artifacts["terminal"],
+        artifacts["request_path"],
+        policy,
+        expected_worker_pid=123,
+        require_completed=True,
+    )
+    if target == "request":
+        value = load_json(artifacts["request_path"], "request")
+        value["replicate"] = "post-exit-tamper"
+        value["run_request_sha256"] = canonical_digest(
+            value, "run_request_sha256"
+        )
+        artifacts["request_path"].write_bytes(canonical_json(value))
+    elif target == "claim":
+        value = load_json(artifacts["claim_path"], "claim")
+        value["started_at"] = "2026-07-26T00:00:01+00:00"
+        value["run_claim_sha256"] = canonical_digest(
+            value, "run_claim_sha256"
+        )
+        artifacts["claim_path"].write_bytes(canonical_json(value))
+    elif target == "result":
+        value = load_json(artifacts["result_path"], "result")
+        value["completed_at"] = "2026-07-26T00:01:01+00:00"
+        value["run_result_sha256"] = canonical_digest(
+            value, "run_result_sha256"
+        )
+        artifacts["result_path"].write_bytes(canonical_json(value))
+    elif target == "terminal":
+        value = load_json(artifacts["terminal_path"], "terminal")
+        value["result"]["sha256"] = "f" * 64
+        value["worker_terminal_sha256"] = canonical_digest(
+            value, "worker_terminal_sha256"
+        )
+        artifacts["terminal_path"].write_bytes(canonical_json(value))
+    else:
+        artifacts[target.removeprefix("missing_") + "_path"].unlink()
+    with pytest.raises((CanonicalScreeningError, FileNotFoundError)):
+        module._build_gpu_completion_summary(
+            policy,
+            request["mode"],
+            module._paths(tmp_path / "campaign", policy["policy_sha256"]),
+            [artifacts["request_path"]],
+            {},
+            {},
+            tmp_path / "monitor.jsonl",
+            {},
+        )
 
 
 def test_run_request_rejects_stale_policy_and_wrong_kid_subset(tmp_path: Path) -> None:
@@ -2563,6 +3548,7 @@ def test_controller_cleanup_terminates_workers_and_releases_owned_lock(
 
     class Process:
         def __init__(self) -> None:
+            self.pid = 4242
             self.terminated = False
             self.waited = False
 
@@ -2596,7 +3582,8 @@ def test_controller_cleanup_terminates_workers_and_releases_owned_lock(
         "log_handle": log,
         "slot": slot,
     }]
-    module._cleanup_active_workers(active, pool)
+    guard = types.SimpleNamespace(unregister_worker_pid=lambda _pid: None)
+    module._cleanup_active_workers(active, pool, guard)
     assert active == []
     assert process.terminated and process.waited and log.closed
     assert not lock.exists()
@@ -2803,6 +3790,1021 @@ def test_runtime_guard_exposes_monitor_thread_failure(
     guard._run()
     with pytest.raises(CanonicalScreeningError, match="proc stat injected"):
         guard.raise_if_violated()
+
+
+def test_runtime_guard_hard_stops_unknown_gpu_pid_during_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("config", None)])
+    policy, _, _ = _policy(tmp_path, ledger)
+    registry = [
+        {
+            "physical_gpu_index": index,
+            "physical_gpu_uuid": _gpu_uuid(index),
+        }
+        for index in range(4)
+    ]
+    monkeypatch.setattr(module, "_cpu_times", lambda: (100, 50))
+    monkeypatch.setattr(module.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(module, "_memory_percent", lambda: 10.0)
+    monkeypatch.setattr(module, "_disk_percent", lambda _path: 10.0)
+    monkeypatch.setattr(module, "_swap_pages", lambda: (0, 0))
+    monkeypatch.setattr(
+        module,
+        "_gpu_snapshot",
+        lambda: [
+            {"index": row["physical_gpu_index"], "uuid": row["physical_gpu_uuid"]}
+            for row in registry
+        ],
+    )
+    monkeypatch.setattr(
+        module,
+        "_gpu_compute_processes",
+        lambda: [
+            {
+                "gpu_uuid": registry[0]["physical_gpu_uuid"],
+                "pid": 99991,
+                "process_name": "foreign",
+            }
+        ],
+    )
+
+    class OneSample:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def wait(self, _seconds: int) -> bool:
+            self.calls += 1
+            return self.calls > 1
+
+        def set(self) -> None:
+            self.calls = 2
+
+    guard = module.RuntimeResourceGuard(
+        policy, tmp_path / "unknown_pid.jsonl", tmp_path, registry
+    )
+    launched = False
+
+    def forbidden_factory():
+        nonlocal launched
+        launched = True
+        return types.SimpleNamespace(pid=99991)
+
+    with pytest.raises(CanonicalScreeningError, match="unknown compute PID"):
+        guard.launch_authorized_worker(forbidden_factory)
+    assert launched is False
+    guard._stop = OneSample()
+    guard._run()
+    with pytest.raises(CanonicalScreeningError, match="unknown compute PID"):
+        guard.raise_if_violated()
+    sample = json.loads(
+        (tmp_path / "unknown_pid.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert sample["unknown_compute_processes"][0]["pid"] == 99991
+
+
+def test_runtime_guard_allows_atomically_registered_worker_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("config", None)])
+    policy, _, _ = _policy(tmp_path, ledger)
+    registry = [
+        {
+            "physical_gpu_index": index,
+            "physical_gpu_uuid": _gpu_uuid(index),
+        }
+        for index in range(4)
+    ]
+    monkeypatch.setattr(module, "_cpu_times", lambda: (100, 50))
+    monkeypatch.setattr(module.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(module, "_memory_percent", lambda: 10.0)
+    monkeypatch.setattr(module, "_disk_percent", lambda _path: 10.0)
+    monkeypatch.setattr(module, "_swap_pages", lambda: (0, 0))
+    monkeypatch.setattr(
+        module,
+        "_gpu_snapshot",
+        lambda: [
+            {"index": row["physical_gpu_index"], "uuid": row["physical_gpu_uuid"]}
+            for row in registry
+        ],
+    )
+    launched = False
+
+    def compute_processes():
+        return (
+            [{"gpu_uuid": registry[0]["physical_gpu_uuid"], "pid": 4242}]
+            if launched
+            else []
+        )
+
+    monkeypatch.setattr(module, "_gpu_compute_processes", compute_processes)
+
+    class OneSample:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def wait(self, _seconds: int) -> bool:
+            self.calls += 1
+            return self.calls > 1
+
+        def set(self) -> None:
+            self.calls = 2
+
+    process = types.SimpleNamespace(pid=4242)
+    guard = module.RuntimeResourceGuard(
+        policy, tmp_path / "allowed_pid.jsonl", tmp_path, registry
+    )
+
+    def launch_worker():
+        nonlocal launched
+        launched = True
+        return process
+
+    assert guard.launch_authorized_worker(launch_worker) is process
+    guard._stop = OneSample()
+    guard._run()
+    guard.raise_if_violated()
+    guard.unregister_worker_pid(4242)
+    assert guard.stop()["final_active_worker_pids"] == []
+
+
+def test_cpu_worker_handshake_orders_rehash_launch_register_check_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("config", None)])
+    policy, _, _ = _policy(tmp_path, ledger)
+    monkeypatch.setattr(module, "_cpu_load_percent", lambda: 10.0)
+    monkeypatch.setattr(module, "_memory_percent", lambda: 10.0)
+    monkeypatch.setattr(module, "_disk_percent", lambda _path: 10.0)
+    monkeypatch.setattr(module, "_swap_pages", lambda: (0, 0))
+    monkeypatch.setattr(module, "_gpu_snapshot", lambda: [])
+    monkeypatch.setattr(module, "_gpu_compute_processes", lambda: [])
+    events = []
+    process = types.SimpleNamespace(pid=5151)
+    guard = module.RuntimeResourceGuard(
+        policy, tmp_path / "handshake.jsonl", tmp_path
+    )
+
+    def initial_validator():
+        events.append("initial_rehash")
+        return {"stage": "initial"}
+
+    def factory():
+        events.append("popen")
+        return process
+
+    launched, validation = guard.launch_cpu_worker(
+        factory, initial_validator
+    )
+    assert launched is process
+    assert validation == {"stage": "initial"}
+
+    def final_validator():
+        assert 5151 in guard._active_worker_pids
+        events.append("final_rehash")
+        return {"stage": "final"}
+
+    def publisher(_validation, snapshot):
+        assert snapshot["active_worker_pids"] == [5151]
+        events.append("release")
+
+    guard.release_worker_after_handshake(
+        5151, final_validator, publisher
+    )
+    assert events == [
+        "initial_rehash",
+        "popen",
+        "final_rehash",
+        "release",
+    ]
+    guard.unregister_worker_pid(5151)
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    (
+        ("cpu", "CPU release hard gate"),
+        ("ram", "RAM release hard gate"),
+        ("disk", "disk release hard gate"),
+        ("swap", "swap I/O release hard gate"),
+        ("gpu_memory", "release memory hard gate"),
+        ("gpu_temperature", "release temperature hard gate"),
+        ("unknown_pid", "unknown compute PID"),
+        ("thread_failure", "guard failed before worker release"),
+    ),
+)
+def test_release_lock_hard_gates_fresh_resource_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    message: str,
+) -> None:
+    module = _controller_module()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("config", None)])
+    policy, _, _ = _policy(tmp_path, ledger)
+    registry = [
+        {
+            "physical_gpu_index": index,
+            "physical_gpu_uuid": _gpu_uuid(index),
+        }
+        for index in range(4)
+    ]
+    monkeypatch.setattr(
+        module,
+        "_cpu_load_percent",
+        lambda: 90.0 if case == "cpu" else 10.0,
+    )
+    monkeypatch.setattr(
+        module,
+        "_memory_percent",
+        lambda: 90.0 if case == "ram" else 10.0,
+    )
+    monkeypatch.setattr(
+        module,
+        "_disk_percent",
+        lambda _path: 90.0 if case == "disk" else 10.0,
+    )
+    swaps = iter(
+        ((0, 0), (1, 0))
+        if case == "swap"
+        else ((0, 0), (0, 0))
+    )
+    monkeypatch.setattr(module, "_swap_pages", lambda: next(swaps))
+    gpus = [
+        {
+            "index": row["physical_gpu_index"],
+            "uuid": row["physical_gpu_uuid"],
+            "memory_total_mib": 24576,
+            "memory_used_mib": (
+                23000
+                if case == "gpu_memory"
+                and row["physical_gpu_index"] == 0
+                else 3
+            ),
+            "memory_free_mib": (
+                1576
+                if case == "gpu_memory"
+                and row["physical_gpu_index"] == 0
+                else 24573
+            ),
+            "temperature_c": (
+                86
+                if case == "gpu_temperature"
+                and row["physical_gpu_index"] == 0
+                else 35
+            ),
+        }
+        for row in registry
+    ]
+    monkeypatch.setattr(module, "_gpu_snapshot", lambda: gpus)
+    monkeypatch.setattr(
+        module,
+        "_gpu_compute_processes",
+        lambda: (
+            [
+                {
+                    "gpu_uuid": registry[0]["physical_gpu_uuid"],
+                    "pid": 9999,
+                    "process_name": "foreign",
+                }
+            ]
+            if case == "unknown_pid"
+            else []
+        ),
+    )
+    guard = module.RuntimeResourceGuard(
+        policy, tmp_path / "release.jsonl", tmp_path, registry
+    )
+    if case == "thread_failure":
+        guard._thread_failure = RuntimeError("injected guard failure")
+    published = False
+
+    def publisher(*_args):
+        nonlocal published
+        published = True
+
+    with pytest.raises(CanonicalScreeningError, match=message):
+        guard.release_worker_after_handshake(
+            5151, lambda: {"validated": True}, publisher
+        )
+    assert published is False
+    assert 5151 not in guard._active_worker_pids
+
+
+def test_worker_release_pid_tamper_fails_before_heavy_import(
+    tmp_path: Path,
+) -> None:
+    policy, request = _run_fixture(tmp_path, mode="screen512")
+    handshake = _handshake_fixture(
+        policy, request, worker_pid=os.getpid()
+    )
+    ready = handshake["worker_ready"]
+    ready_binding = handshake["worker_ready_binding"]
+    release = json.loads(json.dumps(handshake["worker_release"]))
+    release["worker_pid"] = 999999
+    release["worker_release_sha256"] = canonical_digest(
+        release, "worker_release_sha256"
+    )
+    release_path = tmp_path / "tampered-worker-release.json"
+    write_exclusive_json(release_path, release)
+    with pytest.raises(CanonicalScreeningError, match="contract mismatch"):
+        _wait_worker_release(
+            release_path,
+            ready,
+            ready_binding,
+            request,
+            policy,
+            timeout_seconds=0.01,
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "schema_version",
+        "contract_type",
+        "policy_sha256",
+        "phase",
+        "worker_pid",
+        "gpu_index",
+        "gpu_uuid",
+        "run_request_sha256",
+        "request",
+        "final_release",
+        "verification_order",
+        "rehashed_bindings",
+        "rehashed_bindings_sha256",
+        "controller_claim",
+        "screening_worker_sha256",
+        "controller_implementation_sha256",
+        "cuda_visible_devices",
+        "heavy_modules_absent",
+        "loaded_heavy_modules",
+        "asset_content_verification",
+        "external_gpu_race_contract",
+        "ready_at",
+        "worker_ready_sha256",
+    ),
+)
+def test_worker_ready_rejects_each_missing_field(
+    tmp_path: Path, field: str
+) -> None:
+    policy, request = _run_fixture(tmp_path)
+    ready = json.loads(
+        json.dumps(_handshake_fixture(policy, request)["worker_ready"])
+    )
+    ready.pop(field)
+    if field != "worker_ready_sha256":
+        ready["worker_ready_sha256"] = canonical_digest(
+            ready, "worker_ready_sha256"
+        )
+    with pytest.raises(CanonicalScreeningError):
+        validate_worker_ready_value(ready, request, policy)
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "schema_version",
+        "contract_type",
+        "policy_sha256",
+        "run_request_sha256",
+        "worker_pid",
+        "gpu_index",
+        "gpu_uuid",
+        "worker_ready",
+        "verification_order",
+        "rehashed_bindings",
+        "rehashed_bindings_sha256",
+        "resource_snapshot",
+        "asset_content_verification",
+        "external_gpu_race_contract",
+        "validated_at",
+        "controller_launch_rehash_sha256",
+    ),
+)
+def test_controller_rehash_rejects_each_missing_field(
+    tmp_path: Path, field: str
+) -> None:
+    policy, request = _run_fixture(tmp_path)
+    value = json.loads(
+        json.dumps(
+            _handshake_fixture(policy, request)["controller_rehash"]
+        )
+    )
+    value.pop(field)
+    if field != "controller_launch_rehash_sha256":
+        value["controller_launch_rehash_sha256"] = canonical_digest(
+            value, "controller_launch_rehash_sha256"
+        )
+    with pytest.raises(CanonicalScreeningError):
+        validate_controller_launch_rehash_value(value, request, policy)
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "schema_version",
+        "contract_type",
+        "policy_sha256",
+        "phase",
+        "worker_pid",
+        "run_request_sha256",
+        "worker_ready",
+        "controller_launch_rehash",
+        "resource_snapshot",
+        "external_gpu_race_contract",
+        "released_at",
+        "worker_release_sha256",
+    ),
+)
+def test_worker_release_rejects_each_missing_field(
+    tmp_path: Path, field: str
+) -> None:
+    policy, request = _run_fixture(tmp_path)
+    value = json.loads(
+        json.dumps(_handshake_fixture(policy, request)["worker_release"])
+    )
+    value.pop(field)
+    if field != "worker_release_sha256":
+        value["worker_release_sha256"] = canonical_digest(
+            value, "worker_release_sha256"
+        )
+    with pytest.raises(CanonicalScreeningError):
+        validate_worker_release_value(value, request, policy)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "heavy_false",
+        "loaded_torch",
+        "gpu_uuid",
+        "external_race",
+        "nested_request",
+        "asset_digest",
+        "extra_field",
+    ),
+)
+def test_worker_ready_rejects_semantic_tamper(
+    tmp_path: Path, mutation: str
+) -> None:
+    policy, request = _run_fixture(tmp_path)
+    value = json.loads(
+        json.dumps(_handshake_fixture(policy, request)["worker_ready"])
+    )
+    if mutation == "heavy_false":
+        value["heavy_modules_absent"] = False
+    elif mutation == "loaded_torch":
+        value["loaded_heavy_modules"] = ["torch"]
+    elif mutation == "gpu_uuid":
+        value["gpu_uuid"] = _gpu_uuid(1)
+    elif mutation == "external_race":
+        value["external_gpu_race_contract"]["compute_mode_changed"] = True
+    elif mutation == "nested_request":
+        value["rehashed_bindings"]["request"]["sha256"] = "f" * 64
+        value["rehashed_bindings_sha256"] = hashlib.sha256(
+            canonical_json(value["rehashed_bindings"])
+        ).hexdigest()
+    elif mutation == "asset_digest":
+        value["asset_content_verification"]["observed_digest"] = "f" * 64
+    else:
+        value["unexpected"] = True
+    value["worker_ready_sha256"] = canonical_digest(
+        value, "worker_ready_sha256"
+    )
+    with pytest.raises(CanonicalScreeningError):
+        validate_worker_ready_value(value, request, policy)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "ready_rehash",
+        "admission",
+        "runtime_registry",
+        "unknown_pid",
+        "active_pid",
+        "cpu_limit",
+        "swap_delta",
+        "gpu_memory",
+        "gpu_headroom",
+        "gpu_temperature",
+        "guard_failure",
+        "external_race",
+        "extra_field",
+    ),
+)
+def test_worker_release_rejects_semantic_tamper(
+    tmp_path: Path, mutation: str
+) -> None:
+    policy, request = _run_fixture(tmp_path)
+    handshake = _handshake_fixture(policy, request)
+    value = json.loads(json.dumps(handshake["worker_release"]))
+    if mutation == "ready_rehash":
+        rehash = json.loads(json.dumps(handshake["controller_rehash"]))
+        rehash["rehashed_bindings_sha256"] = "e" * 64
+        rehash["controller_launch_rehash_sha256"] = canonical_digest(
+            rehash, "controller_launch_rehash_sha256"
+        )
+        path = tmp_path / "tampered-controller-rehash.json"
+        write_exclusive_json(path, rehash)
+        value["controller_launch_rehash"] = {
+            **_bound(path),
+            "canonical_sha256": rehash[
+                "controller_launch_rehash_sha256"
+            ],
+        }
+    elif mutation == "admission":
+        value["resource_snapshot"]["admission"]["cpu_load_percent"] = 4.0
+    elif mutation == "runtime_registry":
+        value["resource_snapshot"]["runtime_guard"][
+            "runtime_gpu_registry"
+        ] = list(reversed(request["authorized_gpu_registry"]))
+    elif mutation == "unknown_pid":
+        value["resource_snapshot"]["runtime_guard"][
+            "unknown_compute_processes"
+        ] = [{"pid": 999}]
+    elif mutation == "active_pid":
+        value["resource_snapshot"]["runtime_guard"][
+            "active_worker_pids"
+        ] = []
+    elif mutation == "cpu_limit":
+        value["resource_snapshot"]["runtime_guard"][
+            "cpu_load_percent"
+        ] = 90.0
+    elif mutation == "swap_delta":
+        value["resource_snapshot"]["runtime_guard"][
+            "swap_io_delta"
+        ]["in"] = 1
+    elif mutation == "gpu_memory":
+        gpu = value["resource_snapshot"]["runtime_guard"]["gpu"][0]
+        gpu["memory_used_mib"] = 23000
+        gpu["memory_free_mib"] = 1576
+    elif mutation == "gpu_headroom":
+        gpu = value["resource_snapshot"]["runtime_guard"]["gpu"][0]
+        gpu["memory_used_mib"] = 23000
+        gpu["memory_free_mib"] = 1576
+    elif mutation == "gpu_temperature":
+        value["resource_snapshot"]["runtime_guard"]["gpu"][0][
+            "temperature_c"
+        ] = 86
+    elif mutation == "guard_failure":
+        value["resource_snapshot"]["runtime_guard"][
+            "guard_thread_failure"
+        ] = {"type": "RuntimeError"}
+    elif mutation == "external_race":
+        value["external_gpu_race_contract"]["compute_mode_changed"] = True
+    else:
+        value["unexpected"] = True
+    value["worker_release_sha256"] = canonical_digest(
+        value, "worker_release_sha256"
+    )
+    with pytest.raises(CanonicalScreeningError):
+        validate_worker_release_value(value, request, policy)
+
+
+def test_real_cpu_subprocess_completes_production_pre_cuda_handshake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    policy, config, request, request_path = _real_policy_run_fixture(
+        tmp_path, module
+    )
+    final_release = _final_release_for_single_request(
+        tmp_path, policy, request, request_path
+    )
+    gpu_index = 0
+    gpu_uuid = request["authorized_gpu_registry"][0][
+        "physical_gpu_uuid"
+    ]
+    ready_path = tmp_path / "real-handshake/worker_ready.json"
+    release_path = tmp_path / "real-handshake/worker_release.json"
+    controller_rehash_path = (
+        tmp_path / "real-handshake/controller_rehash.json"
+    )
+    gpu_rows = [
+        {
+            "index": row["physical_gpu_index"],
+            "uuid": row["physical_gpu_uuid"],
+            "memory_total_mib": 24576,
+            "memory_used_mib": 3,
+            "memory_free_mib": 24573,
+            "temperature_c": 35,
+        }
+        for row in request["authorized_gpu_registry"]
+    ]
+    controller_resources = {
+        "observed_at": "2026-07-27T00:00:00+00:00",
+        "cpu_load_percent": 1.0,
+        "memory_percent": 2.0,
+        "disk_percent": 3.0,
+        "swap_pages": {"in": 0, "out": 0},
+        "gpus": gpu_rows,
+        "authorized_gpu_registry": request[
+            "authorized_gpu_registry"
+        ],
+        "ram_reservation": _admission_snapshot(policy)[
+            "ram_reservation"
+        ],
+        "compute_processes": [],
+    }
+    monkeypatch.setattr(
+        module,
+        "assert_resource_admission",
+        lambda *_args, **_kwargs: json.loads(
+            json.dumps(controller_resources)
+        ),
+    )
+    monkeypatch.setattr(module, "_cpu_load_percent", lambda: 1.0)
+    monkeypatch.setattr(module, "_memory_percent", lambda: 2.0)
+    monkeypatch.setattr(module, "_disk_percent", lambda _path: 3.0)
+    monkeypatch.setattr(module, "_swap_pages", lambda: (0, 0))
+    monkeypatch.setattr(
+        module,
+        "_gpu_snapshot",
+        lambda: json.loads(json.dumps(gpu_rows)),
+    )
+    monkeypatch.setattr(module, "_gpu_compute_processes", lambda: [])
+    child_code = """
+import json
+from pathlib import Path
+import sys
+from safa.closeout.canonical_screening import load_json, validate_policy
+from safa.closeout.canonical_screening_worker import (
+    HEAVY_MODULE_ROOTS,
+    prepare_screening_request_for_cuda,
+)
+repo_root = Path(sys.argv[1]).resolve()
+config = Path(sys.argv[2]).resolve()
+request_path = Path(sys.argv[3]).resolve()
+final_release_path = Path(sys.argv[4]).resolve()
+ready_path = Path(sys.argv[5]).resolve()
+release_path = Path(sys.argv[6]).resolve()
+gpu_index = int(sys.argv[7])
+gpu_uuid = sys.argv[8]
+policy = validate_policy(
+    repo_root, config, verify_historical_output_evidence=False
+)
+prepared = prepare_screening_request_for_cuda(
+    request_path,
+    gpu_index,
+    gpu_uuid,
+    policy,
+    {
+        "path": str(final_release_path),
+        "sha256": __import__("hashlib").sha256(
+            final_release_path.read_bytes()
+        ).hexdigest(),
+        "canonical_sha256": load_json(
+            final_release_path, "child final release"
+        )["final_release_admission_sha256"],
+    },
+    ready_path,
+    release_path,
+)
+print(json.dumps({
+    "next_stage": prepared["next_stage"],
+    "worker_ready_sha256": prepared["worker_ready"]["worker_ready_sha256"],
+    "worker_release_sha256": prepared["worker_release"]["worker_release_sha256"],
+    "pre_asset_digest": prepared["pre_cuda"]["asset_content_verification"][
+        "observed_digest"
+    ],
+    "post_asset_digest": prepared["post_release"][
+        "asset_content_verification"
+    ]["observed_digest"],
+    "heavy_modules": sorted(
+        name for name in HEAVY_MODULE_ROOTS if name in sys.modules
+    ),
+}, sort_keys=True))
+"""
+    child_env = {
+        **os.environ,
+        "TMUX": "canonical-pre-cuda-integration",
+        "CUDA_VISIBLE_DEVICES": gpu_uuid,
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    child_env.pop("CUDA_DEVICE_ORDER", None)
+    guard = module.RuntimeResourceGuard(
+        policy,
+        tmp_path / "real-handshake/resource.jsonl",
+        tmp_path,
+        request["authorized_gpu_registry"],
+    )
+    process = None
+    try:
+        process, initial_rehash = guard.launch_cpu_worker(
+            lambda: subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    child_code,
+                    str(Path(__file__).parents[1]),
+                    str(config),
+                    str(request_path),
+                    str(final_release["path"]),
+                    str(ready_path),
+                    str(release_path),
+                    str(gpu_index),
+                    gpu_uuid,
+                ],
+                cwd=Path(__file__).parents[1],
+                env=child_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            ),
+            lambda: module._validate_launch_integrity(
+                policy,
+                config,
+                module._paths(
+                    tmp_path / "real-campaign",
+                    policy["policy_sha256"],
+                ),
+                request_path,
+                final_release,
+            ),
+        )
+        assert initial_rehash["worker_pid"] is None
+        ready, ready_binding = module._wait_worker_ready(
+            process,
+            ready_path,
+            request_path,
+            request,
+            policy,
+            gpu_index,
+            gpu_uuid,
+            timeout_seconds=120.0,
+        )
+        final_rehash = None
+
+        def publish_release(validation, guard_snapshot):
+            nonlocal final_rehash
+            final_rehash = dict(validation)
+            validate_controller_launch_rehash_value(
+                final_rehash, request, policy
+            )
+            publish_exclusive_json(
+                controller_rehash_path, final_rehash
+            )
+            controller_rehash_binding = {
+                **_bound(controller_rehash_path),
+                "canonical_sha256": final_rehash[
+                    "controller_launch_rehash_sha256"
+                ],
+            }
+            module._publish_worker_release(
+                release_path,
+                policy,
+                request,
+                process.pid,
+                ready_binding,
+                controller_rehash_binding,
+                {
+                    "admission": final_rehash[
+                        "resource_snapshot"
+                    ],
+                    "runtime_guard": dict(guard_snapshot),
+                },
+            )
+
+        guard.release_worker_after_handshake(
+            process.pid,
+            lambda: module._validate_launch_integrity(
+                policy,
+                config,
+                module._paths(
+                    tmp_path / "real-campaign",
+                    policy["policy_sha256"],
+                ),
+                request_path,
+                final_release,
+                worker_pid=process.pid,
+                gpu_index=gpu_index,
+                gpu_uuid=gpu_uuid,
+                worker_ready=ready_binding,
+            ),
+            publish_release,
+        )
+        stdout, stderr = process.communicate(timeout=120.0)
+        assert process.returncode == 0, stderr
+    finally:
+        if process is not None:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            if process.pid in guard._active_worker_pids:
+                guard.unregister_worker_pid(process.pid)
+    payload = json.loads(stdout)
+    release = validate_worker_release_value(
+        load_json(release_path, "real worker release"),
+        request,
+        policy,
+        expected_worker_pid=process.pid,
+    )
+    assert final_rehash is not None
+    assert payload["next_stage"] == "runtime_cuda_binding"
+    assert payload["heavy_modules"] == []
+    assert payload["worker_ready_sha256"] == ready[
+        "worker_ready_sha256"
+    ]
+    assert payload["worker_release_sha256"] == release[
+        "worker_release_sha256"
+    ]
+    expected_asset_digest = policy["output_decoder_registry"]["latent"][
+        "directory"
+    ]["digest"]
+    assert payload["pre_asset_digest"] == expected_asset_digest
+    assert payload["post_asset_digest"] == expected_asset_digest
+    controller_ready = load_json(
+        Path(request["controller_ready"]["path"]),
+        "real controller ready",
+    )
+    assert ready["controller_claim"] == controller_ready[
+        "controller_claim"
+    ]
+    assert release["controller_launch_rehash"][
+        "canonical_sha256"
+    ] == final_rehash["controller_launch_rehash_sha256"]
+    output_dir = Path(request["output_dir"])
+    assert not output_dir.exists()
+    assert not (output_dir / "claim.json").exists()
+
+
+def test_malformed_release_still_writes_atomic_worker_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_path = tmp_path / "request.json"
+    write_exclusive_json(request_path, {"request": "fixture"})
+    ready_path = tmp_path / "handshake" / "worker_ready.json"
+    release_path = tmp_path / "handshake" / "worker_release.json"
+    write_exclusive_json(
+        ready_path,
+        {"worker_ready_sha256": "a" * 64},
+    )
+    write_exclusive_json(release_path, {"malformed": True})
+
+    def reject_malformed(*_args, **_kwargs):
+        release = load_json(release_path, "malformed release")
+        if "worker_release_sha256" not in release:
+            raise CanonicalScreeningError(
+                "malformed worker release is missing its digest"
+            )
+        raise AssertionError("malformed release unexpectedly passed")
+
+    monkeypatch.setattr(
+        screening_worker_module,
+        "_execute_screening_request_impl",
+        reject_malformed,
+    )
+    with pytest.raises(CanonicalScreeningError, match="malformed"):
+        execute_screening_request(
+            request_path,
+            0,
+            _gpu_uuid(0),
+            {"policy_sha256": "b" * 64},
+            {},
+            ready_path,
+            release_path,
+        )
+    terminal_path = ready_path.parent / "worker_terminal.json"
+    terminal = load_json(terminal_path, "malformed release terminal")
+    assert terminal["status"] == "failed"
+    assert terminal["failure"]["type"] == "CanonicalScreeningError"
+    assert terminal["worker_release"]["canonical_sha256"] is None
+    assert terminal["worker_terminal_sha256"] == canonical_digest(
+        terminal, "worker_terminal_sha256"
+    )
+    assert terminal_path.read_bytes().endswith(b"\n")
+
+
+def test_launch_bootstrap_rejects_invalid_config_before_resource_sample(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    policy, request = _run_fixture(tmp_path)
+    request_path = tmp_path / "bootstrap-request.json"
+    write_exclusive_json(request_path, request)
+    sampled = False
+
+    def forbidden_sample(*_args, **_kwargs):
+        nonlocal sampled
+        sampled = True
+        raise AssertionError("resource sample must follow rehash")
+
+    monkeypatch.setattr(module, "assert_resource_admission", forbidden_sample)
+    with pytest.raises(
+        module.ControllerBootstrapError,
+        match="omits implementations",
+    ):
+        module._validate_launch_integrity(
+            policy,
+            Path(request["policy"]["path"]),
+            module._paths(tmp_path / "campaign", policy["policy_sha256"]),
+            request_path,
+            {},
+        )
+    assert sampled is False
+
+
+def test_real_controller_main_cpu_dry_run_uses_current_policy_without_writes(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).parents[1]
+    script = repo_root / "scripts/run_canonical_checkpoint_screening.py"
+    config = (
+        repo_root
+        / "configs/closeout/canonical_screening_512_v1.json"
+    )
+    campaign = tmp_path / "dry-run-campaign"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--config",
+            str(config),
+            "--phase",
+            "plan",
+            "--campaign-root",
+            str(campaign),
+            "--dry-run",
+        ],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    payload = json.loads(completed.stdout)
+    assert payload["phase"] == "plan"
+    assert payload["execute"] is False
+    assert payload["policy_sha256"]
+    assert not campaign.exists()
+
+
+def test_real_worker_policy_bootstrap_failure_writes_atomic_terminal(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).parents[1]
+    script = repo_root / "scripts/run_canonical_checkpoint_screening.py"
+    source_config = (
+        repo_root
+        / "configs/closeout/canonical_screening_512_v1.json"
+    )
+    raw = json.loads(source_config.read_text(encoding="utf-8"))
+    raw["implementations"]["controller"]["sha256"] = "0" * 64
+    config = tmp_path / "tampered-policy.json"
+    config.write_bytes(canonical_json(raw))
+    request_path = tmp_path / "request.json"
+    request_path.write_text('{"malformed":true}\n', encoding="utf-8")
+    ready_path = tmp_path / "handshake/worker_ready.json"
+    release_path = tmp_path / "handshake/worker_release.json"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--config",
+            str(config),
+            "--phase",
+            "smoke8",
+            "--campaign-root",
+            str(tmp_path / "campaign"),
+            "--execute",
+            "--request",
+            str(request_path),
+            "--worker-ready-path",
+            str(ready_path),
+            "--worker-release-path",
+            str(release_path),
+        ],
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode != 0
+    terminal_path = (
+        ready_path.parent / "worker_bootstrap_terminal.json"
+    )
+    terminal = load_json(terminal_path, "worker bootstrap terminal")
+    assert terminal["stage"] == "policy_bootstrap"
+    assert terminal["status"] == "failed"
+    assert terminal["worker_pid"] > 0
+    assert terminal["request"]["path"] == str(request_path.resolve())
+    assert terminal["worker_bootstrap_terminal_sha256"] == canonical_digest(
+        terminal, "worker_bootstrap_terminal_sha256"
+    )
+    assert not ready_path.exists()
+    assert not release_path.exists()
+    assert not (ready_path.parent / "worker_terminal.json").exists()
 
 
 def test_preflight_monitor_never_queries_gpu(
@@ -3480,11 +5482,65 @@ def test_write_exclusive_json_rejects_overwrite(tmp_path: Path) -> None:
         write_exclusive_json(path, {"value": 2})
 
 
+def test_atomic_publish_exposes_only_complete_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "ready.json"
+    value = {"contract": "ready", "rows": list(range(1000))}
+    original_link = __import__("os").link
+    observed = []
+
+    def inspect_link(source, target):
+        assert Path(target) == path
+        assert not path.exists()
+        observed.append(load_json(Path(source), "temporary publication"))
+        return original_link(source, target)
+
+    module = sys.modules[publish_exclusive_json.__module__]
+    monkeypatch.setattr(module.os, "link", inspect_link)
+    publish_exclusive_json(path, value)
+    assert observed == [value]
+    assert load_json(path, "published ready") == value
+    assert list(tmp_path.glob(".ready.json.publish-*")) == []
+
+
+def test_atomic_publish_race_has_one_winner_and_valid_final(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "observer_ready.json"
+    barrier = threading.Barrier(2)
+    successes = []
+    failures = []
+
+    def publish(value: dict) -> None:
+        barrier.wait()
+        try:
+            publish_exclusive_json(path, value)
+            successes.append(value)
+        except CanonicalScreeningError as exc:
+            failures.append(exc)
+
+    values = [{"writer": 1}, {"writer": 2}]
+    threads = [
+        threading.Thread(target=publish, args=(value,)) for value in values
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert load_json(path, "race winner") == successes[0]
+    assert list(tmp_path.glob(".observer_ready.json.publish-*")) == []
+
+
 def test_gpu_pre_ready_admission_failure_writes_terminal_without_requests(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module = _controller_module()
     policy = {"campaign_id": "fixture", "policy_sha256": "1" * 64}
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text("{}\n", encoding="utf-8")
     paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
     monkeypatch.setattr(
         module,
@@ -3493,9 +5549,30 @@ def test_gpu_pre_ready_admission_failure_writes_terminal_without_requests(
             CanonicalScreeningError("fixture admission race")
         ),
     )
+    claim = {
+        "controller_claim_sha256": "3" * 64,
+        "wrapper_claim": {"canonical_sha256": "4" * 64},
+        "observer_launch": {"canonical_sha256": "5" * 64},
+    }
+    monkeypatch.setenv("TMUX", "fixture")
+    monkeypatch.setattr(
+        module,
+        "_validate_gpu_wrapper_provenance",
+        lambda *_args: (
+            claim["wrapper_claim"],
+            claim["observer_launch"],
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "_write_gpu_controller_claim",
+        lambda *_args: _mock_controller_claim(
+            tmp_path / "claim.json", claim
+        ),
+    )
     with pytest.raises(CanonicalScreeningError, match="admission race"):
-        module._prepare_gpu_ready_barrier(
-            policy, tmp_path / "policy.json", paths, "screen512"
+        module._run_gpu_phase(
+            policy, policy_path, paths, "screen512"
         )
     terminal = load_json(
         paths["gpu_control"] / "screen512" / "controller_terminal.json",
@@ -3504,6 +5581,29 @@ def test_gpu_pre_ready_admission_failure_writes_terminal_without_requests(
     assert terminal["status"] == "failed"
     assert terminal["stage"] == "startup_admission"
     assert not paths["run_requests"].exists()
+
+
+def test_gpu_preclaim_failure_writes_only_bootstrap_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    policy = {"campaign_id": "fixture", "policy_sha256": "6" * 64}
+    config = tmp_path / "policy.json"
+    config.write_text("{}\n", encoding="utf-8")
+    paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
+    monkeypatch.delenv("TMUX", raising=False)
+    with pytest.raises(CanonicalScreeningError, match="inside tmux"):
+        module._run_gpu_phase(policy, config, paths, "screen512")
+    terminal = load_json(
+        paths["gpu_control"] / "screen512" / "bootstrap_terminal.json",
+        "bootstrap terminal",
+    )
+    assert terminal["status"] == "failed"
+    assert terminal["stage"] == "tmux_bootstrap"
+    assert terminal["controller_claim"] is None
+    assert not (
+        paths["gpu_control"] / "screen512" / "controller_terminal.json"
+    ).exists()
 
 
 def test_observer_ready_timeout_is_bounded_and_writes_no_requests(
@@ -3535,7 +5635,7 @@ def test_duplicate_observer_claim_fails_exclusively(
     )
     write_exclusive_json(claim_path, {"occupied": True})
     monkeypatch.setenv("TMUX", "fixture")
-    with pytest.raises(FileExistsError):
+    with pytest.raises(CanonicalScreeningError, match="already exists"):
         module._run_monitor(policy, paths, "smoke8")
 
 
@@ -3662,10 +5762,152 @@ def test_worker_revalidates_ready_files_before_cuda(
         _assert_ready_barrier(request, policy)
 
 
-def test_gpu_wrapper_records_sigkill_before_controller_claim(
+def test_controller_raw_import_executes_no_policy_bound_module() -> None:
+    root = Path(__file__).parents[1]
+    controller = root / "scripts/run_canonical_checkpoint_screening.py"
+    code = (
+        "import importlib.util,json,sys;"
+        f"p={str(controller)!r};"
+        "s=importlib.util.spec_from_file_location('raw_controller',p);"
+        "m=importlib.util.module_from_spec(s);s.loader.exec_module(m);"
+        "print(json.dumps(sorted(x for x in ("
+        "'safa.closeout.canonical_screening',"
+        "'safa.closeout.canonical_screening_worker') if x in sys.modules)))"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(completed.stdout) == []
+
+
+@pytest.mark.parametrize(
+    "implementation",
+    (
+        "checkpoint_preflight",
+        "arcface_evaluator",
+        "e0_loader",
+        "canonical_quality",
+        "screening_contracts",
+        "screening_worker",
+        "controller",
+        "ram_probe_launcher",
+        "preflight_wrapper",
+        "gpu_wrapper",
+        "generator_sampling",
+        "meanflow_sampling",
+        "latent_codec",
+        "output_contract",
+    ),
+)
+def test_controller_stdlib_bootstrap_rejects_each_implementation_tamper(
+    tmp_path: Path, implementation: str
+) -> None:
+    module = _raw_controller_module()
+    root = Path(__file__).parents[1]
+    config = json.loads(
+        (
+            root / "configs/closeout/canonical_screening_512_v1.json"
+        ).read_text(encoding="utf-8")
+    )
+    config["implementations"][implementation]["sha256"] = "0" * 64
+    path = tmp_path / f"{implementation}.json"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    with pytest.raises(
+        module.ControllerBootstrapError,
+        match="implementation digest differs",
+    ):
+        module._stdlib_validate_implementation_bindings(path)
+
+
+def test_controller_tampered_worker_fails_before_dynamic_import(
     tmp_path: Path,
 ) -> None:
+    root = Path(__file__).parents[1]
+    controller = root / "scripts/run_canonical_checkpoint_screening.py"
+    config = json.loads(
+        (
+            root / "configs/closeout/canonical_screening_512_v1.json"
+        ).read_text(encoding="utf-8")
+    )
+    config["implementations"]["screening_worker"]["sha256"] = "0" * 64
+    config_path = tmp_path / "tampered-worker-policy.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    code = (
+        "import importlib.util,json,sys;"
+        f"p={str(controller)!r};c={str(config_path)!r};"
+        "s=importlib.util.spec_from_file_location('raw_controller',p);"
+        "m=importlib.util.module_from_spec(s);s.loader.exec_module(m);"
+        "\ntry:m._install_verified_contract_api(__import__('pathlib').Path(c))\n"
+        "except m.ControllerBootstrapError:pass\n"
+        "else:raise SystemExit(7)\n"
+        "print(json.dumps(sorted(x for x in ("
+        "'safa.closeout.canonical_screening',"
+        "'safa.closeout.canonical_screening_worker') if x in sys.modules)))"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(completed.stdout) == []
+
+
+def test_real_worker_bootstrap_imports_no_heavy_modules() -> None:
+    root = Path(__file__).parents[1]
+    controller = (
+        root
+        / "scripts"
+        / "run_canonical_checkpoint_screening.py"
+    )
+    policy_path = root / "configs/closeout/canonical_screening_512_v1.json"
+    code = (
+        "import importlib.util,json,sys;"
+        f"p={str(controller)!r};"
+        "s=importlib.util.spec_from_file_location('worker_bootstrap',p);"
+        "m=importlib.util.module_from_spec(s);s.loader.exec_module(m);"
+        f"m._install_verified_contract_api(__import__('pathlib').Path({str(policy_path)!r}),"
+        "verify_historical_output_evidence=False);"
+        "print(json.dumps(sorted(x for x in "
+        "('torch','torchvision','onnxruntime','diffusers') if x in sys.modules)))"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(completed.stdout) == []
+
+
+def test_gpu_wrapper_records_sigkill_before_controller_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     wrapper = _gpu_wrapper_module()
+    monkeypatch.setattr(
+        wrapper,
+        "_launch_observer",
+        lambda **_kwargs: {
+            "session": "fixture-monitor",
+            "command": [
+                "monitor",
+                "--monitor-target",
+                "screen512",
+                "--execute",
+            ],
+            "launched_at": "2026-07-27T00:00:00+00:00",
+        },
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_wait_observer_terminal",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("fixture observer exited")
+        ),
+    )
     config = tmp_path / "policy.json"
     config.write_text("{}\n", encoding="utf-8")
     policy_root = tmp_path / "campaign" / "by_policy" / ("8" * 64)
@@ -3691,6 +5933,59 @@ def test_gpu_wrapper_records_sigkill_before_controller_claim(
         policy_root / "gpu_control/screen512/wrapper_exit.json",
         "GPU wrapper exit",
     ) == value
+    terminal = load_json(
+        policy_root / "gpu_control/screen512/wrapper_terminal.json",
+        "GPU wrapper terminal",
+    )
+    assert terminal["status"] == "failed"
+    assert terminal["failure"]["type"] == "ControllerExit"
+
+
+def test_gpu_wrapper_preclaim_failure_still_writes_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wrapper = _gpu_wrapper_module()
+    config = tmp_path / "policy.json"
+    config.write_text("{}\n", encoding="utf-8")
+    policy_root = tmp_path / "campaign" / "by_policy" / ("7" * 64)
+    claim_path = (
+        policy_root / "gpu_control/screen512/wrapper_claim.json"
+    )
+    claim_path.parent.mkdir(parents=True, exist_ok=True)
+    claim_path.write_text("{}\n", encoding="utf-8")
+    popen_calls = 0
+
+    def forbidden_popen(*_args, **_kwargs):
+        nonlocal popen_calls
+        popen_calls += 1
+        raise AssertionError("controller Popen must not run")
+
+    monkeypatch.setattr(wrapper.subprocess, "Popen", forbidden_popen)
+    monkeypatch.setattr(
+        wrapper.subprocess,
+        "run",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            returncode=1, stderr="", stdout=""
+        ),
+    )
+    with pytest.raises((FileExistsError, RuntimeError)):
+        wrapper.run_wrapped_controller(
+            repo_root=tmp_path,
+            policy_root=policy_root,
+            policy_sha256="7" * 64,
+            config=config,
+            campaign_root=tmp_path / "campaign",
+            phase="screen512",
+            python=sys.executable,
+            command=[sys.executable, "-c", "raise SystemExit(0)"],
+        )
+    assert popen_calls == 0
+    terminal = load_json(
+        policy_root / "gpu_control/screen512/wrapper_terminal.json",
+        "wrapper preclaim terminal",
+    )
+    assert terminal["status"] == "failed"
+    assert terminal["wrapper_claim"] is not None
 
 
 def test_gpu_wrapper_validates_observer_terminal_barrier(
@@ -3840,6 +6135,26 @@ def test_controller_has_final_observer_liveness_gate(
         for index in range(4)
     ]
     monkeypatch.setenv("TMUX", "fixture")
+    wrapper, observer_launch = _wrapper_bindings(
+        tmp_path, policy, "screen512"
+    )
+    monkeypatch.setattr(
+        module,
+        "_validate_gpu_wrapper_provenance",
+        lambda *_args: (wrapper, observer_launch),
+    )
+    monkeypatch.setattr(
+        module,
+        "_write_gpu_controller_claim",
+        lambda *_args: _mock_controller_claim(
+            tmp_path / "controller_claim.json",
+            {
+                "controller_claim_sha256": "b" * 64,
+                "wrapper_claim": wrapper,
+                "observer_launch": observer_launch,
+            },
+        ),
+    )
     monkeypatch.setattr(
         module,
         "_prepare_gpu_ready_barrier",
@@ -3874,6 +6189,218 @@ def test_controller_has_final_observer_liveness_gate(
     assert calls == 2
 
 
+def test_final_release_gpu_pid_race_blocks_first_worker_popen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("config", None)])
+    policy, policy_path, _ = _policy(tmp_path, ledger)
+    paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
+    monitor_path = tmp_path / "monitor.jsonl"
+    monitor_path.write_text("{}\n", encoding="utf-8")
+    request_path = tmp_path / "request.json"
+    request_path.write_text("{}\n", encoding="utf-8")
+    registry = [
+        {
+            "physical_gpu_index": index,
+            "physical_gpu_uuid": _gpu_uuid(index),
+        }
+        for index in range(4)
+    ]
+    guard = types.SimpleNamespace(
+        raise_if_violated=lambda: None,
+        stop=lambda: {
+            "violation_reason": None,
+            "thread_failure": None,
+            "final_active_worker_pids": [],
+        },
+    )
+    wrapper, launch = _wrapper_bindings(tmp_path, policy, "screen512")
+    claim = {
+        "controller_claim_sha256": "b" * 64,
+        "wrapper_claim": wrapper,
+        "observer_launch": launch,
+    }
+    monkeypatch.setenv("TMUX", "fixture")
+    monkeypatch.setattr(
+        module,
+        "_validate_gpu_wrapper_provenance",
+        lambda *_args: (wrapper, launch),
+    )
+    monkeypatch.setattr(
+        module,
+        "_write_gpu_controller_claim",
+        lambda *_args: _mock_controller_claim(
+            tmp_path / "claim.json", claim
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "_prepare_gpu_ready_barrier",
+        lambda *_args: {
+            "admission_snapshot": {"authorized_gpu_registry": registry},
+            "admission": {"canonical_sha256": "a" * 64},
+            "requests": [request_path],
+            "resource_guard": guard,
+            "monitor_path": monitor_path,
+            "observer_ready": {"path": "observer"},
+            "controller_ready": {"path": "controller"},
+        },
+    )
+    monkeypatch.setattr(module, "_assert_observer_live", lambda *_args: None)
+    monkeypatch.setattr(
+        module,
+        "_write_final_release_admission",
+        lambda *_args: (_ for _ in ()).throw(
+            CanonicalScreeningError(
+                "unknown compute PID observed at final release"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        module.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("worker Popen must not run")
+        ),
+    )
+    monkeypatch.setattr(
+        module, "_append_monitor_sample", lambda *_args, **_kwargs: monitor_path
+    )
+    with pytest.raises(CanonicalScreeningError, match="unknown compute PID"):
+        module._run_gpu_phase(policy, policy_path, paths, "screen512")
+    terminal = load_json(
+        paths["gpu_control"] / "screen512" / "controller_terminal.json",
+        "race terminal",
+    )
+    assert terminal["status"] == "failed"
+    assert terminal["stage"] == "final_release_admission"
+
+
+def test_release_ready_tamper_fails_before_artifact_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    policy = {"campaign_id": "fixture", "policy_sha256": "1" * 64}
+    paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
+    ready_path = tmp_path / "tampered_ready.json"
+    ready_path.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        module,
+        "_validate_controller_ready",
+        lambda *_args: (_ for _ in ()).throw(
+            CanonicalScreeningError("release controller ready tampered")
+        ),
+    )
+    with pytest.raises(CanonicalScreeningError, match="tampered"):
+        module._write_final_release_admission(
+            policy,
+            paths,
+            "screen512",
+            {"canonical_sha256": "2" * 64},
+            {"path": str(ready_path.resolve())},
+            {"path": str(ready_path.resolve())},
+            [],
+            types.SimpleNamespace(raise_if_violated=lambda: None),
+        )
+    assert not (
+        paths["gpu_control"]
+        / "screen512"
+        / "final_release_admission.json"
+    ).exists()
+
+
+def test_post_worker_summary_exception_writes_failed_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _controller_module()
+    ledger = tmp_path / "ledger.jsonl"
+    _write_jsonl(ledger, [_row("config", None)])
+    policy, policy_path, _ = _policy(tmp_path, ledger)
+    paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
+    monitor_path = tmp_path / "monitor.jsonl"
+    monitor_path.write_text("{}\n", encoding="utf-8")
+    registry = [
+        {
+            "physical_gpu_index": index,
+            "physical_gpu_uuid": _gpu_uuid(index),
+        }
+        for index in range(4)
+    ]
+    stop_summary = {
+        "violation_reason": None,
+        "thread_failure": None,
+        "final_active_worker_pids": [],
+    }
+    guard = types.SimpleNamespace(
+        raise_if_violated=lambda: None,
+        stop=lambda: stop_summary,
+    )
+    wrapper, launch = _wrapper_bindings(tmp_path, policy, "screen512")
+    claim = {
+        "controller_claim_sha256": "b" * 64,
+        "wrapper_claim": wrapper,
+        "observer_launch": launch,
+    }
+    release = {
+        "path": str((tmp_path / "release.json").resolve()),
+        "sha256": "c" * 64,
+        "canonical_sha256": "d" * 64,
+    }
+    monkeypatch.setenv("TMUX", "fixture")
+    monkeypatch.setattr(
+        module,
+        "_validate_gpu_wrapper_provenance",
+        lambda *_args: (wrapper, launch),
+    )
+    monkeypatch.setattr(
+        module,
+        "_write_gpu_controller_claim",
+        lambda *_args: _mock_controller_claim(
+            tmp_path / "claim.json", claim
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "_prepare_gpu_ready_barrier",
+        lambda *_args: {
+            "admission_snapshot": {"authorized_gpu_registry": registry},
+            "admission": {"canonical_sha256": "a" * 64},
+            "requests": [],
+            "resource_guard": guard,
+            "monitor_path": monitor_path,
+            "observer_ready": {"path": "observer"},
+            "controller_ready": {"path": "controller"},
+        },
+    )
+    monkeypatch.setattr(module, "_assert_observer_live", lambda *_args: None)
+    monkeypatch.setattr(
+        module,
+        "_write_final_release_admission",
+        lambda *_args: ({}, release),
+    )
+    monkeypatch.setattr(
+        module, "_append_monitor_sample", lambda *_args, **_kwargs: monitor_path
+    )
+    monkeypatch.setattr(
+        module,
+        "_build_gpu_completion_summary",
+        lambda *_args: (_ for _ in ()).throw(
+            RuntimeError("summary injected")
+        ),
+    )
+    with pytest.raises(RuntimeError, match="summary injected"):
+        module._run_gpu_phase(policy, policy_path, paths, "screen512")
+    terminal = load_json(
+        paths["gpu_control"] / "screen512" / "controller_terminal.json",
+        "summary failure terminal",
+    )
+    assert terminal["status"] == "failed"
+    assert terminal["stage"] == "completion_summary"
+    assert "summary injected" in terminal["failure"]["message"]
+
+
 def test_gpu_ready_barrier_positive_contract_chain(
     tmp_path: Path,
 ) -> None:
@@ -3882,8 +6409,11 @@ def test_gpu_ready_barrier_positive_contract_chain(
         tmp_path
     )
     paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
+    wrapper, observer_launch = _wrapper_bindings(
+        tmp_path, policy, "smoke8"
+    )
     claim, claim_path = module._write_gpu_controller_claim(
-        policy, paths, "smoke8"
+        policy, paths, "smoke8", wrapper, observer_launch
     )
     candidates = []
     template = manifest["candidates"][0]
@@ -3973,9 +6503,13 @@ def test_gpu_ready_barrier_positive_contract_chain(
         "admission_sha256": admission["canonical_sha256"],
         "controller_ready_sha256": controller["controller_ready_sha256"],
         "observer_claim_sha256": observer_claim["observer_claim_sha256"],
+        "wrapper_claim_sha256": wrapper["canonical_sha256"],
+        "observer_launch_sha256": observer_launch["canonical_sha256"],
         "observer_claim": module._artifact_binding(
             observer_claim_path, observer_claim["observer_claim_sha256"]
         ),
+        "wrapper_claim": wrapper,
+        "observer_launch": observer_launch,
         "controller_ready": controller_binding,
         "admission": admission,
         "first_observer_sample": module._artifact_binding(

@@ -343,7 +343,7 @@
     },
     "arcface_evaluator": {
       "path": "src/safa/evaluation/r9_evaluator_worker.py",
-      "sha256": "57e083fa6c910d268e2b90fc1aae4bd0d3a8143a67146822c2626bce7612cfd3"
+      "sha256": "dd734b51c630a4d11e9d5b6dea7953d25471cdb71f682d77e791bab47b50c0dd"
     },
     "e0_loader": {
       "path": "src/safa/models/e0.py",
@@ -355,15 +355,15 @@
     },
     "screening_contracts": {
       "path": "src/safa/closeout/canonical_screening.py",
-      "sha256": "bd30314d24769c3602a0ba84b6aceab1a544ed60e834b2265b4c879a083971e9"
+        "sha256": "fe078d7ba750a5d963fc72de877b78aad2019987c96fd69c82f428aaa15be4b1"
     },
     "screening_worker": {
       "path": "src/safa/closeout/canonical_screening_worker.py",
-      "sha256": "ab30a0d0dd00ea62662b8d7654c41660084c7aa305f0de864cbd4d3489c71e89"
+        "sha256": "63937af1417a5bd84fdbdf61e83e5f391007beee82a9a3ad852c01d361f3a304"
     },
     "controller": {
       "path": "scripts/run_canonical_checkpoint_screening.py",
-      "sha256": "fa6e70489d181667bb4c100c841ff31f8fa43d9d57148a7ee0403dfd86ace6aa"
+        "sha256": "b385b7ac6c9dc4ec5f42e8ee190c6f548c2d5c14d4d7619a47dec6461a6c84c2"
     },
     "ram_probe_launcher": {
       "path": "scripts/run_canonical_screening_ram_probe.py",
@@ -375,7 +375,7 @@
     },
     "gpu_wrapper": {
       "path": "scripts/run_canonical_gpu_wrapper.py",
-      "sha256": "8553ad4642e836c365046578d74e69d60d1b75aa2fa577c6b62423325882df7d"
+        "sha256": "d041b628c6e4e6aac1c44c0176e066653b30cee2b081f7a65ed8aa20e39b122d"
     },
     "generator_sampling": {
       "path": "src/safa/models/generator.py",

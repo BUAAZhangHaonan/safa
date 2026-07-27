@@ -11,14 +11,15 @@ from pathlib import Path
 import re
 import statistics
 import tempfile
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence, TYPE_CHECKING
 
-from safa.evaluation.r9_phase_results import (
-    ArcFaceEvaluationRequest,
-    HeldoutEvaluationRequest,
-    QualityEvaluationRequest,
-    SampleEvidence,
-)
+if TYPE_CHECKING:
+    from safa.evaluation.r9_phase_results import (
+        ArcFaceEvaluationRequest,
+        HeldoutEvaluationRequest,
+        QualityEvaluationRequest,
+        SampleEvidence,
+    )
 
 
 QUALITY_METRICS = ("fid", "kid", "niqe", "sharpness")
@@ -59,6 +60,23 @@ _ARCFACE_EXCLUDED_SESSION_OPTION_FIELDS = (
 
 class R9EvaluatorError(ValueError):
     """Raised when production evaluator evidence violates the R9 contract."""
+
+
+def _load_phase_request_types() -> tuple[type[Any], type[Any], type[Any], type[Any]]:
+    """Import phase-result request types only for evaluator execution paths."""
+    from safa.evaluation.r9_phase_results import (
+        ArcFaceEvaluationRequest,
+        HeldoutEvaluationRequest,
+        QualityEvaluationRequest,
+        SampleEvidence,
+    )
+
+    return (
+        QualityEvaluationRequest,
+        ArcFaceEvaluationRequest,
+        HeldoutEvaluationRequest,
+        SampleEvidence,
+    )
 
 
 QualityBackend = Callable[..., Mapping[str, Any]]
@@ -880,10 +898,16 @@ def build_worker_request(
 ) -> dict[str, Any]:
     if task not in WORKER_TASKS:
         raise R9EvaluatorError(f"unknown evaluator task: {task!r}")
+    (
+        quality_request_type,
+        arcface_request_type,
+        heldout_request_type,
+        _,
+    ) = _load_phase_request_types()
     expected_type = {
-        "quality": QualityEvaluationRequest,
-        "arcface": ArcFaceEvaluationRequest,
-        "heldout": HeldoutEvaluationRequest,
+        "quality": quality_request_type,
+        "arcface": arcface_request_type,
+        "heldout": heldout_request_type,
     }[task]
     if not isinstance(request, expected_type):
         raise R9EvaluatorError(f"{task} worker request type mismatch")
@@ -1529,8 +1553,9 @@ def _validate_samples(samples: Sequence[SampleEvidence]) -> tuple[SampleEvidence
         raise R9EvaluatorError("evaluator samples must be a nonempty sequence")
     normalized = tuple(samples)
     ids = []
+    sample_evidence_type = _load_phase_request_types()[3]
     for sample in normalized:
-        if not isinstance(sample, SampleEvidence):
+        if not isinstance(sample, sample_evidence_type):
             raise R9EvaluatorError("evaluator sample has the wrong type")
         if not isinstance(sample.sample_id, str) or not sample.sample_id:
             raise R9EvaluatorError("sample ID must be a nonempty string")
@@ -1737,6 +1762,12 @@ def _decode_config(value: Any) -> ProductionEvaluatorConfig:
 def _decode_evaluator_request(task: str, value: Any) -> Any:
     if not isinstance(value, Mapping):
         raise R9EvaluatorError("evaluator payload must be a mapping")
+    (
+        quality_request_type,
+        arcface_request_type,
+        heldout_request_type,
+        _,
+    ) = _load_phase_request_types()
     samples = _decode_samples(value.get("samples"))
     if task == "quality":
         expected = {
@@ -1758,7 +1789,7 @@ def _decode_evaluator_request(task: str, value: Any) -> Any:
         }
         if set(value) != expected:
             raise R9EvaluatorError("quality evaluator payload fields are not canonical")
-        return QualityEvaluationRequest(
+        return quality_request_type(
             phase=value["phase"],
             logical_run_id=value["logical_run_id"],
             arm_id=value["arm_id"],
@@ -1787,7 +1818,7 @@ def _decode_evaluator_request(task: str, value: Any) -> Any:
         }
         if set(value) != expected:
             raise R9EvaluatorError("ArcFace evaluator payload fields are not canonical")
-        return ArcFaceEvaluationRequest(
+        return arcface_request_type(
             phase=value["phase"],
             logical_run_id=value["logical_run_id"],
             arm_id=value["arm_id"],
@@ -1812,7 +1843,7 @@ def _decode_evaluator_request(task: str, value: Any) -> Any:
         value["heldout_seal"], Mapping
     ):
         raise R9EvaluatorError("heldout evaluator contracts must be mappings")
-    return HeldoutEvaluationRequest(
+    return heldout_request_type(
         phase=value["phase"],
         arm_id=value["arm_id"],
         seed=value["seed"],
@@ -1827,6 +1858,7 @@ def _decode_evaluator_request(task: str, value: Any) -> Any:
 def _decode_samples(value: Any) -> tuple[SampleEvidence, ...]:
     if not isinstance(value, list) or not value:
         raise R9EvaluatorError("worker samples must be a nonempty list")
+    sample_evidence_type = _load_phase_request_types()[3]
     samples = []
     for index, row in enumerate(value):
         if not isinstance(row, Mapping) or set(row) != {
@@ -1840,7 +1872,7 @@ def _decode_samples(value: Any) -> tuple[SampleEvidence, ...]:
         }:
             raise R9EvaluatorError(f"worker sample {index} fields are not canonical")
         samples.append(
-            SampleEvidence(
+            sample_evidence_type(
                 sample_id=str(row["sample_id"]),
                 source=Path(str(row["source"])),
                 native=Path(str(row["native"])),

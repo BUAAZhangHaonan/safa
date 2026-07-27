@@ -9,10 +9,15 @@ import math
 import os
 from pathlib import Path
 import statistics
+import sys
+import time
 from typing import Any, Mapping, Sequence
 
 from safa.closeout.canonical_screening import (
     CanonicalScreeningError,
+    WORKER_READY_CONTRACT,
+    WORKER_EXTERNAL_GPU_RACE_CONTRACT,
+    WORKER_PRE_CUDA_VERIFICATION_ORDER,
     build_run_claim,
     build_run_result,
     canonical_digest,
@@ -20,13 +25,27 @@ from safa.closeout.canonical_screening import (
     canonical_json,
     load_json,
     load_jsonl,
+    publish_exclusive_json,
     sha256_file,
     validate_candidate_manifest,
     validate_checkpoint_plan,
+    validate_final_release_admission,
     validate_policy,
+    validate_worker_ready_value,
+    validate_worker_release_value,
     validate_run_request,
     validate_run_result,
     write_exclusive_json,
+)
+
+
+PRE_CUDA_VERIFICATION_ORDER = WORKER_PRE_CUDA_VERIFICATION_ORDER
+EXTERNAL_GPU_RACE_CONTRACT = WORKER_EXTERNAL_GPU_RACE_CONTRACT
+HEAVY_MODULE_ROOTS = (
+    "torch",
+    "torchvision",
+    "onnxruntime",
+    "diffusers",
 )
 
 
@@ -55,6 +74,182 @@ def _request_repo_root(request: Mapping[str, Any]) -> Path:
             "screening worker binding is not under a SAFA repository"
         )
     return root
+
+
+def validate_pre_cuda_request(
+    request_path: Path,
+    policy: Mapping[str, Any],
+    final_release_admission: Mapping[str, Any],
+    *,
+    config_path: Path,
+    require_heavy_modules_absent: bool = True,
+) -> dict[str, Any]:
+    loaded_heavy_modules = sorted(
+        name for name in HEAVY_MODULE_ROOTS if name in sys.modules
+    )
+    if require_heavy_modules_absent and loaded_heavy_modules:
+        raise CanonicalScreeningError(
+            "pre-CUDA request validation started after heavy import: "
+            f"{loaded_heavy_modules}"
+        )
+    request = validate_run_request(
+        load_json(request_path, "screening run request"), policy
+    )
+    repo_root = _request_repo_root(request)
+    resolved_config = config_path.resolve()
+    if (
+        resolved_config
+        != Path(str(request["policy"]["path"])).resolve()
+        or sha256_file(resolved_config) != request["policy"]["sha256"]
+    ):
+        raise CanonicalScreeningError(
+            "worker config differs from the request policy binding"
+        )
+    implementations = {}
+    for name, binding in request["implementations"].items():
+        path = _assert_bound_file(binding, f"{name} implementation")
+        implementations[name] = {
+            "path": str(path),
+            "sha256": sha256_file(path),
+        }
+    candidate_manifest_path = _assert_bound_file(
+        request["candidate_manifest"], "candidate manifest"
+    )
+    candidate_manifest = load_json(
+        candidate_manifest_path, "candidate manifest"
+    )
+    plan_binding = candidate_manifest.get("checkpoint_plan")
+    if not isinstance(plan_binding, Mapping):
+        raise CanonicalScreeningError(
+            "candidate manifest omits checkpoint plan binding"
+        )
+    plan_path = _assert_bound_file(plan_binding, "checkpoint plan")
+    plan = load_json(plan_path, "checkpoint plan")
+    preflight_root = Path(str(plan.get("preflight_result_root", ""))).resolve()
+    validate_checkpoint_plan(
+        plan,
+        repo_root=repo_root,
+        policy=policy,
+        preflight_root=preflight_root,
+    )
+    validate_candidate_manifest(
+        candidate_manifest,
+        policy=policy,
+        plan=plan,
+        plan_path=plan_path,
+        repo_root=repo_root,
+        preflight_root=preflight_root,
+    )
+    if request["candidate"] not in candidate_manifest["candidates"]:
+        raise CanonicalScreeningError(
+            "run request candidate is not bound by the immutable candidate manifest"
+        )
+    checkpoint_path = Path(
+        str(request["candidate"]["checkpoint_path"])
+    ).resolve()
+    if (
+        not checkpoint_path.is_file()
+        or sha256_file(checkpoint_path)
+        != request["candidate"]["checkpoint_sha256"]
+    ):
+        raise CanonicalScreeningError(
+            "candidate checkpoint changed before worker release"
+        )
+    asset_verification_audit: list[dict[str, Any]] = []
+    if validate_policy(
+        repo_root,
+        resolved_config,
+        verify_historical_output_evidence=False,
+        asset_verification_audit=asset_verification_audit,
+    ) != dict(policy):
+        raise CanonicalScreeningError(
+            "worker policy differs from current validated policy"
+        )
+    validate_final_release_admission(
+        final_release_admission, request, policy
+    )
+    _assert_ready_barrier(request, policy)
+    rehashed_bindings = {
+        "config": {
+            "path": str(resolved_config),
+            "sha256": sha256_file(resolved_config),
+        },
+        "implementations": implementations,
+        "request": {
+            "path": str(request_path.resolve()),
+            "sha256": sha256_file(request_path),
+            "canonical_sha256": request["run_request_sha256"],
+        },
+        "candidate_manifest": dict(request["candidate_manifest"]),
+        "checkpoint_plan": dict(plan_binding),
+        "checkpoint": {
+            "path": str(checkpoint_path),
+            "sha256": request["candidate"]["checkpoint_sha256"],
+        },
+        "data_and_evaluators": {
+            name: request[name]
+            for name in (
+                "sample_manifest",
+                "source_index",
+                "features",
+                "e0",
+                "edev",
+                "quality_script",
+                "pixel_protocol_config",
+                "arcface",
+            )
+        },
+        "final_release": dict(final_release_admission),
+        "controller_ready": dict(request["controller_ready"]),
+        "observer_ready": dict(request["observer_ready"]),
+    }
+    return {
+        "request": request,
+        "repo_root": str(repo_root),
+        "verification_order": list(PRE_CUDA_VERIFICATION_ORDER),
+        "rehashed_bindings": rehashed_bindings,
+        "rehashed_bindings_sha256": hashlib.sha256(
+            canonical_json(rehashed_bindings)
+        ).hexdigest(),
+        "heavy_modules_absent": loaded_heavy_modules == [],
+        "loaded_heavy_modules": loaded_heavy_modules,
+        "asset_content_verification": asset_verification_audit[0],
+    }
+
+
+def _wait_worker_release(
+    release_path: Path,
+    ready: Mapping[str, Any],
+    ready_binding: Mapping[str, Any],
+    request: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    *,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    while not release_path.is_file():
+        if time.monotonic() >= deadline:
+            raise CanonicalScreeningError(
+                "worker CUDA release token timed out"
+            )
+        time.sleep(0.05)
+    release = validate_worker_release_value(
+        load_json(release_path, "worker CUDA release token"),
+        request,
+        policy,
+        expected_worker_pid=os.getpid(),
+    )
+    validate_worker_ready_value(
+        ready,
+        request,
+        policy,
+        expected_worker_pid=os.getpid(),
+    )
+    if release["worker_ready"] != dict(ready_binding):
+        raise CanonicalScreeningError(
+            "worker CUDA release token binds a different ready artifact"
+        )
+    return release
 
 
 def _assert_ready_barrier(
@@ -97,6 +292,8 @@ def _assert_ready_barrier(
         raise CanonicalScreeningError("worker observer ready binding mismatch")
     for field, digest_field in {
         "controller_claim": "controller_claim_sha256",
+        "wrapper_claim": "wrapper_claim_sha256",
+        "observer_launch": "observer_launch_sha256",
         "admission": "admission_sha256",
         "request_intent_manifest": "request_intent_manifest_sha256",
         "internal_monitor": "monitor_sample_sha256",
@@ -122,6 +319,8 @@ def _assert_ready_barrier(
             )
     for field, digest_field in {
         "observer_claim": "observer_claim_sha256",
+        "wrapper_claim": "wrapper_claim_sha256",
+        "observer_launch": "observer_launch_sha256",
         "controller_ready": "controller_ready_sha256",
         "admission": "admission_sha256",
         "first_observer_sample": "monitor_sample_sha256",
@@ -146,10 +345,16 @@ def _assert_ready_barrier(
     if (
         controller["controller_claim"]["canonical_sha256"]
         != controller.get("controller_claim_sha256")
+        or controller["wrapper_claim"]["canonical_sha256"]
+        != controller.get("wrapper_claim_sha256")
+        or controller["observer_launch"]["canonical_sha256"]
+        != controller.get("observer_launch_sha256")
         or controller["admission"]["canonical_sha256"]
         != controller.get("admission_sha256")
         or observer["observer_claim"]["canonical_sha256"]
         != observer.get("observer_claim_sha256")
+        or observer["wrapper_claim"] != controller["wrapper_claim"]
+        or observer["observer_launch"] != controller["observer_launch"]
         or observer["controller_ready"]["canonical_sha256"]
         != observer.get("controller_ready_sha256")
         or observer["admission"]["canonical_sha256"]
@@ -676,61 +881,145 @@ def _run_quality(
     return quality
 
 
-def execute_screening_request(
+def prepare_screening_request_for_cuda(
     request_path: Path,
     gpu_index: int,
     gpu_uuid: str,
     policy: Mapping[str, Any],
+    final_release_admission: Mapping[str, Any],
+    worker_ready_path: Path,
+    worker_release_path: Path,
 ) -> dict[str, Any]:
-    request = validate_run_request(
-        load_json(request_path, "screening run request"), policy
-    )
+    """Complete the independently validated CPU-only worker handshake."""
     if "TMUX" not in os.environ:
         raise CanonicalScreeningError("screening execution must run inside tmux")
-    for name, binding in request["implementations"].items():
-        _assert_bound_file(binding, f"{name} implementation")
-    candidate_manifest_path = _assert_bound_file(
-        request["candidate_manifest"], "candidate manifest"
+    pre_cuda = validate_pre_cuda_request(
+        request_path,
+        policy,
+        final_release_admission,
+        config_path=Path(str(policy["policy_file"]["path"])),
     )
-    candidate_manifest = load_json(candidate_manifest_path, "candidate manifest")
-    plan_binding = candidate_manifest.get("checkpoint_plan")
-    if not isinstance(plan_binding, Mapping):
-        raise CanonicalScreeningError("candidate manifest omits checkpoint plan binding")
-    plan_path = _assert_bound_file(plan_binding, "checkpoint plan")
-    plan = load_json(plan_path, "checkpoint plan")
-    preflight_root = Path(str(plan.get("preflight_result_root", ""))).resolve()
-    validate_checkpoint_plan(
-        plan,
-        repo_root=_request_repo_root(request),
-        policy=policy,
-        preflight_root=preflight_root,
+    request = pre_cuda["request"]
+    ready = {
+        "schema_version": 1,
+        "contract_type": WORKER_READY_CONTRACT,
+        "policy_sha256": policy["policy_sha256"],
+        "phase": request["mode"],
+        "worker_pid": os.getpid(),
+        "gpu_index": gpu_index,
+        "gpu_uuid": gpu_uuid,
+        "run_request_sha256": request["run_request_sha256"],
+        "request": pre_cuda["rehashed_bindings"]["request"],
+        "final_release": dict(final_release_admission),
+        "verification_order": pre_cuda["verification_order"],
+        "rehashed_bindings": pre_cuda["rehashed_bindings"],
+        "rehashed_bindings_sha256": pre_cuda[
+            "rehashed_bindings_sha256"
+        ],
+        "controller_claim": load_json(
+            Path(str(request["controller_ready"]["path"])),
+            "worker controller ready",
+        )["controller_claim"],
+        "screening_worker_sha256": request["implementations"][
+            "screening_worker"
+        ]["sha256"],
+        "controller_implementation_sha256": request["implementations"][
+            "controller"
+        ]["sha256"],
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "heavy_modules_absent": pre_cuda["heavy_modules_absent"],
+        "loaded_heavy_modules": pre_cuda["loaded_heavy_modules"],
+        "asset_content_verification": pre_cuda[
+            "asset_content_verification"
+        ],
+        "external_gpu_race_contract": EXTERNAL_GPU_RACE_CONTRACT,
+        "ready_at": _utc_now(),
+    }
+    ready["worker_ready_sha256"] = canonical_digest(
+        ready, "worker_ready_sha256"
     )
-    validate_candidate_manifest(
-        candidate_manifest,
-        policy=policy,
-        plan=plan,
-        plan_path=plan_path,
-        repo_root=_request_repo_root(request),
-        preflight_root=preflight_root,
+    validate_worker_ready_value(
+        ready,
+        request,
+        policy,
+        expected_worker_pid=os.getpid(),
+        expected_gpu_index=gpu_index,
+        expected_gpu_uuid=gpu_uuid,
     )
-    if request["candidate"] not in candidate_manifest["candidates"]:
+    publish_exclusive_json(worker_ready_path, ready)
+    ready_binding = {
+        "path": str(worker_ready_path.resolve()),
+        "sha256": sha256_file(worker_ready_path),
+        "canonical_sha256": ready["worker_ready_sha256"],
+    }
+    release = _wait_worker_release(
+        worker_release_path,
+        ready,
+        ready_binding,
+        request,
+        policy,
+        timeout_seconds=180.0,
+    )
+    post_release = validate_pre_cuda_request(
+        request_path,
+        policy,
+        final_release_admission,
+        config_path=Path(str(policy["policy_file"]["path"])),
+    )
+    if (
+        post_release["rehashed_bindings_sha256"]
+        != pre_cuda["rehashed_bindings_sha256"]
+    ):
         raise CanonicalScreeningError(
-            "run request candidate is not bound by the immutable candidate manifest"
+            "worker bindings changed after CUDA release publication"
         )
-    policy_path = _assert_bound_file(request["policy"], "screening policy")
-    if validate_policy(
-        _request_repo_root(request),
-        policy_path,
-        verify_historical_output_evidence=False,
-    ) != dict(policy):
-        raise CanonicalScreeningError("worker policy differs from current validated policy")
-    _assert_ready_barrier(request, policy)
+    release_binding = {
+        "path": str(worker_release_path.resolve()),
+        "sha256": sha256_file(worker_release_path),
+        "canonical_sha256": release["worker_release_sha256"],
+    }
+    return {
+        "request": request,
+        "pre_cuda": pre_cuda,
+        "post_release": post_release,
+        "worker_ready": ready,
+        "worker_ready_binding": ready_binding,
+        "worker_release": release,
+        "worker_release_binding": release_binding,
+        "next_stage": "runtime_cuda_binding",
+    }
+
+
+def _execute_screening_request_impl(
+    request_path: Path,
+    gpu_index: int,
+    gpu_uuid: str,
+    policy: Mapping[str, Any],
+    final_release_admission: Mapping[str, Any],
+    worker_ready_path: Path,
+    worker_release_path: Path,
+) -> dict[str, Any]:
+    prepared = prepare_screening_request_for_cuda(
+        request_path,
+        gpu_index,
+        gpu_uuid,
+        policy,
+        final_release_admission,
+        worker_ready_path,
+        worker_release_path,
+    )
+    request = prepared["request"]
+    ready_binding = prepared["worker_ready_binding"]
+    release_binding = prepared["worker_release_binding"]
     cuda_binding = _assert_runtime_cuda_binding(request, gpu_index, gpu_uuid)
     output_dir = Path(str(request["output_dir"])).resolve()
     output_dir.mkdir(parents=True, exist_ok=False)
     claim = build_run_claim(
         request,
         policy,
+        final_release_admission,
+        ready_binding,
+        release_binding,
         cuda_binding["physical_gpu_index"],
         cuda_binding["physical_gpu_uuid"],
         cuda_binding["runtime_cuda_uuid"],
@@ -814,3 +1103,106 @@ def execute_screening_request(
             output_dir / "result.json", result, request, claim, policy
         )
         raise
+
+
+def execute_screening_request(
+    request_path: Path,
+    gpu_index: int,
+    gpu_uuid: str,
+    policy: Mapping[str, Any],
+    final_release_admission: Mapping[str, Any],
+    worker_ready_path: Path,
+    worker_release_path: Path,
+) -> dict[str, Any]:
+    result: dict[str, Any] | None = None
+    failure: BaseException | None = None
+    started_at = _utc_now()
+    try:
+        result = _execute_screening_request_impl(
+            request_path,
+            gpu_index,
+            gpu_uuid,
+            policy,
+            final_release_admission,
+            worker_ready_path,
+            worker_release_path,
+        )
+        return result
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        def terminal_binding(
+            path: Path, digest_field: str
+        ) -> dict[str, Any] | None:
+            if not path.is_file():
+                return None
+            canonical_sha256 = None
+            try:
+                value = load_json(path, f"{digest_field} terminal binding")
+            except (CanonicalScreeningError, OSError):
+                value = {}
+            if isinstance(value, Mapping):
+                candidate = value.get(digest_field)
+                if isinstance(candidate, str):
+                    canonical_sha256 = candidate
+            return {
+                "path": str(path.resolve()),
+                "sha256": sha256_file(path),
+                "canonical_sha256": canonical_sha256,
+            }
+
+        request_binding = terminal_binding(
+            request_path, "run_request_sha256"
+        )
+        claim_binding = None
+        result_binding = None
+        try:
+            terminal_request = load_json(
+                request_path, "worker terminal request"
+            )
+            terminal_output_dir = Path(
+                str(terminal_request["output_dir"])
+            ).resolve()
+            claim_binding = terminal_binding(
+                terminal_output_dir / "claim.json",
+                "run_claim_sha256",
+            )
+            result_binding = terminal_binding(
+                terminal_output_dir / "result.json",
+                "run_result_sha256",
+            )
+        except (CanonicalScreeningError, KeyError, TypeError, OSError):
+            pass
+        terminal = {
+            "schema_version": 1,
+            "contract_type": "safa_canonical_worker_terminal_v1",
+            "policy_sha256": policy["policy_sha256"],
+            "worker_pid": os.getpid(),
+            "request": request_binding,
+            "claim": claim_binding,
+            "result": result_binding,
+            "worker_ready": terminal_binding(
+                worker_ready_path, "worker_ready_sha256"
+            ),
+            "worker_release": terminal_binding(
+                worker_release_path, "worker_release_sha256"
+            ),
+            "status": "completed" if result is not None else "failed",
+            "failure": (
+                None
+                if failure is None
+                else {
+                    "type": type(failure).__name__,
+                    "message": str(failure),
+                }
+            ),
+            "started_at": started_at,
+            "completed_at": _utc_now(),
+        }
+        terminal["worker_terminal_sha256"] = canonical_digest(
+            terminal, "worker_terminal_sha256"
+        )
+        publish_exclusive_json(
+            worker_ready_path.parent / "worker_terminal.json", terminal
+        )
