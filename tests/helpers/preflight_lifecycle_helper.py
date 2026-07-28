@@ -20,6 +20,8 @@ import time
 import traceback
 from typing import Any, Mapping
 
+_LAUNCHER_PUBLISHER_MODULE: Any | None = None
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -48,13 +50,44 @@ def file_sha(path: Path) -> str:
 
 
 def write_exclusive(path: Path, value: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-    try:
-        os.write(descriptor, canonical_json(value))
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    global _LAUNCHER_PUBLISHER_MODULE
+    path.parent.mkdir(parents=True, mode=0o755, exist_ok=True)
+    if _LAUNCHER_PUBLISHER_MODULE is None:
+        repo_root = Path(__file__).resolve().parents[2]
+        launcher_path = (
+            repo_root
+            / "scripts/run_canonical_preflight_launcher.py"
+        )
+        policy_path = (
+            repo_root
+            / "configs/closeout/canonical_screening_512_v1.json"
+        )
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        launcher_binding = policy["implementations"][
+            "preflight_launcher"
+        ]
+        if (
+            launcher_binding
+            != {
+                "path": "scripts/run_canonical_preflight_launcher.py",
+                "sha256": file_sha(launcher_path),
+            }
+        ):
+            raise RuntimeError(
+                "production launcher publisher SHA binding differs"
+            )
+        spec = importlib.util.spec_from_file_location(
+            "preflight_launcher_publisher_fixture",
+            launcher_path,
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError(
+                "cannot load production launcher publisher"
+            )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _LAUNCHER_PUBLISHER_MODULE = module
+    _LAUNCHER_PUBLISHER_MODULE._write_exclusive(path, value)
 
 
 def load(path: Path) -> dict[str, Any]:
@@ -85,6 +118,30 @@ def file_identity(path: Path) -> dict[str, Any]:
         "mode": int(value.st_mode),
         "size": int(value.st_size),
     }
+
+
+def create_presealed_fault_channel(
+    repo_root: Path,
+    attempt_root: Path,
+    *,
+    name: str = "wrapper_fault.channel",
+) -> tuple[dict[str, Any], int]:
+    launcher_path = (
+        repo_root / "scripts/run_canonical_preflight_launcher.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "preflight_launcher_fault_fixture", launcher_path
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load real preflight launcher")
+    launcher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(launcher)
+    channel_path = attempt_root / name
+    channel = launcher._create_fault_channel(channel_path)
+    descriptor = launcher._open_presealed_fault_channel(
+        attempt_root, channel, name=name
+    )
+    return channel, descriptor
 
 
 def verified_implementations(config: Path) -> dict[str, Any]:
@@ -204,7 +261,9 @@ def install_synthetic_launcher_contract(
         / policy_sha256
         / attempt_id
     )
-    attempt_root.mkdir(parents=True, exist_ok=False)
+    attempt_root.mkdir(
+        parents=True, mode=0o755, exist_ok=False
+    )
     started_path = (
         campaign_root
         / "preflight_launch_attempts"
@@ -231,6 +290,19 @@ def install_synthetic_launcher_contract(
     os.fsync(descriptor)
     os.close(descriptor)
     log_stat = log_path.stat()
+    fault_channel, fault_descriptor = (
+        create_presealed_fault_channel(repo_root, attempt_root)
+    )
+    (
+        pane_gate_fault_channel,
+        pane_gate_fault_descriptor,
+    ) = create_presealed_fault_channel(
+        repo_root,
+        attempt_root,
+        name="pane_gate_fault.channel",
+    )
+    os.close(pane_gate_fault_descriptor)
+    os.close(fault_descriptor)
     receipt_path = attempt_root / "launch_receipt.json"
     accepted_path = attempt_root / "launch_accepted.json"
     release_path = attempt_root / "launch_ownership_release.json"
@@ -303,6 +375,15 @@ def install_synthetic_launcher_contract(
             "inode": int(log_stat.st_ino),
             "mode": int(log_stat.st_mode),
             "size": int(log_stat.st_size),
+        },
+        "fault_channel": fault_channel,
+        "pane_gate_fault_channel": pane_gate_fault_channel,
+        "pane_gate_fault_publisher": {
+            **{
+                "path": str(wrapper_path),
+                "sha256": file_sha(wrapper_path),
+            },
+            "role": "launcher_pane_gate",
         },
         "wrapper_claim_path": str(claim_path.resolve()),
         "started_at": utc_now(),
@@ -440,6 +521,70 @@ def prepare_supervised_launcher_contract(
     policy_sha256: str,
     config: Path,
     wrapper_arguments: list[str],
+    controller_owner_nonce: str | None = None,
+) -> dict[str, Any]:
+    del module
+    global _LAUNCHER_PUBLISHER_MODULE
+    if _LAUNCHER_PUBLISHER_MODULE is None:
+        raise RuntimeError(
+            "production launcher publisher was not loaded"
+        )
+    launcher = _LAUNCHER_PUBLISHER_MODULE
+    launcher._install_verified_preflight_apis(config)
+
+    def verified_test_git_state(root: Path) -> dict[str, str]:
+        values: dict[str, str] = {}
+        for name, arguments in (
+            ("head_sha", ("rev-parse", "HEAD")),
+            ("origin_master_sha", ("rev-parse", "origin/master")),
+            ("branch", ("branch", "--show-current")),
+        ):
+            result = subprocess.run(
+                ["git", "-C", str(root), *arguments],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            values[name] = result.stdout.strip()
+        return values
+
+    launcher._verified_git_state = verified_test_git_state
+    attempt_id = hashlib.sha256(
+        (
+            f"supervised-v4:{policy_root.resolve()}:{os.getpid()}:"
+            f"{wrapper_arguments}"
+        ).encode()
+    ).hexdigest()
+    owner_nonce = (
+        hashlib.sha256(f"owner:{attempt_id}".encode()).hexdigest()
+        if controller_owner_nonce is None
+        else controller_owner_nonce
+    )
+    return launcher.launch_preflight(
+        repo_root=repo_root,
+        config=config,
+        campaign_root=policy_root.parents[1],
+        policy_sha256=policy_sha256,
+        python=sys.executable,
+        startup_timeout_seconds=10.0,
+        attempt_id=attempt_id,
+        owner_nonce=owner_nonce,
+        observer_suffix=hashlib.sha256(
+            f"observer:{attempt_id}".encode()
+        ).hexdigest(),
+        wrapper_arguments_override=wrapper_arguments,
+    )
+
+
+def _legacy_schema_v2_negative_fixture_contract(
+    *,
+    module: Any,
+    repo_root: Path,
+    policy_root: Path,
+    policy_sha256: str,
+    config: Path,
+    wrapper_arguments: list[str],
+    controller_owner_nonce: str | None = None,
 ) -> dict[str, Any]:
     module._install_verified_preflight_apis(config)
     verified = module._reverify_verified_preflight_apis()
@@ -450,9 +595,16 @@ def prepare_supervised_launcher_contract(
             f"{wrapper_arguments}"
         ).encode()
     ).hexdigest()
-    owner_nonce = hashlib.sha256(
-        f"owner:{attempt_id}".encode()
-    ).hexdigest()
+    owner_nonce = (
+        hashlib.sha256(f"owner:{attempt_id}".encode()).hexdigest()
+        if controller_owner_nonce is None
+        else controller_owner_nonce
+    )
+    if (
+        len(owner_nonce) != 64
+        or any(character not in "0123456789abcdef" for character in owner_nonce)
+    ):
+        raise RuntimeError("fixture controller owner nonce differs")
     attempt_root = (
         campaign_root
         / "preflight_launch_attempts"
@@ -460,7 +612,9 @@ def prepare_supervised_launcher_contract(
         / policy_sha256
         / attempt_id
     )
-    attempt_root.mkdir(parents=True, exist_ok=False)
+    attempt_root.mkdir(
+        parents=True, mode=0o755, exist_ok=False
+    )
     started_path = (
         campaign_root
         / "preflight_launch_attempts"
@@ -487,6 +641,17 @@ def prepare_supervised_launcher_contract(
     os.fsync(descriptor)
     os.close(descriptor)
     log_stat = log_path.stat()
+    fault_channel, fault_descriptor = (
+        create_presealed_fault_channel(repo_root, attempt_root)
+    )
+    (
+        pane_gate_fault_channel,
+        pane_gate_fault_descriptor,
+    ) = create_presealed_fault_channel(
+        repo_root,
+        attempt_root,
+        name="pane_gate_fault.channel",
+    )
     receipt_path = attempt_root / "launch_receipt.json"
     accepted_path = attempt_root / "launch_accepted.json"
     release_path = attempt_root / "launch_ownership_release.json"
@@ -512,6 +677,26 @@ def prepare_supervised_launcher_contract(
         os.readlink(f"/proc/{os.getpid()}/exe")
     ).resolve()
     wrapper_path = Path(module.__file__).resolve()
+    launcher_path = (
+        repo_root / "scripts/run_canonical_preflight_launcher.py"
+    ).resolve(strict=True)
+    global _LAUNCHER_PUBLISHER_MODULE
+    if _LAUNCHER_PUBLISHER_MODULE is None:
+        raise RuntimeError(
+            "production launcher publisher was not loaded"
+        )
+    launcher = _LAUNCHER_PUBLISHER_MODULE
+    launcher._install_verified_preflight_apis(config)
+    launcher_binding = {
+        "path": str(launcher_path),
+        "sha256": file_sha(launcher_path),
+    }
+    pane_fault_consumer_registration = (
+        launcher._build_pane_fault_consumer_registration(
+            attempt_root=attempt_root,
+            launcher_binding=launcher_binding,
+        )
+    )
     gate_process = launch_process_identity(os.getpid())
     gate_arguments = [
         item.decode("utf-8")
@@ -521,8 +706,8 @@ def prepare_supervised_launcher_contract(
         if item
     ]
     receipt = {
-        "schema_version": 1,
-        "contract_type": "safa_canonical_preflight_launch_receipt_v1",
+        "schema_version": 2,
+        "contract_type": launcher.LAUNCH_RECEIPT_CONTRACT_TYPE,
         "attempt_id": attempt_id,
         "started_registry": binding(
             started_path, "launch_started_registry_sha256"
@@ -535,8 +720,7 @@ def prepare_supervised_launcher_contract(
                 "sha256": file_sha(config),
             },
             "launcher": {
-                "path": str(wrapper_path),
-                "sha256": file_sha(wrapper_path),
+                **launcher_binding,
             },
             "wrapper": {
                 "path": str(wrapper_path),
@@ -566,6 +750,13 @@ def prepare_supervised_launcher_contract(
             "mode": int(log_stat.st_mode),
             "size": int(log_stat.st_size),
         },
+        "fault_channel": fault_channel,
+        "pane_gate_fault_channel": pane_gate_fault_channel,
+        "pane_gate_fault_publisher": {
+            **launcher_binding,
+            "role": "launcher_pane_gate",
+        },
+        "pane_fault_consumer": pane_fault_consumer_registration,
         "wrapper_claim_path": str(claim_path.resolve()),
         "wrapper_started_path": str(wrapper_started_path.resolve()),
         "gate_execution_terminal_path": str(
@@ -575,6 +766,11 @@ def prepare_supervised_launcher_contract(
     }
     receipt["launch_receipt_sha256"] = digest(
         receipt, "launch_receipt_sha256"
+    )
+    launcher.validate_launch_receipt_schema(
+        receipt,
+        expected_gate_worker_arguments=gate_arguments,
+        label="fixture launch receipt v3",
     )
     write_exclusive(receipt_path, receipt)
     receipt_identity = file_identity(receipt_path)
@@ -597,30 +793,74 @@ def prepare_supervised_launcher_contract(
         gate_ready, "pane_gate_ready_sha256"
     )
     write_exclusive(gate_ready_path, gate_ready)
-    subprocess.run(
-        [
-            "tmux",
-            "set-environment",
-            "-t",
-            module.CONTROLLER_SESSION,
-            module.TMUX_OWNER_ENV,
-            owner_nonce,
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    if controller_owner_nonce is None:
+        subprocess.run(
+            [
+                "tmux",
+                "set-environment",
+                "-t",
+                module.CONTROLLER_SESSION,
+                module.TMUX_OWNER_ENV,
+                owner_nonce,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    elif (
+        launcher._tmux_owner_nonce(module.CONTROLLER_SESSION)
+        != owner_nonce
+    ):
+        raise RuntimeError(
+            "fixture controller atomic owner nonce differs"
+        )
     controller_tmux = module._tmux_identity(
         module.CONTROLLER_SESSION
     )
     controller_tmux_server = module._tmux_server_identity(
         controller_tmux["pane"]
     )
-    tmux_owner_seal = module._build_tmux_owner_seal(
+    wrapper_owner_seal_before_remain = module._build_tmux_owner_seal(
         controller_tmux,
         controller_tmux_server,
         owner_nonce,
     )
+    consumer_gate_owner_before_remain = (
+        launcher._tmux_owner_seal(
+            module.CONTROLLER_SESSION, owner_nonce
+        )
+    )
+    launcher._set_remain_on_exit(
+        str(wrapper_owner_seal_before_remain["pane"]), True
+    )
+    launcher._verify_remain_on_exit(
+        str(wrapper_owner_seal_before_remain["pane"]), "on"
+    )
+    controller_tmux_after_remain = module._tmux_identity(
+        module.CONTROLLER_SESSION
+    )
+    controller_tmux_server_after_remain = (
+        module._tmux_server_identity(
+            controller_tmux_after_remain["pane"]
+        )
+    )
+    tmux_owner_seal = module._build_tmux_owner_seal(
+        controller_tmux_after_remain,
+        controller_tmux_server_after_remain,
+        owner_nonce,
+    )
+    consumer_gate_owner_seal = launcher._tmux_owner_seal(
+        module.CONTROLLER_SESSION, owner_nonce
+    )
+    if (
+        tmux_owner_seal != wrapper_owner_seal_before_remain
+        or consumer_gate_owner_seal
+        != consumer_gate_owner_before_remain
+    ):
+        raise RuntimeError(
+            "fixture controller owner changed while enabling "
+            "remain-on-exit"
+        )
     tmux_started = module.build_tmux_started(
         launch_receipt=receipt_binding,
         launch_receipt_identity=receipt_identity,
@@ -631,16 +871,75 @@ def prepare_supervised_launcher_contract(
         tmux_client={"returncode": 0, "stdout": "", "stderr": ""},
         owner_seal=tmux_owner_seal,
         started_at=utc_now(),
-        tmux_identity=controller_tmux,
-        tmux_server=controller_tmux_server,
+        tmux_identity=controller_tmux_after_remain,
+        tmux_server=controller_tmux_server_after_remain,
     )
     write_exclusive(tmux_started_path, tmux_started)
+    pane_fault_consumer = (
+        launcher._reserve_spawn_ready_pane_fault_consumer(
+            repo_root=repo_root,
+            config=config,
+            attempt_root=attempt_root,
+            policy_sha256=policy_sha256,
+            attempt_id=attempt_id,
+            receipt_path=receipt_path,
+            receipt_identity=receipt_identity,
+            gate_owner_seal=consumer_gate_owner_seal,
+            pane_fault_channel=pane_gate_fault_channel,
+            pane_fault_publisher=receipt[
+                "pane_gate_fault_publisher"
+            ],
+            python=str(proc_executable),
+            ready_timeout_seconds=10.0,
+            registration=receipt["pane_fault_consumer"],
+        )
+    )
+    launcher_gate_reader = {
+        "descriptor": pane_gate_fault_descriptor,
+        "closed": False,
+    }
+    transfer = launcher._transfer_pane_fault_consumer(
+        consumer=pane_fault_consumer,
+        launcher_gate_reader=launcher_gate_reader,
+        timeout_seconds=10.0,
+    )
+    pane_fault_consumer["transfer"] = transfer
+    pane_fault_consumer_chain = (
+        launcher.validate_pane_fault_consumer_chain(
+            {
+                "consumer_started": binding(
+                    Path(pane_fault_consumer["started_path"]),
+                    "consumer_started_sha256",
+                ),
+                "consumer_active": binding(
+                    Path(transfer["active_path"]),
+                    "consumer_active_sha256",
+                ),
+                "consumer_reader_release": binding(
+                    Path(transfer["reader_release_path"]),
+                    "consumer_reader_release_sha256",
+                ),
+                "consumer_release_observed": binding(
+                    Path(transfer["release_observed_path"]),
+                    "consumer_release_observed_sha256",
+                ),
+            },
+            registration=receipt["pane_fault_consumer"],
+            label=(
+                "fixture transferred pane fault consumer chain"
+            ),
+        )
+    )
+    launcher._require_post_handoff_pane_fault_consumer(
+        pane_fault_consumer, "fixture wrapper launch"
+    )
     environment = {
         module.TMUX_OWNER_ENV: owner_nonce,
         module.LAUNCH_RECEIPT_PATH_ENV: str(receipt_path.resolve()),
         module.LAUNCH_ACCEPTED_PATH_ENV: str(accepted_path.resolve()),
         module.LAUNCH_RELEASE_PATH_ENV: str(release_path.resolve()),
         module.PANE_LOG_PATH_ENV: str(log_path.resolve()),
+        module.FAULT_CHANNEL_FD_ENV: str(fault_descriptor),
     }
     return {
         "attempt_root": attempt_root,
@@ -652,177 +951,130 @@ def prepare_supervised_launcher_contract(
         "wrapper_started_path": wrapper_started_path,
         "tmux_started_path": tmux_started_path,
         "log_path": log_path,
-        "controller_pane": controller_tmux,
+        "controller_pane": controller_tmux_after_remain,
         "wrapper_arguments": wrapper_arguments,
         "gate_process": gate_process,
         "environment": environment,
         "receipt_identity": receipt_identity,
         "verified_implementations": verified,
+        "fault_descriptor": fault_descriptor,
+        "launcher": launcher,
+        "pane_fault_consumer": pane_fault_consumer,
+        "pane_fault_consumer_chain": pane_fault_consumer_chain,
     }
 
 
 def complete_supervised_launcher_contract(
-    context: Mapping[str, Any], child_pid: int
-) -> threading.Thread:
+    context: Mapping[str, Any],
+) -> tuple[threading.Thread, list[BaseException]]:
     verified = dict(context["verified_implementations"])
-    wrapper_arguments = list(context["wrapper_arguments"])
-    process = launch_process_identity(child_pid)
-    deadline = time.monotonic() + 5
-    while True:
-        command = [
-            item.decode("utf-8")
-            for item in Path(f"/proc/{child_pid}/cmdline")
-            .read_bytes()
-            .split(b"\0")
-            if item
-        ]
-        if command == wrapper_arguments:
-            break
-        if time.monotonic() >= deadline:
-            raise RuntimeError("fixture child command did not stabilize")
-        time.sleep(0.005)
-    executable_path = Path(
-        os.readlink(f"/proc/{child_pid}/exe")
-    ).resolve()
-    executable_stat = executable_path.stat()
-    executable = {
-        "path": str(executable_path),
-        "device": int(executable_stat.st_dev),
-        "inode": int(executable_stat.st_ino),
-        "mode": int(executable_stat.st_mode),
-        "size": int(executable_stat.st_size),
-    }
-    wrapper_started = {
-        "schema_version": 1,
-        "contract_type": (
-            "safa_canonical_preflight_wrapper_started_v1"
-        ),
-        "launch_receipt": binding(
-            context["receipt_path"], "launch_receipt_sha256"
-        ),
-        "launch_receipt_identity": dict(
-            context["receipt_identity"]
-        ),
-        "verified_implementations": verified,
-        "pane_gate_ready": binding(
-            context["gate_ready_path"], "pane_gate_ready_sha256"
-        ),
-        "pane_gate_process": dict(context["gate_process"]),
-        "wrapper_arguments": wrapper_arguments,
-        "wrapper_process": process,
-        "wrapper_executable": executable,
-        "started_at": utc_now(),
-    }
-    wrapper_started["wrapper_started_sha256"] = digest(
-        wrapper_started, "wrapper_started_sha256"
-    )
-    write_exclusive(
-        context["wrapper_started_path"], wrapper_started
+    launcher = context["launcher"]
+    pane_fault_consumer_chain = dict(
+        context["pane_fault_consumer_chain"]
     )
 
+    failures: list[BaseException] = []
+
     def accept_claim() -> None:
-        claim_path = Path(context["claim_path"])
-        deadline = time.monotonic() + 45
-        while not claim_path.is_file():
-            if time.monotonic() >= deadline:
-                return
-            time.sleep(0.02)
-        claim_binding = binding(
-            claim_path, "wrapper_claim_sha256"
-        )
-        receipt_binding = binding(
-            context["receipt_path"], "launch_receipt_sha256"
-        )
-        accepted = {
-            "schema_version": 1,
-            "contract_type": (
-                "safa_canonical_preflight_launch_accepted_v1"
-            ),
-            "attempt_id": load(context["receipt_path"])["attempt_id"],
-            "launch_receipt": receipt_binding,
-            "launch_receipt_identity": dict(
-                context["receipt_identity"]
-            ),
-            "verified_implementations": verified,
-            "wrapper_claim": claim_binding,
-            "tmux_started": binding(
+        try:
+            claim_path = Path(context["claim_path"])
+            deadline = time.monotonic() + 45
+            while not claim_path.is_file():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "fixture wrapper claim timed out"
+                    )
+                time.sleep(0.02)
+            claim_binding = binding(
+                claim_path, "wrapper_claim_sha256"
+            )
+            receipt_binding = binding(
+                context["receipt_path"],
+                "launch_receipt_sha256",
+            )
+            claim = load(claim_path)
+            if (
+                claim["pane_fault_consumer_chain"]
+                != pane_fault_consumer_chain
+            ):
+                raise RuntimeError(
+                    "fixture wrapper claim consumer chain differs"
+                )
+            receipt = load(context["receipt_path"])
+            tmux_started_binding = binding(
                 context["tmux_started_path"],
                 "launch_tmux_started_sha256",
-            ),
-            "pane": dict(context["controller_pane"]),
-            "pane_log_path": str(
-                Path(context["log_path"]).resolve()
-            ),
-            "startup_window_closed": False,
-            "started_at": load(context["receipt_path"])["started_at"],
-            "accepted_at": utc_now(),
-        }
-        accepted["launch_accepted_sha256"] = digest(
-            accepted, "launch_accepted_sha256"
-        )
-        write_exclusive(context["accepted_path"], accepted)
-        terminal_path = Path(context["accepted_path"]).with_name(
-            "launch_terminal.json"
-        )
-        terminal = {
-            "schema_version": 1,
-            "contract_type": (
-                "safa_canonical_preflight_launch_terminal_v1"
-            ),
-            "launch_receipt": receipt_binding,
-            "launch_receipt_identity": dict(
-                context["receipt_identity"]
-            ),
-            "verified_implementations": verified,
-            "launch_accepted": binding(
-                context["accepted_path"], "launch_accepted_sha256"
-            ),
-            "wrapper_claim": claim_binding,
-            "tmux_started": binding(
-                context["tmux_started_path"],
-                "launch_tmux_started_sha256",
-            ),
-            "status": "ownership_transferred",
-            "failure": None,
-            "tmux_client": None,
-            "pane": dict(context["controller_pane"]),
-            "pane_log": file_identity(Path(context["log_path"])),
-            "session_residual": True,
-            "started_at": load(context["receipt_path"])["started_at"],
-            "completed_at": utc_now(),
-        }
-        terminal["launch_terminal_sha256"] = digest(
-            terminal, "launch_terminal_sha256"
-        )
-        write_exclusive(terminal_path, terminal)
-        release = {
-            "schema_version": 1,
-            "contract_type": (
-                "safa_canonical_preflight_launch_ownership_release_v1"
-            ),
-            "launch_receipt": receipt_binding,
-            "launch_receipt_identity": dict(
-                context["receipt_identity"]
-            ),
-            "verified_implementations": verified,
-            "launch_accepted": binding(
-                context["accepted_path"], "launch_accepted_sha256"
-            ),
-            "launch_terminal": binding(
-                terminal_path, "launch_terminal_sha256"
-            ),
-            "wrapper_claim": claim_binding,
-            "startup_window_closed": True,
-            "released_at": utc_now(),
-        }
-        release["launch_ownership_release_sha256"] = digest(
-            release, "launch_ownership_release_sha256"
-        )
-        write_exclusive(context["release_path"], release)
+            )
+            accepted = launcher.build_launch_accepted(
+                attempt_id=receipt["attempt_id"],
+                launch_receipt=receipt_binding,
+                launch_receipt_identity=dict(
+                    context["receipt_identity"]
+                ),
+                verified_implementations=verified,
+                wrapper_claim=claim_binding,
+                tmux_started=tmux_started_binding,
+                pane=dict(context["controller_pane"]),
+                pane_log_path=str(
+                    Path(context["log_path"]).resolve()
+                ),
+                started_at=receipt["started_at"],
+                accepted_at=utc_now(),
+                pane_fault_consumer_chain=(
+                    pane_fault_consumer_chain
+                ),
+            )
+            write_exclusive(context["accepted_path"], accepted)
+            accepted_binding = binding(
+                context["accepted_path"],
+                "launch_accepted_sha256",
+            )
+            terminal_path = Path(
+                context["accepted_path"]
+            ).with_name("launch_terminal.json")
+            terminal = launcher.build_ownership_terminal(
+                launch_receipt=receipt_binding,
+                launch_receipt_identity=dict(
+                    context["receipt_identity"]
+                ),
+                verified_implementations=verified,
+                launch_accepted=accepted_binding,
+                wrapper_claim=claim_binding,
+                tmux_started=tmux_started_binding,
+                pane=dict(context["controller_pane"]),
+                pane_log=file_identity(
+                    Path(context["log_path"])
+                ),
+                started_at=receipt["started_at"],
+                completed_at=utc_now(),
+                pane_fault_consumer_chain=(
+                    pane_fault_consumer_chain
+                ),
+            )
+            write_exclusive(terminal_path, terminal)
+            release = launcher.build_ownership_release(
+                launch_receipt=receipt_binding,
+                launch_receipt_identity=dict(
+                    context["receipt_identity"]
+                ),
+                verified_implementations=verified,
+                launch_accepted=accepted_binding,
+                launch_terminal=binding(
+                    terminal_path, "launch_terminal_sha256"
+                ),
+                wrapper_claim=claim_binding,
+                released_at=utc_now(),
+                pane_fault_consumer_chain=(
+                    pane_fault_consumer_chain
+                ),
+            )
+            write_exclusive(context["release_path"], release)
+        except BaseException as exc:
+            failures.append(exc)
 
     thread = threading.Thread(target=accept_claim, daemon=True)
     thread.start()
-    return thread
+    return thread, failures
 
 
 def publish_observer_bootstrap(config: Path) -> None:
@@ -1134,12 +1386,108 @@ def wrapper(args: argparse.Namespace) -> int:
     if args.observer_mode in {
         "controller_fault_start_write",
         "controller_fault_start_write_process_exit_write",
+        "controller_fault_start_typed_precommit",
+        "controller_fault_start_typed_unknown",
+        "controller_fault_start_typed_cleanup",
+        "controller_fault_start_typed_collision",
     }:
         original_write = module._write_exclusive
+        typed_mode = args.observer_mode.startswith(
+            "controller_fault_start_typed_"
+        )
+        process_start_poisoned = False
+        post_poison_target_io: list[str] = []
+        control_path = os.path.normpath(
+            str(
+                args.policy_root
+                / "preflight_control"
+            )
+        )
+
+        def control_target(
+            path: Any, directory_descriptor: Any = None
+        ) -> bool:
+            if isinstance(path, int):
+                try:
+                    candidate = os.readlink(
+                        f"/proc/self/fd/{path}"
+                    )
+                except OSError:
+                    return False
+            elif isinstance(path, (str, bytes, os.PathLike)):
+                candidate = os.fsdecode(os.fspath(path))
+                if not os.path.isabs(candidate):
+                    if not isinstance(
+                        directory_descriptor, int
+                    ):
+                        return False
+                    try:
+                        parent = os.readlink(
+                            "/proc/self/fd/"
+                            f"{directory_descriptor}"
+                        )
+                    except OSError:
+                        return False
+                    candidate = os.path.join(parent, candidate)
+            else:
+                return False
+            candidate = os.path.normpath(candidate)
+            return candidate == control_path or candidate.startswith(
+                control_path + os.sep
+            )
+
+        def record_target_io(name: str) -> None:
+            if process_start_poisoned:
+                post_poison_target_io.append(name)
 
         def fail_start_write(path: Path, value: Mapping[str, Any]) -> None:
+            nonlocal process_start_poisoned
             if path.name == "controller_process_start.json":
+                typed_states = {
+                    "controller_fault_start_typed_precommit": (
+                        "precommit_failed_clean"
+                    ),
+                    "controller_fault_start_typed_unknown": (
+                        "durability_unknown_quarantined"
+                    ),
+                    "controller_fault_start_typed_cleanup": (
+                        "committed_cleanup_error"
+                    ),
+                    "controller_fault_start_typed_collision": (
+                        "collision"
+                    ),
+                }
+                if args.observer_mode in typed_states:
+                    process_start_poisoned = True
+                    commit_state = typed_states[
+                        args.observer_mode
+                    ]
+                    raise module.ExclusivePublishError(
+                        commit_state,
+                        "fixture typed process-start publication",
+                        stage=(
+                            "fixture_controller_process_start_"
+                            f"{commit_state}"
+                        ),
+                        directory_seal=None,
+                        payload={
+                            "path": str(path),
+                            "sha256": hashlib.sha256(
+                                module._canonical_json(value)
+                            ).hexdigest(),
+                            "post_poison_target_io": (
+                                post_poison_target_io
+                            ),
+                        },
+                        temporary=None,
+                        error_number=5,
+                    )
                 raise RuntimeError("fixture controller start write failure")
+            if (
+                process_start_poisoned
+                and control_target(path)
+            ):
+                record_target_io("_write_exclusive")
             if (
                 args.observer_mode
                 == "controller_fault_start_write_process_exit_write"
@@ -1149,6 +1497,84 @@ def wrapper(args: argparse.Namespace) -> int:
             original_write(path, value)
 
         module._write_exclusive = fail_start_write
+        if typed_mode:
+            original_open = module.os.open
+            original_stat = module.os.stat
+            original_read = module.os.read
+            original_pread = module.os.pread
+            original_link = module.os.link
+            original_unlink = module.os.unlink
+            original_rename = module.os.rename
+            original_fsync = module.os.fsync
+
+            def audited_open(
+                path: Any, flags: int, mode: int = 0o777, **kwargs: Any
+            ) -> int:
+                if control_target(path, kwargs.get("dir_fd")):
+                    record_target_io("open")
+                return original_open(path, flags, mode, **kwargs)
+
+            def audited_stat(path: Any, **kwargs: Any):
+                if control_target(path, kwargs.get("dir_fd")):
+                    record_target_io("stat")
+                return original_stat(path, **kwargs)
+
+            def audited_read(
+                descriptor: int, size: int
+            ) -> bytes:
+                if control_target(descriptor):
+                    record_target_io("read")
+                return original_read(descriptor, size)
+
+            def audited_pread(
+                descriptor: int, size: int, offset: int
+            ) -> bytes:
+                if control_target(descriptor):
+                    record_target_io("pread")
+                return original_pread(descriptor, size, offset)
+
+            def audited_link(
+                source: Any, target: Any, **kwargs: Any
+            ) -> None:
+                if control_target(
+                    source, kwargs.get("src_dir_fd")
+                ) or control_target(
+                    target, kwargs.get("dst_dir_fd")
+                ):
+                    record_target_io("link")
+                original_link(source, target, **kwargs)
+
+            def audited_unlink(
+                path: Any, **kwargs: Any
+            ) -> None:
+                if control_target(path, kwargs.get("dir_fd")):
+                    record_target_io("unlink")
+                original_unlink(path, **kwargs)
+
+            def audited_rename(
+                source: Any, target: Any, **kwargs: Any
+            ) -> None:
+                if control_target(
+                    source, kwargs.get("src_dir_fd")
+                ) or control_target(
+                    target, kwargs.get("dst_dir_fd")
+                ):
+                    record_target_io("rename")
+                original_rename(source, target, **kwargs)
+
+            def audited_fsync(descriptor: int) -> None:
+                if control_target(descriptor):
+                    record_target_io("fsync")
+                original_fsync(descriptor)
+
+            module.os.open = audited_open
+            module.os.stat = audited_stat
+            module.os.read = audited_read
+            module.os.pread = audited_pread
+            module.os.link = audited_link
+            module.os.unlink = audited_unlink
+            module.os.rename = audited_rename
+            module.os.fsync = audited_fsync
     if args.observer_mode in {
         "controller_fault_monitor",
         "controller_fault_monitor_fsync",
@@ -1259,54 +1685,70 @@ def wrapper(args: argparse.Namespace) -> int:
             }[args.observer_mode]
             if not contract_failure_injected and path.name == target:
                 contract_failure_injected = True
+                if (
+                    args.observer_mode
+                    == "controller_fault_wrapper_exit_write"
+                ):
+                    raise module.ExclusivePublishError(
+                        "precommit_failed_clean",
+                        "fixture wrapper_exit.json write failure",
+                        stage="fixture_wrapper_exit_write",
+                        directory_seal=None,
+                        payload={
+                            "size": 0,
+                            "sha256": hashlib.sha256(b"").hexdigest(),
+                        },
+                        temporary=None,
+                        error_number=5,
+                    )
                 raise OSError(f"fixture {target} write failure")
             original_contract_write(path, value)
 
         module._write_exclusive = fail_contract_write
     if args.observer_mode == "controller_fault_process_exit_binding":
-        original_sha256_file = module._sha256_file
+        original_json_binding = module._json_binding
 
-        def fail_process_exit_binding(path: Path) -> str:
+        def fail_process_exit_binding(path: Path, digest_field: str):
             if path.name == "controller_process_exit.json":
                 raise OSError("fixture process exit binding hash failure")
-            return original_sha256_file(path)
+            return original_json_binding(path, digest_field)
 
-        module._sha256_file = fail_process_exit_binding
+        module._json_binding = fail_process_exit_binding
     if args.observer_mode == "controller_fault_observer_launch_binding":
-        original_sha256_file = module._sha256_file
+        original_secure_json_snapshot = module._secure_json_snapshot
 
-        def fail_observer_launch_binding(path: Path) -> str:
+        def fail_observer_launch_binding(path: Path, **kwargs: Any):
             if path.name == "observer_bootstrap.json":
                 raise OSError(
                     "fixture observer launch binding hash failure"
                 )
-            return original_sha256_file(path)
+            return original_secure_json_snapshot(path, **kwargs)
 
-        module._sha256_file = fail_observer_launch_binding
+        module._secure_json_snapshot = fail_observer_launch_binding
     if args.observer_mode == "controller_fault_process_log_mkdir":
-        original_mkdir = module.Path.mkdir
-        control_path = (
-            args.policy_root / "preflight_control"
-        ).resolve()
-        mkdir_failure_injected = False
+        original_process_log_open = module.os.open
+        process_log_failure_injected = False
 
-        def fail_process_log_mkdir(
-            self: Path, *call_args: Any, **call_kwargs: Any
-        ) -> None:
-            nonlocal mkdir_failure_injected
+        def fail_process_log_open(
+            path: Any,
+            flags: int,
+            mode: int = 0o777,
+            **kwargs: Any,
+        ) -> int:
+            nonlocal process_log_failure_injected
             if (
-                not mkdir_failure_injected
-                and self.resolve() == control_path
-                and (control_path / "observer_launch.json").is_file()
-                and not (
-                    control_path / "controller_process.log"
-                ).exists()
+                not process_log_failure_injected
+                and Path(path).name == "controller_process.log"
             ):
-                mkdir_failure_injected = True
-                raise OSError("fixture process log parent mkdir failure")
-            original_mkdir(self, *call_args, **call_kwargs)
+                process_log_failure_injected = True
+                raise OSError(
+                    "fixture controller process log open failure"
+                )
+            return original_process_log_open(
+                path, flags, mode, **kwargs
+            )
 
-        module.Path.mkdir = fail_process_log_mkdir
+        module.os.open = fail_process_log_open
     if args.observer_mode == "controller_fault_final_binding":
         original_optional_binding = module._optional_binding
         process_log_binding_calls = 0
@@ -1396,26 +1838,50 @@ def wrapper(args: argparse.Namespace) -> int:
             module._validate_terminal_stop_binding = reject_snapshot
     if not args.supervised_child:
         raise RuntimeError("wrapper fixture child is not supervised")
-    value = module.run_wrapped_controller(
-        repo_root=args.repo_root,
-        policy_root=args.policy_root,
-        policy_sha256=args.policy,
-        config=args.config,
-        command=[sys.executable, "-c", controller_code],
-        observer_command=[
-            sys.executable,
-            str(helper),
-            "observer",
-            "--config",
-            str(args.config),
-            "--policy-root",
-            str(args.policy_root),
-            "--policy",
-            args.policy,
-            "--mode",
-            args.observer_mode,
-        ],
+    receipt = load(
+        Path(os.environ[module.LAUNCH_RECEIPT_PATH_ENV])
     )
+    fault_context = module._bind_inherited_fault_channel(
+        receipt
+    )
+
+    def run_operation() -> dict[str, Any]:
+        return module.run_wrapped_controller(
+            repo_root=args.repo_root,
+            policy_root=args.policy_root,
+            policy_sha256=args.policy,
+            config=args.config,
+            command=[sys.executable, "-c", controller_code],
+            observer_command=[
+                sys.executable,
+                str(helper),
+                "observer",
+                "--config",
+                str(args.config),
+                "--policy-root",
+                str(args.policy_root),
+                "--policy",
+                args.policy,
+                "--mode",
+                args.observer_mode,
+            ],
+        )
+
+    value, dedicated_code, dedicated_failure = (
+        module._execute_with_fault_reporting(
+            fault_context, run_operation
+        )
+    )
+    if dedicated_code is not None:
+        print(
+            json.dumps(
+                dedicated_failure,
+                sort_keys=True,
+                allow_nan=False,
+            )
+        )
+        return int(dedicated_code)
+    assert value is not None
     print(json.dumps(value, sort_keys=True))
     return int(value["exit_code"])
 
@@ -1865,7 +2331,9 @@ def production_wrapper(args: argparse.Namespace) -> int:
             observer_command=fixture["observer_command"],
         )
     except BaseException:
-        args.policy_root.mkdir(parents=True, exist_ok=True)
+        args.policy_root.mkdir(
+            parents=True, mode=0o755, exist_ok=True
+        )
         (args.policy_root / "wrapper_fixture_error.log").write_text(
             traceback.format_exc(), encoding="utf-8"
         )
@@ -1901,6 +2369,10 @@ def parse_args() -> argparse.Namespace:
             "controller_fault_identity",
             "controller_fault_pgid",
             "controller_fault_start_write",
+            "controller_fault_start_typed_precommit",
+            "controller_fault_start_typed_unknown",
+            "controller_fault_start_typed_cleanup",
+            "controller_fault_start_typed_collision",
             "controller_fault_monitor",
             "controller_fault_log_fsync",
             "controller_fault_log_close",
@@ -1945,6 +2417,10 @@ def parse_args() -> argparse.Namespace:
             "controller_fault_identity",
             "controller_fault_pgid",
             "controller_fault_start_write",
+            "controller_fault_start_typed_precommit",
+            "controller_fault_start_typed_unknown",
+            "controller_fault_start_typed_cleanup",
+            "controller_fault_start_typed_collision",
             "controller_fault_monitor",
             "controller_fault_log_fsync",
             "controller_fault_log_close",
@@ -1966,6 +2442,11 @@ def parse_args() -> argparse.Namespace:
     wrap.add_argument("--controller-seconds", type=float, default=0.2)
     wrap.add_argument("--controller-exit", type=int, default=0)
     wrap.add_argument("--terminal-timeout", type=float, default=3.0)
+    wrap.add_argument(
+        "--defer-pane-fault-consumer-cleanup",
+        action="store_true",
+    )
+    wrap.add_argument("--controller-owner-nonce")
     wrap.add_argument("--supervised-child", action="store_true")
     production = sub.add_parser("production-role")
     production.add_argument("--controller-module", type=Path, required=True)
@@ -1989,19 +2470,64 @@ def parse_args() -> argparse.Namespace:
 
 def supervise_wrapper_action(args: argparse.Namespace) -> int:
     module = load_module(args.wrapper_module)
+    if (
+        getattr(
+            args, "defer_pane_fault_consumer_cleanup", False
+        )
+        and getattr(args, "controller_owner_nonce", None) is None
+    ):
+        raise RuntimeError(
+            "deferred consumer cleanup requires atomic owner nonce"
+        )
     child_arguments = [
         sys.executable,
         str(Path(__file__).resolve()),
         *sys.argv[1:],
         "--supervised-child",
     ]
-    context = prepare_supervised_launcher_contract(
+    prepare_supervised_launcher_contract(
         module=module,
         repo_root=args.repo_root,
         policy_root=args.policy_root,
         policy_sha256=args.policy,
         config=args.config,
         wrapper_arguments=child_arguments,
+        controller_owner_nonce=getattr(
+            args, "controller_owner_nonce", None
+        ),
+    )
+    return 0
+
+
+def _legacy_schema_v2_negative_supervise_wrapper_action(
+    args: argparse.Namespace,
+) -> int:
+    module = load_module(args.wrapper_module)
+    if (
+        getattr(
+            args, "defer_pane_fault_consumer_cleanup", False
+        )
+        and getattr(args, "controller_owner_nonce", None) is None
+    ):
+        raise RuntimeError(
+            "deferred consumer cleanup requires atomic owner nonce"
+        )
+    child_arguments = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        *sys.argv[1:],
+        "--supervised-child",
+    ]
+    context = _legacy_schema_v2_negative_fixture_contract(
+        module=module,
+        repo_root=args.repo_root,
+        policy_root=args.policy_root,
+        policy_sha256=args.policy,
+        config=args.config,
+        wrapper_arguments=child_arguments,
+        controller_owner_nonce=getattr(
+            args, "controller_owner_nonce", None
+        ),
     )
     environment = os.environ.copy()
     environment.update(context["environment"])
@@ -2010,10 +2536,131 @@ def supervise_wrapper_action(args: argparse.Namespace) -> int:
         shell=False,
         preexec_fn=os.setsid,
         env=environment,
+        pass_fds=(int(context["fault_descriptor"]),),
     )
+    fault_descriptor_owned = True
+    handoff_durably_complete = False
     try:
-        complete_supervised_launcher_contract(context, child.pid)
-        return child.wait()
+        accept_thread, accept_failures = (
+            complete_supervised_launcher_contract(
+            context
+            )
+        )
+        launcher = context["launcher"]
+        result = launcher._supervise_wrapper_child(
+            child=child,
+            wrapper_arguments=child_arguments,
+            receipt_path=context["receipt_path"],
+            gate_ready_path=context["gate_ready_path"],
+            wrapper_started_path=context["wrapper_started_path"],
+            execution_terminal_path=(
+                Path(context["attempt_root"])
+                / "gate_execution_terminal.json"
+            ),
+            launch_terminal_path=(
+                Path(context["attempt_root"])
+                / "launch_terminal.json"
+            ),
+            accepted_path=context["accepted_path"],
+            ownership_release_path=context["release_path"],
+            supervisor_signals=[],
+            fault_descriptor=int(context["fault_descriptor"]),
+            fault_channel=load(context["receipt_path"])[
+                "fault_channel"
+            ],
+            fault_attempt_id=load(context["receipt_path"])[
+                "attempt_id"
+            ],
+            fault_owner_nonce=load(context["receipt_path"])[
+                "controller_owner_nonce"
+            ],
+            fault_receipt_sha256=load(
+                context["receipt_path"]
+            )["launch_receipt_sha256"],
+            fault_publisher=load(context["receipt_path"])[
+                "bindings"
+            ]["wrapper"],
+            wrapper_exit_path=(
+                Path(context["claim_path"]).parent
+                / "wrapper_exit.json"
+            ),
+            policy_sha256=args.policy,
+        )
+        fault_descriptor_owned = False
+        accept_thread.join(timeout=5.0)
+        if accept_thread.is_alive():
+            raise RuntimeError(
+                "fixture ownership publisher did not terminate"
+            )
+        if accept_failures:
+            raise RuntimeError(
+                "fixture ownership publisher failed"
+            ) from accept_failures[0]
+        receipt = load(context["receipt_path"])
+        execution_terminal_path = (
+            Path(context["attempt_root"])
+            / "gate_execution_terminal.json"
+        )
+        gate_execution = (
+            launcher._validate_gate_execution_terminal(
+                execution_terminal_path,
+                receipt_binding=binding(
+                    context["receipt_path"],
+                    "launch_receipt_sha256",
+                ),
+                receipt_identity=dict(
+                    context["receipt_identity"]
+                ),
+                gate_ready_binding=binding(
+                    context["gate_ready_path"],
+                    "pane_gate_ready_sha256",
+                ),
+                wrapper_arguments=receipt["wrapper_arguments"],
+            )
+        )
+        launcher._adjudicate_gate_execution_outcome(
+            gate_execution,
+            wrapper_exit_path=Path(
+                context["claim_path"]
+            ).with_name("wrapper_exit.json"),
+            policy_sha256=args.policy,
+        )
+        accepted_binding = binding(
+            context["accepted_path"],
+            "launch_accepted_sha256",
+        )
+        terminal_path = Path(context["accepted_path"]).with_name(
+            "launch_terminal.json"
+        )
+        terminal_binding = binding(
+            terminal_path, "launch_terminal_sha256"
+        )
+        release_binding = binding(
+            context["release_path"],
+            "launch_ownership_release_sha256",
+        )
+        if (
+            gate_execution["launch_accepted"]
+            != accepted_binding
+            or gate_execution["launch_terminal"]
+            != terminal_binding
+            or gate_execution["launch_ownership_release"]
+            != release_binding
+        ):
+            raise RuntimeError(
+                "fixture durable gate terminal chain differs"
+            )
+        launcher.validate_pane_fault_consumer_chain(
+            context["pane_fault_consumer_chain"],
+            registration=receipt["pane_fault_consumer"],
+            label="fixture durable pane fault consumer handoff",
+        )
+        launcher._require_post_handoff_pane_fault_consumer(
+            context["pane_fault_consumer"],
+            "fixture durable wrapper handoff",
+        )
+        handoff_durably_complete = True
+        return result
     except BaseException:
         if child.poll() is None:
             os.killpg(child.pid, signal.SIGTERM)
@@ -2023,6 +2670,67 @@ def supervise_wrapper_action(args: argparse.Namespace) -> int:
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait(timeout=1)
         raise
+    finally:
+        active_failure = sys.exception()
+        finalization_failures: list[BaseException] = []
+        if fault_descriptor_owned:
+            descriptor = int(context["fault_descriptor"])
+            context["fault_descriptor"] = -1
+            try:
+                os.close(descriptor)
+            except BaseException as exc:
+                finalization_failures.append(exc)
+        consumer = context["pane_fault_consumer"]
+        self_descriptor = int(
+            consumer["self_fault_reader_descriptor"]
+        )
+        consumer["self_fault_reader_descriptor"] = -1
+        try:
+            os.close(self_descriptor)
+        except BaseException as exc:
+            finalization_failures.append(exc)
+        if (
+            not getattr(
+                args,
+                "defer_pane_fault_consumer_cleanup",
+                False,
+            )
+            or not handoff_durably_complete
+        ):
+            try:
+                context[
+                    "launcher"
+                ]._cleanup_failed_pane_fault_consumer(
+                    str(consumer["session"]),
+                    str(consumer["owner_nonce"]),
+                )
+                if (
+                    context["launcher"]._tmux_pane(
+                        str(consumer["session"])
+                    )
+                    is not None
+                ):
+                    raise RuntimeError(
+                        "fixture pane fault consumer cleanup left residual"
+                    )
+            except BaseException as exc:
+                finalization_failures.append(exc)
+        if finalization_failures:
+            if active_failure is not None:
+                finalization_failures.insert(
+                    0, active_failure
+                )
+            error = RuntimeError(
+                "fixture wrapper finalization failed"
+            )
+            for index, failure in enumerate(
+                finalization_failures
+            ):
+                error.add_note(
+                    f"failure[{index}]={type(failure).__name__}: "
+                    f"{failure}"
+                )
+            raise error from finalization_failures[0]
 
 
 def main() -> int:

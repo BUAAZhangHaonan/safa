@@ -336,7 +336,7 @@
     },
     "preflight_launch_contract": {
       "path": "src/safa/closeout/preflight_launch_contract.py",
-      "sha256": "88a7278a28499c51f404893d0a38c870efb620ffe546d7e255cb533d79027992"
+      "sha256": "86798c6a9f718c3a6999274127334ad51ee5a844f0497f3f7bdc1ad6a987e93f"
     },
     "preflight_verified_loader": {
       "path": "src/safa/closeout/verified_preflight_module_loader.py",
@@ -356,11 +356,11 @@
     },
     "preflight_launcher": {
       "path": "scripts/run_canonical_preflight_launcher.py",
-      "sha256": "bc6d157fa1f999994fdb9e4e320ca98fae6581faa1533de68c1d5198b777d739"
+      "sha256": "43a0c62906d6e77f8661ffe61d57a8e7ae45548f89fd1b576eae4924ece8e617"
     },
     "preflight_wrapper": {
       "path": "scripts/run_canonical_preflight_wrapper.py",
-      "sha256": "d9dcc256c902b9e3a1c7d08149fab611a4fb79624ec3a6f12f9e6a4ba13d8eb9"
+      "sha256": "ed0fce856d4bcf6c540e32a5df52568fc226e4b9c83ab59806477fa9e2de00ca"
     },
     "gpu_wrapper": {
       "path": "scripts/run_canonical_gpu_wrapper.py",

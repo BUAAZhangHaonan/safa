@@ -21,19 +21,28 @@ from typing import Any, Callable, Mapping, Sequence, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from safa.closeout.preflight_launch_contract import (
+        FAULT_RECORD_CONTRACT_TYPE,
+        LAUNCH_RECEIPT_CONTRACT_TYPE,
+        PreflightLaunchContractError,
         build_artifact_binding,
         build_claim_v3,
         build_file_identity,
+        build_finalization_secondary_failure,
+        build_pane_fault_consumer_chain,
         build_pane_owner_seal,
         build_process_identity,
+        build_publish_failure_record,
         build_tmux_server_identity,
         build_verified_implementations,
         validate_artifact_binding,
         validate_executable_identity,
         validate_file_identity,
         validate_gate_ready,
+        validate_launch_receipt_schema,
         validate_ownership_chain,
+        validate_pane_fault_consumer_registration,
         validate_pane_owner_seal,
+        validate_publish_failure_record,
         validate_tmux_server_identity,
         validate_tmux_started,
         validate_verified_implementations,
@@ -83,6 +92,13 @@ LAUNCH_RECEIPT_PATH_ENV = "SAFA_PREFLIGHT_LAUNCH_RECEIPT_PATH"
 LAUNCH_ACCEPTED_PATH_ENV = "SAFA_PREFLIGHT_LAUNCH_ACCEPTED_PATH"
 LAUNCH_RELEASE_PATH_ENV = "SAFA_PREFLIGHT_LAUNCH_RELEASE_PATH"
 PANE_LOG_PATH_ENV = "SAFA_PREFLIGHT_PANE_LOG_PATH"
+FAULT_CHANNEL_FD_ENV = "SAFA_PREFLIGHT_FAULT_CHANNEL_FD"
+FAULT_CHANNEL_MAX_RECORD_BYTES = 65536
+FAULT_CHANNEL_PREFIX = b"SAFA-PREFLIGHT-FAULT-V1\n"
+FAULT_CHANNEL_SHA_PREFIX = b"sha256:"
+FAULT_REPORTED_EXIT_CODE = 123
+FAULT_CHANNEL_WRITE_FAILED_EXIT_CODE = 122
+FAULT_CHANNEL_CLOSE_FAILED_EXIT_CODE = 121
 LAUNCH_ACCEPTED_WAIT_SECONDS = 30.0
 OBSERVER_BOOTSTRAP_PATH_ENV = "SAFA_PREFLIGHT_OBSERVER_BOOTSTRAP_PATH"
 OBSERVER_BOOTSTRAP_POLICY_ENV = "SAFA_PREFLIGHT_OBSERVER_POLICY_SHA256"
@@ -102,11 +118,16 @@ _VERIFIED_LOADER_EXPORTS = (
     "reverify_verified_preflight_module",
 )
 _SHARED_CONTRACT_EXPORTS = (
+    "FAULT_RECORD_CONTRACT_TYPE",
+    "LAUNCH_RECEIPT_CONTRACT_TYPE",
     "PreflightLaunchContractError",
     "build_artifact_binding",
     "build_claim_v3",
     "build_file_identity",
+    "build_finalization_secondary_failure",
+    "build_pane_fault_consumer_chain",
     "build_pane_owner_seal",
+    "build_publish_failure_record",
     "build_process_identity",
     "build_tmux_server_identity",
     "build_tmux_started",
@@ -116,8 +137,11 @@ _SHARED_CONTRACT_EXPORTS = (
     "validate_executable_identity",
     "validate_file_identity",
     "validate_gate_ready",
+    "validate_launch_receipt_schema",
     "validate_ownership_chain",
+    "validate_pane_fault_consumer_registration",
     "validate_pane_owner_seal",
+    "validate_publish_failure_record",
     "validate_tmux_server_identity",
     "validate_tmux_started",
     "validate_verified_implementations",
@@ -394,48 +418,1352 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _write_exclusive(path: Path, value: Mapping[str, Any]) -> None:
-    content = _canonical_json(dict(value))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags, 0o644)
-    complete = False
+class ExclusivePublishError(RuntimeError):
+    """Fail-closed result for a one-writer durable publication."""
+
+    def __init__(
+        self,
+        commit_state: str,
+        message: str,
+        *,
+        stage: str,
+        directory_seal: Mapping[str, int] | None,
+        payload: Mapping[str, Any],
+        temporary: Mapping[str, Any] | None,
+        error_number: int | None,
+    ) -> None:
+        if commit_state not in {
+            "precommit_failed_clean",
+            "durability_unknown_quarantined",
+            "committed_cleanup_error",
+            "collision",
+        }:
+            raise ValueError(
+                f"exclusive publication commit state is invalid: "
+                f"{commit_state}"
+            )
+        super().__init__(
+            f"{commit_state} at {stage}: {message}"
+        )
+        self.commit_state = commit_state
+        self.status = commit_state
+        self.stage = stage
+        self.directory_seal = (
+            None if directory_seal is None else dict(directory_seal)
+        )
+        self.payload = dict(payload)
+        self.temporary = (
+            None if temporary is None else dict(temporary)
+        )
+        self.error_number = error_number
+        self.quarantined = commit_state in {
+            "durability_unknown_quarantined",
+            "committed_cleanup_error",
+        }
+        self.secondary_failures: list[dict[str, str]] = []
+
+    def add_secondary_failure(
+        self, *, stage: str, failure: BaseException
+    ) -> None:
+        if len(self.secondary_failures) >= 8:
+            raise RuntimeError(
+                "typed publication secondary failure bound exceeded"
+            )
+        error_number = getattr(failure, "errno", None)
+        if type(error_number) is not int:
+            error_number = None
+        identity = getattr(failure, "identity", None)
+        if not isinstance(identity, Mapping):
+            identity = None
+        self.secondary_failures.append(
+            {
+                "stage": stage,
+                "type": type(failure).__name__,
+                "message": str(failure),
+                "errno": error_number,
+                "identity": (
+                    None if identity is None else dict(identity)
+                ),
+            }
+        )
+
+    def as_record(self) -> dict[str, Any]:
+        return build_publish_failure_record(
+            commit_state=self.commit_state,
+            stage=self.stage,
+            message=str(self),
+            directory_seal=self.directory_seal,
+            payload=self.payload,
+            temporary=self.temporary,
+            error_number=self.error_number,
+            secondary_failures=list(self.secondary_failures),
+        )
+
+
+class _DirectoryDurabilityUnknown(RuntimeError):
+    """A directory mutation completed but its fsync failed."""
+
+
+class _PublicationSealMismatch(RuntimeError):
+    """A sealed publication inode changed before a permitted mutation."""
+
+
+def _checked_close(descriptor: int, label: str) -> None:
     try:
-        view = memoryview(content)
-        while view:
-            view = view[os.write(descriptor, view) :]
-        os.fsync(descriptor)
-        complete = True
-    finally:
         os.close(descriptor)
-        if not complete:
-            path.unlink(missing_ok=True)
+    except OSError as exc:
+        raise RuntimeError(f"{label} close failed") from exc
+
+
+def _bind_inherited_fault_channel(
+    receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    raw_descriptor = os.environ.get(FAULT_CHANNEL_FD_ENV)
+    if (
+        raw_descriptor is None
+        or not raw_descriptor.isascii()
+        or not raw_descriptor.isdecimal()
+    ):
+        raise RuntimeError(
+            "inherited fault channel descriptor is not decimal"
+        )
+    descriptor = int(raw_descriptor)
+    if descriptor <= 2 or str(descriptor) != raw_descriptor:
+        raise RuntimeError(
+            "inherited fault channel descriptor is not canonical"
+        )
+    binding = receipt.get("fault_channel")
+    expected_keys = {
+        "path",
+        "device",
+        "inode",
+        "mode",
+        "uid",
+        "nlink",
+        "size",
+        "sha256",
+        "directory_device",
+        "directory_inode",
+    }
+    if not isinstance(binding, dict) or set(binding) != expected_keys:
+        raise RuntimeError(
+            "inherited fault channel binding is malformed"
+        )
+    try:
+        opened = os.fstat(descriptor)
+    except OSError as exc:
+        raise RuntimeError(
+            "inherited fault channel descriptor is not open"
+        ) from exc
+    observed = {
+        "device": int(opened.st_dev),
+        "inode": int(opened.st_ino),
+        "mode": int(opened.st_mode),
+        "uid": int(opened.st_uid),
+        "nlink": int(opened.st_nlink),
+        "size": int(opened.st_size),
+    }
+    if (
+        not os.get_inheritable(descriptor)
+        or not stat.S_ISREG(opened.st_mode)
+        or stat.S_IMODE(opened.st_mode) != 0o600
+        or opened.st_uid != os.geteuid()
+        or opened.st_nlink != 1
+        or opened.st_size != 0
+        or any(
+            observed[name] != binding[name]
+            for name in observed
+        )
+        or binding["sha256"] != hashlib.sha256(b"").hexdigest()
+    ):
+        raise RuntimeError(
+            "inherited fault channel identity differs"
+        )
+    attempt_id = receipt.get("attempt_id")
+    owner_nonce = receipt.get("controller_owner_nonce")
+    receipt_sha256 = receipt.get("launch_receipt_sha256")
+    publisher = receipt.get("bindings", {}).get("wrapper")
+    if (
+        not isinstance(attempt_id, str)
+        or len(attempt_id) != 64
+        or any(character not in "0123456789abcdef" for character in attempt_id)
+        or not isinstance(owner_nonce, str)
+        or len(owner_nonce) != 64
+        or any(character not in "0123456789abcdef" for character in owner_nonce)
+        or not isinstance(receipt_sha256, str)
+        or len(receipt_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in receipt_sha256
+        )
+        or not isinstance(publisher, dict)
+        or set(publisher) != {"path", "sha256"}
+        or not isinstance(publisher.get("path"), str)
+        or not isinstance(publisher.get("sha256"), str)
+        or len(publisher["sha256"]) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in publisher["sha256"]
+        )
+    ):
+        raise RuntimeError(
+            "inherited fault channel receipt binding differs"
+        )
+    os.set_inheritable(descriptor, False)
+    return {
+        "descriptor": descriptor,
+        "binding": dict(binding),
+        "attempt_id": attempt_id,
+        "owner_nonce": owner_nonce,
+        "launch_receipt_sha256": receipt_sha256,
+        "publisher": dict(publisher),
+    }
+
+
+def _fault_channel_frame(payload: bytes) -> bytes:
+    payload_sha256 = hashlib.sha256(payload).hexdigest().encode(
+        "ascii"
+    )
+    frame = (
+        FAULT_CHANNEL_PREFIX
+        + f"{len(payload):08x}\n".encode("ascii")
+        + payload
+        + FAULT_CHANNEL_SHA_PREFIX
+        + payload_sha256
+        + b"\n"
+    )
+    if len(frame) > FAULT_CHANNEL_MAX_RECORD_BYTES:
+        raise RuntimeError("fault channel record exceeds bound")
+    return frame
+
+
+_FAULT_CHANNEL_BINDING_KEYS = {
+    "path",
+    "device",
+    "inode",
+    "mode",
+    "uid",
+    "nlink",
+    "size",
+    "sha256",
+    "directory_device",
+    "directory_inode",
+}
+
+
+def _create_named_fault_channel(path: Path) -> dict[str, Any]:
+    directory_descriptor, directory = _open_sealed_directory(
+        path.parent
+    )
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path.name,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+            | os.O_CLOEXEC,
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+        os.fchmod(descriptor, 0o600)
+        opened = os.fstat(descriptor)
+        named = os.stat(
+            path.name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_dev != named.st_dev
+            or opened.st_ino != named.st_ino
+            or opened.st_uid != os.geteuid()
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_nlink != 1
+            or opened.st_size != 0
+        ):
+            raise RuntimeError(
+                "named fault channel identity differs"
+            )
+        os.fsync(descriptor)
+        os.fsync(directory_descriptor)
+        return {
+            "path": str(path),
+            "device": int(opened.st_dev),
+            "inode": int(opened.st_ino),
+            "mode": int(opened.st_mode),
+            "uid": int(opened.st_uid),
+            "nlink": int(opened.st_nlink),
+            "size": int(opened.st_size),
+            "sha256": hashlib.sha256(b"").hexdigest(),
+            "directory_device": int(directory.st_dev),
+            "directory_inode": int(directory.st_ino),
+        }
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(directory_descriptor)
+
+
+def _open_named_fault_channel(
+    path: Path, binding: Mapping[str, Any]
+) -> int:
+    directory_descriptor, directory = _open_sealed_directory(
+        path.parent
+    )
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path.name,
+            os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=directory_descriptor,
+        )
+        opened = os.fstat(descriptor)
+        named = os.stat(
+            path.name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        observed = {
+            "path": str(path),
+            "device": int(opened.st_dev),
+            "inode": int(opened.st_ino),
+            "mode": int(opened.st_mode),
+            "uid": int(opened.st_uid),
+            "nlink": int(opened.st_nlink),
+            "size": int(opened.st_size),
+            "sha256": hashlib.sha256(b"").hexdigest(),
+            "directory_device": int(directory.st_dev),
+            "directory_inode": int(directory.st_ino),
+        }
+        if (
+            set(binding) != _FAULT_CHANNEL_BINDING_KEYS
+            or dict(binding) != observed
+            or opened.st_dev != named.st_dev
+            or opened.st_ino != named.st_ino
+            or not stat.S_ISREG(opened.st_mode)
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_uid != os.geteuid()
+            or opened.st_nlink != 1
+            or opened.st_size != 0
+        ):
+            raise RuntimeError(
+                "named presealed fault channel differs"
+            )
+        os.set_inheritable(descriptor, False)
+        result = descriptor
+        descriptor = -1
+        return result
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(directory_descriptor)
+
+
+def _read_named_fault_channel(
+    descriptor: int,
+    binding: Mapping[str, Any],
+    *,
+    context: Mapping[str, Any],
+) -> dict[str, Any]:
+    before = os.fstat(descriptor)
+    if (
+        before.st_dev != binding.get("device")
+        or before.st_ino != binding.get("inode")
+        or before.st_uid != binding.get("uid")
+        or before.st_mode != binding.get("mode")
+        or before.st_nlink != 1
+        or before.st_size > FAULT_CHANNEL_MAX_RECORD_BYTES
+    ):
+        raise RuntimeError(
+            "named fault channel changed before read"
+        )
+    content = os.pread(
+        descriptor, FAULT_CHANNEL_MAX_RECORD_BYTES + 1, 0
+    )
+    after = os.fstat(descriptor)
+    if (
+        after.st_dev != before.st_dev
+        or after.st_ino != before.st_ino
+        or after.st_mode != before.st_mode
+        or after.st_size != before.st_size
+        or len(content) != before.st_size
+    ):
+        raise RuntimeError(
+            "named fault channel changed during read"
+        )
+    if not content:
+        return {"state": "empty", "record": None}
+    if (
+        len(content) > FAULT_CHANNEL_MAX_RECORD_BYTES
+        or not content.startswith(FAULT_CHANNEL_PREFIX)
+    ):
+        raise RuntimeError("named fault channel frame differs")
+    length_start = len(FAULT_CHANNEL_PREFIX)
+    length_line = content[length_start : length_start + 9]
+    if (
+        len(length_line) != 9
+        or length_line[-1:] != b"\n"
+    ):
+        raise RuntimeError(
+            "named fault channel length differs"
+        )
+    payload_start = length_start + 9
+    payload_end = payload_start + int(length_line[:8], 16)
+    payload = content[payload_start:payload_end]
+    trailer = (
+        FAULT_CHANNEL_SHA_PREFIX
+        + hashlib.sha256(payload).hexdigest().encode("ascii")
+        + b"\n"
+    )
+    if content[payload_end:] != trailer:
+        raise RuntimeError(
+            "named fault channel trailer differs"
+        )
+    try:
+        record = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "named fault channel JSON differs"
+        ) from exc
+    if (
+        not isinstance(record, dict)
+        or _canonical_json(record) != payload
+        or record.get("contract_type")
+        != FAULT_RECORD_CONTRACT_TYPE
+        or record.get("fault_channel") != dict(binding)
+        or record.get("attempt_id") != context["attempt_id"]
+        or record.get("owner_nonce") != context["owner_nonce"]
+        or record.get("launch_receipt_sha256")
+        != context["launch_receipt_sha256"]
+        or record.get("publisher") != context["publisher"]
+        or record.get("fault_record_sha256")
+        != _canonical_digest(record, "fault_record_sha256")
+    ):
+        raise RuntimeError(
+            "named fault channel record binding differs"
+        )
+    try:
+        validate_publish_failure_record(record["failure"])
+    except (KeyError, PreflightLaunchContractError) as exc:
+        raise RuntimeError(
+            "named fault channel failure differs"
+        ) from exc
+    return {"state": "valid_fault", "record": record}
+
+
+def _write_fault_channel_record(
+    context: Mapping[str, Any],
+    failure: ExclusivePublishError,
+) -> dict[str, Any]:
+    descriptor = int(context["descriptor"])
+    binding = dict(context["binding"])
+    record = {
+        "schema_version": 1,
+        "contract_type": FAULT_RECORD_CONTRACT_TYPE,
+        "attempt_id": context["attempt_id"],
+        "owner_nonce": context["owner_nonce"],
+        "launch_receipt_sha256": context[
+            "launch_receipt_sha256"
+        ],
+        "publisher": dict(context["publisher"]),
+        "fault_channel": binding,
+        "failure": failure.as_record(),
+        "recorded_at": _utc_now(),
+    }
+    record["fault_record_sha256"] = _canonical_digest(
+        record, "fault_record_sha256"
+    )
+    payload = _canonical_json(record)
+    frame = _fault_channel_frame(payload)
+    before = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_dev != binding["device"]
+        or before.st_ino != binding["inode"]
+        or before.st_uid != binding["uid"]
+        or before.st_mode != binding["mode"]
+        or before.st_nlink != binding["nlink"]
+        or before.st_size != 0
+    ):
+        raise RuntimeError(
+            "fault channel changed before single-record write"
+        )
+    offset = 0
+    while offset < len(frame):
+        try:
+            written = os.pwrite(
+                descriptor, frame[offset:], offset
+            )
+        except InterruptedError:
+            continue
+        if written <= 0:
+            raise RuntimeError(
+                "fault channel write made no progress"
+            )
+        offset += written
+    os.fsync(descriptor)
+    after = os.fstat(descriptor)
+    if (
+        after.st_dev != before.st_dev
+        or after.st_ino != before.st_ino
+        or after.st_uid != before.st_uid
+        or after.st_mode != before.st_mode
+        or after.st_nlink != before.st_nlink
+        or after.st_size != len(frame)
+    ):
+        raise RuntimeError(
+            "fault channel changed after single-record write"
+        )
+    observed_parts: list[bytes] = []
+    offset = 0
+    while offset < len(frame):
+        try:
+            chunk = os.pread(
+                descriptor, len(frame) - offset, offset
+            )
+        except InterruptedError:
+            continue
+        if not chunk:
+            break
+        observed_parts.append(chunk)
+        offset += len(chunk)
+    if b"".join(observed_parts) != frame:
+        raise RuntimeError(
+            "fault channel readback differs after write"
+        )
+    return record
+
+
+def _execute_with_fault_reporting(
+    context: dict[str, Any],
+    operation: Callable[[], dict[str, Any]],
+) -> tuple[dict[str, Any] | None, int | None, dict[str, Any] | None]:
+    value: dict[str, Any] | None = None
+    dedicated_failure_code: int | None = None
+    dedicated_failure: dict[str, Any] | None = None
+    try:
+        value = operation()
+    except ExclusivePublishError as exc:
+        try:
+            _write_fault_channel_record(context, exc)
+            dedicated_failure_code = FAULT_REPORTED_EXIT_CODE
+            dedicated_failure = {
+                "status": "typed_publish_failure_reported",
+                "failure": exc.as_record(),
+            }
+        except BaseException as channel_exc:
+            dedicated_failure_code = (
+                FAULT_CHANNEL_WRITE_FAILED_EXIT_CODE
+            )
+            dedicated_failure = {
+                "status": "fault_channel_write_failed",
+                "failure": exc.as_record(),
+                "channel_failure": {
+                    "type": type(channel_exc).__name__,
+                    "message": str(channel_exc),
+                },
+            }
+    finally:
+        descriptor_to_close = int(context["descriptor"])
+        context["descriptor"] = -1
+        try:
+            _checked_close(
+                descriptor_to_close, "inherited fault channel"
+            )
+        except BaseException as close_exc:
+            dedicated_failure_code = (
+                FAULT_CHANNEL_CLOSE_FAILED_EXIT_CODE
+            )
+            dedicated_failure = {
+                "status": "fault_channel_close_failed",
+                "channel_failure": {
+                    "type": type(close_exc).__name__,
+                    "message": str(close_exc),
+                },
+            }
+    return value, dedicated_failure_code, dedicated_failure
+
+
+def _open_sealed_directory(path: Path) -> tuple[int, os.stat_result]:
+    if (
+        not path.is_absolute()
+        or path.resolve(strict=True) != path
+        or path.is_symlink()
+    ):
+        raise RuntimeError(f"publication directory is not exact: {path}")
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        named = path.lstat()
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_dev != named.st_dev
+            or opened.st_ino != named.st_ino
+            or opened.st_uid != os.geteuid()
+            or stat.S_IMODE(opened.st_mode) & 0o022
+        ):
+            raise RuntimeError(
+                f"publication directory identity or permissions differ: {path}"
+            )
+    except BaseException:
+        _checked_close(descriptor, "publication directory")
+        raise
+    return descriptor, opened
+
+
+def _ensure_secure_leaf_directories(
+    trusted_root: Path,
+    relative_parts: Sequence[str],
+) -> Path:
+    current_path = trusted_root
+    current_descriptor, _identity = _open_sealed_directory(
+        trusted_root
+    )
+    try:
+        for name in relative_parts:
+            if (
+                not name
+                or name in {".", ".."}
+                or "/" in name
+                or "\0" in name
+            ):
+                raise RuntimeError(
+                    "secure directory component is invalid"
+                )
+            created = False
+            try:
+                os.mkdir(
+                    name,
+                    0o755,
+                    dir_fd=current_descriptor,
+                )
+                created = True
+            except FileExistsError:
+                pass
+            flags = (
+                os.O_RDONLY
+                | os.O_CLOEXEC
+                | os.O_NOFOLLOW
+                | os.O_DIRECTORY
+            )
+            child_descriptor = os.open(
+                name, flags, dir_fd=current_descriptor
+            )
+            try:
+                if created:
+                    os.fchmod(child_descriptor, 0o755)
+                child = os.fstat(child_descriptor)
+                if (
+                    not stat.S_ISDIR(child.st_mode)
+                    or child.st_uid != os.geteuid()
+                    or stat.S_IMODE(child.st_mode) != 0o755
+                ):
+                    raise RuntimeError(
+                        "secure directory component identity or "
+                        "permissions differ"
+                    )
+                if created:
+                    _fsync_dirfd(current_descriptor)
+            except BaseException:
+                _checked_close(
+                    child_descriptor,
+                    "secure child directory",
+                )
+                raise
+            _checked_close(
+                current_descriptor, "secure parent directory"
+            )
+            current_descriptor = child_descriptor
+            current_path = current_path / name
+    finally:
+        _checked_close(
+            current_descriptor, "secure directory walk"
+        )
+    return current_path
+
+
+def _read_dirfd_regular(
+    directory_descriptor: int,
+    name: str,
+    *,
+    expected_content: bytes | None = None,
+    expected_identity: tuple[int, int] | None = None,
+    fsync_file: bool = False,
+) -> tuple[bytes, os.stat_result]:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptor = os.open(name, flags, dir_fd=directory_descriptor)
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) != 0o644
+            or before.st_nlink not in {1, 2}
+            or (
+                expected_identity is not None
+                and (before.st_dev, before.st_ino)
+                != expected_identity
+            )
+        ):
+            raise RuntimeError(
+                f"publication file identity or permissions differ: {name}"
+            )
+        chunks: list[bytes] = []
+        while True:
+            try:
+                chunk = os.read(descriptor, 1024 * 1024)
+            except InterruptedError:
+                continue
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        content = b"".join(chunks)
+        if (
+            before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or before.st_mode != after.st_mode
+            or before.st_uid != after.st_uid
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or len(content) != after.st_size
+            or (
+                expected_content is not None
+                and content != expected_content
+            )
+        ):
+            raise RuntimeError(
+                f"publication file changed or content differs: {name}"
+            )
+        if fsync_file:
+            os.fsync(descriptor)
+    finally:
+        _checked_close(descriptor, "publication file")
+    return content, before
+
+
+def _secure_read_file(
+    path: Path, *, missing_ok: bool = False
+) -> tuple[bytes, os.stat_result] | None:
+    directory_descriptor, _directory = _open_sealed_directory(
+        path.parent
+    )
+    try:
+        try:
+            return _read_dirfd_regular(
+                directory_descriptor, path.name
+            )
+        except FileNotFoundError:
+            if missing_ok:
+                return None
+            raise
+    finally:
+        _checked_close(
+            directory_descriptor, "publication directory"
+        )
+
+
+def _secure_json_snapshot(
+    path: Path,
+    *,
+    digest_field: str | None = None,
+    missing_ok: bool = False,
+) -> dict[str, Any] | None:
+    read = _secure_read_file(path, missing_ok=missing_ok)
+    if read is None:
+        return None
+    content, identity = read
+    try:
+        value = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"secure JSON snapshot is invalid: {path}"
+        ) from exc
+    if not isinstance(value, dict):
+        raise RuntimeError(
+            f"secure JSON snapshot is not a mapping: {path}"
+        )
+    canonical: str | None = None
+    if digest_field is not None:
+        canonical = value.get(digest_field)
+        if (
+            not isinstance(canonical, str)
+            or len(canonical) != 64
+            or _canonical_digest(value, digest_field) != canonical
+        ):
+            raise RuntimeError(
+                f"secure JSON snapshot digest differs: {path}"
+            )
+    snapshot = {
+        "path": str(path),
+        "content": content,
+        "value": value,
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "identity": identity,
+    }
+    if canonical is not None:
+        snapshot["binding"] = build_artifact_binding(
+            path=str(path),
+            sha256=snapshot["sha256"],
+            canonical_sha256=canonical,
+        )
+    return snapshot
+
+
+def _fsync_dirfd(descriptor: int) -> None:
+    os.fsync(descriptor)
+
+
+def _cleanup_sealed_temporary(
+    directory_descriptor: int,
+    temporary_name: str,
+    temporary_seal: Mapping[str, Any],
+) -> None:
+    current = os.stat(
+        temporary_name,
+        dir_fd=directory_descriptor,
+        follow_symlinks=False,
+    )
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or current.st_dev != temporary_seal["device"]
+        or current.st_ino != temporary_seal["inode"]
+        or (
+            temporary_seal.get("ctime_ns") is not None
+            and current.st_ctime_ns != temporary_seal["ctime_ns"]
+        )
+        or (
+            temporary_seal.get("size") is not None
+            and current.st_size != temporary_seal["size"]
+        )
+        or (
+            temporary_seal.get("nlink") is not None
+            and current.st_nlink != temporary_seal["nlink"]
+        )
+    ):
+        raise _PublicationSealMismatch(
+            "publication temporary identity changed before cleanup"
+        )
+    expected_content = temporary_seal.get("content")
+    if expected_content is not None:
+        observed, _identity = _read_dirfd_regular(
+            directory_descriptor,
+            temporary_name,
+            expected_content=expected_content,
+            expected_identity=(
+                int(temporary_seal["device"]),
+                int(temporary_seal["inode"]),
+            ),
+        )
+        if hashlib.sha256(observed).hexdigest() != temporary_seal["sha256"]:
+            raise _PublicationSealMismatch(
+                "publication temporary content changed before cleanup"
+            )
+    os.unlink(temporary_name, dir_fd=directory_descriptor)
+    try:
+        _fsync_dirfd(directory_descriptor)
+    except BaseException as exc:
+        raise _DirectoryDurabilityUnknown(
+            "temporary unlink directory fsync failed"
+        ) from exc
+
+
+def _rollback_uncommitted_final(
+    directory_descriptor: int,
+    final_name: str,
+    final_identity: tuple[int, int],
+) -> None:
+    current = os.stat(
+        final_name,
+        dir_fd=directory_descriptor,
+        follow_symlinks=False,
+    )
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or (current.st_dev, current.st_ino) != final_identity
+    ):
+        raise _PublicationSealMismatch(
+            "uncommitted final identity changed before rollback"
+        )
+    os.unlink(final_name, dir_fd=directory_descriptor)
+    try:
+        _fsync_dirfd(directory_descriptor)
+    except BaseException as exc:
+        raise _DirectoryDurabilityUnknown(
+            "final rollback directory fsync failed"
+        ) from exc
+
+
+def _write_exclusive(
+    path: Path, value: Mapping[str, Any]
+) -> dict[str, Any]:
+    content = _canonical_json(dict(value))
+    content_sha256 = hashlib.sha256(content).hexdigest()
+    payload_seal = {
+        "size": len(content),
+        "sha256": content_sha256,
+    }
+    directory_descriptor, directory_identity = (
+        _open_sealed_directory(path.parent)
+    )
+    directory_seal = {
+        "device": int(directory_identity.st_dev),
+        "inode": int(directory_identity.st_ino),
+        "uid": int(directory_identity.st_uid),
+        "mode": int(stat.S_IMODE(directory_identity.st_mode)),
+    }
+    temporary_name = (
+        f".{path.name}.publish-{secrets.token_hex(32)}"
+    )
+    temporary_descriptor = -1
+    temporary_identity: tuple[int, int] | None = None
+    temporary_seal: dict[str, Any] | None = None
+    linked = False
+    committed = False
+    quarantined = False
+
+    def failure(
+        commit_state: str,
+        stage: str,
+        message: str,
+        cause: BaseException | None = None,
+    ) -> ExclusivePublishError:
+        error_number = (
+            cause.errno if isinstance(cause, OSError) else None
+        )
+        return ExclusivePublishError(
+            commit_state,
+            message,
+            stage=stage,
+            directory_seal=directory_seal,
+            payload=payload_seal,
+            temporary=temporary_seal,
+            error_number=error_number,
+        )
+
+    def rollback_final(
+        stage: str,
+        final_identity: tuple[int, int] | None = None,
+    ) -> None:
+        nonlocal linked, quarantined
+        if not linked or temporary_identity is None:
+            return
+        sealed_final_identity = (
+            temporary_identity
+            if final_identity is None
+            else final_identity
+        )
+        try:
+            _rollback_uncommitted_final(
+                directory_descriptor,
+                path.name,
+                sealed_final_identity,
+            )
+        except BaseException as exc:
+            quarantined = True
+            raise failure(
+                "durability_unknown_quarantined",
+                stage,
+                "uncommitted final rollback failed; target "
+                "directory is quarantined",
+                exc,
+            ) from exc
+        linked = False
+
+    def cleanup_temporary(
+        *,
+        stage: str,
+        after_commit: bool,
+    ) -> None:
+        nonlocal temporary_identity, temporary_seal, quarantined
+        if temporary_seal is None:
+            return
+        try:
+            _cleanup_sealed_temporary(
+                directory_descriptor,
+                temporary_name,
+                temporary_seal,
+            )
+        except _PublicationSealMismatch as exc:
+            quarantined = True
+            raise failure(
+                (
+                    "committed_cleanup_error"
+                    if after_commit
+                    else "collision"
+                ),
+                stage,
+                "sealed temporary changed; target directory is "
+                "quarantined",
+                exc,
+            ) from exc
+        except BaseException as exc:
+            quarantined = True
+            raise failure(
+                (
+                    "committed_cleanup_error"
+                    if after_commit
+                    else "durability_unknown_quarantined"
+                ),
+                stage,
+                "temporary cleanup failed; target directory is "
+                "quarantined",
+                exc,
+            ) from exc
+        temporary_identity = None
+        temporary_seal = None
+
+    try:
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_CLOEXEC
+            | os.O_NOFOLLOW
+        )
+        temporary_descriptor = os.open(
+            temporary_name,
+            flags,
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+        opened = os.fstat(temporary_descriptor)
+        temporary_identity = (opened.st_dev, opened.st_ino)
+        temporary_seal = {
+            "device": int(opened.st_dev),
+            "inode": int(opened.st_ino),
+            "ctime_ns": None,
+            "size": None,
+            "sha256": None,
+            "content": None,
+            "nlink": 1,
+        }
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_nlink != 1
+        ):
+            raise RuntimeError(
+                "publication temporary identity differs"
+            )
+        offset = 0
+        while offset < len(content):
+            try:
+                written = os.write(
+                    temporary_descriptor, content[offset:]
+                )
+            except InterruptedError:
+                continue
+            if written <= 0:
+                raise RuntimeError(
+                    "publication write made no progress"
+                )
+            offset += written
+        os.fchmod(temporary_descriptor, 0o644)
+        os.fsync(temporary_descriptor)
+        descriptor_to_close = temporary_descriptor
+        temporary_descriptor = -1
+        _checked_close(
+            descriptor_to_close, "publication temporary"
+        )
+        reopened_content, reopened = _read_dirfd_regular(
+            directory_descriptor,
+            temporary_name,
+            expected_content=content,
+            expected_identity=temporary_identity,
+        )
+        if (
+            len(reopened_content) != len(content)
+            or hashlib.sha256(reopened_content).hexdigest()
+            != content_sha256
+            or reopened.st_nlink != 1
+        ):
+            raise RuntimeError(
+                "publication temporary verification differs"
+            )
+        temporary_seal = {
+            "device": int(reopened.st_dev),
+            "inode": int(reopened.st_ino),
+            "ctime_ns": int(reopened.st_ctime_ns),
+            "size": int(reopened.st_size),
+            "sha256": content_sha256,
+            "content": content,
+            "nlink": 1,
+        }
+        try:
+            os.link(
+                temporary_name,
+                path.name,
+                src_dir_fd=directory_descriptor,
+                dst_dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            linked = True
+        except FileExistsError as exc:
+            try:
+                existing_content, _existing = (
+                    _read_dirfd_regular(
+                        directory_descriptor,
+                        path.name,
+                        expected_content=content,
+                        fsync_file=True,
+                    )
+                )
+            except BaseException as collision:
+                raise failure(
+                    "collision",
+                    "existing_final_verify",
+                    "final path exists with different or unsafe content",
+                    collision,
+                ) from collision
+            if (
+                len(existing_content) != len(content)
+                or hashlib.sha256(existing_content).hexdigest()
+                != content_sha256
+            ):
+                raise failure(
+                    "collision",
+                    "existing_final_compare",
+                    "final path exists with different content",
+                    exc,
+                ) from exc
+            try:
+                _fsync_dirfd(directory_descriptor)
+            except BaseException as sync_failure:
+                quarantined = True
+                raise failure(
+                    "durability_unknown_quarantined",
+                    "existing_final_directory_fsync",
+                    "exact existing final directory fsync failed",
+                    sync_failure,
+                ) from sync_failure
+            committed = True
+            cleanup_temporary(
+                stage="existing_final_temporary_cleanup",
+                after_commit=True,
+            )
+            return {
+                "status": "already_committed_exact",
+                "path": str(path),
+                "payload_size": len(content),
+                "payload_sha256": content_sha256,
+            }
+        linked_final = os.stat(
+            path.name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        temporary_after_link = os.stat(
+            temporary_name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(linked_final.st_mode)
+            or (linked_final.st_dev, linked_final.st_ino)
+            != temporary_identity
+            or temporary_after_link.st_nlink != 2
+            or linked_final.st_nlink != 2
+            or (temporary_after_link.st_dev, temporary_after_link.st_ino)
+            != temporary_identity
+        ):
+            rollback_final(
+                "linked_identity_rollback",
+                (linked_final.st_dev, linked_final.st_ino),
+            )
+            raise failure(
+                "precommit_failed_clean",
+                "linked_identity_verify",
+                "linked final and temporary identity differ",
+            )
+        try:
+            linked_temporary_content, linked_temporary = (
+                _read_dirfd_regular(
+                    directory_descriptor,
+                    temporary_name,
+                    expected_content=content,
+                    expected_identity=temporary_identity,
+                )
+            )
+        except BaseException as exc:
+            rollback_final("linked_temporary_read_rollback")
+            raise failure(
+                "precommit_failed_clean",
+                "linked_temporary_read",
+                str(exc),
+                exc,
+            ) from exc
+        if (
+            linked_temporary_content != content
+            or linked_temporary.st_nlink != 2
+        ):
+            rollback_final("linked_temporary_compare_rollback")
+            raise failure(
+                "precommit_failed_clean",
+                "linked_temporary_compare",
+                "linked temporary content differs",
+            )
+        temporary_seal = {
+            **temporary_seal,
+            "ctime_ns": int(linked_temporary.st_ctime_ns),
+            "nlink": 2,
+        }
+        try:
+            final_content, final_identity = _read_dirfd_regular(
+                directory_descriptor,
+                path.name,
+                expected_content=content,
+                expected_identity=temporary_identity,
+            )
+        except BaseException as exc:
+            rollback_final("linked_final_read_rollback")
+            raise failure(
+                "precommit_failed_clean",
+                "linked_final_read",
+                str(exc),
+                exc,
+            ) from exc
+        if final_content != content or final_identity.st_nlink != 2:
+            rollback_final("linked_final_compare_rollback")
+            raise failure(
+                "precommit_failed_clean",
+                "linked_final_compare",
+                "linked final content differs",
+            )
+        try:
+            _fsync_dirfd(directory_descriptor)
+        except BaseException as exc:
+            quarantined = True
+            raise failure(
+                "durability_unknown_quarantined",
+                "final_link_directory_fsync",
+                "final link directory fsync failed",
+                exc,
+            ) from exc
+        committed = True
+        cleanup_temporary(
+            stage="committed_temporary_cleanup",
+            after_commit=True,
+        )
+        return {
+            "status": "committed",
+            "path": str(path),
+            "payload_size": len(content),
+            "payload_sha256": content_sha256,
+            "directory_device": int(directory_identity.st_dev),
+            "directory_inode": int(directory_identity.st_ino),
+        }
+    except BaseException as exc:
+        if temporary_descriptor >= 0:
+            descriptor_to_close = temporary_descriptor
+            temporary_descriptor = -1
+            try:
+                _checked_close(
+                    descriptor_to_close,
+                    "publication temporary",
+                )
+            except BaseException as close_failure:
+                if not isinstance(exc, ExclusivePublishError):
+                    exc = failure(
+                        "precommit_failed_clean",
+                        "temporary_close",
+                        f"{exc}; close failure: {close_failure}",
+                        close_failure,
+                    )
+        if isinstance(exc, ExclusivePublishError):
+            quarantined = quarantined or exc.quarantined
+        if not quarantined and linked and not committed:
+            try:
+                rollback_final("exception_rollback")
+            except ExclusivePublishError:
+                raise
+        if not quarantined and temporary_seal is not None:
+            try:
+                cleanup_temporary(
+                    stage="exception_temporary_cleanup",
+                    after_commit=committed,
+                )
+            except ExclusivePublishError:
+                raise
+        if isinstance(exc, ExclusivePublishError):
+            raise
+        raise failure(
+            (
+                "committed_cleanup_error"
+                if committed
+                else "precommit_failed_clean"
+            ),
+            "publication",
+            str(exc),
+            exc,
+        ) from exc
+    finally:
+        active_failure = sys.exc_info()[1]
+        descriptor_to_close = directory_descriptor
+        directory_descriptor = -1
+        try:
+            _checked_close(
+                descriptor_to_close, "publication directory"
+            )
+        except BaseException as close_failure:
+            if active_failure is not None:
+                state = (
+                    active_failure.commit_state
+                    if isinstance(
+                        active_failure, ExclusivePublishError
+                    )
+                    else (
+                        "committed_cleanup_error"
+                        if committed
+                        else "precommit_failed_clean"
+                    )
+                )
+                raise failure(
+                    state,
+                    "directory_close",
+                    f"{active_failure}; directory close failed: "
+                    f"{close_failure}",
+                    close_failure,
+                ) from active_failure
+            if committed:
+                raise failure(
+                    "committed_cleanup_error",
+                    "directory_close",
+                    f"final committed; directory close failed: "
+                    f"{close_failure}",
+                    close_failure,
+                ) from close_failure
+            raise failure(
+                "precommit_failed_clean",
+                "directory_close",
+                str(close_failure),
+                close_failure,
+            ) from close_failure
 
 
 def _json_binding(path: Path, digest_field: str) -> dict[str, str]:
-    if not path.is_file():
-        raise RuntimeError(f"required wrapper artifact is absent: {path}")
-    value = json.loads(path.read_text(encoding="utf-8"))
-    canonical = value.get(digest_field)
-    if (
-        not isinstance(canonical, str)
-        or len(canonical) != 64
-        or _canonical_digest(value, digest_field) != canonical
-    ):
-        raise RuntimeError(f"wrapper artifact canonical digest differs: {path}")
-    return build_artifact_binding(
-        path=str(path.resolve()),
-        sha256=_sha256_file(path),
-        canonical_sha256=canonical,
+    snapshot = _secure_json_snapshot(
+        path, digest_field=digest_field
     )
+    assert snapshot is not None
+    return dict(snapshot["binding"])
 
 
 def _optional_binding(path: Path) -> dict[str, str] | None:
-    if not path.is_file():
+    read = _secure_read_file(path, missing_ok=True)
+    if read is None:
         return None
-    return {"path": str(path.resolve()), "sha256": _sha256_file(path)}
+    content, _identity = read
+    return {
+        "path": str(path),
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
 
 
 def _merge_launch_failure(
@@ -445,11 +1773,11 @@ def _merge_launch_failure(
     failure_type: str,
     message: str,
 ) -> dict[str, Any]:
-    entry = {
-        "stage": stage,
-        "type": failure_type,
-        "message": message,
-    }
+    entry = build_finalization_secondary_failure(
+        stage=stage,
+        failure_type=failure_type,
+        message=message,
+    )
     if current is None:
         return {
             **entry,
@@ -466,31 +1794,13 @@ def _publish_wrapper_exit_total(
     path: Path, value: Mapping[str, Any]
 ) -> dict[str, Any]:
     published = dict(value)
-    try:
-        _write_exclusive(path, published)
-        return published
-    except BaseException as exc:
-        if path.is_file():
-            observed = json.loads(path.read_text(encoding="utf-8"))
-            if observed == published:
-                return observed
-            raise RuntimeError(
-                "wrapper exit path contains an unbound publication"
-            ) from exc
-        published["launch_failure"] = _merge_launch_failure(
-            published.get("launch_failure"),
-            stage="wrapper_exit_write",
-            failure_type=type(exc).__name__,
-            message=str(exc),
-        )
-        if published.get("exit_code") == 0:
-            published["exit_code"] = 125
-        published["completed_at"] = _utc_now()
-        published["wrapper_exit_sha256"] = _canonical_digest(
-            published, "wrapper_exit_sha256"
-        )
-        _write_exclusive(path, published)
-        return published
+    _write_exclusive(path, published)
+    return published
+
+
+def _propagate_publish_error(exc: BaseException) -> None:
+    if isinstance(exc, ExclusivePublishError):
+        raise exc
 
 
 def _tmux_session() -> str:
@@ -696,6 +2006,53 @@ def _tmux_identity(session: str) -> dict[str, Any]:
     }
     _validate_tmux_identity(identity, session)
     return identity
+
+
+def _tmux_runtime_status(session: str) -> dict[str, Any]:
+    result = subprocess.run(
+        [
+            "tmux",
+            "list-panes",
+            "-t",
+            session,
+            "-F",
+            (
+                "#{session_name}\t#{pane_id}\t#{pane_pid}\t"
+                "#{pane_dead}\t#{pane_dead_status}\t"
+                "#{pane_pipe}\t#{pane_current_command}"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "tmux runtime status command failed: "
+            f"{result.stderr.strip()}"
+        )
+    rows = [line.split("\t") for line in result.stdout.splitlines() if line]
+    if (
+        len(rows) != 1
+        or len(rows[0]) != 7
+        or rows[0][0] != session
+        or rows[0][3] not in {"0", "1"}
+        or rows[0][5] not in {"0", "1"}
+        or not rows[0][6]
+    ):
+        raise RuntimeError(
+            f"tmux runtime status differs for session {session}"
+        )
+    return {
+        "session": rows[0][0],
+        "pane": rows[0][1],
+        "pane_pid": int(rows[0][2]),
+        "pane_dead": rows[0][3] == "1",
+        "pane_dead_status": (
+            None if rows[0][4] == "" else int(rows[0][4])
+        ),
+        "pane_pipe": rows[0][5] == "1",
+        "pane_current_command": rows[0][6],
+    }
 
 
 def _validate_tmux_identity(
@@ -970,43 +2327,11 @@ def _read_strict_json_contract(
     path: Path,
     digest_field: str,
 ) -> dict[str, Any]:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags)
-    try:
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode):
-            raise RuntimeError(f"contract is not a regular file: {path}")
-        chunks: list[bytes] = []
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        after = os.fstat(descriptor)
-    finally:
-        os.close(descriptor)
-    content = b"".join(chunks)
-    if (
-        before.st_dev != after.st_dev
-        or before.st_ino != after.st_ino
-        or before.st_size != after.st_size
-        or before.st_mtime_ns != after.st_mtime_ns
-        or len(content) != after.st_size
-    ):
-        raise RuntimeError(f"contract changed during atomic read: {path}")
-    value = json.loads(content.decode("utf-8"))
-    if not isinstance(value, dict):
-        raise RuntimeError(f"contract is not a mapping: {path}")
-    canonical = value.get(digest_field)
-    if (
-        not isinstance(canonical, str)
-        or len(canonical) != 64
-        or _canonical_digest(value, digest_field) != canonical
-    ):
-        raise RuntimeError(f"contract canonical digest differs: {path}")
-    return value
+    snapshot = _secure_json_snapshot(
+        path, digest_field=digest_field
+    )
+    assert snapshot is not None
+    return dict(snapshot["value"])
 
 
 def _observer_gate_ready(
@@ -1071,7 +2396,7 @@ def _observer_gate_ready(
         ready, "observer_gate_ready_sha256"
     )
     _write_exclusive(ready_path, ready)
-    while not release_path.is_file():
+    while _secure_read_file(release_path, missing_ok=True) is None:
         time.sleep(0.02)
     release = _read_strict_json_contract(
         release_path, "observer_gate_release_sha256"
@@ -1508,7 +2833,12 @@ def _probe_observer_gate(
                                     "session_residual": True,
                                 }
                             )
-                        if ready_path.is_file():
+                        if (
+                            _secure_read_file(
+                                ready_path, missing_ok=True
+                            )
+                            is not None
+                        ):
                             try:
                                 ready = _validate_observer_gate_ready(
                                     ready_path,
@@ -2116,13 +3446,18 @@ def _wait_tmux_process_identity(
     dict[str, Any],
 ]:
     deadline = time.monotonic() + OBSERVER_IDENTITY_WAIT_SECONDS
-    while not bootstrap_path.is_file():
+    while _secure_read_file(bootstrap_path, missing_ok=True) is None:
         if time.monotonic() >= deadline:
             raise RuntimeError(
                 f"tmux observer bootstrap timed out for session {session}"
             )
         time.sleep(0.05)
-    bootstrap = json.loads(bootstrap_path.read_text(encoding="utf-8"))
+    bootstrap_snapshot = _secure_json_snapshot(
+        bootstrap_path,
+        digest_field="observer_bootstrap_sha256",
+    )
+    assert bootstrap_snapshot is not None
+    bootstrap = dict(bootstrap_snapshot["value"])
     expected_keys = {
         "schema_version",
         "contract_type",
@@ -2237,11 +3572,11 @@ def _close_owned_controller_process(
 
     def record(stage: str, exc: BaseException) -> None:
         failures.append(
-            {
-                "stage": stage,
-                "type": type(exc).__name__,
-                "message": str(exc),
-            }
+            build_finalization_secondary_failure(
+                stage=stage,
+                failure_type=type(exc).__name__,
+                message=str(exc),
+            )
         )
 
     def wait_owned(
@@ -2760,7 +4095,16 @@ def _validate_observer_stop(
     process_start_binding: Mapping[str, str],
     require_live_identity: bool = True,
 ) -> dict[str, Any]:
-    value = json.loads(path.read_text(encoding="utf-8"))
+    stop_snapshot = _secure_json_snapshot(
+        path, digest_field="observer_stop_sha256"
+    )
+    assert stop_snapshot is not None
+    value = dict(stop_snapshot["value"])
+    process_start_snapshot = _secure_json_snapshot(
+        Path(process_start_binding["path"]),
+        digest_field="controller_process_start_sha256",
+    )
+    assert process_start_snapshot is not None
     expected_keys = {
         "schema_version",
         "contract_type",
@@ -2795,9 +4139,7 @@ def _validate_observer_stop(
         or value.get("observer_pid") != observer_process["pid"]
         or value.get("observer_process") != dict(observer_process)
         or value.get("controller_process")
-        != json.loads(
-            Path(process_start_binding["path"]).read_text(encoding="utf-8")
-        ).get("process")
+        != process_start_snapshot["value"].get("process")
         or not isinstance(value.get("failure"), Mapping)
         or value.get("observer_stop_sha256")
         != _canonical_digest(value, "observer_stop_sha256")
@@ -2815,9 +4157,12 @@ def _validate_observer_stop(
         _json_binding(
             Path(value["controller_ready"]["path"]), "controller_ready_sha256"
         )
-    launch = json.loads(
-        Path(observer_launch_binding["path"]).read_text(encoding="utf-8")
+    launch_snapshot = _secure_json_snapshot(
+        Path(observer_launch_binding["path"]),
+        digest_field="observer_launch_sha256",
     )
+    assert launch_snapshot is not None
+    launch = dict(launch_snapshot["value"])
     if (
         value.get("observer_tmux") != launch.get("tmux")
         or value.get("observer_process") != launch.get("process")
@@ -2875,16 +4220,15 @@ def _read_observer_terminal(
         bound_path = Path(str(binding["path"]))
         if (
             expected_path is not None
-            and bound_path.resolve() != expected_path.resolve()
+            and bound_path != expected_path
         ):
             raise RuntimeError(
                 f"CPU preflight observer terminal {label} path differs"
             )
-        bound_flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            bound_flags |= os.O_NOFOLLOW
         try:
-            bound_descriptor = os.open(bound_path, bound_flags)
+            snapshot = _secure_json_snapshot(
+                bound_path, digest_field=digest_field
+            )
         except FileNotFoundError as exc:
             raise RuntimeError(
                 f"CPU preflight observer terminal {label} file is absent"
@@ -2894,81 +4238,26 @@ def _read_observer_terminal(
                 f"CPU preflight observer terminal {label} "
                 "file permission denied"
             ) from exc
-        try:
-            bound_before = os.fstat(bound_descriptor)
-            if not stat.S_ISREG(bound_before.st_mode):
-                raise RuntimeError(
-                    f"CPU preflight observer terminal {label} "
-                    "is not a regular file"
-                )
-            bound_chunks: list[bytes] = []
-            while True:
-                bound_chunk = os.read(bound_descriptor, 1024 * 1024)
-                if not bound_chunk:
-                    break
-                bound_chunks.append(bound_chunk)
-            bound_after = os.fstat(bound_descriptor)
-        finally:
-            os.close(bound_descriptor)
-        bound_content = b"".join(bound_chunks)
-        if (
-            bound_before.st_dev != bound_after.st_dev
-            or bound_before.st_ino != bound_after.st_ino
-            or bound_before.st_size != bound_after.st_size
-            or bound_before.st_mtime_ns != bound_after.st_mtime_ns
-            or len(bound_content) != bound_after.st_size
-        ):
-            raise RuntimeError(
-                f"CPU preflight observer terminal {label} "
-                "changed during atomic read"
-            )
-        if hashlib.sha256(bound_content).hexdigest() != binding["sha256"]:
+        assert snapshot is not None
+        if snapshot["sha256"] != binding["sha256"]:
             raise RuntimeError(
                 f"CPU preflight observer terminal {label} file SHA differs"
             )
-        bound_value = json.loads(bound_content.decode("utf-8"))
-        canonical = bound_value.get(digest_field)
         if (
-            canonical != binding["canonical_sha256"]
-            or _canonical_digest(bound_value, digest_field) != canonical
+            snapshot["binding"]["canonical_sha256"]
+            != binding["canonical_sha256"]
         ):
             raise RuntimeError(
                 f"CPU preflight observer terminal {label} "
                 "canonical SHA differs"
             )
-        return bound_value
+        return dict(snapshot["value"])
 
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags)
-    try:
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode):
-            raise RuntimeError(
-                "CPU preflight observer terminal is not a regular file"
-            )
-        chunks: list[bytes] = []
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        after = os.fstat(descriptor)
-    finally:
-        os.close(descriptor)
-    content = b"".join(chunks)
-    if (
-        before.st_dev != after.st_dev
-        or before.st_ino != after.st_ino
-        or before.st_size != after.st_size
-        or before.st_mtime_ns != after.st_mtime_ns
-        or len(content) != after.st_size
-    ):
-        raise RuntimeError(
-            "CPU preflight observer terminal changed during atomic read"
-        )
-    value = json.loads(content.decode("utf-8"))
+    terminal_snapshot = _secure_json_snapshot(
+        path, digest_field="observer_terminal_sha256"
+    )
+    assert terminal_snapshot is not None
+    value = dict(terminal_snapshot["value"])
     canonical = value.get("observer_terminal_sha256")
     if (
         value.get("contract_type")
@@ -3048,11 +4337,7 @@ def _read_observer_terminal(
             raise RuntimeError(
                 "CPU preflight observer terminal ready identity differs"
             )
-    return value, build_artifact_binding(
-        path=str(path.resolve()),
-        sha256=hashlib.sha256(content).hexdigest(),
-        canonical_sha256=canonical,
-    )
+    return value, dict(terminal_snapshot["binding"])
 
 
 def _wait_observer_terminal(
@@ -3064,7 +4349,7 @@ def _wait_observer_terminal(
     observer_process: Mapping[str, int],
 ) -> tuple[dict[str, Any], dict[str, str]] | None:
     deadline = time.monotonic() + OBSERVER_TERMINAL_WAIT_SECONDS
-    while not path.is_file():
+    while _secure_read_file(path, missing_ok=True) is None:
         if time.monotonic() >= deadline:
             return None
         time.sleep(0.1)
@@ -3088,7 +4373,13 @@ def _validate_terminal_stop_binding(
     process_start_binding: Mapping[str, str],
     observer_stop_binding: dict[str, str] | None,
 ) -> dict[str, str] | None:
-    if observer_stop_binding is None and observer_stop_path.is_file():
+    if (
+        observer_stop_binding is None
+        and _secure_read_file(
+            observer_stop_path, missing_ok=True
+        )
+        is not None
+    ):
         _validate_observer_stop(
             observer_stop_path,
             policy_sha256=policy_sha256,
@@ -3151,21 +4442,12 @@ def _wrapper_file_identity(path: Path) -> dict[str, Any]:
 def _open_regular_json_with_identity(
     path: Path, label: str
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    try:
-        value = os.fstat(descriptor)
-        if not stat.S_ISREG(value.st_mode):
-            raise RuntimeError(f"{label} is not a regular file")
-        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
-            descriptor = -1
-            payload = json.load(handle)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"{label} is malformed")
-    return payload, build_file_identity(
-        path=str(path.resolve()),
+    snapshot = _secure_json_snapshot(path)
+    if snapshot is None:
+        raise RuntimeError(f"{label} is absent")
+    value = snapshot["identity"]
+    return dict(snapshot["value"]), build_file_identity(
+        path=str(path),
         device=int(value.st_dev),
         inode=int(value.st_ino),
         mode=int(value.st_mode),
@@ -3178,6 +4460,353 @@ def _opened_file_identity(path: Path) -> dict[str, Any]:
         path, "opened file"
     )
     return identity
+
+
+def _validate_pane_fault_consumer_runtime(
+    *,
+    receipt: Mapping[str, Any],
+    expected_attempt_root: Path,
+    label: str,
+) -> dict[str, Any]:
+    registration = validate_pane_fault_consumer_registration(
+        receipt.get("pane_fault_consumer"),
+        expected_namespace=str(
+            expected_attempt_root / "pane_fault_consumer"
+        ),
+        label=f"{label} registration",
+    )
+    artifacts = registration["artifacts"]
+    records = {
+        name: _secure_json_snapshot(
+            Path(artifacts[name]), digest_field=digest_field
+        )
+        for name, digest_field in {
+            "ready": "consumer_ready_sha256",
+            "started": "consumer_started_sha256",
+            "active": "consumer_active_sha256",
+            "reader_release": "consumer_reader_release_sha256",
+            "release_observed": (
+                "consumer_release_observed_sha256"
+            ),
+        }.items()
+    }
+    if any(snapshot is None for snapshot in records.values()):
+        raise RuntimeError(
+            f"{label} required consumer artifact is absent"
+        )
+    values = {
+        name: dict(snapshot["value"])
+        for name, snapshot in records.items()
+        if snapshot is not None
+    }
+    expected_keys = {
+        "ready": {
+            "schema_version",
+            "contract_type",
+            "policy_sha256",
+            "attempt_id",
+            "consumer_attempt",
+            "consumer_session",
+            "consumer_owner_nonce",
+            "consumer_wait_supervisor_ready",
+            "supervisor_owner_seal",
+            "supervisor_process",
+            "supervisor_command",
+            "supervisor_executable",
+            "tmux",
+            "tmux_server",
+            "worker_process",
+            "worker_command",
+            "worker_executable",
+            "fault_descriptor",
+            "pane_fault_channel",
+            "self_fault_descriptor",
+            "consumer_self_fault_channel",
+            "ready_at",
+            "consumer_ready_sha256",
+        },
+        "started": {
+            "schema_version",
+            "contract_type",
+            "policy_sha256",
+            "attempt_id",
+            "consumer_attempt",
+            "consumer_ready",
+            "consumer_wait_supervisor_ready",
+            "owner_seal",
+            "supervisor_process",
+            "worker_process",
+            "pane_fault_channel",
+            "consumer_self_fault_channel",
+            "remain_on_exit",
+            "started_at",
+            "consumer_started_sha256",
+        },
+        "active": {
+            "schema_version",
+            "contract_type",
+            "policy_sha256",
+            "attempt_id",
+            "consumer_attempt",
+            "consumer_accepted",
+            "consumer_commit",
+            "consumer_session",
+            "consumer_owner_nonce",
+            "owner_seal",
+            "supervisor_process",
+            "worker_process",
+            "pane_fault_channel",
+            "consumer_self_fault_channel",
+            "active_at",
+            "consumer_active_sha256",
+        },
+        "reader_release": {
+            "schema_version",
+            "contract_type",
+            "policy_sha256",
+            "attempt_id",
+            "consumer_attempt",
+            "consumer_commit",
+            "consumer_active",
+            "launcher_gate_reader_release_intent",
+            "last_empty_snapshots",
+            "released_at",
+            "consumer_reader_release_sha256",
+        },
+        "release_observed": {
+            "schema_version",
+            "contract_type",
+            "policy_sha256",
+            "attempt_id",
+            "consumer_attempt",
+            "consumer_active",
+            "consumer_reader_release",
+            "consumer_session",
+            "consumer_owner_nonce",
+            "owner_seal",
+            "supervisor_process",
+            "worker_process",
+            "release_observed_at",
+            "consumer_release_observed_sha256",
+        },
+    }
+    expected_types = {
+        "ready": "safa_pane_fault_consumer_ready_v1",
+        "started": "safa_pane_fault_consumer_started_v1",
+        "active": "safa_pane_fault_consumer_transfer_active_v1",
+        "reader_release": (
+            "safa_pane_fault_consumer_reader_release_intent_v1"
+        ),
+        "release_observed": (
+            "safa_pane_fault_consumer_release_observed_v1"
+        ),
+    }
+    expected_digests = {
+        "ready": "consumer_ready_sha256",
+        "started": "consumer_started_sha256",
+        "active": "consumer_active_sha256",
+        "reader_release": "consumer_reader_release_sha256",
+        "release_observed": (
+            "consumer_release_observed_sha256"
+        ),
+    }
+    for name, value in values.items():
+        digest_field = expected_digests[name]
+        if (
+            set(value) != expected_keys[name]
+            or value.get("schema_version") != 1
+            or value.get("contract_type") != expected_types[name]
+            or value.get("policy_sha256")
+            != receipt.get("policy_sha256")
+            or value.get("attempt_id") != receipt.get("attempt_id")
+            or value.get(digest_field)
+            != _canonical_digest(value, digest_field)
+        ):
+            raise RuntimeError(
+                f"{label} {name} contract differs"
+            )
+    chain = build_pane_fault_consumer_chain(
+        consumer_started=records["started"]["binding"],
+        consumer_active=records["active"]["binding"],
+        consumer_reader_release=records["reader_release"][
+            "binding"
+        ],
+        consumer_release_observed=records["release_observed"][
+            "binding"
+        ],
+        registration=registration,
+    )
+    ready = values["ready"]
+    active = values["active"]
+    reader_release = values["reader_release"]
+    observed = values["release_observed"]
+    if (
+        reader_release["consumer_active"]
+        != chain["consumer_active"]
+        or observed["consumer_active"]
+        != chain["consumer_active"]
+        or observed["consumer_reader_release"]
+        != chain["consumer_reader_release"]
+        or active["consumer_attempt"]
+        != reader_release["consumer_attempt"]
+        or active["consumer_attempt"]
+        != observed["consumer_attempt"]
+        or observed["owner_seal"] != active["owner_seal"]
+        or observed["supervisor_process"]
+        != active["supervisor_process"]
+        or observed["worker_process"] != active["worker_process"]
+        or observed["consumer_session"]
+        != active["consumer_session"]
+        or observed["consumer_owner_nonce"]
+        != active["consumer_owner_nonce"]
+        or ready["consumer_attempt"]
+        != active["consumer_attempt"]
+        or ready["consumer_session"]
+        != active["consumer_session"]
+        or ready["consumer_owner_nonce"]
+        != active["consumer_owner_nonce"]
+        or ready["supervisor_process"]
+        != active["supervisor_process"]
+        or ready["worker_process"] != active["worker_process"]
+    ):
+        raise RuntimeError(
+            f"{label} artifact reference relation differs"
+    )
+    session = str(active["consumer_session"])
+    live_tmux = _tmux_identity(session)
+    live_tmux_status = _tmux_runtime_status(session)
+    live_tmux_server = _tmux_server_identity(
+        str(live_tmux["pane"])
+    )
+    live_owner_nonce = _tmux_owner_nonce(
+        session, str(live_tmux_server["socket_path"])
+    )
+    live_owner_authority = _build_tmux_owner_seal(
+        live_tmux,
+        live_tmux_server,
+        live_owner_nonce,
+    )
+    live_supervisor = _require_process_identity(
+        int(active["supervisor_process"]["pid"]),
+        f"{label} live supervisor",
+    )
+    live_worker = _require_process_identity(
+        int(active["worker_process"]["pid"]),
+        f"{label} live worker",
+    )
+    live_supervisor_command = _process_command(
+        live_supervisor["pid"]
+    )
+    live_worker_command = _process_command(live_worker["pid"])
+    live_process_command_name = Path(
+        f"/proc/{live_supervisor['pid']}/comm"
+    ).read_text(encoding="utf-8").rstrip("\n")
+    if not live_process_command_name:
+        raise RuntimeError(
+            f"{label} live process command name is empty"
+        )
+    live_supervisor_executable = _process_executable_identity(
+        live_supervisor["pid"]
+    )
+    live_worker_executable = _process_executable_identity(
+        live_worker["pid"]
+    )
+    live_cwd = Path(
+        os.readlink(f"/proc/{live_worker['pid']}/cwd")
+    ).resolve(strict=True)
+    expected_cwd = Path(
+        str(receipt["bindings"]["launcher"]["path"])
+    ).parent.parent.resolve(strict=True)
+    live_owner_seal = {
+        "owner_nonce": live_owner_authority["owner_nonce"],
+        "pane": live_tmux_status["pane"],
+        "pane_dead": live_tmux_status["pane_dead"],
+        "pane_dead_status": live_tmux_status["pane_dead_status"],
+        "pane_pid": live_tmux_status["pane_pid"],
+        "pane_process": live_supervisor,
+        "session": live_tmux_status["session"],
+        "tmux_server": live_tmux_server,
+    }
+    expected_ready_tmux = {
+        key: live_tmux_status[key]
+        for key in (
+            "session",
+            "pane",
+            "pane_pid",
+            "pane_dead",
+            "pane_dead_status",
+        )
+    }
+    live_checks = {
+        "supervisor_process": (
+            live_supervisor == active["supervisor_process"]
+        ),
+        "worker_process": live_worker == active["worker_process"],
+        "pane_pid": live_tmux_status.get("pane_pid")
+        == live_supervisor["pid"],
+        "direct_worker": (
+            live_worker["ppid"] == live_supervisor["pid"]
+            and live_worker["pgid"] == live_worker["pid"]
+            and live_worker["sid"] == live_worker["pid"]
+        ),
+        "pane_live": live_tmux_status.get("pane_dead") is False,
+        "pane_pipe": live_tmux_status.get("pane_pipe") is False,
+        "tmux_identity_status": {
+            key: live_tmux_status[key]
+            for key in ("session", "pane", "pane_pid")
+        }
+        == {
+            key: live_tmux[key]
+            for key in ("session", "pane", "pane_pid")
+        },
+        "pane_current_command": (
+            live_tmux_status["pane_current_command"]
+            == live_tmux["pane_current_command"]
+            == live_process_command_name
+        ),
+        "owner_nonce": live_owner_nonce
+        == active["consumer_owner_nonce"],
+        "owner_seal": live_owner_seal == active["owner_seal"],
+        "ready_tmux": ready["tmux"] == expected_ready_tmux,
+        "ready_tmux_server": ready["tmux_server"]
+        == live_tmux_server,
+        "supervisor_command": (
+            ready["supervisor_command"]
+            == live_supervisor_command
+        ),
+        "supervisor_command_bytes": (
+            _command_bytes(live_supervisor_command)
+            == _process_command_bytes(live_supervisor["pid"])
+        ),
+        "supervisor_executable": (
+            ready["supervisor_executable"]
+            == live_supervisor_executable
+        ),
+        "worker_command": (
+            ready["worker_command"] == live_worker_command
+        ),
+        "worker_command_bytes": (
+            _command_bytes(live_worker_command)
+            == _process_command_bytes(live_worker["pid"])
+        ),
+        "worker_executable": (
+            ready["worker_executable"] == live_worker_executable
+        ),
+        "cwd": live_cwd == expected_cwd,
+    }
+    failed_live_checks = [
+        name for name, passed in live_checks.items() if not passed
+    ]
+    if failed_live_checks:
+        raise RuntimeError(
+            f"{label} live consumer seal differs: "
+            f"{failed_live_checks}"
+        )
+    return {
+        "registration": registration,
+        "chain": chain,
+        "active": active,
+    }
 
 
 def _validate_preflight_launch_receipt(
@@ -3206,8 +4835,44 @@ def _validate_preflight_launch_receipt(
     accepted_path = Path(raw_accepted_path).resolve()
     release_path = Path(raw_release_path).resolve()
     log_path = Path(raw_log_path).resolve()
-    receipt, receipt_identity = _open_regular_json_with_identity(
-        receipt_path, "preflight launch receipt"
+    receipt_snapshot = _secure_json_snapshot(
+        receipt_path, digest_field="launch_receipt_sha256"
+    )
+    assert receipt_snapshot is not None
+    receipt = dict(receipt_snapshot["value"])
+    validate_launch_receipt_schema(
+        receipt,
+        expected_gate_worker_arguments=_process_command(
+            os.getppid()
+        ),
+        expected_consumer_worker_arguments=[
+            sys.executable,
+            "-B",
+            "-u",
+            str(
+                Path(__file__).resolve().with_name(
+                    "run_canonical_preflight_launcher.py"
+                )
+            ),
+            "__pane_fault_consumer__",
+            "--attempt-path",
+            str(
+                receipt["pane_fault_consumer"]["artifacts"][
+                    "attempt"
+                ]
+            ),
+            "--config",
+            str(config.resolve()),
+        ],
+        label="wrapper launch receipt v4",
+    )
+    receipt_stat = receipt_snapshot["identity"]
+    receipt_identity = build_file_identity(
+        path=str(receipt_path),
+        device=int(receipt_stat.st_dev),
+        inode=int(receipt_stat.st_ino),
+        mode=int(receipt_stat.st_mode),
+        size=int(receipt_stat.st_size),
     )
     validate_file_identity(
         receipt_identity, "wrapper launch receipt identity"
@@ -3220,41 +4885,32 @@ def _validate_preflight_launch_receipt(
         / policy_sha256
         / str(attempt_id)
     ).resolve()
-    expected_keys = {
-        "schema_version",
-        "contract_type",
-        "attempt_id",
-        "started_registry",
-        "policy_sha256",
-        "git",
-        "bindings",
-        "verified_implementations",
-        "python_executable",
-        "controller_session",
-        "controller_owner_nonce",
-        "observer_session",
-        "wrapper_arguments",
-        "pane_gate_arguments",
-        "tmux_arguments",
-        "shell",
-        "pane_log",
-        "wrapper_claim_path",
-        "wrapper_started_path",
-        "gate_execution_terminal_path",
-        "started_at",
-        "launch_receipt_sha256",
-    }
     gate_ready_path = expected_attempt_root / "pane_gate_ready.json"
+    supervisor_ready_path = (
+        expected_attempt_root / "gate_wait_supervisor_ready.json"
+    )
     tmux_started_path = expected_attempt_root / "launch_tmux_started.json"
     wrapper_started_path = expected_attempt_root / "wrapper_started.json"
     gate_execution_terminal_path = (
         expected_attempt_root / "gate_execution_terminal.json"
     )
-    gate_ready_binding = _json_binding(
-        gate_ready_path, "pane_gate_ready_sha256"
+    gate_ready_snapshot = _secure_json_snapshot(
+        gate_ready_path, digest_field="pane_gate_ready_sha256"
     )
-    tmux_started_binding = _json_binding(
-        tmux_started_path, "launch_tmux_started_sha256"
+    supervisor_ready_snapshot = _secure_json_snapshot(
+        supervisor_ready_path,
+        digest_field="gate_wait_supervisor_ready_sha256",
+    )
+    tmux_started_snapshot = _secure_json_snapshot(
+        tmux_started_path,
+        digest_field="launch_tmux_started_sha256",
+    )
+    assert gate_ready_snapshot is not None
+    assert supervisor_ready_snapshot is not None
+    assert tmux_started_snapshot is not None
+    gate_ready_binding = dict(gate_ready_snapshot["binding"])
+    tmux_started_binding = dict(
+        tmux_started_snapshot["binding"]
     )
     process_arguments = _process_command(os.getpid())
     executable_path = str(
@@ -3265,13 +4921,10 @@ def _validate_preflight_launch_receipt(
         "path": str(config.resolve()),
         "sha256": _sha256_file(config),
     }
-    receipt_binding = _json_binding(
-        receipt_path, "launch_receipt_sha256"
-    )
+    receipt_binding = dict(receipt_snapshot["binding"])
     live_implementations = _reverify_verified_preflight_apis()
-    tmux_started = json.loads(
-        tmux_started_path.read_text(encoding="utf-8")
-    )
+    tmux_started = dict(tmux_started_snapshot["value"])
+    supervisor_ready = dict(supervisor_ready_snapshot["value"])
     validate_tmux_started(
         tmux_started,
         verified_implementations=live_implementations,
@@ -3285,10 +4938,9 @@ def _validate_preflight_launch_receipt(
     )
     log_identity = _wrapper_file_identity(log_path)
     if (
-        set(receipt) != expected_keys
-        or receipt.get("schema_version") != 1
+        receipt.get("schema_version") != 4
         or receipt.get("contract_type")
-        != "safa_canonical_preflight_launch_receipt_v1"
+        != LAUNCH_RECEIPT_CONTRACT_TYPE
         or not isinstance(attempt_id, str)
         or len(attempt_id) != 64
         or any(character not in "0123456789abcdef" for character in attempt_id)
@@ -3301,6 +4953,8 @@ def _validate_preflight_launch_receipt(
         != str(wrapper_started_path)
         or receipt.get("gate_execution_terminal_path")
         != str(gate_execution_terminal_path)
+        or receipt.get("gate_lifecycle_wait_supervisor_ready_path")
+        != str(supervisor_ready_path)
         or receipt.get("policy_sha256") != policy_sha256
         or receipt.get("controller_session") != CONTROLLER_SESSION
         or receipt.get("controller_owner_nonce")
@@ -3311,6 +4965,23 @@ def _validate_preflight_launch_receipt(
         or receipt.get("wrapper_arguments") != process_arguments
         or receipt.get("shell") is not False
         or receipt.get("pane_log") != log_identity
+        or receipt.get("fault_channel", {}).get("path")
+        != str(expected_attempt_root / "wrapper_fault.channel")
+        or receipt.get(
+            "pane_gate_fault_channel", {}
+        ).get("path")
+        != str(
+            expected_attempt_root / "pane_gate_fault.channel"
+        )
+        or receipt.get("pane_gate_fault_publisher")
+        != {
+            **dict(
+                receipt.get("bindings", {}).get(
+                    "launcher", {}
+                )
+            ),
+            "role": "launcher_pane_gate",
+        }
         or receipt.get("git") != _launcher_git_state(repo_root)
         or receipt.get("bindings", {}).get("config")
         != config_binding
@@ -3328,20 +4999,31 @@ def _validate_preflight_launch_receipt(
         != _canonical_digest(receipt, "launch_receipt_sha256")
     ):
         raise RuntimeError("formal preflight launch receipt differs")
+    consumer_runtime = _validate_pane_fault_consumer_runtime(
+        receipt=receipt,
+        expected_attempt_root=expected_attempt_root,
+        label="wrapper receipt pane fault consumer",
+    )
     deadline = time.monotonic() + LAUNCH_ACCEPTED_WAIT_SECONDS
-    while not wrapper_started_path.is_file():
+    while (
+        _secure_read_file(
+            wrapper_started_path, missing_ok=True
+        )
+        is None
+    ):
         if time.monotonic() >= deadline:
             raise RuntimeError(
                 "formal preflight wrapper-start evidence timed out"
             )
         time.sleep(0.005)
-    wrapper_started = json.loads(
-        wrapper_started_path.read_text(encoding="utf-8")
+    wrapper_started_snapshot = _secure_json_snapshot(
+        wrapper_started_path,
+        digest_field="wrapper_started_sha256",
     )
+    assert wrapper_started_snapshot is not None
+    wrapper_started = dict(wrapper_started_snapshot["value"])
     wrapper_launch_process = _launch_process_identity(os.getpid())
-    gate_ready = json.loads(
-        gate_ready_path.read_text(encoding="utf-8")
-    )
+    gate_ready = dict(gate_ready_snapshot["value"])
     validate_gate_ready(
         gate_ready,
         verified_implementations=live_implementations,
@@ -3368,6 +5050,8 @@ def _validate_preflight_launch_receipt(
         or tmux_started.get("pane_gate_ready")
         != gate_ready_binding
         or tmux_started.get("owner_seal", {}).get("pane_process")
+        != supervisor_ready.get("supervisor_process")
+        or supervisor_ready.get("gate_worker_process")
         != gate_ready.get("process")
         or gate_ready.get("wrapper_arguments")
         != process_arguments
@@ -3387,7 +5071,7 @@ def _validate_preflight_launch_receipt(
         or gate_ready.get("process", {}).get("pgid") != os.getppid()
         or gate_ready.get("process", {}).get("sid") != os.getppid()
         or _process_command_bytes(os.getppid())
-        != _command_bytes(receipt["pane_gate_arguments"])
+        != _command_bytes(receipt["gate_worker_arguments"])
         or str(Path(os.readlink(f"/proc/{os.getppid()}/exe")).resolve())
         != receipt["python_executable"]["path"]
         or wrapper_started.get("wrapper_arguments")
@@ -3405,7 +5089,6 @@ def _validate_preflight_launch_receipt(
         != _canonical_digest(
             wrapper_started, "wrapper_started_sha256"
         )
-        or _opened_file_identity(receipt_path) != receipt_identity
     ):
         raise RuntimeError("formal preflight wrapper-start evidence differs")
     return {
@@ -3417,10 +5100,13 @@ def _validate_preflight_launch_receipt(
         "gate_ready_binding": gate_ready_binding,
         "gate_ready": gate_ready,
         "tmux_started_binding": tmux_started_binding,
-        "wrapper_started_binding": _json_binding(
-            wrapper_started_path, "wrapper_started_sha256"
+        "wrapper_started_binding": dict(
+            wrapper_started_snapshot["binding"]
         ),
         "wrapper_started": wrapper_started,
+        "gate_supervisor_process": supervisor_ready[
+            "supervisor_process"
+        ],
         "gate_process": wrapper_started["pane_gate_process"],
         "wrapper_launch_process": wrapper_launch_process,
         "accepted_path": accepted_path,
@@ -3429,6 +5115,11 @@ def _validate_preflight_launch_receipt(
         "wrapper_executable": executable,
         "pane_log": log_identity,
         "git": dict(receipt["git"]),
+        "pane_fault_consumer_registration": (
+            consumer_runtime["registration"]
+        ),
+        "pane_fault_consumer_chain": consumer_runtime["chain"],
+        "pane_fault_consumer_active": consumer_runtime["active"],
     }
 
 
@@ -3441,21 +5132,28 @@ def _wait_preflight_launch_release(
     release_path = Path(str(launch["release_path"]))
     terminal_path = accepted_path.with_name("launch_terminal.json")
     deadline = time.monotonic() + LAUNCH_ACCEPTED_WAIT_SECONDS
-    while not release_path.is_file():
+    while _secure_read_file(release_path, missing_ok=True) is None:
         if time.monotonic() >= deadline:
             raise RuntimeError(
                 "formal preflight launch acceptance timed out"
             )
         time.sleep(0.02)
-    accepted = json.loads(
-        accepted_path.read_text(encoding="utf-8")
+    accepted_snapshot = _secure_json_snapshot(
+        accepted_path, digest_field="launch_accepted_sha256"
     )
-    terminal = json.loads(
-        terminal_path.read_text(encoding="utf-8")
+    terminal_snapshot = _secure_json_snapshot(
+        terminal_path, digest_field="launch_terminal_sha256"
     )
-    release = json.loads(
-        release_path.read_text(encoding="utf-8")
+    release_snapshot = _secure_json_snapshot(
+        release_path,
+        digest_field="launch_ownership_release_sha256",
     )
+    assert accepted_snapshot is not None
+    assert terminal_snapshot is not None
+    assert release_snapshot is not None
+    accepted = dict(accepted_snapshot["value"])
+    terminal = dict(terminal_snapshot["value"])
+    release = dict(release_snapshot["value"])
     validate_ownership_chain(
         accepted,
         terminal,
@@ -3463,14 +5161,13 @@ def _wait_preflight_launch_release(
         receipt_binding=launch["receipt_binding"],
         receipt_identity=launch["receipt_identity"],
         wrapper_binding=wrapper_binding,
-        accepted_binding=_json_binding(
-            accepted_path, "launch_accepted_sha256"
-        ),
-        terminal_binding=_json_binding(
-            terminal_path, "launch_terminal_sha256"
-        ),
+        accepted_binding=dict(accepted_snapshot["binding"]),
+        terminal_binding=dict(terminal_snapshot["binding"]),
         verified_implementations=launch[
             "verified_implementations"
+        ],
+        pane_fault_consumer_chain=launch[
+            "pane_fault_consumer_chain"
         ],
         label="formal preflight launch ownership chain",
     )
@@ -3498,7 +5195,10 @@ def _run_wrapped_controller_owned(
     verified_implementations = _install_verified_preflight_apis(
         config
     )
-    control = policy_root.resolve() / "preflight_control"
+    exact_policy_root = policy_root.resolve()
+    control = _ensure_secure_leaf_directories(
+        exact_policy_root, ("preflight_control",)
+    )
     wrapper_claim_path = control / "wrapper_claim.json"
     process_log_path = control / "controller_process.log"
     process_exit_path = control / "controller_process_exit.json"
@@ -3547,8 +5247,19 @@ def _run_wrapped_controller_owned(
         CONTROLLER_SESSION,
         controller_tmux,
         controller_tmux_server,
-        launch["gate_process"],
+        launch["gate_supervisor_process"],
     )
+    _assert_process_identity(
+        launch["gate_process"], "CPU preflight gate worker"
+    )
+    if (
+        launch["gate_process"]["ppid"]
+        != launch["gate_supervisor_process"]["pid"]
+        or wrapper_process["ppid"] != launch["gate_process"]["pid"]
+    ):
+        raise RuntimeError(
+            "preflight supervisor/gate/wrapper process chain differs"
+        )
     verified_implementations = _reverify_verified_preflight_apis()
     if verified_implementations != launch["verified_implementations"]:
         raise RuntimeError(
@@ -3589,6 +5300,9 @@ def _run_wrapped_controller_owned(
         wrapper_launch_process=launch["wrapper_launch_process"],
         started_at=started_at,
         external_timeout_seconds=None,
+        pane_fault_consumer_chain=(
+            launch["pane_fault_consumer_chain"]
+        ),
         gate_ready=launch["gate_ready"],
         wrapper_started=launch["wrapper_started"],
     )
@@ -3813,6 +5527,7 @@ def _run_wrapped_controller_owned(
             )
         observer_launch_status = "launched"
     except BaseException as exc:
+        _propagate_publish_error(exc)
         recorded_owner = emergency_state.get(
             "provisional_observer"
         )
@@ -3911,6 +5626,7 @@ def _run_wrapped_controller_owned(
             observer_launch_binding
         )
     except BaseException as exc:
+        _propagate_publish_error(exc)
         observer_launch_failure = _merge_launch_failure(
             observer_launch_failure,
             stage="observer_launch_write",
@@ -4027,6 +5743,7 @@ def _run_wrapped_controller_owned(
                 observer_cleanup_path, "observer_cleanup_sha256"
             )
         except BaseException as exc:
+            _propagate_publish_error(exc)
             durable_launch_failure = _merge_launch_failure(
                 durable_launch_failure,
                 stage="observer_cleanup_write",
@@ -4061,6 +5778,7 @@ def _run_wrapped_controller_owned(
                 process_start_path, "controller_process_start_sha256"
             )
         except BaseException as exc:
+            _propagate_publish_error(exc)
             durable_launch_failure = _merge_launch_failure(
                 durable_launch_failure,
                 stage="controller_not_started_write",
@@ -4101,6 +5819,7 @@ def _run_wrapped_controller_owned(
                 process_exit_path, "controller_process_exit_sha256"
             )
         except BaseException as exc:
+            _propagate_publish_error(exc)
             durable_launch_failure = _merge_launch_failure(
                 durable_launch_failure,
                 stage="controller_not_started_exit_write",
@@ -4145,7 +5864,6 @@ def _run_wrapped_controller_owned(
         return _publish_wrapper_exit_total(
             wrapper_exit_path, failed_wrapper_exit
         )
-    process_log_path.parent.mkdir(parents=True, exist_ok=True)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -4170,6 +5888,7 @@ def _run_wrapped_controller_owned(
     observer_terminal_validation_failure: dict[str, str] | None = None
     late_observer_terminal_validation_failure: dict[str, str] | None = None
     launch_failure: dict[str, Any] | None = None
+    publication_poison: ExclusivePublishError | None = None
 
     def optional_artifact_binding(
         path: Path, stage: str
@@ -4178,6 +5897,7 @@ def _run_wrapped_controller_owned(
         try:
             return _optional_binding(path)
         except BaseException as exc:
+            _propagate_publish_error(exc)
             launch_failure = _merge_launch_failure(
                 launch_failure,
                 stage=stage,
@@ -4187,6 +5907,22 @@ def _run_wrapped_controller_owned(
             return None
 
     try:
+        live_consumer = _validate_pane_fault_consumer_runtime(
+            receipt=launch["receipt"],
+            expected_attempt_root=Path(
+                launch[
+                    "pane_fault_consumer_registration"
+                ]["namespace"]
+            ).parent,
+            label="wrapper controller conversion pane fault consumer",
+        )
+        if (
+            live_consumer["chain"]
+            != launch["pane_fault_consumer_chain"]
+        ):
+            raise RuntimeError(
+                "pane fault consumer chain changed before controller start"
+            )
         descriptor = os.open(process_log_path, flags, 0o644)
         controller_environment = dict(os.environ)
         controller_environment[OBSERVER_SESSION_ENV] = OBSERVER_SESSION
@@ -4259,7 +5995,12 @@ def _run_wrapped_controller_owned(
                     observer_tmux_server,
                     observer_process,
                 )
-                if observer_stop_path.is_file():
+                if (
+                    _secure_read_file(
+                        observer_stop_path, missing_ok=True
+                    )
+                    is not None
+                ):
                     stop = _validate_observer_stop(
                         observer_stop_path,
                         policy_sha256=policy_sha256,
@@ -4279,6 +6020,7 @@ def _run_wrapped_controller_owned(
                     )
                     break
             except BaseException as exc:
+                _propagate_publish_error(exc)
                 launch_failure = _merge_launch_failure(
                     launch_failure,
                     stage="controller_monitor",
@@ -4287,6 +6029,9 @@ def _run_wrapped_controller_owned(
                 )
                 break
             time.sleep(0.1)
+    except ExclusivePublishError as exc:
+        publication_poison = exc
+        raise
     except BaseException as exc:
         launch_failure = _merge_launch_failure(
             launch_failure,
@@ -4301,74 +6046,148 @@ def _run_wrapped_controller_owned(
                 if controller_process_start is None
                 else controller_process_start.get("process")
             )
-            return_code, controller_process_closure = (
-                _close_owned_controller_process(
-                    process,
-                    sealed_process,
-                    terminate=launch_failure is not None,
-                )
-            )
-            if controller_process_closure["failures"]:
-                for closure_failure in controller_process_closure[
-                    "failures"
-                ]:
-                    launch_failure = _merge_launch_failure(
-                        launch_failure,
-                        stage=(
-                            "controller_closure."
-                            f"{closure_failure['stage']}"
-                        ),
-                        failure_type=str(closure_failure["type"]),
-                        message=str(closure_failure["message"]),
-                    )
-            if (
-                not controller_process_closure["wait_observed"]
-                or controller_process_closure["process_residual"] is not False
-            ):
-                launch_failure = _merge_launch_failure(
-                    launch_failure,
-                    stage="controller_closure.residual",
-                    failure_type="ControllerProcessResidual",
-                    message=(
-                        "controller process was not proven reaped by wait"
-                    ),
-                )
             try:
-                _write_exclusive(
-                    process_closure_path, controller_process_closure
-                )
-                controller_process_closure_binding = _json_binding(
-                    process_closure_path,
-                    "controller_process_closure_sha256",
+                return_code, controller_process_closure = (
+                    _close_owned_controller_process(
+                        process,
+                        sealed_process,
+                        terminate=(
+                            publication_poison is not None
+                            or launch_failure is not None
+                        ),
+                    )
                 )
             except BaseException as exc:
-                launch_failure = _merge_launch_failure(
-                    launch_failure,
-                    stage="controller_closure_write",
-                    failure_type=type(exc).__name__,
-                    message=str(exc),
-                )
-        if descriptor is not None:
-            try:
-                try:
-                    os.fsync(descriptor)
-                except BaseException as exc:
+                if publication_poison is not None:
+                    publication_poison.add_secondary_failure(
+                        stage="controller_process_reap",
+                        failure=exc,
+                    )
+                else:
+                    raise
+            if (
+                publication_poison is None
+                and controller_process_closure is not None
+            ):
+                if controller_process_closure["failures"]:
+                    for closure_failure in controller_process_closure[
+                        "failures"
+                    ]:
+                        launch_failure = _merge_launch_failure(
+                            launch_failure,
+                            stage=(
+                                "controller_closure."
+                                f"{closure_failure['stage']}"
+                            ),
+                            failure_type=str(
+                                closure_failure["type"]
+                            ),
+                            message=str(
+                                closure_failure["message"]
+                            ),
+                        )
+                if (
+                    not controller_process_closure["wait_observed"]
+                    or controller_process_closure[
+                        "process_residual"
+                    ]
+                    is not False
+                ):
                     launch_failure = _merge_launch_failure(
                         launch_failure,
-                        stage="controller_log_fsync",
+                        stage="controller_closure.residual",
+                        failure_type="ControllerProcessResidual",
+                        message=(
+                            "controller process was not proven reaped "
+                            "by wait"
+                        ),
+                    )
+                try:
+                    _write_exclusive(
+                        process_closure_path,
+                        controller_process_closure,
+                    )
+                    controller_process_closure_binding = (
+                        _json_binding(
+                            process_closure_path,
+                            "controller_process_closure_sha256",
+                        )
+                    )
+                except BaseException as exc:
+                    _propagate_publish_error(exc)
+                    launch_failure = _merge_launch_failure(
+                        launch_failure,
+                        stage="controller_closure_write",
                         failure_type=type(exc).__name__,
                         message=str(exc),
                     )
-            finally:
+        if (
+            publication_poison is not None
+            and observer_tmux is not None
+            and observer_tmux_server is not None
+            and observer_tmux_owner_seal is not None
+            and observer_process is not None
+        ):
+            try:
+                observer_termination = (
+                    _terminate_bound_observer(
+                        observer_tmux,
+                        observer_tmux_server,
+                        observer_tmux_owner_seal,
+                        observer_process,
+                    )
+                )
+                if (
+                    observer_termination.get(
+                        "session_residual"
+                    )
+                    is not False
+                    or observer_termination.get(
+                        "process_residual"
+                    )
+                    is not False
+                ):
+                    publication_poison.add_secondary_failure(
+                        stage="observer_reap",
+                        failure=RuntimeError(
+                            "observer reap left a residual"
+                        ),
+                    )
+            except BaseException as exc:
+                publication_poison.add_secondary_failure(
+                    stage="observer_reap",
+                    failure=exc,
+                )
+        if descriptor is not None:
+            if publication_poison is not None:
                 try:
                     os.close(descriptor)
                 except BaseException as exc:
-                    launch_failure = _merge_launch_failure(
-                        launch_failure,
+                    publication_poison.add_secondary_failure(
                         stage="controller_log_close",
-                        failure_type=type(exc).__name__,
-                        message=str(exc),
+                        failure=exc,
                     )
+            else:
+                try:
+                    try:
+                        os.fsync(descriptor)
+                    except BaseException as exc:
+                        launch_failure = _merge_launch_failure(
+                            launch_failure,
+                            stage="controller_log_fsync",
+                            failure_type=type(exc).__name__,
+                            message=str(exc),
+                        )
+                finally:
+                    try:
+                        os.close(descriptor)
+                    except BaseException as exc:
+                        launch_failure = _merge_launch_failure(
+                            launch_failure,
+                            stage="controller_log_close",
+                            failure_type=type(exc).__name__,
+                            message=str(exc),
+                        )
     if (
         process is not None
         and controller_process_closure is not None
@@ -4376,7 +6195,13 @@ def _run_wrapped_controller_owned(
         and return_code is not None
     ):
         exit_code, signal_number = _normalized_exit(return_code)
-        if observer_stop_path.is_file() and observer_stop_binding is None:
+        if (
+            _secure_read_file(
+                observer_stop_path, missing_ok=True
+            )
+            is not None
+            and observer_stop_binding is None
+        ):
             try:
                 stop = _validate_observer_stop(
                     observer_stop_path,
@@ -4435,6 +6260,7 @@ def _run_wrapped_controller_owned(
         try:
             _write_exclusive(process_exit_path, process_exit)
         except BaseException as exc:
+            _propagate_publish_error(exc)
             launch_failure = _merge_launch_failure(
                 launch_failure,
                 stage="controller_process_exit_write",
@@ -4607,6 +6433,7 @@ def _run_wrapped_controller_owned(
                 observer_cleanup_path, "observer_cleanup_sha256"
             )
         except BaseException as exc:
+            _propagate_publish_error(exc)
             launch_failure = _merge_launch_failure(
                 launch_failure,
                 stage="observer_cleanup_write",
@@ -4666,6 +6493,7 @@ def _run_wrapped_controller_owned(
                 observer_cleanup_path, "observer_cleanup_sha256"
             )
         except BaseException as exc:
+            _propagate_publish_error(exc)
             launch_failure = _merge_launch_failure(
                 launch_failure,
                 stage="observer_cleanup_write",
@@ -4865,6 +6693,8 @@ def run_wrapped_controller(
             emergency_state=emergency_state,
         )
     except BaseException as exc:
+        if isinstance(exc, ExclusivePublishError):
+            raise
         failure = _merge_launch_failure(
             None,
             stage="outer_emergency_closure",
@@ -4905,15 +6735,15 @@ def run_wrapped_controller(
                     message=str(item["message"]),
                 )
             try:
-                if not closure_path.exists():
-                    _write_exclusive(
-                        closure_path, controller_closure
-                    )
+                _write_exclusive(
+                    closure_path, controller_closure
+                )
                 controller_closure_binding = _json_binding(
                     closure_path,
                     "controller_process_closure_sha256",
                 )
             except BaseException as closure_exc:
+                _propagate_publish_error(closure_exc)
                 failure = _merge_launch_failure(
                     failure,
                     stage="outer_controller_closure_write",
@@ -4992,12 +6822,12 @@ def run_wrapped_controller(
                 )
             )
             try:
-                if not cleanup_path.exists():
-                    _write_exclusive(cleanup_path, cleanup)
+                _write_exclusive(cleanup_path, cleanup)
                 cleanup_binding = _json_binding(
                     cleanup_path, "observer_cleanup_sha256"
                 )
             except BaseException as cleanup_exc:
+                _propagate_publish_error(cleanup_exc)
                 failure = _merge_launch_failure(
                     failure,
                     stage="outer_observer_cleanup_write",
@@ -5177,11 +7007,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise RuntimeError(
             "formal preflight launcher CLI/environment differs"
         )
-    receipt = json.loads(
-        args.launch_receipt.read_text(encoding="utf-8")
+    cli_receipt_snapshot = _secure_json_snapshot(
+        args.launch_receipt,
+        digest_field="launch_receipt_sha256",
     )
+    assert cli_receipt_snapshot is not None
+    receipt = dict(cli_receipt_snapshot["value"])
     if receipt.get("attempt_id") != args.attempt_id:
         raise RuntimeError("formal preflight attempt ID differs")
+    _fault_channel_context = _bind_inherited_fault_channel(
+        receipt
+    )
     repo_root = args.repo_root.resolve()
     config = args.config.resolve()
     campaign_root = args.campaign_root.resolve()
@@ -5212,14 +7048,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         "preflight",
         "--execute",
     ]
-    value = run_wrapped_controller(
-        repo_root=repo_root,
-        policy_root=policy_root,
-        policy_sha256=args.policy_sha256,
-        config=config,
-        command=command,
-        observer_command=observer_command,
+    def run_operation() -> dict[str, Any]:
+        return run_wrapped_controller(
+            repo_root=repo_root,
+            policy_root=policy_root,
+            policy_sha256=args.policy_sha256,
+            config=config,
+            command=command,
+            observer_command=observer_command,
+        )
+
+    (
+        value,
+        dedicated_failure_code,
+        dedicated_failure,
+    ) = _execute_with_fault_reporting(
+        _fault_channel_context, run_operation
     )
+    if dedicated_failure_code is not None:
+        print(
+            json.dumps(
+                dedicated_failure,
+                sort_keys=True,
+                allow_nan=False,
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+        return dedicated_failure_code
+    assert value is not None
     print(json.dumps(value, sort_keys=True, allow_nan=False))
     return int(value["exit_code"])
 
