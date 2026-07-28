@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 from typing import Any, Mapping, Sequence, TYPE_CHECKING
 
 
@@ -56,6 +57,24 @@ if TYPE_CHECKING:
         write_exclusive_json,
         write_preflight_requests,
     )
+    from safa.closeout.preflight_launch_contract import (
+        PreflightLaunchContractError,
+        build_artifact_binding,
+        build_file_identity,
+        build_process_identity,
+        build_tmux_server_identity,
+        build_verified_implementations,
+        validate_artifact_binding,
+        validate_claim_v3,
+        validate_executable_identity,
+        validate_file_identity,
+        validate_gate_ready,
+        validate_ownership_chain,
+        validate_pane_owner_seal,
+        validate_tmux_started,
+        validate_verified_implementations,
+        validate_wrapper_started,
+    )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _CONTRACT_EXPORTS = (
@@ -88,7 +107,33 @@ _CONTRACT_EXPORTS = (
     "write_exclusive_json",
     "write_preflight_requests",
 )
+_PREFLIGHT_CONTRACT_EXPORTS = (
+    "PreflightLaunchContractError",
+    "build_artifact_binding",
+    "build_file_identity",
+    "build_process_identity",
+    "build_tmux_server_identity",
+    "build_tmux_started",
+    "build_verified_implementations",
+    "validate_artifact_binding",
+    "validate_claim_v3",
+    "validate_executable_identity",
+    "validate_file_identity",
+    "validate_gate_ready",
+    "validate_ownership_chain",
+    "validate_pane_owner_seal",
+    "validate_tmux_server_identity",
+    "validate_tmux_started",
+    "validate_verified_implementations",
+    "validate_wrapper_started",
+)
 _CONTRACT_API_INSTALLED = False
+_PREFLIGHT_CONTRACT_API_INSTALLED = False
+_PREFLIGHT_CONTRACT_MODULE: types.ModuleType | None = None
+_PREFLIGHT_CONTRACT_SEAL: tuple[Any, ...] | None = None
+_PREFLIGHT_VERIFIED_LOADER_SEAL: tuple[Any, ...] | None = None
+_PREFLIGHT_VERIFIED_IMPLEMENTATIONS: dict[str, Any] | None = None
+_PREFLIGHT_IMPLEMENTATIONS: dict[str, dict[str, str]] | None = None
 PHASES = (
     "plan",
     "prepare",
@@ -166,7 +211,13 @@ def _stdlib_validate_implementation_bindings(
         raise ControllerBootstrapError(
             "controller bootstrap policy omits implementations"
         )
-    required = {"screening_contracts", "screening_worker", "controller"}
+    required = {
+        "screening_contracts",
+        "screening_worker",
+        "preflight_launch_contract",
+        "preflight_verified_loader",
+        "controller",
+    }
     if not required.issubset(implementations):
         raise ControllerBootstrapError(
             "controller bootstrap policy omits trust-boundary implementations"
@@ -208,15 +259,258 @@ def _stdlib_validate_implementation_bindings(
     return normalized, _stdlib_sha256_file(resolved_config)
 
 
+def _stdlib_read_sealed_module_source(
+    path: Path, expected_sha256: str
+) -> tuple[bytes, tuple[Any, ...]]:
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_CLOEXEC"):
+        raise ControllerBootstrapError(
+            "controller bootstrap requires no-follow file descriptors"
+        )
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+    except OSError as exc:
+        raise ControllerBootstrapError(
+            f"preflight launch contract cannot be opened: {path}"
+        ) from exc
+    try:
+        before = os.fstat(descriptor)
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+    except OSError as exc:
+        raise ControllerBootstrapError(
+            f"preflight launch contract cannot be read: {path}"
+        ) from exc
+    finally:
+        os.close(descriptor)
+    source = b"".join(chunks)
+    before_identity = (
+        str(path),
+        int(before.st_dev),
+        int(before.st_ino),
+        int(before.st_mode),
+        int(before.st_size),
+        expected_sha256,
+    )
+    after_identity = (
+        str(path),
+        int(after.st_dev),
+        int(after.st_ino),
+        int(after.st_mode),
+        int(after.st_size),
+        expected_sha256,
+    )
+    if (
+        before_identity != after_identity
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_size != len(source)
+        or hashlib.sha256(source).hexdigest() != expected_sha256
+    ):
+        raise ControllerBootstrapError(
+            "preflight launch contract file identity or SHA differs"
+        )
+    return source, before_identity
+
+
+def _stdlib_reverify_preflight_contract(
+    module: types.ModuleType,
+    seal: tuple[Any, ...],
+    implementations: Mapping[str, Mapping[str, str]],
+) -> None:
+    binding = implementations["preflight_launch_contract"]
+    path = Path(binding["path"])
+    _source, current_seal = _stdlib_read_sealed_module_source(
+        path, binding["sha256"]
+    )
+    loader_binding = implementations["preflight_verified_loader"]
+    _loader_source, current_loader_seal = (
+        _stdlib_read_sealed_module_source(
+            Path(loader_binding["path"]),
+            loader_binding["sha256"],
+        )
+    )
+    if (
+        current_seal != seal
+        or _PREFLIGHT_VERIFIED_LOADER_SEAL is None
+        or current_loader_seal != _PREFLIGHT_VERIFIED_LOADER_SEAL
+        or any(
+            globals().get(name) is not getattr(module, name, None)
+            for name in _PREFLIGHT_CONTRACT_EXPORTS
+        )
+    ):
+        raise ControllerBootstrapError(
+            "preflight launch contract changed after verified import"
+        )
+
+
+def _install_verified_preflight_contract_api(
+    config: Path,
+) -> tuple[dict[str, dict[str, str]], str]:
+    global _PREFLIGHT_CONTRACT_API_INSTALLED
+    global _PREFLIGHT_CONTRACT_MODULE
+    global _PREFLIGHT_CONTRACT_SEAL
+    global _PREFLIGHT_VERIFIED_LOADER_SEAL
+    global _PREFLIGHT_VERIFIED_IMPLEMENTATIONS
+    global _PREFLIGHT_IMPLEMENTATIONS
+    implementations, config_sha256 = _stdlib_validate_implementation_bindings(
+        config
+    )
+    launch_contracts_path = Path(
+        implementations["preflight_launch_contract"]["path"]
+    )
+    expected_path = (
+        REPO_ROOT / "src/safa/closeout/preflight_launch_contract.py"
+    ).resolve(strict=True)
+    if launch_contracts_path != expected_path:
+        raise ControllerBootstrapError(
+            "preflight launch contract path differs from exact repository path"
+        )
+    source, seal = _stdlib_read_sealed_module_source(
+        launch_contracts_path,
+        implementations["preflight_launch_contract"]["sha256"],
+    )
+    verified_loader_path = Path(
+        implementations["preflight_verified_loader"]["path"]
+    )
+    expected_loader_path = (
+        REPO_ROOT
+        / "src/safa/closeout/verified_preflight_module_loader.py"
+    ).resolve(strict=True)
+    if verified_loader_path != expected_loader_path:
+        raise ControllerBootstrapError(
+            "verified preflight loader path differs from exact repository path"
+        )
+    _loader_source, loader_seal = _stdlib_read_sealed_module_source(
+        verified_loader_path,
+        implementations["preflight_verified_loader"]["sha256"],
+    )
+    launch_module = types.ModuleType(
+        "_safa_verified_preflight_launch_contract"
+    )
+    launch_module.__file__ = str(launch_contracts_path)
+    launch_module.__package__ = "safa.closeout"
+    try:
+        exec(
+            compile(source, str(launch_contracts_path), "exec"),
+            launch_module.__dict__,
+        )
+    except BaseException as exc:
+        raise ControllerBootstrapError(
+            "verified preflight launch contract import failed"
+        ) from exc
+    missing_launch = [
+        name
+        for name in _PREFLIGHT_CONTRACT_EXPORTS
+        if not hasattr(launch_module, name)
+    ]
+    if missing_launch:
+        raise ControllerBootstrapError(
+            "preflight launch contracts omit controller API: "
+            f"{missing_launch}"
+        )
+    for name in _PREFLIGHT_CONTRACT_EXPORTS:
+        globals()[name] = getattr(launch_module, name)
+    if _stdlib_sha256_file(config.resolve()) != config_sha256:
+        raise ControllerBootstrapError(
+            "policy changed during preflight contract bootstrap"
+        )
+    _PREFLIGHT_CONTRACT_MODULE = launch_module
+    _PREFLIGHT_CONTRACT_SEAL = seal
+    _PREFLIGHT_VERIFIED_LOADER_SEAL = loader_seal
+    _PREFLIGHT_VERIFIED_IMPLEMENTATIONS = (
+        build_verified_implementations(
+            verified_loader={
+                "path": loader_seal[0],
+                "sha256": loader_seal[5],
+                "file_identity": {
+                    "path": loader_seal[0],
+                    "device": loader_seal[1],
+                    "inode": loader_seal[2],
+                    "mode": loader_seal[3],
+                    "size": loader_seal[4],
+                },
+            },
+            preflight_launch_contract={
+                "path": seal[0],
+                "sha256": seal[5],
+                "file_identity": {
+                    "path": seal[0],
+                    "device": seal[1],
+                    "inode": seal[2],
+                    "mode": seal[3],
+                    "size": seal[4],
+                },
+            },
+        )
+    )
+    _PREFLIGHT_IMPLEMENTATIONS = {
+        name: dict(binding)
+        for name, binding in implementations.items()
+    }
+    _PREFLIGHT_CONTRACT_API_INSTALLED = True
+    _stdlib_reverify_preflight_contract(
+        launch_module, seal, implementations
+    )
+    return implementations, config_sha256
+
+
+def _verified_preflight_implementations(
+    implementations: Mapping[str, Mapping[str, str]] | None = None,
+) -> dict[str, Any]:
+    active_implementations = (
+        _PREFLIGHT_IMPLEMENTATIONS
+        if implementations is None
+        else implementations
+    )
+    if (
+        _PREFLIGHT_CONTRACT_MODULE is None
+        or _PREFLIGHT_CONTRACT_SEAL is None
+        or _PREFLIGHT_VERIFIED_IMPLEMENTATIONS is None
+        or active_implementations is None
+    ):
+        raise ControllerBootstrapError(
+            "verified preflight implementations are not installed"
+        )
+    _stdlib_reverify_preflight_contract(
+        _PREFLIGHT_CONTRACT_MODULE,
+        _PREFLIGHT_CONTRACT_SEAL,
+        active_implementations,
+    )
+    return validate_verified_implementations(
+        _PREFLIGHT_VERIFIED_IMPLEMENTATIONS
+    )
+
+
 def _install_verified_contract_api(
     config: Path,
     *,
     verify_historical_output_evidence: bool = True,
 ) -> dict[str, Any]:
     global _CONTRACT_API_INSTALLED
-    implementations, config_sha256 = _stdlib_validate_implementation_bindings(
-        config
-    )
+    if (
+        not _PREFLIGHT_CONTRACT_API_INSTALLED
+        or _PREFLIGHT_CONTRACT_MODULE is None
+        or _PREFLIGHT_CONTRACT_SEAL is None
+    ):
+        implementations, config_sha256 = (
+            _install_verified_preflight_contract_api(config)
+        )
+    else:
+        implementations, config_sha256 = (
+            _stdlib_validate_implementation_bindings(config)
+        )
+        _stdlib_reverify_preflight_contract(
+            _PREFLIGHT_CONTRACT_MODULE,
+            _PREFLIGHT_CONTRACT_SEAL,
+            implementations,
+        )
     contracts_path = Path(implementations["screening_contracts"]["path"])
     module = importlib.import_module("safa.closeout.canonical_screening")
     if Path(module.__file__).resolve() != contracts_path:
@@ -249,6 +543,18 @@ def _install_verified_contract_api(
         raise ControllerBootstrapError(
             "policy or implementation bindings changed during controller bootstrap"
         )
+    if (
+        _PREFLIGHT_CONTRACT_MODULE is None
+        or _PREFLIGHT_CONTRACT_SEAL is None
+    ):
+        raise ControllerBootstrapError(
+            "preflight launch contract seal is unavailable"
+        )
+    _stdlib_reverify_preflight_contract(
+        _PREFLIGHT_CONTRACT_MODULE,
+        _PREFLIGHT_CONTRACT_SEAL,
+        implementations,
+    )
     _CONTRACT_API_INSTALLED = True
     return policy
 
@@ -355,9 +661,9 @@ def _stdlib_optional_artifact_binding(
     resolved = path.resolve()
     if not resolved.is_file():
         return {
-            "path": str(resolved),
-            "sha256": None,
-            "canonical_sha256": None,
+            "observed_path": str(resolved),
+            "observed_sha256": None,
+            "observed_canonical_sha256": None,
         }
     canonical_sha256 = None
     if digest_field is not None:
@@ -375,9 +681,9 @@ def _stdlib_optional_artifact_binding(
         ):
             canonical_sha256 = candidate
     return {
-        "path": str(resolved),
-        "sha256": _stdlib_sha256_file(resolved),
-        "canonical_sha256": canonical_sha256,
+        "observed_path": str(resolved),
+        "observed_sha256": _stdlib_sha256_file(resolved),
+        "observed_canonical_sha256": canonical_sha256,
     }
 
 
@@ -1391,28 +1697,28 @@ def _write_admission(
     ).hexdigest()
     path = paths["admissions"] / f"{phase}__{value['admission_sha256']}.json"
     publish_exclusive_json(path, value)
-    return {
-        "path": str(path.resolve()),
-        "sha256": sha256_file(path),
-        "canonical_sha256": value["admission_sha256"],
-    }
+    return _artifact_binding(path, value["admission_sha256"])
 
 
 def _artifact_binding(path: Path, canonical_sha256: str) -> dict[str, str]:
     if not path.is_file():
         raise CanonicalScreeningError(f"bound artifact does not exist: {path}")
-    return {
-        "path": str(path.resolve()),
-        "sha256": sha256_file(path),
-        "canonical_sha256": canonical_sha256,
-    }
+    return build_artifact_binding(
+        path=str(path.resolve()),
+        sha256=sha256_file(path),
+        canonical_sha256=canonical_sha256,
+    )
 
 
 def _validate_json_artifact_binding(
     binding: Mapping[str, Any], label: str, digest_field: str
 ) -> dict[str, Any]:
-    if set(binding) != {"path", "sha256", "canonical_sha256"}:
-        raise CanonicalScreeningError(f"{label} binding fields differ")
+    try:
+        binding = validate_artifact_binding(
+            binding, f"{label} binding"
+        )
+    except PreflightLaunchContractError as exc:
+        raise CanonicalScreeningError(str(exc)) from exc
     path = Path(str(binding["path"])).resolve()
     if not path.is_file() or sha256_file(path) != binding["sha256"]:
         raise CanonicalScreeningError(f"{label} file binding mismatch")
@@ -1423,6 +1729,110 @@ def _validate_json_artifact_binding(
     ):
         raise CanonicalScreeningError(f"{label} canonical binding mismatch")
     return value
+
+
+def _require_exact_unsymlinked_directory(
+    raw_path: Any,
+    expected_path: Path,
+    label: str,
+) -> os.stat_result:
+    expected = Path(os.path.abspath(expected_path))
+    supplied = Path(str(raw_path))
+    if (
+        not supplied.is_absolute()
+        or str(supplied) != str(expected)
+        or supplied != expected
+    ):
+        raise CanonicalScreeningError(f"{label} exact path differs")
+    try:
+        resolved = supplied.resolve(strict=True)
+        value = os.lstat(supplied)
+    except OSError as exc:
+        raise CanonicalScreeningError(f"{label} is inaccessible") from exc
+    if (
+        resolved != expected
+        or stat.S_ISLNK(value.st_mode)
+        or not stat.S_ISDIR(value.st_mode)
+    ):
+        raise CanonicalScreeningError(
+            f"{label} must be an exact non-symlink directory"
+        )
+    return value
+
+
+def _require_exact_owned_regular_entry(
+    raw_path: Any,
+    expected_path: Path,
+    label: str,
+    *,
+    identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    expected = Path(os.path.abspath(expected_path))
+    supplied = Path(str(raw_path))
+    if (
+        not supplied.is_absolute()
+        or str(supplied) != str(expected)
+        or supplied != expected
+    ):
+        raise CanonicalScreeningError(f"{label} exact path differs")
+    _require_exact_unsymlinked_directory(
+        str(expected.parent),
+        expected.parent,
+        f"{label} parent",
+    )
+    descriptor = -1
+    entry_descriptor = -1
+    try:
+        descriptor = os.open(
+            expected.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        entry_descriptor = os.open(
+            expected.name,
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=descriptor,
+        )
+        owned = os.fstat(entry_descriptor)
+        direct = os.lstat(expected)
+    except OSError as exc:
+        raise CanonicalScreeningError(
+            f"{label} exact directory entry is inaccessible"
+        ) from exc
+    finally:
+        if entry_descriptor >= 0:
+            os.close(entry_descriptor)
+        if descriptor >= 0:
+            os.close(descriptor)
+    if (
+        stat.S_ISLNK(owned.st_mode)
+        or not stat.S_ISREG(owned.st_mode)
+        or (owned.st_dev, owned.st_ino, owned.st_mode)
+        != (direct.st_dev, direct.st_ino, direct.st_mode)
+    ):
+        raise CanonicalScreeningError(
+            f"{label} is not owned by its exact directory entry"
+        )
+    observed = build_file_identity(
+        path=str(expected),
+        device=int(owned.st_dev),
+        inode=int(owned.st_ino),
+        mode=int(owned.st_mode),
+        size=int(owned.st_size),
+    )
+    if identity is not None:
+        expected_identity = dict(identity)
+        if (
+            not expected_identity
+            or any(key not in observed for key in expected_identity)
+            or {
+                key: observed[key] for key in expected_identity
+            }
+            != expected_identity
+        ):
+            raise CanonicalScreeningError(
+                f"{label} inode identity differs"
+            )
+    return observed
 
 
 def _gpu_phase_control(paths: Mapping[str, Path], phase: str) -> Path:
@@ -1798,11 +2208,7 @@ def _write_final_release_admission(
             load_json(path, "release run request"), policy
         )
         requests.append(
-            {
-                "path": str(path.resolve()),
-                "sha256": sha256_file(path),
-                "canonical_sha256": request["run_request_sha256"],
-            }
+            _artifact_binding(path, request["run_request_sha256"])
         )
     value = {
         "schema_version": 1,
@@ -2180,15 +2586,156 @@ def _process_identity(pid: int) -> dict[str, int]:
             f"process identity is unavailable for PID {pid}"
         )
     try:
-        return {
-            "pid": pid,
-            "pgid": int(fields[2]),
-            "start_ticks": int(fields[19]),
-        }
+        return build_process_identity(
+            pid=pid,
+            ppid=int(fields[1]),
+            pgid=int(fields[2]),
+            sid=int(fields[3]),
+            start_ticks=int(fields[19]),
+        )
     except (IndexError, ValueError) as exc:
         raise CanonicalScreeningError(
             f"process identity stat is malformed for PID {pid}"
         ) from exc
+
+
+def _process_command(pid: int) -> list[str]:
+    try:
+        content = Path(f"/proc/{pid}/cmdline").read_bytes()
+        command = [
+            item.decode("utf-8")
+            for item in content.split(b"\0")
+            if item
+        ]
+    except (OSError, UnicodeError) as exc:
+        raise CanonicalScreeningError(
+            f"process command is unreadable for PID {pid}"
+        ) from exc
+    if not command:
+        raise CanonicalScreeningError(
+            f"process command is empty for PID {pid}"
+        )
+    return command
+
+
+def _process_command_bytes(pid: int) -> bytes:
+    try:
+        value = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError as exc:
+        raise CanonicalScreeningError(
+            f"process command bytes are unreadable for PID {pid}"
+        ) from exc
+    if not value or not value.endswith(b"\0"):
+        raise CanonicalScreeningError(
+            f"process command bytes are malformed for PID {pid}"
+        )
+    return value
+
+
+def _command_bytes(arguments: Sequence[str]) -> bytes:
+    if not arguments or any(not isinstance(item, str) for item in arguments):
+        raise CanonicalScreeningError("expected process arguments are invalid")
+    return b"\0".join(os.fsencode(item) for item in arguments) + b"\0"
+
+
+def _launch_process_identity(pid: int) -> dict[str, int]:
+    raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    closing = raw.rfind(")")
+    if closing < 0:
+        raise CanonicalScreeningError(
+            f"launch process stat is malformed for PID {pid}"
+        )
+    fields = raw[closing + 2 :].split()
+    if len(fields) < 20:
+        raise CanonicalScreeningError(
+            f"launch process stat is incomplete for PID {pid}"
+        )
+    return build_process_identity(
+        pid=pid,
+        ppid=int(fields[1]),
+        pgid=int(fields[2]),
+        sid=int(fields[3]),
+        start_ticks=int(fields[19]),
+    )
+
+
+def _validate_live_preflight_process_layers(
+    wrapper: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+    label: str,
+) -> None:
+    gate = wrapper.get("pane_gate_process")
+    child = wrapper.get("wrapper_launch_process")
+    gate_arguments = receipt.get("pane_gate_arguments")
+    wrapper_arguments = receipt.get("wrapper_arguments")
+    python_binding = receipt.get("python_executable")
+    wrapper_executable = wrapper.get("wrapper_executable")
+    if (
+        not isinstance(gate, Mapping)
+        or not isinstance(child, Mapping)
+        or not isinstance(gate_arguments, list)
+        or not isinstance(wrapper_arguments, list)
+        or not isinstance(python_binding, Mapping)
+        or not isinstance(wrapper_executable, Mapping)
+    ):
+        raise CanonicalScreeningError(f"{label} process seal is malformed")
+    gate_pid = gate.get("pid")
+    wrapper_pid = child.get("pid")
+    if type(gate_pid) is not int or type(wrapper_pid) is not int:
+        raise CanonicalScreeningError(f"{label} process PID seal differs")
+    try:
+        live_gate = _launch_process_identity(gate_pid)
+        live_child = _launch_process_identity(wrapper_pid)
+        gate_cmdline = _process_command_bytes(gate_pid)
+        child_cmdline = _process_command_bytes(wrapper_pid)
+        gate_executable = str(
+            Path(os.readlink(f"/proc/{gate_pid}/exe")).resolve()
+        )
+        child_executable = str(
+            Path(os.readlink(f"/proc/{wrapper_pid}/exe")).resolve()
+        )
+    except (OSError, ProcessLookupError) as exc:
+        raise CanonicalScreeningError(
+            f"{label} sealed process is not live"
+        ) from exc
+    comparisons = (
+        ("gate_identity", live_gate == dict(gate)),
+        ("gate_process_group", gate.get("pgid") == gate_pid),
+        ("gate_session", gate.get("sid") == gate_pid),
+        (
+            "gate_command",
+            gate_cmdline == _command_bytes(gate_arguments),
+        ),
+        (
+            "gate_executable",
+            gate_executable == python_binding.get("path"),
+        ),
+        ("wrapper_identity", live_child == dict(child)),
+        ("distinct_processes", wrapper_pid != gate_pid),
+        ("wrapper_parent", child.get("ppid") == gate_pid),
+        ("wrapper_process_group", child.get("pgid") == wrapper_pid),
+        ("wrapper_session", child.get("sid") == wrapper_pid),
+        (
+            "wrapper_command",
+            child_cmdline == _command_bytes(wrapper_arguments),
+        ),
+        (
+            "wrapper_executable_claim",
+            child_executable == wrapper_executable.get("path"),
+        ),
+        (
+            "wrapper_executable_receipt",
+            child_executable == python_binding.get("path"),
+        ),
+    )
+    failed_comparisons = [
+        name for name, matched in comparisons if not matched
+    ]
+    if failed_comparisons:
+        raise CanonicalScreeningError(
+            f"{label} gate/wrapper exact process seal differs: "
+            + ",".join(failed_comparisons)
+        )
 
 
 def _tmux_identity(session: str) -> dict[str, Any]:
@@ -2304,19 +2851,20 @@ def _tmux_server_identity(target: str) -> dict[str, Any]:
         raise CanonicalScreeningError(
             f"tmux server identity differs for target {target}"
         )
-    identity = {
-        "server_pid": int(rows[0][0]),
-        "socket_path": rows[0][1],
-    }
-    if (
-        set(identity) != {"server_pid", "socket_path"}
-        or type(identity["server_pid"]) is not int
-        or identity["server_pid"] <= 1
-        or not isinstance(identity["socket_path"], str)
-        or not Path(identity["socket_path"]).is_absolute()
-    ):
-        raise CanonicalScreeningError("tmux server identity is invalid")
-    return identity
+    server_pid = int(rows[0][0])
+    socket_path = Path(rows[0][1])
+    socket_value = os.lstat(socket_path)
+    if not stat.S_ISSOCK(socket_value.st_mode):
+        raise CanonicalScreeningError(
+            "tmux server socket identity is invalid"
+        )
+    return build_tmux_server_identity(
+        server_pid=server_pid,
+        server_process=_process_identity(server_pid),
+        socket_path=str(socket_path),
+        socket_device=int(socket_value.st_dev),
+        socket_inode=int(socket_value.st_ino),
+    )
 
 
 def _validate_tmux_owner_nonce(owner_nonce: object) -> str:
@@ -2334,20 +2882,17 @@ def _validate_tmux_owner_seal(
     sealed_tmux: Mapping[str, Any],
     sealed_tmux_server: Mapping[str, Any],
 ) -> None:
-    expected_keys = {
-        "server_pid",
-        "server_start_ticks",
-        "socket_path",
-        "socket_device",
-        "socket_inode",
-        "session",
-        "pane",
-        "pane_pid",
-        "owner_nonce",
-    }
+    try:
+        validate_pane_owner_seal(
+            owner_seal,
+            tmux_identity=sealed_tmux,
+            tmux_server=sealed_tmux_server,
+            label="controller pane owner seal",
+        )
+    except PreflightLaunchContractError as exc:
+        raise CanonicalScreeningError(str(exc)) from exc
     if (
-        set(owner_seal) != expected_keys
-        or owner_seal.get("server_pid")
+        owner_seal.get("server_pid")
         != sealed_tmux_server.get("server_pid")
         or owner_seal.get("socket_path")
         != sealed_tmux_server.get("socket_path")
@@ -2371,6 +2916,18 @@ def _validate_tmux_owner_seal(
     ):
         raise CanonicalScreeningError(
             "tmux owner server process identity differs"
+        )
+    try:
+        pane_process = _launch_process_identity(
+            int(owner_seal["pane_pid"])
+        )
+    except (FileNotFoundError, ProcessLookupError) as exc:
+        raise CanonicalScreeningError(
+            "tmux owner pane process is absent"
+        ) from exc
+    if pane_process != owner_seal["pane_process"]:
+        raise CanonicalScreeningError(
+            "tmux owner pane process identity differs"
         )
     socket_path = Path(str(owner_seal["socket_path"]))
     try:
@@ -2464,6 +3021,15 @@ def _publish_preflight_observer_bootstrap_from_environment() -> None:
     tmux = _tmux_identity(PREFLIGHT_OBSERVER_SESSION)
     try:
         executable = os.readlink(f"/proc/{os.getpid()}/exe")
+        executable_descriptor = os.open(
+            f"/proc/{os.getpid()}/exe", os.O_RDONLY
+        )
+        try:
+            executable_stat = os.fstat(executable_descriptor)
+        finally:
+            os.close(executable_descriptor)
+        executable_path = Path(executable).resolve(strict=True)
+        executable_target_stat = executable_path.stat()
         command = [
             item.decode("utf-8")
             for item in Path(f"/proc/{os.getpid()}/cmdline")
@@ -2479,20 +3045,43 @@ def _publish_preflight_observer_bootstrap_from_environment() -> None:
         tmux["pane_pid"] != os.getpid()
         or process["pgid"] != os.getpid()
         or not Path(executable).is_absolute()
+        or not stat.S_ISREG(executable_stat.st_mode)
+        or executable_target_stat.st_dev
+        != executable_stat.st_dev
+        or executable_target_stat.st_ino
+        != executable_stat.st_ino
         or not command
     ):
         raise ControllerBootstrapError(
             "preflight observer live process binding differs"
         )
+    executable_identity = build_file_identity(
+        path=str(executable_path),
+        device=int(executable_stat.st_dev),
+        inode=int(executable_stat.st_ino),
+        mode=int(executable_stat.st_mode),
+        size=int(executable_stat.st_size),
+    )
+    try:
+        validate_executable_identity(
+            executable_identity,
+            "controller observer executable identity",
+        )
+    except PreflightLaunchContractError as exc:
+        raise ControllerBootstrapError(str(exc)) from exc
     value = {
         "schema_version": 1,
         "contract_type": "safa_canonical_preflight_observer_bootstrap_v1",
         "policy_sha256": policy_sha256,
+        "verified_implementations": (
+            _verified_preflight_implementations()
+        ),
         "wrapper_claim": wrapper_binding,
         "observer_session": PREFLIGHT_OBSERVER_SESSION,
         "owner_nonce": owner_nonce,
         "process": process,
         "executable": executable,
+        "executable_identity": executable_identity,
         "command": command,
         "tmux": tmux,
         "published_at": _utc_now(),
@@ -2725,48 +3314,50 @@ def _validate_preflight_wrapper_provenance(
     dict[str, str],
 ]:
     control = paths["preflight_control"]
+    verified_implementations = _verified_preflight_implementations(
+        policy["implementations"]
+    )
     wrapper_path = control / "wrapper_claim.json"
     wrapper = load_json(wrapper_path, "CPU preflight wrapper claim")
     expected_command = _expected_preflight_controller_command(policy, paths)
     expected_observer_command = _expected_preflight_observer_command(
         policy, paths
     )
+    try:
+        validate_claim_v3(
+            wrapper,
+            verified_implementations=verified_implementations,
+            label="controller wrapper claim v3",
+        )
+    except PreflightLaunchContractError as exc:
+        raise CanonicalScreeningError(str(exc)) from exc
     if (
-        set(wrapper)
-        != {
-            "schema_version",
-            "contract_type",
-            "policy_sha256",
-            "config",
-            "checkpoint_plan",
-            "preflight_request_manifest",
-            "controller_session",
-            "controller_tmux",
-            "controller_tmux_server",
-            "observer_session",
-            "command",
-            "observer_command",
-            "wrapper_pid",
-            "wrapper_process",
-            "started_at",
-            "external_timeout_seconds",
-            "wrapper_claim_sha256",
-        }
-        or wrapper.get("schema_version") != 1
-        or wrapper.get("contract_type")
-        != "safa_canonical_preflight_wrapper_claim_v2"
-        or wrapper.get("policy_sha256") != policy["policy_sha256"]
+        wrapper.get("policy_sha256") != policy["policy_sha256"]
         or wrapper.get("config") != policy["policy_file"]
+        or wrapper.get("verified_implementations")
+        != verified_implementations
         or wrapper.get("controller_session") != PREFLIGHT_CONTROLLER_SESSION
         or wrapper.get("observer_session") != PREFLIGHT_OBSERVER_SESSION
         or wrapper.get("command") != expected_command
         or wrapper.get("observer_command") != expected_observer_command
         or wrapper.get("wrapper_pid") != os.getppid()
+        or wrapper.get("wrapper_arguments")
+        != _process_command(os.getppid())
+        or wrapper.get("wrapper_executable", {}).get("path")
+        != str(
+            Path(
+                os.readlink(f"/proc/{os.getppid()}/exe")
+            ).resolve()
+        )
+        or wrapper.get("pane_log", {}).get("path")
+        != os.environ.get("SAFA_PREFLIGHT_PANE_LOG_PATH")
         or wrapper.get("wrapper_process") != _process_identity(os.getppid())
+        or wrapper.get("wrapper_launch_process")
+        != _launch_process_identity(os.getppid())
         or wrapper.get("controller_tmux", {}).get("session")
         != PREFLIGHT_CONTROLLER_SESSION
         or wrapper.get("controller_tmux", {}).get("pane_pid")
-        != os.getppid()
+        != wrapper.get("pane_gate_process", {}).get("pid")
         or wrapper.get("external_timeout_seconds") is not None
         or wrapper.get("wrapper_claim_sha256")
         != canonical_digest(wrapper, "wrapper_claim_sha256")
@@ -2774,11 +3365,248 @@ def _validate_preflight_wrapper_provenance(
         raise CanonicalScreeningError(
             "CPU preflight wrapper claim contract mismatch"
         )
+    attempt_id = wrapper["attempt_id"]
+    if (
+        not isinstance(attempt_id, str)
+        or len(attempt_id) != 64
+        or any(character not in "0123456789abcdef" for character in attempt_id)
+    ):
+        raise CanonicalScreeningError(
+            "CPU preflight launch attempt ID differs"
+        )
+    expected_attempt_root = (
+        paths["root"]
+        / "preflight_launch_attempts"
+        / "by_policy"
+        / str(policy["policy_sha256"])
+        / attempt_id
+    )
+    _require_exact_unsymlinked_directory(
+        str(expected_attempt_root),
+        expected_attempt_root,
+        "CPU preflight launch attempt root",
+    )
+    receipt_path = expected_attempt_root / "launch_receipt.json"
+    gate_ready_path = expected_attempt_root / "pane_gate_ready.json"
+    tmux_started_path = expected_attempt_root / "launch_tmux_started.json"
+    wrapper_started_path = expected_attempt_root / "wrapper_started.json"
+    receipt_identity = wrapper[
+        "preflight_launch_receipt_identity"
+    ]
+    try:
+        receipt_identity = validate_file_identity(
+            receipt_identity,
+            "controller launch receipt identity",
+        )
+    except PreflightLaunchContractError as exc:
+        raise CanonicalScreeningError(str(exc)) from exc
+    _require_exact_owned_regular_entry(
+        wrapper["preflight_launch_receipt"].get("path"),
+        receipt_path,
+        "CPU preflight launch receipt",
+        identity=receipt_identity,
+    )
+    _require_exact_owned_regular_entry(
+        wrapper["pane_gate_ready"].get("path"),
+        gate_ready_path,
+        "CPU preflight pane gate ready",
+    )
+    _require_exact_owned_regular_entry(
+        wrapper["preflight_launch_tmux_started"].get("path"),
+        tmux_started_path,
+        "CPU preflight launch tmux started",
+    )
+    _require_exact_owned_regular_entry(
+        wrapper["preflight_wrapper_started"].get("path"),
+        wrapper_started_path,
+        "CPU preflight wrapper started",
+    )
+    receipt = _validate_json_artifact_binding(
+        wrapper["preflight_launch_receipt"],
+        "CPU preflight launch receipt",
+        "launch_receipt_sha256",
+    )
+    _validate_live_preflight_process_layers(
+        wrapper,
+        receipt,
+        "CPU preflight controller",
+    )
+    gate_ready = _validate_json_artifact_binding(
+        wrapper["pane_gate_ready"],
+        "CPU preflight pane gate ready",
+        "pane_gate_ready_sha256",
+    )
+    tmux_started = _validate_json_artifact_binding(
+        wrapper["preflight_launch_tmux_started"],
+        "CPU preflight launch tmux started",
+        "launch_tmux_started_sha256",
+    )
+    wrapper_started = _validate_json_artifact_binding(
+        wrapper["preflight_wrapper_started"],
+        "CPU preflight wrapper started",
+        "wrapper_started_sha256",
+    )
+    try:
+        validate_gate_ready(
+            gate_ready,
+            verified_implementations=verified_implementations,
+            label="controller pane gate ready",
+        )
+        validate_tmux_started(
+            tmux_started,
+            verified_implementations=verified_implementations,
+            tmux_identity=wrapper["controller_tmux"],
+            tmux_server=wrapper["controller_tmux_server"],
+            label="controller launch tmux started",
+        )
+        validate_wrapper_started(
+            wrapper_started,
+            verified_implementations=verified_implementations,
+            gate_ready=gate_ready,
+            label="controller wrapper started",
+        )
+        validate_claim_v3(
+            wrapper,
+            verified_implementations=verified_implementations,
+            gate_ready=gate_ready,
+            wrapper_started=wrapper_started,
+            label="controller wrapper claim v3",
+        )
+    except PreflightLaunchContractError as exc:
+        raise CanonicalScreeningError(str(exc)) from exc
+    attempt_root = receipt_path.parent
+    started_registry_path = (
+        paths["root"]
+        / "preflight_launch_attempts"
+        / "started"
+        / f"{attempt_id}.json"
+    )
+    _require_exact_owned_regular_entry(
+        receipt.get("started_registry", {}).get("path"),
+        started_registry_path,
+        "CPU preflight launch started registry",
+    )
+    started_registry = _validate_json_artifact_binding(
+        receipt["started_registry"],
+        "CPU preflight launch started registry",
+        "launch_started_registry_sha256",
+    )
+    pane_log_path = expected_attempt_root / "pane.log"
+    _require_exact_owned_regular_entry(
+        receipt.get("pane_log", {}).get("path"),
+        pane_log_path,
+        "CPU preflight pane log",
+        identity=receipt.get("pane_log"),
+    )
+    accepted_path = attempt_root / "launch_accepted.json"
+    terminal_path = attempt_root / "launch_terminal.json"
+    release_path = attempt_root / "launch_ownership_release.json"
+    for path, label in (
+        (accepted_path, "CPU preflight launch accepted"),
+        (terminal_path, "CPU preflight launch terminal"),
+        (release_path, "CPU preflight launch ownership release"),
+    ):
+        _require_exact_owned_regular_entry(path, path, label)
+    accepted = load_json(
+        accepted_path, "CPU preflight launch accepted"
+    )
+    launch_terminal = load_json(
+        terminal_path, "CPU preflight launch terminal"
+    )
+    launch_release = load_json(
+        release_path, "CPU preflight launch ownership release"
+    )
+    wrapper_binding = _artifact_binding(
+        wrapper_path, wrapper["wrapper_claim_sha256"]
+    )
+    try:
+        validate_ownership_chain(
+            accepted,
+            launch_terminal,
+            launch_release,
+            receipt_binding=wrapper["preflight_launch_receipt"],
+            receipt_identity=receipt_identity,
+            wrapper_binding=wrapper_binding,
+            accepted_binding=_artifact_binding(
+                accepted_path, accepted["launch_accepted_sha256"]
+            ),
+            terminal_binding=_artifact_binding(
+                terminal_path,
+                launch_terminal["launch_terminal_sha256"],
+            ),
+            verified_implementations=verified_implementations,
+            label="CPU preflight launch ownership chain",
+        )
+    except PreflightLaunchContractError as exc:
+        raise CanonicalScreeningError(str(exc)) from exc
+    if (
+        attempt_root != expected_attempt_root
+        or started_registry.get("attempt_id") != attempt_id
+        or started_registry.get("policy_sha256")
+        != policy["policy_sha256"]
+        or started_registry.get("contract_type")
+        != "safa_canonical_preflight_launch_started_registry_v1"
+        or started_registry.get("launch_started_registry_sha256")
+        != canonical_digest(
+            started_registry, "launch_started_registry_sha256"
+        )
+        or receipt.get("wrapper_claim_path") != str(wrapper_path)
+        or receipt.get("wrapper_started_path")
+        != str(wrapper_started_path)
+        or receipt.get("gate_execution_terminal_path")
+        != str(expected_attempt_root / "gate_execution_terminal.json")
+        or receipt.get("attempt_id") != wrapper["attempt_id"]
+        or receipt.get("policy_sha256") != policy["policy_sha256"]
+        or receipt.get("wrapper_arguments")
+        != wrapper["wrapper_arguments"]
+        or receipt.get("git") != wrapper["git"]
+        or receipt.get("verified_implementations")
+        != verified_implementations
+        or receipt.get("pane_log") != wrapper["pane_log"]
+        or gate_ready.get("launch_receipt")
+        != wrapper["preflight_launch_receipt"]
+        or gate_ready.get("launch_receipt_identity")
+        != receipt_identity
+        or gate_ready.get("verified_implementations")
+        != verified_implementations
+        or tmux_started.get("launch_receipt")
+        != wrapper["preflight_launch_receipt"]
+        or tmux_started.get("launch_receipt_identity")
+        != receipt_identity
+        or tmux_started.get("verified_implementations")
+        != verified_implementations
+        or tmux_started.get("pane_gate_ready")
+        != wrapper["pane_gate_ready"]
+        or tmux_started.get("owner_seal", {}).get("pane_process")
+        != wrapper["pane_gate_process"]
+        or gate_ready.get("process") != wrapper["pane_gate_process"]
+        or wrapper_started.get("pane_gate_process")
+        != wrapper["pane_gate_process"]
+        or wrapper_started.get("launch_receipt_identity")
+        != receipt_identity
+        or wrapper_started.get("verified_implementations")
+        != verified_implementations
+        or wrapper_started.get("wrapper_process")
+        != wrapper["wrapper_launch_process"]
+        or wrapper_started.get("wrapper_arguments")
+        != wrapper["wrapper_arguments"]
+        or wrapper["wrapper_launch_process"].get("ppid")
+        != wrapper["pane_gate_process"].get("pid")
+        or wrapper["wrapper_launch_process"].get("pgid")
+        != wrapper["wrapper_pid"]
+        or wrapper["wrapper_launch_process"].get("sid")
+        != wrapper["wrapper_pid"]
+        or wrapper["wrapper_launch_process"] != wrapper["wrapper_process"]
+        or accepted.get("attempt_id") != wrapper["attempt_id"]
+    ):
+        raise CanonicalScreeningError(
+            "CPU preflight launch ownership contract mismatch"
+        )
     _assert_tmux_process_identity(
         PREFLIGHT_CONTROLLER_SESSION,
         wrapper["controller_tmux"],
         wrapper["controller_tmux_server"],
-        wrapper["wrapper_process"],
+        wrapper["pane_gate_process"],
         "CPU preflight controller-bound wrapper",
     )
     _validate_json_artifact_binding(
@@ -2818,6 +3646,7 @@ def _validate_preflight_wrapper_provenance(
             "policy_sha256",
             "wrapper_claim",
             "wrapper_claim_sha256",
+            "verified_implementations",
             "observer_session",
             "command",
             "observer_gate_ready",
@@ -2842,6 +3671,8 @@ def _validate_preflight_wrapper_provenance(
         )
         or observer_launch.get("wrapper_claim_sha256")
         != wrapper["wrapper_claim_sha256"]
+        or observer_launch.get("verified_implementations")
+        != verified_implementations
         or observer_launch.get("observer_session")
         != PREFLIGHT_OBSERVER_SESSION
         or observer_launch.get("command") != expected_observer_command
@@ -3067,6 +3898,11 @@ def _write_preflight_controller_claim(
         "campaign_id": policy["campaign_id"],
         "policy_sha256": policy["policy_sha256"],
         "supersedes_policy_sha256": policy["supersedes_policy_sha256"],
+        "verified_implementations": (
+            _verified_preflight_implementations(
+                policy["implementations"]
+            )
+        ),
         "wrapper_claim": dict(wrapper_binding),
         "observer_launch": dict(observer_launch_binding),
         "controller_process_start": dict(process_start_binding),
@@ -3104,6 +3940,9 @@ def _write_preflight_controller_ready(
         "contract_type": "safa_canonical_preflight_controller_ready_v1",
         "campaign_id": policy["campaign_id"],
         "policy_sha256": policy["policy_sha256"],
+        "verified_implementations": dict(
+            claim["verified_implementations"]
+        ),
         "controller_claim_sha256": claim["controller_claim_sha256"],
         "controller_claim": _artifact_binding(
             claim_path, claim["controller_claim_sha256"]
@@ -3151,6 +3990,10 @@ def _validate_preflight_controller_ready(
         ready.get("contract_type")
         != "safa_canonical_preflight_controller_ready_v1"
         or ready.get("policy_sha256") != policy["policy_sha256"]
+        or ready.get("verified_implementations")
+        != _verified_preflight_implementations(
+            policy["implementations"]
+        )
         or ready.get("controller_session") != PREFLIGHT_CONTROLLER_SESSION
         or ready.get("observer_session") != PREFLIGHT_OBSERVER_SESSION
         or ready.get("controller_ready_sha256")
@@ -3201,6 +4044,8 @@ def _validate_preflight_controller_ready(
     if (
         ready.get("controller_pid") != process_start["process"]["pid"]
         or ready.get("controller_process") != process_start["process"]
+        or process_start.get("verified_implementations")
+        != ready.get("verified_implementations")
     ):
         raise CanonicalScreeningError(
             "CPU preflight controller ready process binding differs"
@@ -3239,6 +4084,8 @@ def _wait_preflight_observer_ready(
         != controller_ready["controller_ready_sha256"]
         or ready.get("request_count") != controller_ready["request_count"]
         or ready.get("observer_session") != PREFLIGHT_OBSERVER_SESSION
+        or ready.get("verified_implementations")
+        != controller_ready.get("verified_implementations")
         or ready.get("observer_launch")
         != controller_ready["observer_launch"]
         or ready.get("controller_process_start")
@@ -3395,6 +4242,21 @@ def materialize_preflights(
         raise CanonicalScreeningError(
             "current-policy preflight refuses result reuse; use a new policy namespace"
         )
+    observer_ready_value = _validate_json_artifact_binding(
+        observer_ready,
+        "CPU preflight materialization observer ready",
+        "observer_ready_sha256",
+    )
+    verified_implementations = _verified_preflight_implementations(
+        policy["implementations"]
+    )
+    if (
+        observer_ready_value.get("verified_implementations")
+        != verified_implementations
+    ):
+        raise CanonicalScreeningError(
+            "CPU preflight materialization observer chain differs"
+        )
     completed = 0
     valid = 0
     invalid = 0
@@ -3408,6 +4270,9 @@ def materialize_preflights(
             "schema_version": 1,
             "contract_type": "safa_canonical_preflight_attempt_claim_v1",
             "policy_sha256": policy["policy_sha256"],
+            "verified_implementations": dict(
+                observer_ready_value["verified_implementations"]
+            ),
             "sequence": sequence,
             "request_path": str(request_path.resolve()),
             "preflight_request_sha256": request["preflight_request_sha256"],
@@ -3602,11 +4467,9 @@ def _execute_preflight_controller(
                 summary = {
                     "preflight": materialized,
                     "counts": refreshed["counts"],
-                    "final_plan": {
-                        "path": str(final_plan.resolve()),
-                        "sha256": sha256_file(final_plan),
-                        "canonical_sha256": refreshed["checkpoint_plan_sha256"],
-                    },
+                    "final_plan": _artifact_binding(
+                        final_plan, refreshed["checkpoint_plan_sha256"]
+                    ),
                 }
             except BaseException as exc:
                 caught = exc
@@ -3995,15 +4858,13 @@ def _tmux_commands(
     python = str(policy["python"])
     if phase == "preflight":
         controller = [
-            "tmux",
-            "new-session",
-            "-d",
-            "-s",
-            "safa-screening-preflight-controller",
-            "-c",
-            str(REPO_ROOT),
             python,
-            str(REPO_ROOT / "scripts/run_canonical_preflight_wrapper.py"),
+            "-B",
+            "-u",
+            str(
+                REPO_ROOT
+                / "scripts/run_canonical_preflight_launcher.py"
+            ),
             "--repo-root",
             str(REPO_ROOT),
             "--config",
@@ -4056,7 +4917,7 @@ def _preflight_observer_sample(
     sealed_observer_process: Mapping[str, int],
     sealed_controller_tmux: Mapping[str, Any],
     sealed_controller_tmux_server: Mapping[str, Any],
-    sealed_wrapper_process: Mapping[str, int],
+    sealed_gate_process: Mapping[str, int],
     *,
     terminal: bool,
 ) -> dict[str, Any]:
@@ -4071,8 +4932,8 @@ def _preflight_observer_sample(
         PREFLIGHT_CONTROLLER_SESSION,
         sealed_controller_tmux,
         sealed_controller_tmux_server,
-        sealed_wrapper_process,
-        "CPU preflight sampling wrapper",
+        sealed_gate_process,
+        "CPU preflight sampling wrapper gate",
     )
     resource_rows = load_jsonl(
         resource_sample_path, "CPU preflight observer resource samples"
@@ -4115,6 +4976,11 @@ def _preflight_observer_sample(
         "campaign_id": policy["campaign_id"],
         "phase": "preflight",
         "policy_sha256": policy["policy_sha256"],
+        "verified_implementations": (
+            _verified_preflight_implementations(
+                policy["implementations"]
+            )
+        ),
         "sequence": sequence,
         "terminal": terminal,
         "observer_session": PREFLIGHT_OBSERVER_SESSION,
@@ -4439,6 +5305,7 @@ def _run_preflight_monitor(
     failure: dict[str, str] | None = None
     request_count = 0
     wrapper_claim_sha256: str | None = None
+    launch_receipt_identity: dict[str, Any] | None = None
     try:
         deadline = time.monotonic() + PREFLIGHT_BARRIER_TIMEOUT_SECONDS
         wrapper_path = control / "wrapper_claim.json"
@@ -4449,15 +5316,78 @@ def _run_preflight_monitor(
                 )
             time.sleep(0.1)
         wrapper = load_json(wrapper_path, "CPU preflight wrapper claim")
+        verified_implementations = (
+            _verified_preflight_implementations(
+                policy.get("implementations")
+            )
+        )
+        try:
+            validate_claim_v3(
+                wrapper,
+                verified_implementations=verified_implementations,
+                label="observer wrapper claim v3",
+            )
+        except PreflightLaunchContractError as exc:
+            raise CanonicalScreeningError(str(exc)) from exc
         if (
-            wrapper.get("contract_type")
-            != "safa_canonical_preflight_wrapper_claim_v2"
-            or wrapper.get("policy_sha256") != policy["policy_sha256"]
+            wrapper.get("verified_implementations")
+            != verified_implementations
+        ):
+            raise CanonicalScreeningError(
+                "CPU preflight observer verified implementations differ"
+            )
+        raw_receipt_identity = wrapper.get(
+            "preflight_launch_receipt_identity"
+        )
+        try:
+            launch_receipt_identity = validate_file_identity(
+                raw_receipt_identity,
+                "observer launch receipt identity",
+            )
+        except PreflightLaunchContractError as exc:
+            raise CanonicalScreeningError(str(exc)) from exc
+        attempt_id = wrapper.get("attempt_id")
+        expected_receipt_path = (
+            paths["root"]
+            / "preflight_launch_attempts"
+            / "by_policy"
+            / str(policy["policy_sha256"])
+            / str(attempt_id)
+            / "launch_receipt.json"
+        )
+        _require_exact_owned_regular_entry(
+            wrapper["preflight_launch_receipt"].get("path"),
+            expected_receipt_path,
+            "CPU preflight observer launch receipt",
+            identity=launch_receipt_identity,
+        )
+        receipt = _validate_json_artifact_binding(
+            wrapper["preflight_launch_receipt"],
+            "CPU preflight observer launch receipt",
+            "launch_receipt_sha256",
+        )
+        _validate_live_preflight_process_layers(
+            wrapper,
+            receipt,
+            "CPU preflight observer",
+        )
+        if (
+            wrapper.get("policy_sha256") != policy["policy_sha256"]
             or wrapper.get("observer_session") != PREFLIGHT_OBSERVER_SESSION
             or wrapper.get("controller_session")
             != PREFLIGHT_CONTROLLER_SESSION
-            or wrapper.get("wrapper_claim_sha256")
-            != canonical_digest(wrapper, "wrapper_claim_sha256")
+            or wrapper.get("wrapper_launch_process")
+            != _launch_process_identity(wrapper["wrapper_pid"])
+            or wrapper.get("wrapper_arguments")
+            != _process_command(wrapper["wrapper_pid"])
+            or wrapper.get("wrapper_executable", {}).get("path")
+            != str(
+                Path(
+                    os.readlink(
+                        f"/proc/{wrapper['wrapper_pid']}/exe"
+                    )
+                ).resolve()
+            )
         ):
             raise CanonicalScreeningError(
                 "CPU preflight observer wrapper provenance mismatch"
@@ -4466,13 +5396,156 @@ def _run_preflight_monitor(
             PREFLIGHT_CONTROLLER_SESSION,
             wrapper["controller_tmux"],
             wrapper["controller_tmux_server"],
-            wrapper["wrapper_process"],
+            wrapper["pane_gate_process"],
             "CPU preflight observer-bound wrapper",
         )
         wrapper_claim_sha256 = wrapper["wrapper_claim_sha256"]
         wrapper_binding = _artifact_binding(
             wrapper_path, wrapper_claim_sha256
         )
+        observer_attempt_root = expected_receipt_path.parent
+        for binding, expected_name, artifact_label in (
+            (
+                wrapper["pane_gate_ready"],
+                "pane_gate_ready.json",
+                "CPU preflight observer pane gate ready",
+            ),
+            (
+                wrapper["preflight_launch_tmux_started"],
+                "launch_tmux_started.json",
+                "CPU preflight observer tmux started",
+            ),
+            (
+                wrapper["preflight_wrapper_started"],
+                "wrapper_started.json",
+                "CPU preflight observer wrapper started",
+            ),
+        ):
+            _require_exact_owned_regular_entry(
+                binding.get("path"),
+                observer_attempt_root / expected_name,
+                artifact_label,
+            )
+        observer_gate_ready = _validate_json_artifact_binding(
+            wrapper["pane_gate_ready"],
+            "CPU preflight observer pane gate ready",
+            "pane_gate_ready_sha256",
+        )
+        observer_tmux_started = _validate_json_artifact_binding(
+            wrapper["preflight_launch_tmux_started"],
+            "CPU preflight observer tmux started",
+            "launch_tmux_started_sha256",
+        )
+        observer_wrapper_started = _validate_json_artifact_binding(
+            wrapper["preflight_wrapper_started"],
+            "CPU preflight observer wrapper started",
+            "wrapper_started_sha256",
+        )
+        try:
+            validate_gate_ready(
+                observer_gate_ready,
+                verified_implementations=verified_implementations,
+                label="observer pane gate ready",
+            )
+            validate_tmux_started(
+                observer_tmux_started,
+                verified_implementations=verified_implementations,
+                tmux_identity=wrapper["controller_tmux"],
+                tmux_server=wrapper["controller_tmux_server"],
+                label="observer launch tmux started",
+            )
+            validate_wrapper_started(
+                observer_wrapper_started,
+                verified_implementations=verified_implementations,
+                gate_ready=observer_gate_ready,
+                label="observer wrapper started",
+            )
+            validate_claim_v3(
+                wrapper,
+                verified_implementations=verified_implementations,
+                gate_ready=observer_gate_ready,
+                wrapper_started=observer_wrapper_started,
+                label="observer wrapper claim v3",
+            )
+        except PreflightLaunchContractError as exc:
+            raise CanonicalScreeningError(str(exc)) from exc
+        observer_accepted_path = (
+            observer_attempt_root / "launch_accepted.json"
+        )
+        observer_terminal_path = (
+            observer_attempt_root / "launch_terminal.json"
+        )
+        observer_release_path = (
+            observer_attempt_root / "launch_ownership_release.json"
+        )
+        for artifact_path, artifact_label in (
+            (
+                observer_accepted_path,
+                "CPU preflight observer launch accepted",
+            ),
+            (
+                observer_terminal_path,
+                "CPU preflight observer launch terminal",
+            ),
+            (
+                observer_release_path,
+                "CPU preflight observer ownership release",
+            ),
+        ):
+            _require_exact_owned_regular_entry(
+                artifact_path, artifact_path, artifact_label
+            )
+        observer_accepted = load_json(
+            observer_accepted_path,
+            "CPU preflight observer launch accepted",
+        )
+        observer_terminal = load_json(
+            observer_terminal_path,
+            "CPU preflight observer launch terminal",
+        )
+        observer_release = load_json(
+            observer_release_path,
+            "CPU preflight observer ownership release",
+        )
+        receipt_binding = wrapper["preflight_launch_receipt"]
+        try:
+            validate_ownership_chain(
+                observer_accepted,
+                observer_terminal,
+                observer_release,
+                receipt_binding=receipt_binding,
+                receipt_identity=launch_receipt_identity,
+                wrapper_binding=wrapper_binding,
+                accepted_binding=_artifact_binding(
+                    observer_accepted_path,
+                    observer_accepted["launch_accepted_sha256"],
+                ),
+                terminal_binding=_artifact_binding(
+                    observer_terminal_path,
+                    observer_terminal["launch_terminal_sha256"],
+                ),
+                verified_implementations=verified_implementations,
+                label="CPU preflight observer ownership chain",
+            )
+        except PreflightLaunchContractError as exc:
+            raise CanonicalScreeningError(str(exc)) from exc
+        if (
+            observer_gate_ready.get("launch_receipt")
+            != receipt_binding
+            or observer_gate_ready.get("launch_receipt_identity")
+            != launch_receipt_identity
+            or observer_tmux_started.get("launch_receipt")
+            != receipt_binding
+            or observer_tmux_started.get("launch_receipt_identity")
+            != launch_receipt_identity
+            or observer_wrapper_started.get("launch_receipt")
+            != receipt_binding
+            or observer_wrapper_started.get("launch_receipt_identity")
+            != launch_receipt_identity
+        ):
+            raise CanonicalScreeningError(
+                "CPU preflight observer receipt ownership chain mismatch"
+            )
         observer_launch_path = control / "observer_launch.json"
         while not observer_launch_path.is_file():
             if time.monotonic() >= deadline:
@@ -4502,6 +5575,10 @@ def _run_preflight_monitor(
             or observer_launch.get("command")
             != _expected_preflight_observer_command(policy, paths)
             or observer_launch.get("status") != "launched"
+            or observer_launch.get("verified_implementations")
+            != _verified_preflight_implementations(
+                policy["implementations"]
+            )
             or observer_launch.get("failure") is not None
             or observer_launch.get("observer_session")
             != PREFLIGHT_OBSERVER_SESSION
@@ -4545,6 +5622,10 @@ def _run_preflight_monitor(
             != "safa_canonical_preflight_observer_gate_release_v1"
             or gate_ready.get("process")
             != observer_launch["process"]
+            or gate_ready.get("verified_implementations")
+            != observer_launch["verified_implementations"]
+            or gate_release.get("verified_implementations")
+            != observer_launch["verified_implementations"]
             or gate_ready.get("tmux") != observer_launch["tmux"]
             or gate_ready.get("tmux_server")
             != observer_launch["tmux_server"]
@@ -4567,6 +5648,8 @@ def _run_preflight_monitor(
             or observer_bootstrap.get("tmux") != observer_launch["tmux"]
             or observer_bootstrap.get("wrapper_claim")
             != observer_launch["wrapper_claim"]
+            or observer_bootstrap.get("verified_implementations")
+            != observer_launch["verified_implementations"]
         ):
             raise CanonicalScreeningError(
                 "CPU preflight observer bootstrap binding differs"
@@ -4627,7 +5710,13 @@ def _run_preflight_monitor(
             "campaign_id": policy["campaign_id"],
             "phase": "preflight",
             "policy_sha256": policy["policy_sha256"],
+            "verified_implementations": dict(
+                controller_ready["verified_implementations"]
+            ),
             "wrapper_claim": wrapper_binding,
+            "preflight_launch_receipt_identity": (
+                launch_receipt_identity
+            ),
             "observer_launch": dict(
                 controller_ready["observer_launch"]
             ),
@@ -4685,7 +5774,7 @@ def _run_preflight_monitor(
             observer_launch["process"],
             wrapper["controller_tmux"],
             wrapper["controller_tmux_server"],
-            wrapper["wrapper_process"],
+            wrapper["pane_gate_process"],
             terminal=False,
         )
         _append_jsonl(progress_path, first_sample)
@@ -4696,6 +5785,12 @@ def _run_preflight_monitor(
             "campaign_id": policy["campaign_id"],
             "phase": "preflight",
             "policy_sha256": policy["policy_sha256"],
+            "verified_implementations": dict(
+                claim["verified_implementations"]
+            ),
+            "preflight_launch_receipt_identity": (
+                launch_receipt_identity
+            ),
             "observer_claim_sha256": claim[
                 "observer_claim_sha256"
             ],
@@ -4771,7 +5866,7 @@ def _run_preflight_monitor(
                 observer_launch["process"],
                 wrapper["controller_tmux"],
                 wrapper["controller_tmux_server"],
-                wrapper["wrapper_process"],
+                wrapper["pane_gate_process"],
                 terminal=False,
             )
             _append_jsonl(progress_path, sample)
@@ -4829,7 +5924,7 @@ def _run_preflight_monitor(
             observer_launch["process"],
             wrapper["controller_tmux"],
             wrapper["controller_tmux_server"],
-            wrapper["wrapper_process"],
+            wrapper["pane_gate_process"],
             terminal=True,
         )
         _append_jsonl(progress_path, terminal_sample)
@@ -4886,12 +5981,39 @@ def _run_preflight_monitor(
     finally:
         if resource_guard is not None:
             resource_guard_summary = resource_guard.stop()
+        if launch_receipt_identity is not None:
+            try:
+                _require_exact_owned_regular_entry(
+                    launch_receipt_identity["path"],
+                    Path(str(launch_receipt_identity["path"])),
+                    "CPU preflight observer terminal receipt",
+                    identity=launch_receipt_identity,
+                )
+            except BaseException as identity_exc:
+                identity_failure = {
+                    "type": type(identity_exc).__name__,
+                    "message": str(identity_exc),
+                }
+                if failure is None:
+                    failure = identity_failure
+                else:
+                    failure = {
+                        "type": "MultipleObserverFailures",
+                        "message": (
+                            f"primary={failure}; "
+                            f"receipt_identity={identity_failure}"
+                        ),
+                    }
+                status = "failed"
         terminal = {
             "schema_version": 1,
             "contract_type": "safa_canonical_preflight_observer_terminal_v1",
             "campaign_id": policy["campaign_id"],
             "phase": "preflight",
             "policy_sha256": policy["policy_sha256"],
+            "preflight_launch_receipt_identity": (
+                launch_receipt_identity
+            ),
             "observer_claim": claim_binding,
             "observer_ready": ready_binding,
             "status": status,
@@ -5252,11 +6374,9 @@ def _monitor_sample(
                 )
             admission_path = admission_paths[0]
             admission_value = load_json(admission_path, "resource admission")
-            admission = {
-                "path": str(admission_path.resolve()),
-                "sha256": sha256_file(admission_path),
-                "canonical_sha256": admission_value["admission_sha256"],
-            }
+            admission = _artifact_binding(
+                admission_path, admission_value["admission_sha256"]
+            )
         admission_path = Path(str(admission["path"])).resolve()
         if (
             not admission_path.is_file()
@@ -5603,6 +6723,14 @@ def _wait_worker_ready(
                     if isinstance(bootstrap.get("request"), Mapping)
                     else {}
                 )
+                try:
+                    validate_artifact_binding(
+                        request_binding,
+                        "worker bootstrap request binding",
+                    )
+                    request_binding_valid = True
+                except PreflightLaunchContractError:
+                    request_binding_valid = False
                 failure = bootstrap.get("failure")
                 if (
                     set(bootstrap) != required
@@ -5626,8 +6754,7 @@ def _wait_worker_ready(
                     or set(failure) != {"type", "message"}
                     or not failure["type"]
                     or not failure["message"]
-                    or set(request_binding)
-                    != {"path", "sha256", "canonical_sha256"}
+                    or not request_binding_valid
                     or Path(str(request_binding["path"])).resolve()
                     != request_path.resolve()
                     or request_binding["canonical_sha256"]
@@ -6549,10 +7676,11 @@ def _run_gpu_phase(
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    _publish_preflight_observer_bootstrap_from_environment()
     config = _root(args.config)
     campaign_root = _root(args.campaign_root)
     try:
+        _install_verified_preflight_contract_api(config)
+        _publish_preflight_observer_bootstrap_from_environment()
         policy = _install_verified_contract_api(config)
     except BaseException as exc:
         if args.execute:
@@ -6643,11 +7771,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.gpu_index,
             args.gpu_uuid,
             policy,
-            {
-                "path": str(_root(args.final_release_path)),
-                "sha256": args.final_release_sha256,
-                "canonical_sha256": args.final_release_canonical_sha256,
-            },
+            build_artifact_binding(
+                path=str(_root(args.final_release_path)),
+                sha256=args.final_release_sha256,
+                canonical_sha256=args.final_release_canonical_sha256,
+            ),
             _root(args.worker_ready_path),
             _root(args.worker_release_path),
         )
@@ -6691,17 +7819,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 {
                     "checkpoint_plan": str(paths["checkpoint_plan"]),
                     "preflight_requests": len(request_paths),
-                    "preflight_request_manifest": {
-                        "path": str(
-                            paths["preflight_request_manifest"].resolve()
-                        ),
-                        "sha256": sha256_file(
-                            paths["preflight_request_manifest"]
-                        ),
-                        "canonical_sha256": request_manifest[
+                    "preflight_request_manifest": _artifact_binding(
+                        paths["preflight_request_manifest"],
+                        request_manifest[
                             "preflight_request_manifest_sha256"
                         ],
-                    },
+                    ),
                     "counts": plan["counts"],
                 },
                 sort_keys=True,

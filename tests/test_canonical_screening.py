@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import inspect
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import shutil
 import sys
@@ -76,6 +78,26 @@ from safa.closeout.generator_output_contract import (
     decoder_registry_digest,
     resolve_checkpoint_output_capability,
 )
+from safa.closeout.preflight_launch_contract import (
+    PreflightLaunchContractError,
+    build_claim_v3 as build_preflight_claim_v3,
+    build_file_identity as build_preflight_file_identity,
+    build_gate_ready as build_preflight_gate_ready,
+    build_launch_accepted as build_preflight_launch_accepted,
+    build_ownership_release as build_preflight_ownership_release,
+    build_ownership_terminal as build_preflight_ownership_terminal,
+    build_pane_owner_seal as build_preflight_pane_owner_seal,
+    build_process_identity as build_preflight_process_identity,
+    build_tmux_server_identity as build_preflight_tmux_server_identity,
+    build_tmux_started as build_preflight_tmux_started,
+    build_verified_implementations as build_preflight_verified_implementations,
+    build_wrapper_started as build_preflight_wrapper_started,
+    canonical_digest as preflight_launch_digest,
+    shared_contract_types,
+    shared_schema_keysets,
+    validate_claim_v3 as validate_preflight_claim_v3,
+)
+import safa.closeout.preflight_launch_contract as preflight_launch_contract_module
 
 
 def _gpu_uuid(index: int) -> str:
@@ -107,7 +129,624 @@ def _wrapper_module():
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    module._install_verified_preflight_apis(
+        Path(__file__).parents[1]
+        / "configs/closeout/canonical_screening_512_v1.json"
+    )
     return module
+
+
+def _launcher_module():
+    path = (
+        Path(__file__).parents[1]
+        / "scripts/run_canonical_preflight_launcher.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "canonical_preflight_launcher_test", path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module._install_verified_preflight_apis(
+        Path(__file__).parents[1]
+        / "configs/closeout/canonical_screening_512_v1.json"
+    )
+    return module
+
+
+def _shared_binding(name: str) -> dict[str, str]:
+    return {
+        "path": f"/contract/{name}.json",
+        "sha256": hashlib.sha256(f"{name}:file".encode()).hexdigest(),
+        "canonical_sha256": hashlib.sha256(
+            f"{name}:canonical".encode()
+        ).hexdigest(),
+    }
+
+
+def _shared_file_identity(name: str) -> dict[str, Any]:
+    return {
+        "path": f"/contract/{name}",
+        "device": 7,
+        "inode": 11,
+        "mode": 33188,
+        "size": 101,
+    }
+
+
+def _shared_process(pid: int, *, ppid: int) -> dict[str, int]:
+    return {
+        "pid": pid,
+        "ppid": ppid,
+        "pgid": pid,
+        "sid": pid,
+        "start_ticks": pid * 10,
+    }
+
+
+def _shared_launch_contract_values() -> dict[str, Any]:
+    gate_process = _shared_process(101, ppid=1)
+    wrapper_process = _shared_process(202, ppid=101)
+    receipt = _shared_binding("receipt")
+    receipt_identity = _shared_file_identity("receipt")
+    verified_implementations = (
+        _test_verified_preflight_implementations()
+    )
+    gate_ready = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_preflight_pane_gate_ready_v1",
+        "launch_receipt": receipt,
+        "launch_receipt_identity": receipt_identity,
+        "verified_implementations": verified_implementations,
+        "process": gate_process,
+        "wrapper_arguments": ["/usr/bin/python", "wrapper.py"],
+        "ready_at": "2026-07-28T00:00:00+00:00",
+    }
+    gate_ready["pane_gate_ready_sha256"] = preflight_launch_digest(
+        gate_ready, "pane_gate_ready_sha256"
+    )
+    wrapper_started = {
+        "schema_version": 1,
+        "contract_type": (
+            "safa_canonical_preflight_wrapper_started_v1"
+        ),
+        "launch_receipt": receipt,
+        "launch_receipt_identity": receipt_identity,
+        "verified_implementations": verified_implementations,
+        "pane_gate_ready": _shared_binding("gate-ready"),
+        "pane_gate_process": gate_process,
+        "wrapper_arguments": ["/usr/bin/python", "wrapper.py"],
+        "wrapper_process": wrapper_process,
+        "wrapper_executable": _shared_file_identity("python"),
+        "started_at": "2026-07-28T00:00:01+00:00",
+    }
+    wrapper_started["wrapper_started_sha256"] = (
+        preflight_launch_digest(
+            wrapper_started, "wrapper_started_sha256"
+        )
+    )
+    server_process = _shared_process(303, ppid=1)
+    pane = {
+        "session": "safa-screening-preflight-controller",
+        "pane": "%1",
+        "pane_pid": gate_process["pid"],
+        "pane_dead": False,
+        "pane_dead_status": None,
+    }
+    tmux_server = {
+        "server_pid": server_process["pid"],
+        "server_process": server_process,
+        "socket_path": "/tmp/tmux.sock",
+        "socket_device": 7,
+        "socket_inode": 13,
+    }
+    owner_seal = build_preflight_pane_owner_seal(
+        server_pid=server_process["pid"],
+        server_start_ticks=server_process["start_ticks"],
+        socket_path=tmux_server["socket_path"],
+        socket_device=tmux_server["socket_device"],
+        socket_inode=tmux_server["socket_inode"],
+        session=pane["session"],
+        pane=pane["pane"],
+        pane_pid=pane["pane_pid"],
+        pane_process=gate_process,
+        owner_nonce=hashlib.sha256(b"owner").hexdigest(),
+        tmux_identity=pane,
+        tmux_server=tmux_server,
+    )
+    tmux_started = build_preflight_tmux_started(
+        launch_receipt=receipt,
+        launch_receipt_identity=receipt_identity,
+        verified_implementations=verified_implementations,
+        pane_gate_ready=_shared_binding("gate-ready"),
+        tmux_client={"returncode": 0, "stdout": "", "stderr": ""},
+        owner_seal=owner_seal,
+        started_at="2026-07-28T00:00:00+00:00",
+        tmux_identity=pane,
+        tmux_server=tmux_server,
+    )
+    claim = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_preflight_wrapper_claim_v3",
+        "attempt_id": hashlib.sha256(b"attempt").hexdigest(),
+        "preflight_launch_receipt": receipt,
+        "preflight_launch_receipt_identity": receipt_identity,
+        "verified_implementations": verified_implementations,
+        "pane_gate_ready": _shared_binding("gate-ready"),
+        "preflight_launch_tmux_started": _shared_binding("tmux-started"),
+        "preflight_wrapper_started": _shared_binding("wrapper-started"),
+        "pane_gate_process": gate_process,
+        "wrapper_arguments": ["/usr/bin/python", "wrapper.py"],
+        "wrapper_executable": _shared_file_identity("python"),
+        "pane_log": _shared_file_identity("pane-log"),
+        "git": {"sha": hashlib.sha256(b"git").hexdigest()},
+        "policy_sha256": hashlib.sha256(b"policy").hexdigest(),
+        "config": {
+            "path": "/contract/config.json",
+            "sha256": hashlib.sha256(b"config").hexdigest(),
+        },
+        "checkpoint_plan": _shared_binding("plan"),
+        "preflight_request_manifest": _shared_binding("requests"),
+        "controller_session": "safa-screening-preflight-controller",
+        "controller_tmux": pane,
+        "controller_tmux_server": tmux_server,
+        "observer_session": "safa-screening-preflight-monitor-abc",
+        "command": ["/usr/bin/python", "controller.py"],
+        "observer_command": ["/usr/bin/python", "controller.py", "monitor"],
+        "wrapper_pid": wrapper_process["pid"],
+        "wrapper_process": wrapper_process,
+        "wrapper_launch_process": wrapper_process,
+        "started_at": "2026-07-28T00:00:01+00:00",
+        "external_timeout_seconds": None,
+    }
+    claim["wrapper_claim_sha256"] = preflight_launch_digest(
+        claim, "wrapper_claim_sha256"
+    )
+    accepted = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_preflight_launch_accepted_v1",
+        "attempt_id": claim["attempt_id"],
+        "launch_receipt": receipt,
+        "launch_receipt_identity": receipt_identity,
+        "verified_implementations": verified_implementations,
+        "wrapper_claim": _shared_binding("claim"),
+        "tmux_started": _shared_binding("tmux-started"),
+        "pane": pane,
+        "pane_log_path": "/contract/pane-log",
+        "startup_window_closed": False,
+        "started_at": "2026-07-28T00:00:00+00:00",
+        "accepted_at": "2026-07-28T00:00:02+00:00",
+    }
+    accepted["launch_accepted_sha256"] = preflight_launch_digest(
+        accepted, "launch_accepted_sha256"
+    )
+    terminal = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_preflight_launch_terminal_v1",
+        "launch_receipt": receipt,
+        "launch_receipt_identity": receipt_identity,
+        "verified_implementations": verified_implementations,
+        "launch_accepted": _shared_binding("accepted"),
+        "wrapper_claim": _shared_binding("claim"),
+        "tmux_started": _shared_binding("tmux-started"),
+        "status": "ownership_transferred",
+        "failure": None,
+        "tmux_client": None,
+        "pane": pane,
+        "pane_log": _shared_file_identity("pane-log"),
+        "session_residual": True,
+        "started_at": accepted["started_at"],
+        "completed_at": "2026-07-28T00:00:03+00:00",
+    }
+    terminal["launch_terminal_sha256"] = preflight_launch_digest(
+        terminal, "launch_terminal_sha256"
+    )
+    release = {
+        "schema_version": 1,
+        "contract_type": (
+            "safa_canonical_preflight_launch_ownership_release_v1"
+        ),
+        "launch_receipt": receipt,
+        "launch_receipt_identity": receipt_identity,
+        "verified_implementations": verified_implementations,
+        "launch_accepted": _shared_binding("accepted"),
+        "launch_terminal": _shared_binding("terminal"),
+        "wrapper_claim": _shared_binding("claim"),
+        "startup_window_closed": True,
+        "released_at": "2026-07-28T00:00:04+00:00",
+    }
+    release["launch_ownership_release_sha256"] = (
+        preflight_launch_digest(
+            release, "launch_ownership_release_sha256"
+        )
+    )
+    return {
+        "gate_ready": gate_ready,
+        "tmux_started": tmux_started,
+        "tmux_identity": pane,
+        "tmux_server": tmux_server,
+        "wrapper_started": wrapper_started,
+        "claim": claim,
+        "accepted": accepted,
+        "terminal": terminal,
+        "release": release,
+        "receipt": receipt,
+        "receipt_identity": receipt_identity,
+        "verified_implementations": verified_implementations,
+        "wrapper_binding": _shared_binding("claim"),
+        "accepted_binding": _shared_binding("accepted"),
+        "terminal_binding": _shared_binding("terminal"),
+    }
+
+
+def test_preflight_launch_contract_is_pure_and_consumers_share_schemas():
+    repo_root = Path(__file__).parents[1]
+    contract_path = (
+        repo_root / "src/safa/closeout/preflight_launch_contract.py"
+    )
+    contract_tree = ast.parse(contract_path.read_text(encoding="utf-8"))
+    imported_roots: set[str] = set()
+    for node in ast.walk(contract_tree):
+        if isinstance(node, ast.Import):
+            imported_roots.update(
+                alias.name.split(".", 1)[0] for alias in node.names
+            )
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported_roots.add(node.module.split(".", 1)[0])
+    assert not imported_roots.intersection(
+        {"io", "os", "pathlib", "signal", "subprocess"}
+    )
+    consumer_expectations = {
+        "scripts/run_canonical_preflight_launcher.py": {
+            "build_tmux_started",
+            "validate_claim_v3",
+            "validate_gate_ready",
+            "validate_ownership_chain",
+            "validate_wrapper_started",
+        },
+        "scripts/run_canonical_preflight_wrapper.py": {
+            "build_claim_v3",
+            "validate_gate_ready",
+            "validate_ownership_chain",
+            "validate_pane_owner_seal",
+            "validate_tmux_started",
+            "validate_wrapper_started",
+        },
+        "scripts/run_canonical_checkpoint_screening.py": {
+            "validate_claim_v3",
+            "validate_ownership_chain",
+            "validate_pane_owner_seal",
+            "validate_tmux_started",
+        },
+    }
+    shared_sets = set(shared_schema_keysets().values())
+    shared_sets.update(
+        {
+            frozenset({"server_pid", "socket_path"}),
+            frozenset({"pid", "pgid", "start_ticks"}),
+            frozenset({"path", "device", "inode", "mode"}),
+            frozenset({"argv0", "sys_executable", "proc_executable"}),
+        }
+    )
+    legacy_field_names = {
+        "argv0",
+        "sys_executable",
+        "proc_executable",
+    }
+    bootstrap_schema_functions = {
+        "scripts/run_canonical_preflight_launcher.py": {
+            "build_file_identity",
+            "build_process_identity",
+            "_bootstrap_read_file",
+            "_json_binding",
+            "_reverify_verified_loader",
+        },
+        "scripts/run_canonical_preflight_wrapper.py": {
+            "_bootstrap_read_file",
+            "_reverify_verified_loader",
+        },
+        "scripts/run_canonical_checkpoint_screening.py": {
+            "_install_verified_preflight_contract_api",
+        },
+    }
+    for relative, expected_calls in consumer_expectations.items():
+        consumer_tree = ast.parse(
+            (repo_root / relative).read_text(encoding="utf-8")
+        )
+        calls = {
+            node.func.id
+            for node in ast.walk(consumer_tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+        }
+        assert expected_calls <= calls
+        bootstrap_nodes = {
+            id(descendant)
+            for function in consumer_tree.body
+            if isinstance(function, ast.FunctionDef)
+            and function.name
+            in bootstrap_schema_functions.get(relative, set())
+            for descendant in ast.walk(function)
+        }
+        string_literals = {
+            node.value
+            for node in ast.walk(consumer_tree)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+        }
+        assert not string_literals.intersection(shared_contract_types())
+        assert not string_literals.intersection(legacy_field_names)
+        for node in ast.walk(consumer_tree):
+            if id(node) in bootstrap_nodes:
+                continue
+            if isinstance(node, ast.Dict):
+                elements = node.keys
+            elif isinstance(node, (ast.Set, ast.List, ast.Tuple)):
+                elements = node.elts
+            else:
+                continue
+            literal = frozenset(
+                item.value
+                for item in elements
+                if isinstance(item, ast.Constant)
+                and isinstance(item.value, str)
+            )
+            if len(literal) == len(elements):
+                assert literal not in shared_sets
+    helper_tree = ast.parse(
+        (
+            repo_root / "tests/helpers/preflight_lifecycle_helper.py"
+        ).read_text(encoding="utf-8")
+    )
+    production_builder = next(
+        node
+        for node in helper_tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "prepare_supervised_launcher_contract"
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "build_tmux_started"
+        for node in ast.walk(production_builder)
+    )
+    assert not any(
+        isinstance(node, ast.Constant)
+        and node.value == "safa_canonical_preflight_launch_tmux_started_v1"
+        for node in ast.walk(production_builder)
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing",
+        "extra",
+        "schema_v2",
+        "missing_ppid",
+        "missing_sid",
+        "reduced_only",
+        "full_mismatch",
+        "parent_spoof",
+        "identity_extra",
+    ),
+)
+def test_shared_claim_mutations_rejected_by_all_consumers(mutation: str):
+    modules = (
+        _launcher_module(),
+        _wrapper_module(),
+        _controller_module(),
+    )
+    values = _shared_launch_contract_values()
+    claim = json.loads(json.dumps(values["claim"]))
+    if mutation == "missing":
+        claim.pop("policy_sha256")
+    elif mutation == "extra":
+        claim["unshared_schema_field"] = True
+    elif mutation == "schema_v2":
+        claim["schema_version"] = 2
+    elif mutation == "missing_ppid":
+        claim["wrapper_process"].pop("ppid")
+    elif mutation == "missing_sid":
+        claim["wrapper_launch_process"].pop("sid")
+    elif mutation == "reduced_only":
+        claim["wrapper_process"] = {
+            key: claim["wrapper_process"][key]
+            for key in ("pid", "pgid", "start_ticks")
+        }
+    elif mutation == "full_mismatch":
+        claim["wrapper_process"]["start_ticks"] += 1
+    elif mutation == "parent_spoof":
+        claim["wrapper_launch_process"]["ppid"] = 1
+    else:
+        claim["wrapper_process"]["extra"] = True
+    if mutation not in {"missing", "extra"}:
+        claim["wrapper_claim_sha256"] = preflight_launch_digest(
+            claim, "wrapper_claim_sha256"
+        )
+    for module in modules:
+        expected_error = getattr(
+            module,
+            "PreflightLaunchContractError",
+            PreflightLaunchContractError,
+        )
+        with pytest.raises(expected_error):
+            module.validate_claim_v3(
+                claim,
+                verified_implementations=values[
+                    "verified_implementations"
+                ],
+                gate_ready=values["gate_ready"],
+                wrapper_started=values["wrapper_started"],
+            )
+
+
+def test_shared_full_process_claim_accepted_by_all_consumers():
+    values = _shared_launch_contract_values()
+    for module in (
+        _launcher_module(),
+        _wrapper_module(),
+        _controller_module(),
+    ):
+        assert (
+            module.validate_claim_v3(
+                values["claim"],
+                verified_implementations=values[
+                    "verified_implementations"
+                ],
+                gate_ready=values["gate_ready"],
+                wrapper_started=values["wrapper_started"],
+            )
+            == values["claim"]
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing", "extra", "wrong_chain", "wrong_owner"),
+)
+def test_shared_tmux_started_mutations_are_rejected(mutation: str):
+    values = _shared_launch_contract_values()
+    tmux_started = json.loads(json.dumps(values["tmux_started"]))
+    if mutation == "missing":
+        tmux_started.pop("pane_gate_ready")
+    elif mutation == "extra":
+        tmux_started["unshared_schema_field"] = True
+    elif mutation == "wrong_chain":
+        tmux_started["verified_implementations"][
+            "verified_loader"
+        ]["sha256"] = hashlib.sha256(b"wrong-loader").hexdigest()
+    else:
+        tmux_started["owner_seal"]["pane_pid"] += 1
+    if mutation not in {"missing", "extra"}:
+        tmux_started["launch_tmux_started_sha256"] = (
+            preflight_launch_digest(
+                tmux_started, "launch_tmux_started_sha256"
+            )
+        )
+    with pytest.raises(PreflightLaunchContractError):
+        preflight_launch_contract_module.validate_tmux_started(
+            tmux_started,
+            verified_implementations=values[
+                "verified_implementations"
+            ],
+            tmux_identity=values["tmux_identity"],
+            tmux_server=values["tmux_server"],
+        )
+
+
+_VERIFIED_IMPLEMENTATION_CONTRACT_CALLS = frozenset(
+    {
+        "build_gate_ready",
+        "validate_gate_ready",
+        "build_tmux_started",
+        "validate_tmux_started",
+        "build_wrapper_started",
+        "validate_wrapper_started",
+        "build_claim_v3",
+        "validate_claim_v3",
+        "build_launch_accepted",
+        "build_ownership_terminal",
+        "build_ownership_release",
+        "validate_ownership_chain",
+    }
+)
+
+
+def test_shared_verified_implementation_chain_is_required_by_every_api():
+    for name in sorted(_VERIFIED_IMPLEMENTATION_CONTRACT_CALLS):
+        function = getattr(preflight_launch_contract_module, name)
+        signature = inspect.signature(function)
+        parameter = signature.parameters.get("verified_implementations")
+        assert parameter is not None, name
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY, name
+        assert parameter.default is inspect.Parameter.empty, name
+        arguments = {
+            item.name: None
+            for item in signature.parameters.values()
+            if item.default is inspect.Parameter.empty
+            and item.kind
+            not in {
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            }
+            and item.name != "verified_implementations"
+        }
+        with pytest.raises(TypeError, match="verified_implementations"):
+            function(**arguments)
+
+
+def test_all_verified_implementation_contract_calls_pass_chain_explicitly():
+    repo_root = Path(__file__).parents[1]
+    missing: list[str] = []
+    for source_root in (
+        repo_root / "src",
+        repo_root / "scripts",
+        repo_root / "tests",
+    ):
+        for path in source_root.rglob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                if isinstance(node.func, ast.Name):
+                    name = node.func.id
+                elif isinstance(node.func, ast.Attribute):
+                    name = node.func.attr
+                else:
+                    continue
+                if name not in _VERIFIED_IMPLEMENTATION_CONTRACT_CALLS:
+                    continue
+                if not any(
+                    keyword.arg == "verified_implementations"
+                    for keyword in node.keywords
+                ):
+                    missing.append(
+                        f"{path.relative_to(repo_root)}:{node.lineno}:{name}"
+                    )
+    assert missing == []
+
+
+@pytest.mark.parametrize("mutation", ("missing", "extra", "schema_v2"))
+def test_shared_ownership_mutations_rejected_by_all_consumers(
+    mutation: str,
+):
+    modules = (
+        _launcher_module(),
+        _wrapper_module(),
+        _controller_module(),
+    )
+    values = _shared_launch_contract_values()
+    accepted = json.loads(json.dumps(values["accepted"]))
+    if mutation == "missing":
+        accepted.pop("attempt_id")
+    elif mutation == "extra":
+        accepted["unshared_schema_field"] = True
+    else:
+        accepted["schema_version"] = 2
+        accepted["launch_accepted_sha256"] = preflight_launch_digest(
+            accepted, "launch_accepted_sha256"
+        )
+    for module in modules:
+        expected_error = getattr(
+            module,
+            "PreflightLaunchContractError",
+            PreflightLaunchContractError,
+        )
+        with pytest.raises(expected_error):
+            module.validate_ownership_chain(
+                accepted,
+                values["terminal"],
+                values["release"],
+                receipt_binding=values["receipt"],
+                receipt_identity=values["receipt_identity"],
+                wrapper_binding=values["wrapper_binding"],
+                accepted_binding=values["accepted_binding"],
+                terminal_binding=values["terminal_binding"],
+                verified_implementations=values[
+                    "verified_implementations"
+                ],
+            )
 
 
 def _gpu_wrapper_module():
@@ -146,6 +785,164 @@ def _bound(path: Path) -> dict:
     if not path.exists():
         path.write_bytes(b"x")
     return {"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def _test_executable_identity(
+    path: str | Path = sys.executable,
+) -> dict[str, Any]:
+    resolved = Path(path).resolve(strict=True)
+    value = resolved.stat()
+    return build_preflight_file_identity(
+        path=str(resolved),
+        device=int(value.st_dev),
+        inode=int(value.st_ino),
+        mode=int(value.st_mode),
+        size=int(value.st_size),
+    )
+
+
+def _test_process_identity(
+    pid: int,
+    *,
+    ppid: int = 1,
+    pgid: int | None = None,
+    sid: int | None = None,
+    start_ticks: int = 77,
+) -> dict[str, int]:
+    return build_preflight_process_identity(
+        pid=pid,
+        ppid=ppid,
+        pgid=pid if pgid is None else pgid,
+        sid=pid if sid is None else sid,
+        start_ticks=start_ticks,
+    )
+
+
+def _test_tmux_server_identity(
+    path: Path,
+    *,
+    server_pid: int,
+    server_process: Mapping[str, Any] | None = None,
+    socket_device: int = 1,
+    socket_inode: int = 2,
+) -> dict[str, Any]:
+    process = (
+        _test_process_identity(server_pid)
+        if server_process is None
+        else dict(server_process)
+    )
+    return build_preflight_tmux_server_identity(
+        server_pid=server_pid,
+        server_process=process,
+        socket_path=str(path.resolve()),
+        socket_device=socket_device,
+        socket_inode=socket_inode,
+    )
+
+
+def _test_file_identity(
+    path: Path,
+    *,
+    device: int = 1,
+    inode: int = 2,
+    mode: int = 0o100644,
+    size: int = 1,
+) -> dict[str, Any]:
+    return build_preflight_file_identity(
+        path=str(path.resolve()),
+        device=device,
+        inode=inode,
+        mode=mode,
+        size=size,
+    )
+
+
+def _test_verified_preflight_implementations() -> dict[str, Any]:
+    root = Path(__file__).parents[1]
+
+    def implementation(path: Path) -> dict[str, Any]:
+        resolved = path.resolve(strict=True)
+        value = resolved.stat()
+        return {
+            "path": str(resolved),
+            "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest(),
+            "file_identity": build_preflight_file_identity(
+                path=str(resolved),
+                device=int(value.st_dev),
+                inode=int(value.st_ino),
+                mode=int(value.st_mode),
+                size=int(value.st_size),
+            ),
+        }
+
+    return build_preflight_verified_implementations(
+        verified_loader=implementation(
+            root
+            / "src/safa/closeout/verified_preflight_module_loader.py"
+        ),
+        preflight_launch_contract=implementation(
+            root / "src/safa/closeout/preflight_launch_contract.py"
+        ),
+    )
+
+
+def _test_validated_preflight_launch(
+    *,
+    tmp_path: Path,
+    attempt_id: str,
+    receipt_binding: Mapping[str, Any],
+    receipt_identity: Mapping[str, Any],
+    gate_ready_binding: Mapping[str, Any],
+    tmux_started_binding: Mapping[str, Any],
+    wrapper_started_binding: Mapping[str, Any],
+    gate_process: Mapping[str, Any],
+    wrapper_process: Mapping[str, Any],
+    wrapper_arguments: list[str],
+    wrapper_executable: Mapping[str, Any],
+    pane_log: Mapping[str, Any],
+) -> dict[str, Any]:
+    verified_implementations = (
+        _test_verified_preflight_implementations()
+    )
+    gate_ready = build_preflight_gate_ready(
+        launch_receipt=receipt_binding,
+        launch_receipt_identity=receipt_identity,
+        verified_implementations=verified_implementations,
+        process=gate_process,
+        wrapper_arguments=wrapper_arguments,
+        ready_at="2026-07-28T00:00:00+00:00",
+    )
+    wrapper_started = build_preflight_wrapper_started(
+        launch_receipt=receipt_binding,
+        launch_receipt_identity=receipt_identity,
+        verified_implementations=verified_implementations,
+        pane_gate_ready=gate_ready_binding,
+        pane_gate_process=gate_process,
+        wrapper_arguments=wrapper_arguments,
+        wrapper_process=wrapper_process,
+        wrapper_executable=wrapper_executable,
+        started_at="2026-07-28T00:00:01+00:00",
+        gate_ready=gate_ready,
+    )
+    return {
+        "attempt_id": attempt_id,
+        "receipt_binding": dict(receipt_binding),
+        "receipt_identity": dict(receipt_identity),
+        "verified_implementations": verified_implementations,
+        "gate_ready_binding": dict(gate_ready_binding),
+        "tmux_started_binding": dict(tmux_started_binding),
+        "wrapper_started_binding": dict(wrapper_started_binding),
+        "gate_process": dict(gate_process),
+        "wrapper_launch_process": dict(wrapper_process),
+        "accepted_path": tmp_path / "fixture-launch-accepted.json",
+        "release_path": tmp_path / "fixture-launch-release.json",
+        "wrapper_arguments": list(wrapper_arguments),
+        "wrapper_executable": dict(wrapper_executable),
+        "pane_log": dict(pane_log),
+        "git": {},
+        "gate_ready": gate_ready,
+        "wrapper_started": wrapper_started,
+    }
 
 
 def _decoder_registry(tmp_path: Path) -> dict:
@@ -314,6 +1111,7 @@ def _policy(tmp_path: Path, ledger: Path) -> tuple[dict, Path, dict]:
             "screening_worker",
             "controller",
             "ram_probe_launcher",
+            "preflight_launcher",
             "preflight_wrapper",
             "generator_sampling",
             "meanflow_sampling",
@@ -321,6 +1119,22 @@ def _policy(tmp_path: Path, ledger: Path) -> tuple[dict, Path, dict]:
             "output_contract",
         )
     }
+    root = Path(__file__).parents[1]
+    for name, relative in (
+        (
+            "preflight_verified_loader",
+            "src/safa/closeout/verified_preflight_module_loader.py",
+        ),
+        (
+            "preflight_launch_contract",
+            "src/safa/closeout/preflight_launch_contract.py",
+        ),
+    ):
+        path = (root / relative).resolve(strict=True)
+        implementations[name] = {
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
     policy = {
         "campaign_id": "historical-canonical-512-v1",
         "supersedes_policy_sha256": "f7d9b8e263bdd54af7754889c7e7ce92d3ec7212d3784ac11c819fc3c07381cd",
@@ -4803,7 +5617,13 @@ def test_real_worker_policy_bootstrap_failure_writes_atomic_terminal(
     assert terminal["stage"] == "policy_bootstrap"
     assert terminal["status"] == "failed"
     assert terminal["worker_pid"] > 0
-    assert terminal["request"]["path"] == str(request_path.resolve())
+    assert terminal["request"] == {
+        "observed_path": str(request_path.resolve()),
+        "observed_sha256": hashlib.sha256(
+            request_path.read_bytes()
+        ).hexdigest(),
+        "observed_canonical_sha256": None,
+    }
     assert terminal["worker_bootstrap_terminal_sha256"] == canonical_digest(
         terminal, "worker_bootstrap_terminal_sha256"
     )
@@ -5240,6 +6060,31 @@ def test_unknown_supersession_policy_sha_fails_closed() -> None:
         )
 
 
+def _materialize_observer_ready_binding(
+    module: Any,
+    policy: Mapping[str, Any],
+    paths: Mapping[str, Path],
+) -> dict[str, str]:
+    value = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_preflight_observer_ready_v1",
+        "verified_implementations": (
+            module._verified_preflight_implementations(
+                policy["implementations"]
+            )
+        ),
+    }
+    value["observer_ready_sha256"] = canonical_digest(
+        value, "observer_ready_sha256"
+    )
+    path = paths["preflight_control"] / "observer_ready.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    publish_exclusive_json(path, value)
+    return module._artifact_binding(
+        path, value["observer_ready_sha256"]
+    )
+
+
 def test_preflight_attempt_failure_writes_claim_and_terminal_without_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -5270,12 +6115,23 @@ def test_preflight_attempt_failure_writes_claim_and_terminal_without_result(
         module, "_assert_preflight_observer_live", lambda *_args: None
     )
     guard = types.SimpleNamespace(raise_if_violated=lambda: None)
+    observer_ready = _materialize_observer_ready_binding(
+        module, policy, paths
+    )
     with pytest.raises(RuntimeError, match="injected"):
         module.materialize_preflights(
-            policy, paths, guard, "d" * 64, {"sha256": "e" * 64}
+            policy, paths, guard, "d" * 64, observer_ready
         )
     attempts = paths["preflight_control"] / "attempts"
     claim = load_json(next(attempts.glob("*.claim.json")), "attempt claim")
+    ready = load_json(
+        paths["preflight_control"] / "observer_ready.json",
+        "materialization observer ready",
+    )
+    assert (
+        claim["verified_implementations"]
+        == ready["verified_implementations"]
+    )
     terminal = load_json(next(attempts.glob("*.terminal.json")), "attempt terminal")
     assert terminal["attempt_claim_sha256"] == claim["attempt_claim_sha256"]
     assert terminal["status"] == "failed"
@@ -5305,6 +6161,9 @@ def test_runtime_stop_before_result_writes_one_failed_attempt_terminal(
     monkeypatch.setattr(
         module, "_assert_preflight_observer_live", lambda *_args: None
     )
+    observer_ready = _materialize_observer_ready_binding(
+        module, policy, paths
+    )
 
     class Guard:
         def __init__(self) -> None:
@@ -5321,7 +6180,7 @@ def test_runtime_stop_before_result_writes_one_failed_attempt_terminal(
             paths,
             Guard(),
             "d" * 64,
-            {"sha256": "e" * 64},
+            observer_ready,
         )
     attempts = paths["preflight_control"] / "attempts"
     terminals = list(attempts.glob("*.terminal.json"))
@@ -5479,6 +6338,7 @@ def _prepare_wrapper_contract_inputs(wrapper, policy_root: Path) -> None:
 def _patch_wrapper_tmux(
     wrapper, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    gate_pid = os.getpid() + 100000
     fake_terminal = tmp_path / "fake_observer_terminal.json"
     fake_terminal.write_text(
         json.dumps({"status": "completed"}) + "\n", encoding="utf-8"
@@ -5499,7 +6359,11 @@ def _patch_wrapper_tmux(
             "pane": (
                 "%0" if session == wrapper.CONTROLLER_SESSION else "%1"
             ),
-            "pane_pid": os.getpid(),
+            "pane_pid": (
+                gate_pid
+                if session == wrapper.CONTROLLER_SESSION
+                else os.getpid()
+            ),
             "pane_current_command": "python",
         },
     )
@@ -5513,17 +6377,18 @@ def _patch_wrapper_tmux(
                 else wrapper.OBSERVER_SESSION
             ),
             "pane": pane,
-            "pane_pid": os.getpid(),
+            "pane_pid": gate_pid if pane == "%0" else os.getpid(),
             "pane_current_command": "python",
         },
     )
     monkeypatch.setattr(
         wrapper,
         "_tmux_server_identity",
-        lambda _target=None: {
-            "server_pid": os.getpid(),
-            "socket_path": str((tmp_path / "tmux.sock").resolve()),
-        },
+        lambda _target=None: _test_tmux_server_identity(
+            tmp_path / "tmux.sock",
+            server_pid=os.getpid(),
+            server_process=fixture_process,
+        ),
     )
     fixture_tmux = {
         "session": wrapper.OBSERVER_SESSION,
@@ -5531,14 +6396,17 @@ def _patch_wrapper_tmux(
         "pane_pid": os.getpid(),
         "pane_current_command": "python",
     }
-    fixture_server = {
-        "server_pid": os.getpid(),
-        "socket_path": str((tmp_path / "tmux.sock").resolve()),
-    }
     fixture_process = wrapper._require_process_identity(
         os.getpid(), "fixture"
     )
+    fixture_process["ppid"] = gate_pid
     fixture_process["pgid"] = fixture_process["pid"]
+    fixture_process["sid"] = fixture_process["pid"]
+    fixture_server = _test_tmux_server_identity(
+        tmp_path / "tmux.sock",
+        server_pid=os.getpid(),
+        server_process=fixture_process,
+    )
     real_process_identity = wrapper._process_identity
     real_read_process_stat = wrapper._read_process_stat
     monkeypatch.setattr(
@@ -5547,6 +6415,8 @@ def _patch_wrapper_tmux(
         lambda pid: (
             dict(fixture_process)
             if pid == fixture_process["pid"]
+            else _test_process_identity(gate_pid, start_ticks=77)
+            if pid == gate_pid
             else real_process_identity(pid)
         ),
     )
@@ -5562,17 +6432,54 @@ def _patch_wrapper_tmux(
     monkeypatch.setattr(
         wrapper,
         "_build_tmux_owner_seal",
-        lambda tmux, server, owner_nonce: {
-            "server_pid": server["server_pid"],
-            "server_start_ticks": fixture_process["start_ticks"],
-            "socket_path": server["socket_path"],
-            "socket_device": 1,
-            "socket_inode": 2,
-            "session": tmux["session"],
-            "pane": tmux["pane"],
-            "pane_pid": tmux["pane_pid"],
-            "owner_nonce": owner_nonce,
-        },
+        lambda tmux, server, owner_nonce: _test_tmux_owner_seal(
+            tmux,
+            server,
+            owner_nonce=owner_nonce,
+            server_start_ticks=fixture_process["start_ticks"],
+            pane_process=fixture_process,
+        ),
+    )
+    launch_binding = dict(fake_terminal_binding)
+    wrapper_arguments = wrapper._process_command(os.getpid())
+    wrapper_executable = str(
+        Path(os.readlink(f"/proc/{os.getpid()}/exe")).resolve()
+    )
+    fixture_launch = _test_validated_preflight_launch(
+        tmp_path=tmp_path,
+        attempt_id="f" * 64,
+        receipt_binding=launch_binding,
+        receipt_identity=_test_file_identity(
+            Path(launch_binding["path"])
+        ),
+        gate_ready_binding=launch_binding,
+        tmux_started_binding=launch_binding,
+        wrapper_started_binding=launch_binding,
+        gate_process=_test_process_identity(
+            gate_pid, start_ticks=77
+        ),
+        wrapper_process=_test_process_identity(
+            os.getpid(),
+            ppid=gate_pid,
+            start_ticks=fixture_process["start_ticks"],
+        ),
+        wrapper_arguments=wrapper_arguments,
+        wrapper_executable=_test_executable_identity(
+            wrapper_executable
+        ),
+        pane_log=_test_file_identity(
+            tmp_path / "fixture-pane.log"
+        ),
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_validate_preflight_launch_receipt",
+        lambda **_kwargs: dict(fixture_launch),
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_wait_preflight_launch_release",
+        lambda **_kwargs: None,
     )
 
     def fake_wait_identity(
@@ -5587,11 +6494,15 @@ def _patch_wrapper_tmux(
                 "safa_canonical_preflight_observer_bootstrap_v1"
             ),
             "policy_sha256": wait_kwargs["policy_sha256"],
+            "verified_implementations": (
+                wrapper._reverify_verified_preflight_apis()
+            ),
             "wrapper_claim": dict(wait_kwargs["wrapper_binding"]),
             "observer_session": wrapper.OBSERVER_SESSION,
             "owner_nonce": owner_nonce,
             "process": dict(fixture_process),
             "executable": sys.executable,
+            "executable_identity": _test_executable_identity(),
             "command": list(wait_kwargs["expected_command"]),
             "tmux": dict(fixture_tmux),
             "published_at": wrapper._utc_now(),
@@ -5605,17 +6516,13 @@ def _patch_wrapper_tmux(
         return (
             dict(fixture_tmux),
             dict(fixture_server),
-            {
-                "server_pid": fixture_server["server_pid"],
-                "server_start_ticks": fixture_process["start_ticks"],
-                "socket_path": fixture_server["socket_path"],
-                "socket_device": 1,
-                "socket_inode": 2,
-                "session": fixture_tmux["session"],
-                "pane": fixture_tmux["pane"],
-                "pane_pid": fixture_tmux["pane_pid"],
-                "owner_nonce": owner_nonce,
-            },
+            _test_tmux_owner_seal(
+                fixture_tmux,
+                fixture_server,
+                owner_nonce=owner_nonce,
+                server_start_ticks=fixture_process["start_ticks"],
+                pane_process=fixture_process,
+            ),
             dict(fixture_process),
             bootstrap,
         )
@@ -5642,6 +6549,9 @@ def _patch_wrapper_tmux(
                 "safa_canonical_preflight_observer_gate_ready_v1"
             ),
             "policy_sha256": policy_sha256,
+            "verified_implementations": (
+                wrapper._reverify_verified_preflight_apis()
+            ),
             "wrapper_claim": dict(wrapper_binding),
             "observer_session": wrapper.OBSERVER_SESSION,
             "owner_nonce": owner_nonce,
@@ -5666,19 +6576,15 @@ def _patch_wrapper_tmux(
                 "status": "exact_ready",
                 "tmux": dict(fixture_tmux),
                 "tmux_server": dict(fixture_server),
-                "tmux_owner_seal": {
-                    "server_pid": fixture_server["server_pid"],
-                    "server_start_ticks": fixture_process[
+                "tmux_owner_seal": _test_tmux_owner_seal(
+                    fixture_tmux,
+                    fixture_server,
+                    owner_nonce=owner_nonce,
+                    server_start_ticks=fixture_process[
                         "start_ticks"
                     ],
-                    "socket_path": fixture_server["socket_path"],
-                    "socket_device": 1,
-                    "socket_inode": 2,
-                    "session": fixture_tmux["session"],
-                    "pane": fixture_tmux["pane"],
-                    "pane_pid": fixture_tmux["pane_pid"],
-                    "owner_nonce": owner_nonce,
-                },
+                    pane_process=fixture_process,
+                ),
                 "process": dict(fixture_process),
                 "gate_ready": ready,
                 "failure": None,
@@ -5738,21 +6644,14 @@ def _patch_wrapper_tmux(
                 "pane_pid": os.getpid(),
                 "pane_current_command": "python",
             },
-            "sealed_tmux_server": {
-                "server_pid": os.getpid(),
-                "socket_path": str((tmp_path / "tmux.sock").resolve()),
-            },
-            "sealed_tmux_owner": {
-                "server_pid": fixture_server["server_pid"],
-                "server_start_ticks": fixture_process["start_ticks"],
-                "socket_path": fixture_server["socket_path"],
-                "socket_device": 1,
-                "socket_inode": 2,
-                "session": fixture_tmux["session"],
-                "pane": fixture_tmux["pane"],
-                "pane_pid": fixture_tmux["pane_pid"],
-                "owner_nonce": "a" * 64,
-            },
+            "sealed_tmux_server": dict(fixture_server),
+            "sealed_tmux_owner": _test_tmux_owner_seal(
+                fixture_tmux,
+                fixture_server,
+                owner_nonce="a" * 64,
+                server_start_ticks=fixture_process["start_ticks"],
+                pane_process=fixture_process,
+            ),
             "sealed_process": dict(fixture_process),
             "status": "closed_terminal_observer",
             "session_residual": False,
@@ -5776,25 +6675,38 @@ def _run_provisional_observer_launch_failure(
     wrapper = _wrapper_module()
     policy_sha256 = "7" * 64
     policy_root = tmp_path / "campaign" / "by_policy" / policy_sha256
-    config = tmp_path / "policy.json"
-    config.write_text("{}\n", encoding="utf-8")
+    config = (
+        Path(__file__).parents[1]
+        / "configs/closeout/canonical_screening_512_v1.json"
+    )
     _prepare_wrapper_contract_inputs(wrapper, policy_root)
-    observer_command = [sys.executable, "-c", "pass"]
+    observer_command = [
+        sys.executable,
+        "controller.py",
+        "--config",
+        str(config),
+    ]
     controller_command = [sys.executable, "-c", "raise SystemExit(0)"]
     control = policy_root / "preflight_control"
     controller_process = wrapper._require_process_identity(
         os.getpid(), "fixture controller"
     )
+    gate_pid = 301
+    controller_process["ppid"] = gate_pid
     controller_process["pgid"] = controller_process["pid"]
-    observer_process = {"pid": 401, "pgid": 401, "start_ticks": 88}
-    server = {
-        "server_pid": os.getpid(),
-        "socket_path": str((tmp_path / "tmux.sock").resolve()),
-    }
+    controller_process["sid"] = controller_process["pid"]
+    observer_process = _test_process_identity(
+        401, ppid=os.getpid(), start_ticks=88
+    )
+    server = _test_tmux_server_identity(
+        tmp_path / "tmux.sock",
+        server_pid=os.getpid(),
+        server_process=controller_process,
+    )
     controller_tmux = {
         "session": wrapper.CONTROLLER_SESSION,
         "pane": "%0",
-        "pane_pid": os.getpid(),
+        "pane_pid": gate_pid,
         "pane_current_command": "python",
     }
     observer_tmux = {
@@ -5885,6 +6797,8 @@ def _run_provisional_observer_launch_failure(
     def process_identity(pid: int):
         if pid == os.getpid():
             return dict(controller_process)
+        if pid == gate_pid:
+            return _test_process_identity(gate_pid, start_ticks=77)
         if pid == observer_process["pid"] and state["owner"] == "sealed":
             return dict(observer_process)
         return None
@@ -5895,15 +6809,71 @@ def _run_provisional_observer_launch_failure(
 
     monkeypatch.setattr(wrapper, "_process_identity", process_identity)
     monkeypatch.setattr(wrapper, "_read_process_stat", process_stat)
+    wrapper_arguments = wrapper._process_command(os.getpid())
+    wrapper_executable = str(
+        Path(os.readlink(f"/proc/{os.getpid()}/exe")).resolve()
+    )
+    launch_binding = {
+        "path": str((tmp_path / "fixture-launch.json").resolve()),
+        "sha256": "a" * 64,
+        "canonical_sha256": "b" * 64,
+    }
+    fixture_launch = _test_validated_preflight_launch(
+        tmp_path=tmp_path,
+        attempt_id="f" * 64,
+        receipt_binding=launch_binding,
+        receipt_identity=_test_file_identity(
+            Path(launch_binding["path"])
+        ),
+        gate_ready_binding=launch_binding,
+        tmux_started_binding=launch_binding,
+        wrapper_started_binding=launch_binding,
+        gate_process=_test_process_identity(
+            gate_pid, start_ticks=77
+        ),
+        wrapper_process=_test_process_identity(
+            os.getpid(),
+            ppid=gate_pid,
+            start_ticks=controller_process["start_ticks"],
+        ),
+        wrapper_arguments=wrapper_arguments,
+        wrapper_executable=_test_executable_identity(
+            wrapper_executable
+        ),
+        pane_log=_test_file_identity(
+            tmp_path / "fixture-pane.log"
+        ),
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_validate_preflight_launch_receipt",
+        lambda **_kwargs: dict(fixture_launch),
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_wait_preflight_launch_release",
+        lambda **_kwargs: None,
+    )
+    original_wrapper_readlink = wrapper.os.readlink
     monkeypatch.setattr(
         wrapper.os,
         "readlink",
         lambda path: (
             sys.executable
             if path == f"/proc/{observer_process['pid']}/exe"
-            else (_ for _ in ()).throw(
-                AssertionError(f"unexpected executable probe: {path}")
-            )
+            else original_wrapper_readlink(path)
+        ),
+    )
+    real_process_executable_identity = (
+        wrapper._process_executable_identity
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_process_executable_identity",
+        lambda pid: (
+            _test_executable_identity()
+            if pid == observer_process["pid"]
+            else real_process_executable_identity(pid)
         ),
     )
     monkeypatch.setattr(
@@ -5914,6 +6884,17 @@ def _run_provisional_observer_launch_failure(
             if pid == observer_process["pid"]
             else (_ for _ in ()).throw(
                 AssertionError("unexpected process command PID")
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_process_command_bytes",
+        lambda pid: (
+            wrapper._command_bytes(observer_command)
+            if pid == observer_process["pid"]
+            else (_ for _ in ()).throw(
+                AssertionError("unexpected raw process command PID")
             )
         ),
     )
@@ -5942,11 +6923,15 @@ def _run_provisional_observer_launch_failure(
                     "safa_canonical_preflight_observer_bootstrap_v1"
                 ),
                 "policy_sha256": policy_sha256,
+                "verified_implementations": (
+                    wrapper._reverify_verified_preflight_apis()
+                ),
                 "wrapper_claim": wrapper_binding,
                 "observer_session": wrapper.OBSERVER_SESSION,
                 "owner_nonce": owner_nonce,
                 "process": dict(observer_process),
                 "executable": sys.executable,
+                "executable_identity": _test_executable_identity(),
                 "command": list(observer_command),
                 "tmux": dict(observer_tmux),
                 "published_at": wrapper._utc_now(),
@@ -5962,6 +6947,13 @@ def _run_provisional_observer_launch_failure(
                 bootstrap["process"] = {
                     **observer_process,
                     "start_ticks": observer_process["start_ticks"] + 1,
+                }
+            elif mutation == "executable_identity":
+                bootstrap["executable_identity"] = {
+                    **bootstrap["executable_identity"],
+                    "inode": (
+                        bootstrap["executable_identity"]["inode"] + 1
+                    ),
                 }
             bootstrap["observer_bootstrap_sha256"] = (
                 wrapper._canonical_digest(
@@ -6235,7 +7227,14 @@ def _run_provisional_observer_launch_failure(
 
 @pytest.mark.parametrize(
     "mutation",
-    ("never_publish", "canonical", "wrapper", "command", "process"),
+    (
+        "never_publish",
+        "canonical",
+        "wrapper",
+        "command",
+        "process",
+        "executable_identity",
+    ),
 )
 def test_wrapper_provisional_owner_closes_each_bootstrap_failure(
     tmp_path: Path,
@@ -6581,6 +7580,8 @@ def test_wrapper_gate_post_seal_probe_failure_keeps_exact_cleanup(
     (
         ("ready_canonical", "exact_owner_ready_invalid"),
         ("ready_identity", "exact_owner_ready_invalid"),
+        ("ready_executable", "exact_owner_ready_invalid"),
+        ("ready_command", "exact_owner_ready_invalid"),
         ("process_stat", "exact_owner_process_probe_failed"),
     ),
 )
@@ -6664,8 +7665,16 @@ def test_wrapper_probe_owner_seal_is_monotonic_after_exact_marker(
             "observer_session": wrapper.OBSERVER_SESSION,
             "owner_nonce": owner_nonce,
             "process": ready_process,
-            "gate_executable": sys.executable,
-            "gate_command": [sys.executable, "gate"],
+            "gate_executable": (
+                "/wrong/executable"
+                if failure_kind == "ready_executable"
+                else sys.executable
+            ),
+            "gate_command": (
+                [sys.executable, "wrong-gate"]
+                if failure_kind == "ready_command"
+                else [sys.executable, "gate"]
+            ),
             "tmux": tmux_identity,
             "tmux_server": tmux_server,
             "release_path": str(release_path.resolve()),
@@ -6689,6 +7698,13 @@ def test_wrapper_probe_owner_seal_is_monotonic_after_exact_marker(
             "_process_command",
             lambda _pid: [sys.executable, "gate"],
         )
+        monkeypatch.setattr(
+            wrapper,
+            "_process_command_bytes",
+            lambda _pid: wrapper._command_bytes(
+                [sys.executable, "gate"]
+            ),
+        )
     probe = wrapper._probe_observer_gate(
         ready_path=ready_path,
         release_path=release_path,
@@ -6706,6 +7722,241 @@ def test_wrapper_probe_owner_seal_is_monotonic_after_exact_marker(
     else:
         assert probe["process_probe"]["status"] == "live"
         assert probe["process"] == process
+
+
+def test_wrapper_probe_allows_diagnostic_command_transition_for_same_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper = _wrapper_module()
+    owner_nonce = "a" * 64
+    initial_tmux = {
+        "session": wrapper.OBSERVER_SESSION,
+        "pane": "%75",
+        "pane_pid": 705,
+        "pane_current_command": "bash",
+    }
+    ready_tmux = {
+        **initial_tmux,
+        "pane_current_command": "python",
+    }
+    tmux_server = {
+        "server_pid": 605,
+        "socket_path": str((tmp_path / "tmux.sock").resolve()),
+    }
+    process = {"pid": 705, "pgid": 705, "start_ticks": 89}
+    owner_seal = _test_tmux_owner_seal(
+        ready_tmux, tmux_server, owner_nonce=owner_nonce
+    )
+    ready_path = tmp_path / "observer_gate_ready.json"
+    release_path = tmp_path / "observer_gate_release.json"
+    bootstrap_path = tmp_path / "observer_bootstrap.json"
+    wrapper_binding = {
+        "path": str((tmp_path / "wrapper.json").resolve()),
+        "sha256": "b" * 64,
+        "canonical_sha256": "c" * 64,
+    }
+    observer_command = [sys.executable, "-c", "pass"]
+    ready = {
+        "schema_version": 1,
+        "contract_type": (
+            "safa_canonical_preflight_observer_gate_ready_v1"
+        ),
+        "policy_sha256": "d" * 64,
+        "verified_implementations": (
+            wrapper._reverify_verified_preflight_apis()
+        ),
+        "wrapper_claim": wrapper_binding,
+        "observer_session": wrapper.OBSERVER_SESSION,
+        "owner_nonce": owner_nonce,
+        "process": process,
+        "gate_executable": sys.executable,
+        "gate_command": [sys.executable, "gate"],
+        "tmux": ready_tmux,
+        "tmux_server": tmux_server,
+        "release_path": str(release_path.resolve()),
+        "bootstrap_path": str(bootstrap_path.resolve()),
+        "observer_command": observer_command,
+        "published_at": wrapper._utc_now(),
+    }
+    ready["observer_gate_ready_sha256"] = (
+        wrapper._canonical_digest(
+            ready, "observer_gate_ready_sha256"
+        )
+    )
+    calls = {"identity": 0}
+
+    def identity(_session: str) -> dict[str, Any]:
+        calls["identity"] += 1
+        if calls["identity"] == 2:
+            wrapper._write_exclusive(ready_path, ready)
+        return dict(
+            initial_tmux
+            if calls["identity"] == 1
+            else ready_tmux
+        )
+
+    monkeypatch.setattr(wrapper, "OBSERVER_IDENTITY_WAIT_SECONDS", 1.0)
+    monkeypatch.setattr(wrapper, "_tmux_identity", identity)
+    monkeypatch.setattr(
+        wrapper,
+        "_tmux_server_identity",
+        lambda _target=None: dict(tmux_server),
+    )
+    monkeypatch.setattr(
+        wrapper, "_tmux_owner_nonce_raw", lambda *_args: owner_nonce
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_build_tmux_owner_seal",
+        lambda *_args: dict(owner_seal),
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_read_process_stat",
+        lambda _pid: (dict(process), "S"),
+    )
+    monkeypatch.setattr(
+        wrapper.os, "readlink", lambda _path: sys.executable
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_process_command",
+        lambda _pid: [sys.executable, "gate"],
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_process_command_bytes",
+        lambda _pid: wrapper._command_bytes(
+            [sys.executable, "gate"]
+        ),
+    )
+    probe = wrapper._probe_observer_gate(
+        ready_path=ready_path,
+        release_path=release_path,
+        bootstrap_path=bootstrap_path,
+        policy_sha256="d" * 64,
+        wrapper_binding=wrapper_binding,
+        owner_nonce=owner_nonce,
+        observer_command=observer_command,
+    )
+    assert probe["status"] == "exact_ready"
+    assert probe["tmux"] == ready_tmux
+    assert probe["best_process"] == process
+    assert calls["identity"] >= 2
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "pane",
+        "pane_pid",
+        "process_ppid",
+        "process_sid",
+        "process_start_ticks",
+        "server",
+        "owner_nonce",
+    ),
+)
+def test_wrapper_probe_rejects_stable_owner_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    wrapper = _wrapper_module()
+    owner_nonce = "a" * 64
+    tmux_identity = {
+        "session": wrapper.OBSERVER_SESSION,
+        "pane": "%76",
+        "pane_pid": 706,
+        "pane_current_command": "bash",
+    }
+    tmux_server = {
+        "server_pid": 606,
+        "socket_path": str((tmp_path / "tmux.sock").resolve()),
+    }
+    process = {"pid": 706, "pgid": 706, "start_ticks": 90}
+    owner_seal = _test_tmux_owner_seal(
+        tmux_identity, tmux_server, owner_nonce=owner_nonce
+    )
+    calls = {"identity": 0}
+
+    def identity(_session: str) -> dict[str, Any]:
+        calls["identity"] += 1
+        value = dict(tmux_identity)
+        if calls["identity"] >= 2:
+            if mutation == "pane":
+                value["pane"] = "%77"
+            elif mutation == "pane_pid":
+                value["pane_pid"] += 1
+        return value
+
+    def server(_target=None) -> dict[str, Any]:
+        value = dict(tmux_server)
+        if calls["identity"] >= 2 and mutation == "server":
+            value["server_pid"] += 1
+        return value
+
+    def seal(*_args) -> dict[str, Any]:
+        value = dict(owner_seal)
+        if calls["identity"] >= 2:
+            if mutation == "pane":
+                value["pane"] = "%77"
+            elif mutation == "pane_pid":
+                value["pane_pid"] += 1
+            elif mutation == "server":
+                value["server_pid"] += 1
+            elif mutation == "owner_nonce":
+                value["owner_nonce"] = "b" * 64
+            elif mutation in {"process_ppid", "process_sid"}:
+                value["pane_process"] = dict(
+                    value["pane_process"]
+                )
+                field = (
+                    "ppid"
+                    if mutation == "process_ppid"
+                    else "sid"
+                )
+                value["pane_process"][field] += 1
+        return value
+
+    def process_stat(_pid: int):
+        value = dict(process)
+        if (
+            calls["identity"] >= 2
+            and mutation == "process_start_ticks"
+        ):
+            value["start_ticks"] += 1
+        return value, "S"
+
+    monkeypatch.setattr(wrapper, "OBSERVER_IDENTITY_WAIT_SECONDS", 5.0)
+    monkeypatch.setattr(wrapper.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(wrapper, "_tmux_identity", identity)
+    monkeypatch.setattr(wrapper, "_tmux_server_identity", server)
+    monkeypatch.setattr(
+        wrapper, "_tmux_owner_nonce_raw", lambda *_args: owner_nonce
+    )
+    monkeypatch.setattr(wrapper, "_build_tmux_owner_seal", seal)
+    monkeypatch.setattr(wrapper, "_read_process_stat", process_stat)
+    probe = wrapper._probe_observer_gate(
+        ready_path=tmp_path / "observer_gate_ready.json",
+        release_path=tmp_path / "observer_gate_release.json",
+        bootstrap_path=tmp_path / "observer_bootstrap.json",
+        policy_sha256="d" * 64,
+        wrapper_binding={
+            "path": str((tmp_path / "wrapper.json").resolve()),
+            "sha256": "b" * 64,
+            "canonical_sha256": "c" * 64,
+        },
+        owner_nonce=owner_nonce,
+        observer_command=[sys.executable, "-c", "pass"],
+    )
+    assert probe["status"] == "exact_owner_evidence_conflict"
+    assert probe["failure"]["type"] in {
+        "TmuxOwnerEvidenceConflict",
+        "ProcessOwnerEvidenceConflict",
+    }
+    assert probe["session_residual"] is True
 
 
 @pytest.mark.parametrize(
@@ -6810,6 +8061,10 @@ def test_wrapper_probe_retains_best_exact_evidence_after_weaker_observation(
 
 def test_wrapper_gate_new_session_is_one_exec_command() -> None:
     wrapper = _wrapper_module()
+    config_path = (
+        Path(__file__).parents[1]
+        / "configs/closeout/canonical_screening_512_v1.json"
+    )
     command = wrapper._observer_gate_command(
         ready_path=Path("/tmp/ready.json"),
         release_path=Path("/tmp/release.json"),
@@ -6821,7 +8076,12 @@ def test_wrapper_gate_new_session_is_one_exec_command() -> None:
             "canonical_sha256": "c" * 64,
         },
         owner_nonce="d" * 64,
-        observer_command=[sys.executable, "-c", "pass"],
+        observer_command=[
+            sys.executable,
+            "controller.py",
+            "--config",
+            str(config_path),
+        ],
     )
     shell_command = "exec " + wrapper.shlex.join(command)
     assert shell_command.startswith("exec ")
@@ -6885,7 +8145,15 @@ def test_wrapper_gate_creation_binds_nonce_atomically_before_replacement_probe(
             "canonical_sha256": "c" * 64,
         },
         owner_nonce=owner_nonce,
-        observer_command=[sys.executable, "-c", "pass"],
+        observer_command=[
+            sys.executable,
+            "controller.py",
+            "--config",
+            str(
+                Path(__file__).parents[1]
+                / "configs/closeout/canonical_screening_512_v1.json"
+            ),
+        ],
     )
     assert probe == replacement_probe
     assert client["returncode"] == 0
@@ -6972,7 +8240,13 @@ def test_wrapper_process_identity_zombie_skips_executable_probe(
         ),
     )
     assert wrapper._process_identity_state(pid) == (
-        {"pid": pid, "pgid": 401, "start_ticks": 88},
+        _test_process_identity(
+            pid,
+            ppid=1,
+            pgid=401,
+            sid=401,
+            start_ticks=88,
+        ),
         "Z",
     )
 
@@ -7156,7 +8430,13 @@ def test_wrapper_process_identity_parses_command_spaces(
     monkeypatch.setattr(wrapper.os, "readlink", lambda _path: "/tmux")
     monkeypatch.setattr(wrapper.os, "getpgid", lambda _pid: 400)
     assert wrapper._process_identity_state(pid) == (
-        {"pid": pid, "pgid": 400, "start_ticks": 96},
+        _test_process_identity(
+            pid,
+            ppid=1,
+            pgid=400,
+            sid=400,
+            start_ticks=96,
+        ),
         "S",
     )
 
@@ -7231,11 +8511,13 @@ def test_controller_process_identity_parses_parenthesized_command_spaces(
         "read_text",
         lambda *_args, **_kwargs: raw_stat,
     )
-    assert module._process_identity(301) == {
-        "pid": 301,
-        "pgid": 301,
-        "start_ticks": 777,
-    }
+    assert module._process_identity(301) == _test_process_identity(
+        301,
+        ppid=1,
+        pgid=301,
+        sid=301,
+        start_ticks=777,
+    )
 
 
 @pytest.mark.parametrize(
@@ -7633,18 +8915,406 @@ def _test_tmux_owner_seal(
     *,
     owner_nonce: str = "a" * 64,
     server_start_ticks: int = 55,
+    pane_process: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
-        "server_pid": server["server_pid"],
-        "server_start_ticks": server_start_ticks,
-        "socket_path": server["socket_path"],
-        "socket_device": 1,
-        "socket_inode": 2,
-        "session": tmux["session"],
-        "pane": tmux["pane"],
-        "pane_pid": tmux["pane_pid"],
-        "owner_nonce": owner_nonce,
+    sealed_server = (
+        dict(server)
+        if set(server) == {
+            "server_pid",
+            "server_process",
+            "socket_path",
+            "socket_device",
+            "socket_inode",
+        }
+        else _test_tmux_server_identity(
+            Path(str(server["socket_path"])),
+            server_pid=int(server["server_pid"]),
+            server_process=_test_process_identity(
+                int(server["server_pid"]),
+                start_ticks=server_start_ticks,
+            ),
+        )
+    )
+    sealed_pane_process = (
+        _test_process_identity(
+            int(tmux["pane_pid"]), start_ticks=77
+        )
+        if pane_process is None
+        else dict(pane_process)
+    )
+    return build_preflight_pane_owner_seal(
+        server_pid=int(sealed_server["server_pid"]),
+        server_start_ticks=server_start_ticks,
+        socket_path=str(sealed_server["socket_path"]),
+        socket_device=int(sealed_server["socket_device"]),
+        socket_inode=int(sealed_server["socket_inode"]),
+        session=str(tmux["session"]),
+        pane=str(tmux["pane"]),
+        pane_pid=int(tmux["pane_pid"]),
+        pane_process=sealed_pane_process,
+        owner_nonce=owner_nonce,
+        tmux_identity=tmux,
+        tmux_server=sealed_server,
+    )
+
+
+def _write_preflight_wrapper_v3_fixture(
+    module: Any,
+    policy: Mapping[str, Any],
+    paths: Mapping[str, Path],
+    *,
+    gate_pid: int,
+    wrapper_pid: int,
+    controller_tmux: Mapping[str, Any],
+    tmux_server: Mapping[str, Any],
+) -> tuple[dict[str, Any], Path, dict[str, Any]]:
+    control = paths["preflight_control"]
+    verified_implementations = (
+        _test_verified_preflight_implementations()
+    )
+    module.validate_tmux_server_identity(
+        tmux_server, "fixture tmux server"
+    )
+    gate_process = _test_process_identity(
+        gate_pid, start_ticks=30
+    )
+    wrapper_launch_process = _test_process_identity(
+        wrapper_pid, ppid=gate_pid, start_ticks=31
+    )
+    gate_arguments = [str(Path(sys.executable).resolve()), "fixture-gate"]
+    wrapper_arguments = [
+        str(Path(sys.executable).resolve()),
+        "fixture-wrapper",
+    ]
+    executable_identity = _test_executable_identity()
+    attempt_id = "f" * 64
+    attempt_root = (
+        paths["root"]
+        / "preflight_launch_attempts"
+        / "by_policy"
+        / str(policy["policy_sha256"])
+        / attempt_id
+    )
+    pane_log_path = attempt_root / "pane.log"
+    pane_log_path.parent.mkdir(parents=True, exist_ok=True)
+    pane_log_path.write_bytes(b"")
+    pane_log_stat = pane_log_path.stat()
+    pane_log = build_preflight_file_identity(
+        path=str(pane_log_path.resolve()),
+        device=int(pane_log_stat.st_dev),
+        inode=int(pane_log_stat.st_ino),
+        mode=int(pane_log_stat.st_mode),
+        size=int(pane_log_stat.st_size),
+    )
+    started_registry = {
+        "schema_version": 1,
+        "contract_type": (
+            "safa_canonical_preflight_launch_started_registry_v1"
+        ),
+        "attempt_id": attempt_id,
+        "policy_sha256": policy["policy_sha256"],
+        "started_at": "2026-07-28T00:00:00+00:00",
     }
+    started_registry["launch_started_registry_sha256"] = (
+        canonical_digest(
+            started_registry, "launch_started_registry_sha256"
+        )
+    )
+    started_registry_path = (
+        paths["root"]
+        / "preflight_launch_attempts"
+        / "started"
+        / f"{attempt_id}.json"
+    )
+    write_exclusive_json(started_registry_path, started_registry)
+    started_registry_binding = module._artifact_binding(
+        started_registry_path,
+        started_registry["launch_started_registry_sha256"],
+    )
+    wrapper_path = control / "wrapper_claim.json"
+    wrapper_started_path = attempt_root / "wrapper_started.json"
+    receipt = {
+        "schema_version": 1,
+        "contract_type": (
+            "safa_canonical_preflight_launch_receipt_v1"
+        ),
+        "attempt_id": attempt_id,
+        "policy_sha256": policy["policy_sha256"],
+        "verified_implementations": verified_implementations,
+        "pane_gate_arguments": gate_arguments,
+        "wrapper_arguments": wrapper_arguments,
+        "python_executable": {
+            "path": executable_identity["path"],
+            "sha256": hashlib.sha256(
+                Path(executable_identity["path"]).read_bytes()
+            ).hexdigest(),
+        },
+        "started_registry": started_registry_binding,
+        "pane_log": pane_log,
+        "wrapper_claim_path": str(wrapper_path.resolve()),
+        "wrapper_started_path": str(wrapper_started_path.resolve()),
+        "gate_execution_terminal_path": str(
+            (attempt_root / "gate_execution_terminal.json").resolve()
+        ),
+        "git": {},
+        "started_at": "2026-07-28T00:00:00+00:00",
+    }
+    receipt["launch_receipt_sha256"] = canonical_digest(
+        receipt, "launch_receipt_sha256"
+    )
+    receipt_path = attempt_root / "launch_receipt.json"
+    write_exclusive_json(receipt_path, receipt)
+    receipt_stat = receipt_path.stat()
+    receipt_identity = {
+        "path": str(receipt_path.resolve()),
+        "device": int(receipt_stat.st_dev),
+        "inode": int(receipt_stat.st_ino),
+        "mode": int(receipt_stat.st_mode),
+        "size": int(receipt_stat.st_size),
+    }
+    receipt_binding = module._artifact_binding(
+        receipt_path, receipt["launch_receipt_sha256"]
+    )
+    gate_ready = build_preflight_gate_ready(
+        launch_receipt=receipt_binding,
+        launch_receipt_identity=receipt_identity,
+        verified_implementations=verified_implementations,
+        process=gate_process,
+        wrapper_arguments=wrapper_arguments,
+        ready_at="2026-07-28T00:00:01+00:00",
+    )
+    gate_ready_path = attempt_root / "pane_gate_ready.json"
+    write_exclusive_json(gate_ready_path, gate_ready)
+    gate_ready_binding = module._artifact_binding(
+        gate_ready_path, gate_ready["pane_gate_ready_sha256"]
+    )
+    owner_seal = build_preflight_pane_owner_seal(
+        server_pid=int(tmux_server["server_pid"]),
+        server_start_ticks=int(
+            tmux_server["server_process"]["start_ticks"]
+        ),
+        socket_path=str(tmux_server["socket_path"]),
+        socket_device=int(tmux_server["socket_device"]),
+        socket_inode=int(tmux_server["socket_inode"]),
+        session=str(controller_tmux["session"]),
+        pane=str(controller_tmux["pane"]),
+        pane_pid=int(controller_tmux["pane_pid"]),
+        pane_process=gate_process,
+        owner_nonce="a" * 64,
+        tmux_identity=controller_tmux,
+        tmux_server=tmux_server,
+    )
+    tmux_started = build_preflight_tmux_started(
+        launch_receipt=receipt_binding,
+        launch_receipt_identity=receipt_identity,
+        verified_implementations=verified_implementations,
+        pane_gate_ready=gate_ready_binding,
+        tmux_client={"returncode": 0, "stdout": "", "stderr": ""},
+        owner_seal=owner_seal,
+        started_at="2026-07-28T00:00:01+00:00",
+        tmux_identity=controller_tmux,
+        tmux_server=tmux_server,
+    )
+    tmux_started_path = attempt_root / "launch_tmux_started.json"
+    write_exclusive_json(tmux_started_path, tmux_started)
+    wrapper_started = build_preflight_wrapper_started(
+        launch_receipt=receipt_binding,
+        launch_receipt_identity=receipt_identity,
+        verified_implementations=verified_implementations,
+        pane_gate_ready=gate_ready_binding,
+        pane_gate_process=gate_process,
+        wrapper_arguments=wrapper_arguments,
+        wrapper_process=wrapper_launch_process,
+        wrapper_executable=executable_identity,
+        started_at="2026-07-28T00:00:02+00:00",
+        gate_ready=gate_ready,
+    )
+    write_exclusive_json(wrapper_started_path, wrapper_started)
+    if not paths["checkpoint_plan"].is_file():
+        plan = build_checkpoint_plan(
+            paths["root"].parent, policy, paths["preflight_results"]
+        )
+        write_exclusive_json(paths["checkpoint_plan"], plan)
+        request_paths = module.write_preflight_requests(
+            plan, paths["preflight_requests"]
+        )
+        module._build_preflight_request_manifest(
+            policy, paths, plan, request_paths
+        )
+    checkpoint_plan = module._artifact_binding(
+        paths["checkpoint_plan"],
+        load_json(
+            paths["checkpoint_plan"], "fixture checkpoint plan"
+        )["checkpoint_plan_sha256"],
+    )
+    preflight_request_manifest = module._artifact_binding(
+        paths["preflight_request_manifest"],
+        load_json(
+            paths["preflight_request_manifest"],
+            "fixture preflight request manifest",
+        )["preflight_request_manifest_sha256"],
+    )
+    wrapper = build_preflight_claim_v3(
+        attempt_id=attempt_id,
+        preflight_launch_receipt=receipt_binding,
+        preflight_launch_receipt_identity=receipt_identity,
+        verified_implementations=verified_implementations,
+        pane_gate_ready=gate_ready_binding,
+        preflight_launch_tmux_started=module._artifact_binding(
+            tmux_started_path,
+            tmux_started["launch_tmux_started_sha256"],
+        ),
+        preflight_wrapper_started=module._artifact_binding(
+            wrapper_started_path,
+            wrapper_started["wrapper_started_sha256"],
+        ),
+        pane_gate_process=gate_process,
+        wrapper_arguments=wrapper_arguments,
+        wrapper_executable=executable_identity,
+        pane_log=pane_log,
+        git={},
+        policy_sha256=policy["policy_sha256"],
+        config=policy["policy_file"],
+        checkpoint_plan=checkpoint_plan,
+        preflight_request_manifest=preflight_request_manifest,
+        controller_session=module.PREFLIGHT_CONTROLLER_SESSION,
+        controller_tmux=controller_tmux,
+        controller_tmux_server=tmux_server,
+        observer_session=module.PREFLIGHT_OBSERVER_SESSION,
+        command=module._expected_preflight_controller_command(
+            policy, paths
+        ),
+        observer_command=module._expected_preflight_observer_command(
+            policy, paths
+        ),
+        wrapper_pid=wrapper_pid,
+        wrapper_process=wrapper_launch_process,
+        wrapper_launch_process=wrapper_launch_process,
+        started_at="2026-07-28T00:00:03+00:00",
+        external_timeout_seconds=None,
+        gate_ready=gate_ready,
+        wrapper_started=wrapper_started,
+    )
+    write_exclusive_json(wrapper_path, wrapper)
+    wrapper_binding = module._artifact_binding(
+        wrapper_path, wrapper["wrapper_claim_sha256"]
+    )
+    pane = {
+        "session": controller_tmux["session"],
+        "pane": controller_tmux["pane"],
+        "pane_pid": controller_tmux["pane_pid"],
+        "pane_dead": False,
+        "pane_dead_status": None,
+    }
+    tmux_started_binding = module._artifact_binding(
+        tmux_started_path,
+        tmux_started["launch_tmux_started_sha256"],
+    )
+    accepted = build_preflight_launch_accepted(
+        attempt_id=attempt_id,
+        launch_receipt=receipt_binding,
+        launch_receipt_identity=receipt_identity,
+        verified_implementations=verified_implementations,
+        wrapper_claim=wrapper_binding,
+        tmux_started=tmux_started_binding,
+        pane=pane,
+        pane_log_path=pane_log["path"],
+        started_at="2026-07-28T00:00:00+00:00",
+        accepted_at="2026-07-28T00:00:04+00:00",
+    )
+    accepted_path = attempt_root / "launch_accepted.json"
+    write_exclusive_json(accepted_path, accepted)
+    accepted_binding = module._artifact_binding(
+        accepted_path, accepted["launch_accepted_sha256"]
+    )
+    terminal = build_preflight_ownership_terminal(
+        launch_receipt=receipt_binding,
+        launch_receipt_identity=receipt_identity,
+        verified_implementations=verified_implementations,
+        launch_accepted=accepted_binding,
+        wrapper_claim=wrapper_binding,
+        tmux_started=tmux_started_binding,
+        pane=pane,
+        pane_log=pane_log,
+        started_at="2026-07-28T00:00:00+00:00",
+        completed_at="2026-07-28T00:00:05+00:00",
+    )
+    terminal_path = attempt_root / "launch_terminal.json"
+    write_exclusive_json(terminal_path, terminal)
+    terminal_binding = module._artifact_binding(
+        terminal_path,
+        terminal["launch_terminal_sha256"],
+    )
+    release = build_preflight_ownership_release(
+        launch_receipt=receipt_binding,
+        launch_receipt_identity=receipt_identity,
+        verified_implementations=verified_implementations,
+        wrapper_claim=wrapper_binding,
+        launch_accepted=accepted_binding,
+        launch_terminal=terminal_binding,
+        released_at="2026-07-28T00:00:06+00:00",
+    )
+    write_exclusive_json(
+        attempt_root / "launch_ownership_release.json", release
+    )
+    return wrapper, wrapper_path, {
+        "gate": gate_process,
+        "wrapper": wrapper_launch_process,
+        "gate_arguments": gate_arguments,
+        "wrapper_arguments": wrapper_arguments,
+    }
+
+
+def _mock_preflight_wrapper_process_seals(
+    module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    seals: Mapping[str, Any],
+) -> None:
+    original_readlink = module.os.readlink
+    identities = {
+        seals["gate"]["pid"]: seals["gate"],
+        seals["wrapper"]["pid"]: seals["wrapper"],
+    }
+    commands = {
+        seals["gate"]["pid"]: module._command_bytes(
+            seals["gate_arguments"]
+        ),
+        seals["wrapper"]["pid"]: module._command_bytes(
+            seals["wrapper_arguments"]
+        ),
+    }
+    monkeypatch.setattr(
+        module,
+        "_launch_process_identity",
+        lambda pid: dict(identities[pid]),
+    )
+    monkeypatch.setattr(
+        module,
+        "_process_command_bytes",
+        lambda pid: commands[pid],
+    )
+    monkeypatch.setattr(
+        module,
+        "_process_command",
+        lambda pid: (
+            list(seals["gate_arguments"])
+            if pid == seals["gate"]["pid"]
+            else list(seals["wrapper_arguments"])
+            if pid == seals["wrapper"]["pid"]
+            else (_ for _ in ()).throw(AssertionError(pid))
+        ),
+    )
+    monkeypatch.setattr(
+        module.os,
+        "readlink",
+        lambda path: str(Path(sys.executable).resolve())
+        if path
+        in {
+            f"/proc/{seals['gate']['pid']}/exe",
+            f"/proc/{seals['wrapper']['pid']}/exe",
+        }
+        else original_readlink(path),
+    )
 
 
 def _write_preflight_observer_provenance_fixture(
@@ -7658,6 +9328,9 @@ def _write_preflight_observer_provenance_fixture(
     tmux_server: Mapping[str, Any],
     observer_process: Mapping[str, int],
 ) -> tuple[dict[str, Any], Path]:
+    verified_implementations = (
+        _test_verified_preflight_implementations()
+    )
     wrapper_binding = module._artifact_binding(
         wrapper_path, wrapper["wrapper_claim_sha256"]
     )
@@ -7679,6 +9352,7 @@ def _write_preflight_observer_provenance_fixture(
             "safa_canonical_preflight_observer_gate_ready_v1"
         ),
         "policy_sha256": policy["policy_sha256"],
+        "verified_implementations": verified_implementations,
         "wrapper_claim": wrapper_binding,
         "observer_session": module.PREFLIGHT_OBSERVER_SESSION,
         "owner_nonce": "a" * 64,
@@ -7705,6 +9379,7 @@ def _write_preflight_observer_provenance_fixture(
             "safa_canonical_preflight_observer_gate_release_v1"
         ),
         "policy_sha256": policy["policy_sha256"],
+        "verified_implementations": verified_implementations,
         "wrapper_claim": wrapper_binding,
         "observer_gate_ready": gate_ready_binding,
         "observer_session": module.PREFLIGHT_OBSERVER_SESSION,
@@ -7722,11 +9397,13 @@ def _write_preflight_observer_provenance_fixture(
             "safa_canonical_preflight_observer_bootstrap_v1"
         ),
         "policy_sha256": policy["policy_sha256"],
+        "verified_implementations": verified_implementations,
         "wrapper_claim": wrapper_binding,
         "observer_session": module.PREFLIGHT_OBSERVER_SESSION,
         "owner_nonce": "a" * 64,
         "process": dict(observer_process),
         "executable": sys.executable,
+        "executable_identity": _test_executable_identity(),
         "command": observer_command,
         "tmux": dict(observer_tmux),
         "published_at": module._utc_now(),
@@ -7739,6 +9416,7 @@ def _write_preflight_observer_provenance_fixture(
         "schema_version": 1,
         "contract_type": "safa_canonical_preflight_observer_launch_v3",
         "policy_sha256": policy["policy_sha256"],
+        "verified_implementations": verified_implementations,
         "wrapper_claim": wrapper_binding,
         "wrapper_claim_sha256": wrapper["wrapper_claim_sha256"],
         "observer_session": module.PREFLIGHT_OBSERVER_SESSION,
@@ -7781,6 +9459,9 @@ def _write_preflight_process_start_fixture(
             "safa_canonical_preflight_controller_process_start_v1"
         ),
         "policy_sha256": policy["policy_sha256"],
+        "verified_implementations": (
+            _test_verified_preflight_implementations()
+        ),
         "process": {"pid": pid, "pgid": pid, "start_ticks": 10},
     }
     process_start["controller_process_start_sha256"] = canonical_digest(
@@ -7857,7 +9538,7 @@ def test_wrapper_killpg_error_classification(
     expected: str,
 ) -> None:
     wrapper = _wrapper_module()
-    sealed = {"pid": 401, "pgid": 401, "start_ticks": 77}
+    sealed = _test_process_identity(401, start_ticks=77)
     state = {"kill_called": False}
     monkeypatch.setattr(
         wrapper,
@@ -7906,7 +9587,11 @@ def test_wrapper_killpg_error_classification(
         "pane_pid": 401,
         "pane_current_command": "python",
     }
-    server = {"server_pid": 301, "socket_path": "/tmp/tmux.sock"}
+    server = _test_tmux_server_identity(
+        Path("/tmp/tmux.sock"),
+        server_pid=301,
+        server_process=_test_process_identity(301, start_ticks=55),
+    )
     if expected == "raises":
         with pytest.raises(RuntimeError):
             wrapper._terminate_bound_observer(
@@ -7931,8 +9616,10 @@ def test_wrapper_cleanup_permission_failure_is_durable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     wrapper = _wrapper_module()
-    config = tmp_path / "policy.json"
-    config.write_text("{}\n", encoding="utf-8")
+    config = (
+        Path(__file__).parents[1]
+        / "configs/closeout/canonical_screening_512_v1.json"
+    )
     policy_root = tmp_path / "campaign" / "by_policy" / ("6" * 64)
     _prepare_wrapper_contract_inputs(wrapper, policy_root)
     _patch_wrapper_tmux(wrapper, monkeypatch, tmp_path)
@@ -7996,13 +9683,17 @@ def test_wrapper_kill_pane_check_to_kill_replacement_preserves_foreign(
         "pane_pid": 401,
         "pane_current_command": "python",
     }
-    sealed_server = {
-        "server_pid": 301,
-        "socket_path": "/tmp/tmux-test/default",
-    }
-    sealed_process = {"pid": 401, "pgid": 401, "start_ticks": 77}
+    sealed_server = _test_tmux_server_identity(
+        Path("/tmp/tmux-test/default"),
+        server_pid=301,
+        server_process=_test_process_identity(301, start_ticks=55),
+    )
+    sealed_process = _test_process_identity(401, start_ticks=77)
     sealed_owner = _test_tmux_owner_seal(
-        sealed_tmux, sealed_server, server_start_ticks=55
+        sealed_tmux,
+        sealed_server,
+        server_start_ticks=55,
+        pane_process=sealed_process,
     )
     foreign_tmux = {
         "session": wrapper.OBSERVER_SESSION,
@@ -8095,12 +9786,17 @@ def test_wrapper_kill_pane_failure_with_live_seal_fails_closed(
         "pane_pid": 501,
         "pane_current_command": "python",
     }
-    sealed_server = {
-        "server_pid": 301,
-        "socket_path": "/tmp/tmux-test/default",
-    }
-    sealed_process = {"pid": 501, "pgid": 501, "start_ticks": 88}
-    sealed_owner = _test_tmux_owner_seal(sealed_tmux, sealed_server)
+    sealed_server = _test_tmux_server_identity(
+        Path("/tmp/tmux-test/default"),
+        server_pid=301,
+        server_process=_test_process_identity(301, start_ticks=55),
+    )
+    sealed_process = _test_process_identity(501, start_ticks=88)
+    sealed_owner = _test_tmux_owner_seal(
+        sealed_tmux,
+        sealed_server,
+        pane_process=sealed_process,
+    )
     monkeypatch.setattr(
         wrapper,
         "_tmux_server_identity",
@@ -8199,10 +9895,11 @@ def test_wrapper_atomic_tmux_owner_kill_is_nonce_and_pane_bound(
         "pane_pid": 401,
         "pane_current_command": "python",
     }
-    sealed_server = {
-        "server_pid": 301,
-        "socket_path": "/tmp/tmux-test/default",
-    }
+    sealed_server = _test_tmux_server_identity(
+        Path("/tmp/tmux-test/default"),
+        server_pid=301,
+        server_process=_test_process_identity(301, start_ticks=55),
+    )
     owner = _test_tmux_owner_seal(sealed_tmux, sealed_server)
     calls: list[list[str]] = []
     foreign_killed = {"value": False}
@@ -8277,10 +9974,11 @@ def test_wrapper_remain_on_exit_replacement_is_rejected_without_mutation(
         "pane_pid": 501,
         "pane_current_command": "python",
     }
-    sealed_server = {
-        "server_pid": 401,
-        "socket_path": "/tmp/tmux-test/default",
-    }
+    sealed_server = _test_tmux_server_identity(
+        Path("/tmp/tmux-test/default"),
+        server_pid=401,
+        server_process=_test_process_identity(401, start_ticks=55),
+    )
     owner = _test_tmux_owner_seal(sealed_tmux, sealed_server)
     calls: list[list[str]] = []
     monkeypatch.setattr(
@@ -8344,10 +10042,11 @@ def test_wrapper_tmux_owner_host_precheck_failure_issues_no_command(
         "pane_pid": 401,
         "pane_current_command": "python",
     }
-    server = {
-        "server_pid": 301,
-        "socket_path": "/tmp/tmux-test/default",
-    }
+    server = _test_tmux_server_identity(
+        Path("/tmp/tmux-test/default"),
+        server_pid=301,
+        server_process=_test_process_identity(301, start_ticks=55),
+    )
     owner = _test_tmux_owner_seal(tmux, server)
     calls: list[list[str]] = []
     monkeypatch.setattr(
@@ -8426,6 +10125,9 @@ def test_wrapper_real_tmux_nonce_change_rejects_without_killing_pane(
             "session": session,
             "pane": identity_row[1],
             "pane_pid": int(identity_row[2]),
+            "pane_process": wrapper._launch_process_identity(
+                int(identity_row[2])
+            ),
             "owner_nonce": old_nonce,
         }
         subprocess.run(
@@ -8525,6 +10227,9 @@ def test_wrapper_real_tmux_replacement_rejects_remain_on_exit(
             "session": session,
             "pane": identity_row[1],
             "pane_pid": int(identity_row[2]),
+            "pane_process": wrapper._launch_process_identity(
+                int(identity_row[2])
+            ),
             "owner_nonce": old_nonce,
         }
         subprocess.run(
@@ -8601,22 +10306,28 @@ def test_wrapper_server_replacement_is_never_terminated(
         "pane_pid": 601,
         "pane_current_command": "python",
     }
-    sealed_server = {
-        "server_pid": 301,
-        "socket_path": "/tmp/tmux-test/default",
-    }
-    foreign_server = {
-        "server_pid": 302,
-        "socket_path": "/tmp/tmux-test/default",
-    }
+    sealed_server = _test_tmux_server_identity(
+        Path("/tmp/tmux-test/default"),
+        server_pid=301,
+        server_process=_test_process_identity(301, start_ticks=55),
+    )
+    foreign_server = _test_tmux_server_identity(
+        Path("/tmp/tmux-test/default"),
+        server_pid=302,
+        server_process=_test_process_identity(302, start_ticks=56),
+    )
     foreign_tmux = {
         "session": wrapper.OBSERVER_SESSION,
         "pane": "%32",
         "pane_pid": 602,
         "pane_current_command": "python",
     }
-    sealed_process = {"pid": 601, "pgid": 601, "start_ticks": 99}
-    sealed_owner = _test_tmux_owner_seal(sealed_tmux, sealed_server)
+    sealed_process = _test_process_identity(601, start_ticks=99)
+    sealed_owner = _test_tmux_owner_seal(
+        sealed_tmux,
+        sealed_server,
+        pane_process=sealed_process,
+    )
     monkeypatch.setattr(
         wrapper,
         "_tmux_server_identity",
@@ -8649,8 +10360,10 @@ def test_wrapper_records_native_stderr_and_sigkill_without_controller_claim(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     wrapper = _wrapper_module()
-    config = tmp_path / "policy.json"
-    config.write_text("{}\n", encoding="utf-8")
+    config = (
+        Path(__file__).parents[1]
+        / "configs/closeout/canonical_screening_512_v1.json"
+    )
     policy_root = tmp_path / "campaign" / "by_policy" / ("1" * 64)
     _prepare_wrapper_contract_inputs(wrapper, policy_root)
     _patch_wrapper_tmux(wrapper, monkeypatch, tmp_path)
@@ -8685,8 +10398,10 @@ def test_wrapper_records_pre_main_failure_without_controller_artifacts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     wrapper = _wrapper_module()
-    config = tmp_path / "policy.json"
-    config.write_text("{bad policy}\n", encoding="utf-8")
+    config = (
+        Path(__file__).parents[1]
+        / "configs/closeout/canonical_screening_512_v1.json"
+    )
     policy_root = tmp_path / "campaign" / "by_policy" / ("2" * 64)
     _prepare_wrapper_contract_inputs(wrapper, policy_root)
     _patch_wrapper_tmux(wrapper, monkeypatch, tmp_path)
@@ -8709,7 +10424,7 @@ def test_wrapper_records_pre_main_failure_without_controller_artifacts(
     assert Path(value["controller_process_log"]["path"]).read_bytes() == b"pre-main\n"
 
 
-def test_preflight_tmux_wrapper_has_exit_recorder_and_no_timeout(
+def test_preflight_tmux_launcher_has_gate_terminal_and_no_timeout(
     tmp_path: Path,
 ) -> None:
     module = _controller_module()
@@ -8720,7 +10435,8 @@ def test_preflight_tmux_wrapper_has_exit_recorder_and_no_timeout(
         policy, policy_path, tmp_path / "campaign", "preflight"
     )
     controller = " ".join(commands["controller"])
-    assert "run_canonical_preflight_wrapper.py" in controller
+    assert "run_canonical_preflight_launcher.py" in controller
+    assert "run_canonical_preflight_wrapper.py" not in controller
     assert "--policy-sha256" in controller
     assert "timeout" not in controller.lower()
 
@@ -9039,6 +10755,2283 @@ def test_worker_revalidates_ready_files_before_cuda(
         _assert_ready_barrier(request, policy)
 
 
+def _prepare_preflight_launcher_fixture(
+    tmp_path: Path,
+) -> tuple[Any, Path, Path, Path, str]:
+    source_root = Path(__file__).parents[1]
+    repo_root = tmp_path / "launcher-repo"
+    scripts = repo_root / "scripts"
+    scripts.mkdir(parents=True)
+    launcher_path = scripts / "run_canonical_preflight_launcher.py"
+    wrapper_path = scripts / "run_canonical_preflight_wrapper.py"
+    controller_path = scripts / "run_canonical_checkpoint_screening.py"
+    closeout = repo_root / "src/safa/closeout"
+    closeout.mkdir(parents=True)
+    verified_loader_path = (
+        closeout / "verified_preflight_module_loader.py"
+    )
+    launch_contract_path = (
+        closeout / "preflight_launch_contract.py"
+    )
+    shutil.copy2(
+        source_root / "scripts/run_canonical_preflight_launcher.py",
+        launcher_path,
+    )
+    shutil.copy2(
+        source_root
+        / "src/safa/closeout/verified_preflight_module_loader.py",
+        verified_loader_path,
+    )
+    shutil.copy2(
+        source_root / "src/safa/closeout/preflight_launch_contract.py",
+        launch_contract_path,
+    )
+    wrapper_path.write_text("# bound wrapper fixture\n", encoding="utf-8")
+    controller_path.write_text(
+        "# bound controller fixture\n", encoding="utf-8"
+    )
+    fake_wrapper = scripts / "fake_wrapper.py"
+    fake_wrapper.write_text(
+        """
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "mode",
+    choices=(
+        "claim",
+        "claim_wrong_policy",
+        "claim_wrong_pid",
+        "claim_wrong_ppid",
+        "claim_wrong_pgid",
+        "claim_wrong_start_ticks",
+        "claim_wrong_pane",
+        "claim_wrong_gate",
+        "claim_wrong_argv",
+        "claim_wrong_receipt",
+        "claim_wrong_started",
+        "claim_wrong_executable",
+        "claim_replace_receipt_before_claim",
+        "claim_malformed",
+        "claim_late",
+        "claim_hold",
+    ),
+)
+args = parser.parse_args()
+receipt_path = Path(os.environ["SAFA_PREFLIGHT_LAUNCH_RECEIPT_PATH"])
+receipt_descriptor = os.open(
+    receipt_path, os.O_RDONLY | os.O_NOFOLLOW
+)
+try:
+    receipt_stat = os.fstat(receipt_descriptor)
+    with os.fdopen(receipt_descriptor, "rb") as receipt_handle:
+        receipt_descriptor = -1
+        receipt_bytes = receipt_handle.read()
+finally:
+    if receipt_descriptor >= 0:
+        os.close(receipt_descriptor)
+receipt = json.loads(receipt_bytes.decode("utf-8"))
+receipt_identity = {
+    "path": str(receipt_path.resolve()),
+    "device": int(receipt_stat.st_dev),
+    "inode": int(receipt_stat.st_ino),
+    "mode": int(receipt_stat.st_mode),
+    "size": int(receipt_stat.st_size),
+}
+claim_path = Path(receipt["wrapper_claim_path"])
+claim_path.parent.mkdir(parents=True, exist_ok=True)
+command = [
+    item.decode("utf-8")
+    for item in Path(f"/proc/{os.getpid()}/cmdline")
+    .read_bytes()
+    .split(b"\\0")
+    if item
+]
+proc_executable_path = Path(
+    os.readlink(f"/proc/{os.getpid()}/exe")
+).resolve()
+proc_executable_stat = proc_executable_path.stat()
+log_path = Path(os.environ["SAFA_PREFLIGHT_PANE_LOG_PATH"]).resolve()
+log_stat = log_path.stat()
+attempt_root = receipt_path.parent
+gate_ready_path = attempt_root / "pane_gate_ready.json"
+tmux_started_path = attempt_root / "launch_tmux_started.json"
+wrapper_started_path = Path(receipt["wrapper_started_path"])
+deadline = time.monotonic() + 5
+while not wrapper_started_path.is_file():
+    if time.monotonic() >= deadline:
+        raise SystemExit(92)
+    time.sleep(0.005)
+def artifact_binding(path, field):
+    value = json.loads(path.read_text(encoding="utf-8"))
+    return {
+        "path": str(path.resolve()),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "canonical_sha256": value[field],
+    }
+def process_identity(pid):
+    raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    fields = raw[raw.rfind(")") + 2 :].split()
+    return {
+        "pid": pid,
+        "ppid": int(fields[1]),
+        "pgid": int(fields[2]),
+        "sid": int(fields[3]),
+        "start_ticks": int(fields[19]),
+    }
+def digest(value, excluded):
+    payload = {k: v for k, v in value.items() if k != excluded}
+    return hashlib.sha256(
+        (
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\\n"
+        ).encode()
+    ).hexdigest()
+tmux_started = json.loads(
+    tmux_started_path.read_text(encoding="utf-8")
+)
+tmux_owner_seal = tmux_started["owner_seal"]
+tmux_server_process = process_identity(
+    tmux_owner_seal["server_pid"]
+)
+controller_tmux_server = {
+    "server_pid": tmux_owner_seal["server_pid"],
+    "server_process": tmux_server_process,
+    "socket_path": tmux_owner_seal["socket_path"],
+    "socket_device": tmux_owner_seal["socket_device"],
+    "socket_inode": tmux_owner_seal["socket_inode"],
+}
+claim = {
+    "schema_version": 1,
+    "contract_type": "safa_canonical_preflight_wrapper_claim_v3",
+    "attempt_id": receipt["attempt_id"],
+    "preflight_launch_receipt": {
+        "path": str(receipt_path.resolve()),
+        "sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+        "canonical_sha256": receipt["launch_receipt_sha256"],
+    },
+    "preflight_launch_receipt_identity": receipt_identity,
+    "pane_gate_ready": artifact_binding(
+        gate_ready_path, "pane_gate_ready_sha256"
+    ),
+    "preflight_launch_tmux_started": artifact_binding(
+        tmux_started_path, "launch_tmux_started_sha256"
+    ),
+    "preflight_wrapper_started": artifact_binding(
+        wrapper_started_path,
+        "wrapper_started_sha256",
+    ),
+    "pane_gate_process": json.loads(
+        gate_ready_path.read_text(encoding="utf-8")
+    )["process"],
+    "wrapper_arguments": command,
+    "wrapper_executable": {
+        "path": str(proc_executable_path),
+        "device": int(proc_executable_stat.st_dev),
+        "inode": int(proc_executable_stat.st_ino),
+        "mode": int(proc_executable_stat.st_mode),
+        "size": int(proc_executable_stat.st_size),
+    },
+    "pane_log": {
+        "path": str(log_path),
+        "device": int(log_stat.st_dev),
+        "inode": int(log_stat.st_ino),
+        "mode": int(log_stat.st_mode),
+        "size": int(log_stat.st_size),
+    },
+    "git": receipt["git"],
+    "policy_sha256": receipt["policy_sha256"],
+    "config": receipt["bindings"]["config"],
+    "verified_implementations": receipt["verified_implementations"],
+    "checkpoint_plan": artifact_binding(
+        wrapper_started_path, "wrapper_started_sha256"
+    ),
+    "preflight_request_manifest": artifact_binding(
+        wrapper_started_path, "wrapper_started_sha256"
+    ),
+    "controller_session": "safa-screening-preflight-controller",
+    "wrapper_pid": os.getpid(),
+    "controller_tmux": {
+        "pane_pid": json.loads(
+            gate_ready_path.read_text(encoding="utf-8")
+        )["process"]["pid"]
+    },
+    "controller_tmux_server": controller_tmux_server,
+    "observer_session": receipt["observer_session"],
+    "command": command,
+    "observer_command": command,
+    "wrapper_process": process_identity(os.getpid()),
+    "wrapper_launch_process": process_identity(os.getpid()),
+    "started_at": "fixture",
+    "external_timeout_seconds": None,
+}
+if args.mode == "claim_wrong_policy":
+    claim["policy_sha256"] = "0" * 64
+elif args.mode == "claim_wrong_pid":
+    claim["wrapper_pid"] += 1
+elif args.mode == "claim_wrong_ppid":
+    claim["wrapper_launch_process"]["ppid"] += 1
+elif args.mode == "claim_wrong_pgid":
+    claim["wrapper_launch_process"]["pgid"] += 1
+elif args.mode == "claim_wrong_start_ticks":
+    claim["wrapper_launch_process"]["start_ticks"] += 1
+elif args.mode == "claim_wrong_pane":
+    claim["controller_tmux"]["pane_pid"] += 1
+elif args.mode == "claim_wrong_gate":
+    claim["pane_gate_process"]["start_ticks"] += 1
+elif args.mode == "claim_wrong_argv":
+    claim["wrapper_arguments"] = [*command, "unexpected"]
+elif args.mode == "claim_wrong_receipt":
+    claim["preflight_launch_receipt"]["canonical_sha256"] = "0" * 64
+elif args.mode == "claim_wrong_started":
+    claim["preflight_wrapper_started"]["canonical_sha256"] = "0" * 64
+elif args.mode == "claim_wrong_executable":
+    claim["wrapper_executable"]["path"] = "/wrong/executable"
+elif args.mode == "claim_replace_receipt_before_claim":
+    replacement_path = receipt_path.with_name(
+        f".replacement-{os.getpid()}.json"
+    )
+    descriptor = os.open(
+        replacement_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o644,
+    )
+    try:
+        os.write(descriptor, receipt_bytes)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(replacement_path, receipt_path)
+if args.mode == "claim_late":
+    time.sleep(2)
+claim["wrapper_claim_sha256"] = digest(
+    claim, "wrapper_claim_sha256"
+)
+payload = (
+    json.dumps(claim, sort_keys=True, indent=2, allow_nan=False)
+    + "\\n"
+).encode()
+if args.mode == "claim_malformed":
+    payload = b"{"
+descriptor = os.open(
+    claim_path,
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+    0o644,
+)
+try:
+    os.write(descriptor, payload)
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+release = Path(os.environ["SAFA_PREFLIGHT_LAUNCH_RELEASE_PATH"])
+deadline = time.monotonic() + 10
+while not release.is_file():
+    if time.monotonic() >= deadline:
+        raise SystemExit(91)
+    time.sleep(0.02)
+if args.mode == "claim_hold":
+    time.sleep(30)
+""".lstrip(),
+        encoding="utf-8",
+    )
+    (repo_root / ".gitignore").write_text(
+        "__pycache__/\n*.pyc\n",
+        encoding="utf-8",
+    )
+    config = repo_root / "policy.json"
+
+    def binding(path: Path) -> dict[str, str]:
+        return {
+            "path": str(path.relative_to(repo_root).as_posix()),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+
+    config.write_text(
+        json.dumps(
+            {
+                "implementations": {
+                    "preflight_launcher": binding(launcher_path),
+                    "preflight_verified_loader": binding(
+                        verified_loader_path
+                    ),
+                    "preflight_launch_contract": binding(
+                        launch_contract_path
+                    ),
+                    "preflight_wrapper": binding(wrapper_path),
+                    "controller": binding(controller_path),
+                }
+            },
+            sort_keys=True,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "init", "-q", "-b", "master"],
+        cwd=repo_root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "launcher@test.invalid"],
+        cwd=repo_root,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Launcher Test"],
+        cwd=repo_root,
+        check=True,
+    )
+    subprocess.run(["git", "add", "."], cwd=repo_root, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "fixture"],
+        cwd=repo_root,
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "update-ref",
+            "refs/remotes/origin/master",
+            "HEAD",
+        ],
+        cwd=repo_root,
+        check=True,
+    )
+    spec = importlib.util.spec_from_file_location(
+        f"launcher_fixture_{tmp_path.name}", launcher_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    policy_sha256 = hashlib.sha256(
+        str(tmp_path).encode()
+    ).hexdigest()
+    return module, repo_root, config, fake_wrapper, policy_sha256
+
+
+def _prepare_verified_preflight_entry_fixture(
+    tmp_path: Path,
+    entry: str,
+) -> tuple[Any, Path, Path, Path, Path]:
+    source_root = Path(__file__).parents[1]
+    repo_root = tmp_path / f"{entry}-verified-repo"
+    scripts = repo_root / "scripts"
+    closeout = repo_root / "src/safa/closeout"
+    scripts.mkdir(parents=True)
+    closeout.mkdir(parents=True)
+    entry_relative = {
+        "launcher": "scripts/run_canonical_preflight_launcher.py",
+        "wrapper": "scripts/run_canonical_preflight_wrapper.py",
+    }[entry]
+    implementation_name = {
+        "launcher": "preflight_launcher",
+        "wrapper": "preflight_wrapper",
+    }[entry]
+    entry_path = repo_root / entry_relative
+    loader_path = closeout / "verified_preflight_module_loader.py"
+    contract_path = closeout / "preflight_launch_contract.py"
+    shutil.copy2(source_root / entry_relative, entry_path)
+    shutil.copy2(
+        source_root
+        / "src/safa/closeout/verified_preflight_module_loader.py",
+        loader_path,
+    )
+    shutil.copy2(
+        source_root / "src/safa/closeout/preflight_launch_contract.py",
+        contract_path,
+    )
+
+    def binding(path: Path) -> dict[str, str]:
+        return {
+            "path": path.relative_to(repo_root).as_posix(),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+
+    config_path = repo_root / "policy.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "implementations": {
+                    implementation_name: binding(entry_path),
+                    "preflight_verified_loader": binding(loader_path),
+                    "preflight_launch_contract": binding(contract_path),
+                }
+            },
+            sort_keys=True,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    spec = importlib.util.spec_from_file_location(
+        f"verified_{entry}_{tmp_path.name}", entry_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module, repo_root, config_path, loader_path, contract_path
+
+
+@pytest.mark.parametrize("entry", ("launcher", "wrapper"))
+def test_preflight_entry_raw_import_executes_no_verified_module(
+    entry: str,
+) -> None:
+    root = Path(__file__).parents[1]
+    script = root / {
+        "launcher": "scripts/run_canonical_preflight_launcher.py",
+        "wrapper": "scripts/run_canonical_preflight_wrapper.py",
+    }[entry]
+    code = (
+        "import importlib.util,json,sys;"
+        f"p={str(script)!r};"
+        "s=importlib.util.spec_from_file_location('raw_entry',p);"
+        "m=importlib.util.module_from_spec(s);s.loader.exec_module(m);"
+        "print(json.dumps(sorted(x for x in ("
+        "'safa.closeout.verified_preflight_module_loader',"
+        "'safa.closeout.preflight_launch_contract') if x in sys.modules)))"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(completed.stdout) == []
+
+
+@pytest.mark.parametrize("entry", ("launcher", "wrapper"))
+def test_preflight_entry_ignores_ambient_verified_modules(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+) -> None:
+    module, _, config, _, _ = (
+        _prepare_verified_preflight_entry_fixture(tmp_path, entry)
+    )
+    ambient_loader = types.ModuleType(
+        "safa.closeout.verified_preflight_module_loader"
+    )
+    ambient_contract = types.ModuleType(
+        "safa.closeout.preflight_launch_contract"
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "safa.closeout.verified_preflight_module_loader",
+        ambient_loader,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "safa.closeout.preflight_launch_contract",
+        ambient_contract,
+    )
+    module._install_verified_preflight_apis(config)
+    assert module._VERIFIED_LOADER_HANDLE["module"] is not ambient_loader
+    assert module._SHARED_CONTRACT_HANDLE["module"] is not ambient_contract
+    assert (
+        sys.modules["safa.closeout.verified_preflight_module_loader"]
+        is ambient_loader
+    )
+    assert (
+        sys.modules["safa.closeout.preflight_launch_contract"]
+        is ambient_contract
+    )
+
+
+@pytest.mark.parametrize("entry", ("launcher", "wrapper"))
+@pytest.mark.parametrize(
+    ("target", "fault"),
+    (
+        ("loader", "wrong_path"),
+        ("loader", "wrong_sha"),
+        ("loader", "symlink"),
+        ("loader", "same_content_inode_replacement"),
+        ("loader", "post_load_tamper"),
+        ("loader", "api_missing"),
+        ("loader", "execution_failure"),
+        ("contract", "wrong_path"),
+        ("contract", "wrong_sha"),
+        ("contract", "symlink"),
+        ("contract", "same_content_inode_replacement"),
+        ("contract", "post_load_tamper"),
+        ("contract", "api_missing"),
+        ("contract", "execution_failure"),
+    ),
+)
+def test_preflight_entry_verified_module_fault_matrix(
+    tmp_path: Path,
+    entry: str,
+    target: str,
+    fault: str,
+) -> None:
+    module, repo_root, config_path, loader_path, contract_path = (
+        _prepare_verified_preflight_entry_fixture(tmp_path, entry)
+    )
+    target_path = (
+        loader_path if target == "loader" else contract_path
+    )
+    implementation = (
+        "preflight_verified_loader"
+        if target == "loader"
+        else "preflight_launch_contract"
+    )
+    if fault in {
+        "same_content_inode_replacement",
+        "post_load_tamper",
+    }:
+        module._install_verified_preflight_apis(config_path)
+        if fault == "same_content_inode_replacement":
+            replacement = target_path.with_name(
+                f"{target_path.name}.replacement"
+            )
+            replacement.write_bytes(target_path.read_bytes())
+            os.replace(replacement, target_path)
+        else:
+            target_path.write_bytes(
+                target_path.read_bytes() + b"\n# post-load tamper\n"
+            )
+        with pytest.raises(RuntimeError):
+            module._reverify_verified_preflight_apis()
+        return
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    binding = config["implementations"][implementation]
+    if fault == "wrong_path":
+        binding["path"] = "scripts/induced_target.py"
+    elif fault == "wrong_sha":
+        binding["sha256"] = "0" * 64
+    elif fault == "symlink":
+        replacement = repo_root / f"{target}.real.py"
+        replacement.write_bytes(target_path.read_bytes())
+        target_path.unlink()
+        target_path.symlink_to(replacement)
+    elif fault == "api_missing":
+        target_path.write_text(
+            "UNRELATED_API = object()\n", encoding="utf-8"
+        )
+        binding["sha256"] = hashlib.sha256(
+            target_path.read_bytes()
+        ).hexdigest()
+    else:
+        target_path.write_text(
+            "raise RuntimeError('induced execution failure')\n",
+            encoding="utf-8",
+        )
+        binding["sha256"] = hashlib.sha256(
+            target_path.read_bytes()
+        ).hexdigest()
+    config_path.write_text(
+        json.dumps(config, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError):
+        module._install_verified_preflight_apis(config_path)
+
+
+def test_preflight_launcher_bootstrap_failure_is_minimal_and_pre_tmux(
+    tmp_path: Path,
+) -> None:
+    launcher, repo_root, config_path, _, policy_sha256 = (
+        _prepare_preflight_launcher_fixture(tmp_path)
+    )
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["implementations"]["preflight_verified_loader"][
+        "sha256"
+    ] = "0" * 64
+    config_path.write_text(
+        json.dumps(config, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    attempt_id = hashlib.sha256(b"bootstrap-failure").hexdigest()
+    campaign_root = tmp_path / "campaign"
+    with pytest.raises(RuntimeError):
+        launcher.launch_preflight(
+            repo_root=repo_root,
+            config=config_path,
+            campaign_root=campaign_root,
+            policy_sha256=policy_sha256,
+            python=sys.executable,
+            startup_timeout_seconds=1,
+            attempt_id=attempt_id,
+            owner_nonce=hashlib.sha256(b"owner").hexdigest(),
+            observer_suffix=hashlib.sha256(b"observer").hexdigest(),
+        )
+    setup_path = (
+        campaign_root
+        / "preflight_launch_attempts/setup_terminals"
+        / f"{attempt_id}.json"
+    )
+    setup = load_json(setup_path, "launcher setup terminal")
+    assert set(setup) == {
+        "schema_version",
+        "contract_type",
+        "attempt_id",
+        "policy_sha256",
+        "started_registry",
+        "stage",
+        "failure",
+        "tmux_execution_count",
+        "scientific_execution_started",
+        "started_at",
+        "completed_at",
+        "launch_setup_terminal_sha256",
+    }
+    assert setup["contract_type"] == (
+        "safa_canonical_preflight_launch_setup_terminal_v1"
+    )
+    assert setup["stage"] == "verified_implementation_bootstrap"
+    assert setup["tmux_execution_count"] == 0
+    assert setup["scientific_execution_started"] is False
+    assert setup["contract_type"] not in shared_contract_types()
+    with pytest.raises(PreflightLaunchContractError):
+        validate_preflight_claim_v3(
+            setup,
+            verified_implementations=(
+                _test_verified_preflight_implementations()
+            ),
+            gate_ready={},
+            wrapper_started={},
+        )
+    attempt_root = (
+        campaign_root
+        / "preflight_launch_attempts/by_policy"
+        / policy_sha256
+        / attempt_id
+    )
+    for name in (
+        "launch_receipt.json",
+        "pane.log",
+        "pane_gate_ready.json",
+        "launch_tmux_started.json",
+        "wrapper_started.json",
+        "launch_accepted.json",
+        "launch_terminal.json",
+        "launch_ownership_release.json",
+    ):
+        assert not (attempt_root / name).exists()
+    assert not (
+        campaign_root
+        / "by_policy"
+        / policy_sha256
+        / "preflight_control/wrapper_claim.json"
+    ).exists()
+
+
+def test_preflight_wrapper_bootstrap_failure_precedes_claim_and_process(
+    tmp_path: Path,
+) -> None:
+    wrapper, repo_root, config_path, _, _ = (
+        _prepare_verified_preflight_entry_fixture(tmp_path, "wrapper")
+    )
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["implementations"]["preflight_launch_contract"][
+        "sha256"
+    ] = "0" * 64
+    config_path.write_text(
+        json.dumps(config, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    policy_root = tmp_path / "policy"
+    emergency_state: dict[str, Any] = {}
+    with pytest.raises(RuntimeError):
+        wrapper._run_wrapped_controller_owned(
+            repo_root=repo_root,
+            policy_root=policy_root,
+            policy_sha256=hashlib.sha256(b"policy").hexdigest(),
+            config=config_path,
+            command=[sys.executable, "-c", "raise SystemExit(93)"],
+            observer_command=[
+                sys.executable,
+                "-c",
+                "raise SystemExit(94)",
+            ],
+            emergency_state=emergency_state,
+        )
+    assert emergency_state == {}
+    control = policy_root / "preflight_control"
+    for name in (
+        "wrapper_claim.json",
+        "controller_process_start.json",
+        "controller_process_exit.json",
+        "observer_launch.json",
+        "observer_bootstrap.json",
+        "observer_gate_ready.json",
+    ):
+        assert not (control / name).exists()
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("tmux") is None,
+    reason="requires Linux /proc and tmux",
+)
+def test_preflight_launcher_claim_gate_is_evidence_complete(
+    tmp_path: Path,
+) -> None:
+    launcher, repo_root, config, fake_wrapper, policy_sha256 = (
+        _prepare_preflight_launcher_fixture(tmp_path)
+    )
+    campaign_root = tmp_path / "campaign"
+    attempt_id = hashlib.sha256(b"launcher-success").hexdigest()
+    owner_nonce = hashlib.sha256(b"launcher-owner").hexdigest()
+    try:
+        result = launcher.launch_preflight(
+            repo_root=repo_root,
+            config=config,
+            campaign_root=campaign_root,
+            policy_sha256=policy_sha256,
+            python=sys.executable,
+            startup_timeout_seconds=10,
+            attempt_id=attempt_id,
+            owner_nonce=owner_nonce,
+            observer_suffix=hashlib.sha256(
+                b"launcher-observer"
+            ).hexdigest(),
+            wrapper_arguments_override=[
+                sys.executable,
+                "-B",
+                "-u",
+                str(fake_wrapper),
+                "claim",
+            ],
+        )
+        assert result["contract_type"] == (
+            "safa_canonical_preflight_launch_ownership_release_v1"
+        )
+        attempt_root = (
+            campaign_root
+            / "preflight_launch_attempts/by_policy"
+            / policy_sha256
+            / attempt_id
+        )
+        receipt = load_json(
+            attempt_root / "launch_receipt.json", "launch receipt"
+        )
+        assert receipt["shell"] is False
+        assert isinstance(receipt["tmux_arguments"], list)
+        assert receipt["pane_log"]["inode"] > 0
+        started = load_json(
+            attempt_root / "launch_tmux_started.json",
+            "launch tmux started",
+        )
+        assert started["remain_on_exit"] == "on"
+        assert started["owner_seal"]["owner_nonce"] == owner_nonce
+        accepted = load_json(
+            attempt_root / "launch_accepted.json",
+            "launch accepted",
+        )
+        assert accepted["startup_window_closed"] is False
+        terminal = load_json(
+            attempt_root / "launch_terminal.json",
+            "launch terminal",
+        )
+        assert terminal["status"] == "ownership_transferred"
+        assert terminal["failure"] is None
+        assert result["startup_window_closed"] is True
+        execution_path = attempt_root / "gate_execution_terminal.json"
+        deadline = time.monotonic() + 5
+        while not execution_path.is_file():
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    "accepted wrapper execution terminal timed out"
+                )
+            time.sleep(0.01)
+        execution = load_json(
+            execution_path, "accepted wrapper execution terminal"
+        )
+        assert execution["exit_kind"] == "exit"
+        assert execution["exit_code"] == 0
+        assert execution["signal_number"] is None
+        assert execution["launch_terminal"] == launcher._json_binding(
+            attempt_root / "launch_terminal.json",
+            "launch_terminal_sha256",
+        )
+        assert execution["launch_accepted"] == launcher._json_binding(
+            attempt_root / "launch_accepted.json",
+            "launch_accepted_sha256",
+        )
+        assert execution["launch_ownership_release"] == launcher._json_binding(
+            attempt_root / "launch_ownership_release.json",
+            "launch_ownership_release_sha256",
+        )
+    finally:
+        subprocess.run(
+            [
+                "tmux",
+                "kill-session",
+                "-t",
+                launcher.CONTROLLER_SESSION,
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("tmux") is None,
+    reason="requires Linux /proc and tmux",
+)
+@pytest.mark.parametrize(
+    ("phase", "gate_signal"),
+    (
+        ("preclaim", signal.SIGTERM),
+        ("preclaim", signal.SIGKILL),
+        ("postclaim", signal.SIGTERM),
+        ("postclaim", signal.SIGKILL),
+    ),
+)
+def test_preflight_gate_signal_has_no_wrapper_orphan(
+    tmp_path: Path,
+    phase: str,
+    gate_signal: signal.Signals,
+) -> None:
+    launcher, repo_root, config, fake_wrapper, policy_sha256 = (
+        _prepare_preflight_launcher_fixture(tmp_path)
+    )
+    attempt_id = hashlib.sha256(
+        f"gate-signal:{phase}:{gate_signal.value}".encode()
+    ).hexdigest()
+    campaign_root = tmp_path / "campaign"
+    attempt_root = (
+        campaign_root
+        / "preflight_launch_attempts/by_policy"
+        / policy_sha256
+        / attempt_id
+    )
+    arguments = {
+        "repo_root": repo_root,
+        "config": config,
+        "campaign_root": campaign_root,
+        "policy_sha256": policy_sha256,
+        "python": sys.executable,
+        "startup_timeout_seconds": 5,
+        "attempt_id": attempt_id,
+        "owner_nonce": hashlib.sha256(
+            f"gate-owner:{phase}:{gate_signal.value}".encode()
+        ).hexdigest(),
+        "observer_suffix": hashlib.sha256(
+            f"gate-observer:{phase}:{gate_signal.value}".encode()
+        ).hexdigest(),
+        "wrapper_arguments_override": (
+            [
+                sys.executable,
+                "-B",
+                "-u",
+                "-c",
+                "import time; time.sleep(30)",
+            ]
+            if phase == "preclaim"
+            else [
+                sys.executable,
+                "-B",
+                "-u",
+                str(fake_wrapper),
+                "claim_hold",
+            ]
+        ),
+    }
+    result_box: dict[str, Any] = {}
+    failure_box: list[BaseException] = []
+
+    def launch() -> None:
+        try:
+            result_box["value"] = launcher.launch_preflight(
+                **arguments
+            )
+        except BaseException as exc:
+            failure_box.append(exc)
+
+    thread: threading.Thread | None = None
+    if phase == "preclaim":
+        thread = threading.Thread(target=launch, daemon=True)
+        thread.start()
+    else:
+        launch()
+        assert not failure_box
+        assert result_box["value"]["startup_window_closed"] is True
+    started_path = attempt_root / "wrapper_started.json"
+    deadline = time.monotonic() + 5
+    while not started_path.is_file():
+        if time.monotonic() >= deadline:
+            raise AssertionError("wrapper-start evidence timed out")
+        time.sleep(0.01)
+    started = load_json(started_path, "wrapper started")
+    gate_pid = started["pane_gate_process"]["pid"]
+    wrapper_pid = started["wrapper_process"]["pid"]
+    os.kill(gate_pid, gate_signal)
+    if thread is not None:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert not failure_box
+        result = result_box["value"]
+        assert result["status"] == "wrapper_exited_before_claim"
+        assert not (attempt_root / "launch_accepted.json").exists()
+    deadline = time.monotonic() + 5
+    while Path(f"/proc/{wrapper_pid}").exists():
+        if time.monotonic() >= deadline:
+            raise AssertionError("wrapper child survived gate death")
+        time.sleep(0.01)
+    execution_path = attempt_root / "gate_execution_terminal.json"
+    if gate_signal == signal.SIGTERM:
+        deadline = time.monotonic() + 5
+        while not execution_path.is_file():
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    "forwarded gate signal terminal timed out"
+                )
+            time.sleep(0.01)
+        execution = load_json(
+            execution_path, "gate signal execution terminal"
+        )
+        assert execution["exit_kind"] == "signal"
+        assert execution["signal_number"] == signal.SIGTERM
+        assert signal.SIGTERM in execution["supervisor_signals"]
+        if phase == "postclaim":
+            assert execution["launch_terminal"] is not None
+            assert execution["launch_ownership_release"] is not None
+    else:
+        assert not execution_path.exists()
+    deadline = time.monotonic() + 5
+    while launcher._tmux_pane(launcher.CONTROLLER_SESSION) is not None:
+        if time.monotonic() >= deadline:
+            raise AssertionError("gate session survived signal")
+        time.sleep(0.01)
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="requires Linux prctl and /proc",
+)
+def test_wrapper_pdeathsig_covers_pre_evidence_parent_death(
+    tmp_path: Path,
+) -> None:
+    launcher_path = (
+        Path(__file__).parents[1]
+        / "scripts/run_canonical_preflight_launcher.py"
+    )
+    child_pid_path = tmp_path / "child.pid"
+    parent_code = """
+import importlib.util
+from pathlib import Path
+import subprocess
+import sys
+import time
+spec = importlib.util.spec_from_file_location("launcher", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+child = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(30)"],
+    shell=False,
+    preexec_fn=module._wrapper_child_setup,
+)
+Path(sys.argv[2]).write_text(str(child.pid), encoding="utf-8")
+time.sleep(30)
+"""
+    parent = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            parent_code,
+            str(launcher_path),
+            str(child_pid_path),
+        ]
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not child_pid_path.is_file():
+            if time.monotonic() >= deadline:
+                raise AssertionError("child PID publication timed out")
+            time.sleep(0.005)
+        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        assert Path(f"/proc/{child_pid}").exists()
+        os.kill(parent.pid, signal.SIGKILL)
+        parent.wait(timeout=5)
+        deadline = time.monotonic() + 5
+        while Path(f"/proc/{child_pid}").exists():
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    "PDEATHSIG child survived pre-evidence parent death"
+                )
+            time.sleep(0.005)
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait(timeout=5)
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("tmux") is None,
+    reason="requires Linux /proc and tmux",
+)
+@pytest.mark.parametrize(
+    (
+        "mode",
+        "expected_kind",
+        "expected_returncode",
+        "expected_exit_code",
+        "expected_signal",
+    ),
+    (
+        ("bad_argparse", "exit", 2, 2, None),
+        ("bad_python", "exec_error", None, None, None),
+        ("bad_script", "exit", 2, 2, None),
+        ("bad_import", "exit", 1, 1, None),
+        ("early_exit", "exit", 7, 7, None),
+        ("signal_exit", "signal", -15, None, 15),
+    ),
+)
+def test_preflight_launcher_preclaim_failures_are_terminal(
+    tmp_path: Path,
+    mode: str,
+    expected_kind: str,
+    expected_returncode: int | None,
+    expected_exit_code: int | None,
+    expected_signal: int | None,
+) -> None:
+    launcher, repo_root, config, fake_wrapper, policy_sha256 = (
+        _prepare_preflight_launcher_fixture(tmp_path)
+    )
+    campaign_root = tmp_path / "campaign"
+    commands = {
+        "bad_argparse": [
+            sys.executable,
+            "-B",
+            "-u",
+            str(fake_wrapper),
+            "--not-valid",
+        ],
+        "bad_python": [
+            str(tmp_path / "missing-python"),
+            str(fake_wrapper),
+            "claim",
+        ],
+        "bad_script": [
+            sys.executable,
+            "-B",
+            "-u",
+            str(tmp_path / "missing-script.py"),
+        ],
+        "bad_import": [
+            sys.executable,
+            "-B",
+            "-u",
+            "-c",
+            "import deliberately_missing_preflight_module",
+        ],
+        "early_exit": [
+            sys.executable,
+            "-B",
+            "-u",
+            "-c",
+            "raise SystemExit(7)",
+        ],
+        "signal_exit": [
+            sys.executable,
+            "-B",
+            "-u",
+            "-c",
+            "import os, signal; os.kill(os.getpid(), signal.SIGTERM)",
+        ],
+    }
+    result = launcher.launch_preflight(
+        repo_root=repo_root,
+        config=config,
+        campaign_root=campaign_root,
+        policy_sha256=policy_sha256,
+        python=sys.executable,
+        startup_timeout_seconds=10,
+        attempt_id=hashlib.sha256(mode.encode()).hexdigest(),
+        owner_nonce=hashlib.sha256(
+            f"owner:{mode}".encode()
+        ).hexdigest(),
+        observer_suffix=hashlib.sha256(
+            f"observer:{mode}".encode()
+        ).hexdigest(),
+        wrapper_arguments_override=commands[mode],
+    )
+    assert result["status"] == "wrapper_exited_before_claim"
+    execution = result["gate_execution"]
+    assert execution["exit_kind"] == expected_kind
+    assert execution["returncode"] == expected_returncode
+    assert execution["exit_code"] == expected_exit_code
+    assert execution["signal_number"] == expected_signal
+    assert not (
+        execution["exit_code"] is None
+        and execution["signal_number"] is None
+        and execution["exit_kind"] != "exec_error"
+    )
+    assert result["pane_log"] is not None
+    assert Path(result["pane_log"]["path"]).is_file()
+    assert (
+        subprocess.run(
+            [
+                "tmux",
+                "has-session",
+                "-t",
+                launcher.CONTROLLER_SESSION,
+            ],
+            capture_output=True,
+            text=True,
+        ).returncode
+        != 0
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("tmux") is None,
+    reason="requires Linux /proc and tmux",
+)
+@pytest.mark.parametrize(
+    ("mode", "expected_status"),
+    (
+        ("claim_wrong_policy", "launcher_failed"),
+        ("claim_wrong_pid", "launcher_failed"),
+        ("claim_wrong_ppid", "launcher_failed"),
+        ("claim_wrong_pgid", "launcher_failed"),
+        ("claim_wrong_start_ticks", "launcher_failed"),
+        ("claim_wrong_pane", "launcher_failed"),
+        ("claim_wrong_gate", "launcher_failed"),
+        ("claim_wrong_argv", "launcher_failed"),
+        ("claim_wrong_receipt", "launcher_failed"),
+        ("claim_wrong_started", "launcher_failed"),
+        ("claim_wrong_executable", "launcher_failed"),
+        ("claim_malformed", "launcher_failed"),
+        ("claim_late", "wrapper_claim_timeout"),
+    ),
+)
+def test_preflight_launcher_rejects_wrong_or_late_claim(
+    tmp_path: Path,
+    mode: str,
+    expected_status: str,
+) -> None:
+    launcher, repo_root, config, fake_wrapper, policy_sha256 = (
+        _prepare_preflight_launcher_fixture(tmp_path)
+    )
+    result = launcher.launch_preflight(
+        repo_root=repo_root,
+        config=config,
+        campaign_root=tmp_path / "campaign",
+        policy_sha256=policy_sha256,
+        python=sys.executable,
+        startup_timeout_seconds=0.5,
+        attempt_id=hashlib.sha256(mode.encode()).hexdigest(),
+        owner_nonce=hashlib.sha256(
+            f"owner:{mode}".encode()
+        ).hexdigest(),
+        observer_suffix=hashlib.sha256(
+            f"observer:{mode}".encode()
+        ).hexdigest(),
+        wrapper_arguments_override=[
+            sys.executable,
+            "-B",
+            "-u",
+            str(fake_wrapper),
+            mode,
+        ],
+    )
+    assert result["status"] == expected_status
+    assert result["session_residual"] is False
+    attempt_root = (
+        tmp_path
+        / "campaign/preflight_launch_attempts/by_policy"
+        / policy_sha256
+        / hashlib.sha256(mode.encode()).hexdigest()
+    )
+    assert not (
+        attempt_root / "launch_ownership_release.json"
+    ).exists()
+    assert not (attempt_root / "launch_accepted.json").exists()
+    assert (
+        subprocess.run(
+            [
+                "tmux",
+                "has-session",
+                "-t",
+                launcher.CONTROLLER_SESSION,
+            ],
+            capture_output=True,
+            text=True,
+        ).returncode
+        != 0
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("tmux") is None,
+    reason="requires Linux /proc and tmux",
+)
+def test_preflight_launcher_rejects_same_content_receipt_inode_replacement_before_claim(
+    tmp_path: Path,
+) -> None:
+    launcher, repo_root, config, fake_wrapper, policy_sha256 = (
+        _prepare_preflight_launcher_fixture(tmp_path)
+    )
+    attempt_id = hashlib.sha256(
+        b"receipt-replaced-before-claim"
+    ).hexdigest()
+    campaign_root = tmp_path / "campaign"
+    result = launcher.launch_preflight(
+        repo_root=repo_root,
+        config=config,
+        campaign_root=campaign_root,
+        policy_sha256=policy_sha256,
+        python=sys.executable,
+        startup_timeout_seconds=5,
+        attempt_id=attempt_id,
+        owner_nonce=hashlib.sha256(
+            b"receipt-before-owner"
+        ).hexdigest(),
+        observer_suffix=hashlib.sha256(
+            b"receipt-before-observer"
+        ).hexdigest(),
+        wrapper_arguments_override=[
+            sys.executable,
+            "-B",
+            "-u",
+            str(fake_wrapper),
+            "claim_replace_receipt_before_claim",
+        ],
+    )
+    attempt_root = (
+        campaign_root
+        / "preflight_launch_attempts/by_policy"
+        / policy_sha256
+        / attempt_id
+    )
+    receipt = load_json(
+        attempt_root / "launch_receipt.json",
+        "replaced launch receipt",
+    )
+    assert receipt["launch_receipt_sha256"] == (
+        launcher._canonical_digest(
+            receipt, "launch_receipt_sha256"
+        )
+    )
+    assert result["status"] == "launcher_failed"
+    assert "identity" in result["failure"]["message"]
+    assert result["session_residual"] is False
+    assert not (attempt_root / "launch_accepted.json").exists()
+    assert not (
+        attempt_root / "launch_ownership_release.json"
+    ).exists()
+    assert launcher._tmux_pane(launcher.CONTROLLER_SESSION) is None
+
+
+def test_preflight_launcher_rechecks_receipt_identity_after_claim_before_accept(
+    tmp_path: Path,
+) -> None:
+    launcher, *_unused = _prepare_preflight_launcher_fixture(
+        tmp_path
+    )
+    source = inspect.getsource(launcher.launch_preflight)
+    claim_validation = source.index("_validate_wrapper_claim(")
+    identity_recheck = source.index(
+        "if _opened_file_identity(receipt_path) != receipt_identity:",
+        claim_validation,
+    )
+    accepted_publication = source.index(
+        "_publish_accepted(", identity_recheck
+    )
+    assert claim_validation < identity_recheck < accepted_publication
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("tmux") is None,
+    reason="requires Linux /proc and tmux",
+)
+def test_preflight_launcher_rejects_same_content_receipt_inode_replacement_after_claim_and_preserves_foreign_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launcher, repo_root, config, fake_wrapper, policy_sha256 = (
+        _prepare_preflight_launcher_fixture(tmp_path)
+    )
+    real_validate = launcher._validate_wrapper_claim
+    replacement: dict[str, Any] = {}
+    foreign_nonce = hashlib.sha256(
+        b"receipt-after-foreign"
+    ).hexdigest()
+
+    def replace_after_valid_claim(
+        path: Path, **kwargs: Any
+    ) -> dict[str, Any]:
+        claim = real_validate(path, **kwargs)
+        receipt_path = Path(
+            str(kwargs["receipt_binding"]["path"])
+        )
+        original_bytes = receipt_path.read_bytes()
+        original = receipt_path.stat()
+        replacement_path = receipt_path.with_name(
+            ".same-content-after-claim.json"
+        )
+        descriptor = os.open(
+            replacement_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o644,
+        )
+        try:
+            os.write(descriptor, original_bytes)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(replacement_path, receipt_path)
+        current = receipt_path.stat()
+        replacement.update(
+            {
+                "original_inode": int(original.st_ino),
+                "current_inode": int(current.st_ino),
+                "content": receipt_path.read_bytes(),
+                "expected_content": original_bytes,
+            }
+        )
+        subprocess.run(
+            [
+                "tmux",
+                "kill-session",
+                "-t",
+                launcher.CONTROLLER_SESSION,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [
+                "tmux",
+                "new-session",
+                "-d",
+                "-s",
+                launcher.CONTROLLER_SESSION,
+                "-e",
+                f"{launcher.TMUX_OWNER_ENV}={foreign_nonce}",
+                "sleep",
+                "30",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return claim
+
+    monkeypatch.setattr(
+        launcher,
+        "_validate_wrapper_claim",
+        replace_after_valid_claim,
+    )
+    attempt_id = hashlib.sha256(
+        b"receipt-replaced-after-claim"
+    ).hexdigest()
+    campaign_root = tmp_path / "campaign"
+    try:
+        result = launcher.launch_preflight(
+            repo_root=repo_root,
+            config=config,
+            campaign_root=campaign_root,
+            policy_sha256=policy_sha256,
+            python=sys.executable,
+            startup_timeout_seconds=5,
+            attempt_id=attempt_id,
+            owner_nonce=hashlib.sha256(
+                b"receipt-after-owner"
+            ).hexdigest(),
+            observer_suffix=hashlib.sha256(
+                b"receipt-after-observer"
+            ).hexdigest(),
+            wrapper_arguments_override=[
+                sys.executable,
+                "-B",
+                "-u",
+                str(fake_wrapper),
+                "claim_hold",
+            ],
+        )
+        attempt_root = (
+            campaign_root
+            / "preflight_launch_attempts/by_policy"
+            / policy_sha256
+            / attempt_id
+        )
+        assert replacement["original_inode"] != replacement[
+            "current_inode"
+        ]
+        assert replacement["content"] == replacement[
+            "expected_content"
+        ]
+        assert result["status"] == "launcher_failed"
+        assert "identity" in result["failure"]["message"]
+        assert result["session_residual"] is True
+        assert not (attempt_root / "launch_accepted.json").exists()
+        assert not (
+            attempt_root / "launch_ownership_release.json"
+        ).exists()
+        pane = launcher._tmux_pane(launcher.CONTROLLER_SESSION)
+        assert pane is not None
+        foreign_owner = subprocess.run(
+            [
+                "tmux",
+                "show-environment",
+                "-t",
+                launcher.CONTROLLER_SESSION,
+                launcher.TMUX_OWNER_ENV,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert foreign_owner == (
+            f"{launcher.TMUX_OWNER_ENV}={foreign_nonce}"
+        )
+    finally:
+        subprocess.run(
+            [
+                "tmux",
+                "kill-session",
+                "-t",
+                launcher.CONTROLLER_SESSION,
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("tmux") is None,
+    reason="requires Linux /proc and tmux",
+)
+def test_preflight_launcher_duplicate_session_is_foreign_safe(
+    tmp_path: Path,
+) -> None:
+    launcher, repo_root, config, _, policy_sha256 = (
+        _prepare_preflight_launcher_fixture(tmp_path)
+    )
+    subprocess.run(
+        [
+            "tmux",
+            "new-session",
+            "-d",
+            "-s",
+            launcher.CONTROLLER_SESSION,
+            "sleep",
+            "30",
+        ],
+        check=True,
+    )
+    before = launcher._tmux_pane(launcher.CONTROLLER_SESSION)
+    assert before is not None
+    before_process = launcher._process_identity(before["pane_pid"])
+    try:
+        result = launcher.launch_preflight(
+            repo_root=repo_root,
+            config=config,
+            campaign_root=tmp_path / "campaign",
+            policy_sha256=policy_sha256,
+            python=sys.executable,
+            attempt_id=hashlib.sha256(b"duplicate").hexdigest(),
+            owner_nonce=hashlib.sha256(
+                b"duplicate-owner"
+            ).hexdigest(),
+            observer_suffix=hashlib.sha256(
+                b"duplicate-observer"
+            ).hexdigest(),
+            wrapper_arguments_override=[
+                sys.executable,
+                "-c",
+                "raise SystemExit(0)",
+            ],
+        )
+        assert result["status"] == "tmux_launch_failed"
+        assert result["session_residual"] is True
+        assert (
+            subprocess.run(
+                [
+                    "tmux",
+                    "has-session",
+                    "-t",
+                    launcher.CONTROLLER_SESSION,
+                ],
+                capture_output=True,
+                text=True,
+            ).returncode
+            == 0
+        )
+        after = launcher._tmux_pane(launcher.CONTROLLER_SESSION)
+        assert after == before
+        assert launcher._process_identity(after["pane_pid"]) == before_process
+    finally:
+        subprocess.run(
+            [
+                "tmux",
+                "kill-session",
+                "-t",
+                launcher.CONTROLLER_SESSION,
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("tmux") is None,
+    reason="requires Linux /proc and tmux",
+)
+def test_preflight_launcher_attempt_id_is_never_reused(
+    tmp_path: Path,
+) -> None:
+    launcher, repo_root, config, _, policy_sha256 = (
+        _prepare_preflight_launcher_fixture(tmp_path)
+    )
+    attempt_id = hashlib.sha256(b"one-start-only").hexdigest()
+    arguments = {
+        "repo_root": repo_root,
+        "config": config,
+        "campaign_root": tmp_path / "campaign",
+        "policy_sha256": policy_sha256,
+        "python": sys.executable,
+        "startup_timeout_seconds": 10,
+        "attempt_id": attempt_id,
+        "owner_nonce": hashlib.sha256(b"reuse-owner").hexdigest(),
+        "observer_suffix": hashlib.sha256(
+            b"reuse-observer"
+        ).hexdigest(),
+        "wrapper_arguments_override": [
+            sys.executable,
+            "-c",
+            "raise SystemExit(9)",
+        ],
+    }
+    first = launcher.launch_preflight(**arguments)
+    assert first["status"] == "wrapper_exited_before_claim"
+    registry = (
+        tmp_path
+        / "campaign/preflight_launch_attempts/started"
+        / f"{attempt_id}.json"
+    )
+    attempt_root = (
+        tmp_path
+        / "campaign/preflight_launch_attempts/by_policy"
+        / policy_sha256
+        / attempt_id
+    )
+    evidence = [
+        registry,
+        attempt_root / "pane.log",
+        attempt_root / "launch_receipt.json",
+        attempt_root / "pane_gate_ready.json",
+        attempt_root / "launch_tmux_started.json",
+        attempt_root / "pane_gate_release.json",
+        attempt_root / "launch_terminal.json",
+    ]
+    evidence_sha = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in evidence
+    }
+    with pytest.raises(FileExistsError):
+        launcher.launch_preflight(**arguments)
+    assert {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in evidence
+    } == evidence_sha
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("tmux") is None,
+    reason="requires Linux /proc and tmux",
+)
+@pytest.mark.parametrize(
+    ("stage", "expected_setup_terminal"),
+    (
+        ("registry_create", False),
+        ("pane_log_create", True),
+        ("receipt_create", True),
+    ),
+)
+def test_preflight_launcher_create_faults_never_reach_tmux(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    expected_setup_terminal: bool,
+) -> None:
+    launcher, repo_root, config, _, policy_sha256 = (
+        _prepare_preflight_launcher_fixture(tmp_path)
+    )
+    attempt_id = hashlib.sha256(stage.encode()).hexdigest()
+    campaign_root = tmp_path / "campaign"
+    original_write = launcher._write_exclusive
+    original_open = launcher.os.open
+    original_run = launcher.subprocess.run
+    tmux_called = False
+
+    def guarded_run(arguments, *args, **kwargs):
+        nonlocal tmux_called
+        if arguments and arguments[0] == "tmux":
+            tmux_called = True
+        return original_run(arguments, *args, **kwargs)
+
+    def failing_write(path, value):
+        if (
+            stage == "registry_create"
+            and path.name == f"{attempt_id}.json"
+            and path.parent.name == "started"
+        ) or (
+            stage == "receipt_create"
+            and path.name == "launch_receipt.json"
+        ):
+            raise OSError(f"injected {stage}")
+        return original_write(path, value)
+
+    def failing_open(path, flags, mode=0o777):
+        if stage == "pane_log_create" and Path(path).name == "pane.log":
+            raise OSError("injected pane_log_create")
+        return original_open(path, flags, mode)
+
+    monkeypatch.setattr(launcher.subprocess, "run", guarded_run)
+    monkeypatch.setattr(launcher, "_write_exclusive", failing_write)
+    monkeypatch.setattr(launcher.os, "open", failing_open)
+    with pytest.raises(OSError, match=f"injected {stage}"):
+        launcher.launch_preflight(
+            repo_root=repo_root,
+            config=config,
+            campaign_root=campaign_root,
+            policy_sha256=policy_sha256,
+            python=sys.executable,
+            attempt_id=attempt_id,
+            owner_nonce=hashlib.sha256(
+                f"owner:{stage}".encode()
+            ).hexdigest(),
+            observer_suffix=hashlib.sha256(
+                f"observer:{stage}".encode()
+            ).hexdigest(),
+        )
+    assert tmux_called is False
+    setup_terminal = (
+        campaign_root
+        / "preflight_launch_attempts/setup_terminals"
+        / f"{attempt_id}.json"
+    )
+    assert setup_terminal.exists() is expected_setup_terminal
+    if expected_setup_terminal:
+        value = load_json(setup_terminal, "setup terminal")
+        assert value["contract_type"] == (
+            "safa_canonical_preflight_launch_setup_terminal_v1"
+        )
+        assert value["tmux_execution_count"] == 0
+        assert value["scientific_execution_started"] is False
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("tmux") is None,
+    reason="requires Linux /proc and tmux",
+)
+@pytest.mark.parametrize(
+    "target",
+    ("started", "pane.log", "launch_receipt.json"),
+)
+def test_preflight_launcher_fsync_faults_are_durable_and_pre_tmux(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+) -> None:
+    launcher, repo_root, config, _, policy_sha256 = (
+        _prepare_preflight_launcher_fixture(tmp_path)
+    )
+    attempt_id = hashlib.sha256(f"fsync:{target}".encode()).hexdigest()
+    campaign_root = tmp_path / "campaign"
+    original_fsync = launcher.os.fsync
+    original_run = launcher.subprocess.run
+    injected = False
+    tmux_called = False
+
+    def guarded_run(arguments, *args, **kwargs):
+        nonlocal tmux_called
+        if arguments and arguments[0] == "tmux":
+            tmux_called = True
+        return original_run(arguments, *args, **kwargs)
+
+    def failing_fsync(descriptor):
+        nonlocal injected
+        descriptor_path = Path(
+            os.readlink(f"/proc/self/fd/{descriptor}")
+        )
+        matches = (
+            target == "started"
+            and descriptor_path.name == f"{attempt_id}.json"
+            and descriptor_path.parent.name == "started"
+        ) or descriptor_path.name == target
+        if matches and not injected:
+            injected = True
+            raise OSError(f"injected fsync:{target}")
+        return original_fsync(descriptor)
+
+    monkeypatch.setattr(launcher.subprocess, "run", guarded_run)
+    monkeypatch.setattr(launcher.os, "fsync", failing_fsync)
+    with pytest.raises(OSError, match="injected fsync"):
+        launcher.launch_preflight(
+            repo_root=repo_root,
+            config=config,
+            campaign_root=campaign_root,
+            policy_sha256=policy_sha256,
+            python=sys.executable,
+            attempt_id=attempt_id,
+            owner_nonce=hashlib.sha256(
+                f"owner:fsync:{target}".encode()
+            ).hexdigest(),
+            observer_suffix=hashlib.sha256(
+                f"observer:fsync:{target}".encode()
+            ).hexdigest(),
+        )
+    assert injected is True
+    assert tmux_called is False
+    setup_terminal = (
+        campaign_root
+        / "preflight_launch_attempts/setup_terminals"
+        / f"{attempt_id}.json"
+    )
+    value = load_json(setup_terminal, "setup terminal")
+    assert value["contract_type"] == (
+        "safa_canonical_preflight_launch_setup_terminal_v1"
+    )
+    assert value["tmux_execution_count"] == 0
+    assert value["scientific_execution_started"] is False
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("tmux") is None,
+    reason="requires Linux /proc and tmux",
+)
+@pytest.mark.parametrize(
+    ("fault", "expected_contract", "expected_status"),
+    (
+        (
+            "remain_set",
+            "safa_canonical_preflight_launch_terminal_v1",
+            "launcher_failed",
+        ),
+        (
+            "remain_verify",
+            "safa_canonical_preflight_launch_terminal_v1",
+            "launcher_failed",
+        ),
+        (
+            "gate_release_write",
+            "safa_canonical_preflight_launch_terminal_v1",
+            "launcher_failed",
+        ),
+        (
+            "accepted_write",
+            "safa_canonical_preflight_launch_terminal_v1",
+            "launcher_failed",
+        ),
+        (
+            "ownership_terminal_write",
+            "safa_canonical_preflight_launch_terminal_v1",
+            "launcher_failed",
+        ),
+        (
+            "remain_off",
+            (
+                "safa_canonical_preflight_launch_post_terminal_"
+                "failure_v1"
+            ),
+            "launch_release_failed",
+        ),
+        (
+            "ownership_release_write",
+            (
+                "safa_canonical_preflight_launch_post_terminal_"
+                "failure_v1"
+            ),
+            "launch_release_failed",
+        ),
+    ),
+)
+def test_preflight_launcher_ownership_faults_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+    expected_contract: str,
+    expected_status: str,
+) -> None:
+    launcher, repo_root, config, fake_wrapper, policy_sha256 = (
+        _prepare_preflight_launcher_fixture(tmp_path)
+    )
+    original_write = launcher._write_exclusive
+    original_set = launcher._set_remain_on_exit
+    original_verify = launcher._verify_remain_on_exit
+
+    def failing_write(path, value):
+        matches = {
+            "gate_release_write": "pane_gate_release.json",
+            "accepted_write": "launch_accepted.json",
+            "ownership_terminal_write": "launch_terminal.json",
+            "ownership_release_write": "launch_ownership_release.json",
+        }
+        if (
+            fault in matches
+            and path.name == matches[fault]
+            and (
+                fault != "ownership_terminal_write"
+                or value.get("status") == "ownership_transferred"
+            )
+        ):
+            raise OSError(f"injected {fault}")
+        return original_write(path, value)
+
+    def failing_set(pane, enabled):
+        if (fault == "remain_set" and enabled) or (
+            fault == "remain_off" and not enabled
+        ):
+            raise OSError(f"injected {fault}")
+        return original_set(pane, enabled)
+
+    def failing_verify(pane, expected):
+        if fault == "remain_verify" and expected == "on":
+            raise OSError("injected remain_verify")
+        return original_verify(pane, expected)
+
+    monkeypatch.setattr(launcher, "_write_exclusive", failing_write)
+    monkeypatch.setattr(launcher, "_set_remain_on_exit", failing_set)
+    monkeypatch.setattr(launcher, "_verify_remain_on_exit", failing_verify)
+    attempt_id = hashlib.sha256(fault.encode()).hexdigest()
+    result = launcher.launch_preflight(
+        repo_root=repo_root,
+        config=config,
+        campaign_root=tmp_path / "campaign",
+        policy_sha256=policy_sha256,
+        python=sys.executable,
+        startup_timeout_seconds=2,
+        attempt_id=attempt_id,
+        owner_nonce=hashlib.sha256(
+            f"owner:{fault}".encode()
+        ).hexdigest(),
+        observer_suffix=hashlib.sha256(
+            f"observer:{fault}".encode()
+        ).hexdigest(),
+        wrapper_arguments_override=[
+            sys.executable,
+            "-B",
+            "-u",
+            str(fake_wrapper),
+            "claim",
+        ],
+    )
+    assert result["contract_type"] == expected_contract
+    assert result["status"] == expected_status
+    assert result["session_residual"] is False
+    assert result["pane_log"]["size"] >= 0
+    assert len(result["pane_log"]["sha256"]) == 64
+    attempt_root = (
+        tmp_path
+        / "campaign/preflight_launch_attempts/by_policy"
+        / policy_sha256
+        / attempt_id
+    )
+    assert not (
+        attempt_root / "launch_ownership_release.json"
+    ).exists()
+    assert (
+        subprocess.run(
+            [
+                "tmux",
+                "has-session",
+                "-t",
+                launcher.CONTROLLER_SESSION,
+            ],
+            capture_output=True,
+            text=True,
+        ).returncode
+        != 0
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("tmux") is None,
+    reason="requires Linux /proc and tmux",
+)
+def test_preflight_launcher_terminal_first_write_fault_is_recorded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launcher, repo_root, config, _, policy_sha256 = (
+        _prepare_preflight_launcher_fixture(tmp_path)
+    )
+    original_write = launcher._write_exclusive
+    injected = False
+
+    def fail_first_terminal(path, value):
+        nonlocal injected
+        if path.name == "launch_terminal.json" and not injected:
+            injected = True
+            raise OSError("injected first terminal write")
+        return original_write(path, value)
+
+    monkeypatch.setattr(launcher, "_write_exclusive", fail_first_terminal)
+    result = launcher.launch_preflight(
+        repo_root=repo_root,
+        config=config,
+        campaign_root=tmp_path / "campaign",
+        policy_sha256=policy_sha256,
+        python=sys.executable,
+        startup_timeout_seconds=2,
+        attempt_id=hashlib.sha256(b"terminal-first-write").hexdigest(),
+        owner_nonce=hashlib.sha256(b"terminal-first-owner").hexdigest(),
+        observer_suffix=hashlib.sha256(
+            b"terminal-first-observer"
+        ).hexdigest(),
+        wrapper_arguments_override=[
+            sys.executable,
+            "-c",
+            "raise SystemExit(13)",
+        ],
+    )
+    assert injected is True
+    assert result["status"] == "wrapper_exited_before_claim"
+    assert result["failure"]["secondary_failures"] == [
+        {
+            "stage": "launch_terminal_write",
+            "type": "OSError",
+            "message": "injected first terminal write",
+        }
+    ]
+    assert len(result["pane_log"]["sha256"]) == 64
+    assert result["pane_log"]["size"] >= 0
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("tmux") is None,
+    reason="requires Linux /proc and tmux",
+)
+def test_preflight_launcher_unwritable_terminal_preserves_attempt_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launcher, repo_root, config, _, policy_sha256 = (
+        _prepare_preflight_launcher_fixture(tmp_path)
+    )
+    original_write = launcher._write_exclusive
+    attempt_id = hashlib.sha256(b"terminal-unwritable").hexdigest()
+    campaign_root = tmp_path / "campaign"
+
+    def fail_all_terminals(path, value):
+        if path.name in {
+            "launch_terminal.json",
+            "launch_terminal_emergency.json",
+        }:
+            raise OSError("injected terminal permanently unwritable")
+        return original_write(path, value)
+
+    monkeypatch.setattr(launcher, "_write_exclusive", fail_all_terminals)
+    arguments = {
+        "repo_root": repo_root,
+        "config": config,
+        "campaign_root": campaign_root,
+        "policy_sha256": policy_sha256,
+        "python": sys.executable,
+        "startup_timeout_seconds": 2,
+        "attempt_id": attempt_id,
+        "owner_nonce": hashlib.sha256(
+            b"terminal-unwritable-owner"
+        ).hexdigest(),
+        "observer_suffix": hashlib.sha256(
+            b"terminal-unwritable-observer"
+        ).hexdigest(),
+        "wrapper_arguments_override": [
+            sys.executable,
+            "-c",
+            "raise SystemExit(17)",
+        ],
+    }
+    with pytest.raises(
+        OSError, match="terminal permanently unwritable"
+    ):
+        launcher.launch_preflight(**arguments)
+    attempt_root = (
+        campaign_root
+        / "preflight_launch_attempts/by_policy"
+        / policy_sha256
+        / attempt_id
+    )
+    evidence = [
+        campaign_root
+        / "preflight_launch_attempts/started"
+        / f"{attempt_id}.json",
+        attempt_root / "pane.log",
+        attempt_root / "launch_receipt.json",
+        attempt_root / "pane_gate_ready.json",
+        attempt_root / "launch_tmux_started.json",
+        attempt_root / "pane_gate_release.json",
+    ]
+    evidence_sha = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in evidence
+    }
+    with pytest.raises(FileExistsError):
+        launcher.launch_preflight(**arguments)
+    assert {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in evidence
+    } == evidence_sha
+    assert not (attempt_root / "launch_accepted.json").exists()
+    assert not (
+        attempt_root / "launch_ownership_release.json"
+    ).exists()
+
+
+def test_preflight_launcher_never_overwrites_primary_terminal(
+    tmp_path: Path,
+) -> None:
+    launcher, _, config, _, _ = _prepare_preflight_launcher_fixture(
+        tmp_path
+    )
+    launcher._install_verified_preflight_apis(config)
+    receipt_path = tmp_path / "launch_receipt.json"
+    receipt = {
+        "schema_version": 1,
+        "contract_type": (
+            "safa_canonical_preflight_launch_receipt_v1"
+        ),
+    }
+    receipt["launch_receipt_sha256"] = launcher._canonical_digest(
+        receipt, "launch_receipt_sha256"
+    )
+    launcher._write_exclusive(receipt_path, receipt)
+    log_path = tmp_path / "pane.log"
+    log_path.write_text("sealed log\n", encoding="utf-8")
+    terminal_path = tmp_path / "launch_terminal.json"
+    first = launcher._publish_terminal(
+        terminal_path,
+        receipt_path=receipt_path,
+        receipt_identity=launcher._opened_file_identity(
+            receipt_path
+        ),
+        status="first_failure",
+        failure_type="FirstFailure",
+        message="primary",
+        client=None,
+        pane=None,
+        tmux_started_path=None,
+        log_path=log_path,
+        session_residual=False,
+        started_at="2026-07-28T00:00:00+00:00",
+    )
+    primary_sha = hashlib.sha256(
+        terminal_path.read_bytes()
+    ).hexdigest()
+    second = launcher._publish_terminal(
+        terminal_path,
+        receipt_path=receipt_path,
+        receipt_identity=launcher._opened_file_identity(
+            receipt_path
+        ),
+        status="second_failure",
+        failure_type="SecondFailure",
+        message="must not replace primary",
+        client=None,
+        pane=None,
+        tmux_started_path=None,
+        log_path=log_path,
+        session_residual=False,
+        started_at="2026-07-28T00:00:01+00:00",
+    )
+    assert second == first
+    assert (
+        hashlib.sha256(terminal_path.read_bytes()).hexdigest()
+        == primary_sha
+    )
+    assert not (
+        tmp_path / "launch_terminal_emergency.json"
+    ).exists()
+
+
+def test_preflight_gate_terminal_first_write_fault_is_secondary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launcher = _launcher_module()
+    path = tmp_path / "gate_execution_terminal.json"
+    original_write = launcher._write_exclusive
+    injected = False
+
+    def fail_first(target, value):
+        nonlocal injected
+        if target == path and not injected:
+            injected = True
+            raise OSError("injected gate terminal first write")
+        return original_write(target, value)
+
+    monkeypatch.setattr(launcher, "_write_exclusive", fail_first)
+    value = {
+        "schema_version": 1,
+        "contract_type": (
+            "safa_canonical_preflight_gate_execution_terminal_v1"
+        ),
+        "publication_failures": [],
+    }
+    published = launcher._publish_gate_execution_terminal(path, value)
+    assert injected is True
+    assert published["publication_failures"] == [
+        {
+            "type": "OSError",
+            "message": "injected gate terminal first write",
+        }
+    ]
+    assert (
+        published["gate_execution_terminal_sha256"]
+        == launcher._canonical_digest(
+            published, "gate_execution_terminal_sha256"
+        )
+    )
+
+
+def test_preflight_gate_terminal_permanent_fault_preserves_registry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launcher = _launcher_module()
+    registry = tmp_path / "started.json"
+    registry.write_text("reserved\n", encoding="utf-8")
+    registry_sha = hashlib.sha256(registry.read_bytes()).hexdigest()
+
+    def fail_terminal(_path, _value):
+        raise OSError("injected gate terminal permanently unwritable")
+
+    monkeypatch.setattr(launcher, "_write_exclusive", fail_terminal)
+    with pytest.raises(
+        OSError, match="gate terminal permanently unwritable"
+    ):
+        launcher._publish_gate_execution_terminal(
+            tmp_path / "gate_execution_terminal.json",
+            {
+                "schema_version": 1,
+                "contract_type": (
+                    "safa_canonical_preflight_"
+                    "gate_execution_terminal_v1"
+                ),
+                "publication_failures": [],
+            },
+        )
+    assert (
+        hashlib.sha256(registry.read_bytes()).hexdigest()
+        == registry_sha
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="requires Linux /proc",
+)
+def test_preflight_pane_gate_rejects_replaced_log_before_redirect(
+    tmp_path: Path,
+) -> None:
+    launcher = _launcher_module()
+    attempt_root = tmp_path / "attempt"
+    attempt_root.mkdir()
+    log_path = attempt_root / "pane.log"
+    log_path.write_bytes(b"")
+    receipt = {
+        "schema_version": 1,
+        "contract_type": (
+            "safa_canonical_preflight_launch_receipt_v1"
+        ),
+        "pane_log": {
+            **launcher._file_identity(log_path),
+            "inode": log_path.stat().st_ino + 1,
+        },
+    }
+    receipt["launch_receipt_sha256"] = launcher._canonical_digest(
+        receipt, "launch_receipt_sha256"
+    )
+    launcher._write_exclusive(
+        attempt_root / "launch_receipt.json", receipt
+    )
+    with pytest.raises(RuntimeError, match="pane log identity differs"):
+        launcher._pane_gate(
+            attempt_root=attempt_root,
+            release_path=attempt_root / "pane_gate_release.json",
+            log_path=log_path,
+            wrapper_arguments=[sys.executable, "-c", "pass"],
+        )
+    assert not (attempt_root / "pane_gate_ready.json").exists()
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("tmux") is None,
+    reason="requires Linux /proc and tmux",
+)
+def test_preflight_cleanup_refuses_replaced_session(
+    tmp_path: Path,
+) -> None:
+    launcher = _launcher_module()
+    nonce = hashlib.sha256(b"cleanup-owner").hexdigest()
+    subprocess.run(
+        [
+            "tmux",
+            "new-session",
+            "-d",
+            "-s",
+            launcher.CONTROLLER_SESSION,
+            "-e",
+            f"{launcher.TMUX_OWNER_ENV}={nonce}",
+            "sleep",
+            "30",
+        ],
+        check=True,
+    )
+    seal = launcher._tmux_owner_seal(
+        launcher.CONTROLLER_SESSION, nonce
+    )
+    subprocess.run(
+        [
+            "tmux",
+            "kill-session",
+            "-t",
+            launcher.CONTROLLER_SESSION,
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "tmux",
+            "new-session",
+            "-d",
+            "-s",
+            launcher.CONTROLLER_SESSION,
+            "-e",
+            f"{launcher.TMUX_OWNER_ENV}={nonce}",
+            "sleep",
+            "30",
+        ],
+        check=True,
+    )
+    try:
+        with pytest.raises(
+            RuntimeError, match="refuses to kill a replaced tmux owner"
+        ):
+            launcher._kill_exact_session(
+                launcher.CONTROLLER_SESSION, nonce, seal
+            )
+        assert launcher._tmux_pane(launcher.CONTROLLER_SESSION) is not None
+    finally:
+        subprocess.run(
+            [
+                "tmux",
+                "kill-session",
+                "-t",
+                launcher.CONTROLLER_SESSION,
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+
 def test_cpu_preflight_request_manifest_binds_plan_and_request_files(
     tmp_path: Path,
 ) -> None:
@@ -9070,6 +13063,173 @@ def test_cpu_preflight_request_manifest_binds_plan_and_request_files(
         module._validate_preflight_request_manifest(
             manifest, policy, paths
         )
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="requires Linux openat and O_NOFOLLOW",
+)
+def test_preflight_exact_owned_entry_rejects_path_aliases_and_inode_spoof(
+    tmp_path: Path,
+) -> None:
+    module = _controller_module()
+    exact_root = tmp_path / "campaign/preflight_launch_attempts/attempt"
+    exact_root.mkdir(parents=True)
+    receipt_path = exact_root / "launch_receipt.json"
+    receipt_path.write_text("{}\n", encoding="utf-8")
+    identity = module._require_exact_owned_regular_entry(
+        str(receipt_path),
+        receipt_path,
+        "fixture receipt",
+    )
+    assert identity["path"] == str(receipt_path)
+    with pytest.raises(
+        CanonicalScreeningError, match="exact path differs"
+    ):
+        module._require_exact_owned_regular_entry(
+            str(exact_root / "nested/../launch_receipt.json"),
+            receipt_path,
+            "fixture receipt",
+        )
+    spoofed_identity = dict(identity)
+    spoofed_identity["inode"] += 1
+    with pytest.raises(
+        CanonicalScreeningError, match="inode identity differs"
+    ):
+        module._require_exact_owned_regular_entry(
+            str(receipt_path),
+            receipt_path,
+            "fixture receipt",
+            identity=spoofed_identity,
+        )
+    real_parent = tmp_path / "real-attempt"
+    real_parent.mkdir()
+    (real_parent / "launch_receipt.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
+    alias_parent = tmp_path / "alias-attempt"
+    alias_parent.symlink_to(real_parent, target_is_directory=True)
+    alias_receipt = alias_parent / "launch_receipt.json"
+    with pytest.raises(
+        CanonicalScreeningError, match="non-symlink directory"
+    ):
+        module._require_exact_owned_regular_entry(
+            str(alias_receipt),
+            alias_receipt,
+            "fixture receipt",
+        )
+
+
+def test_preflight_two_layer_process_contract_rejects_old_pane_wrapper_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _controller_module()
+    gate_pid = 101
+    wrapper_pid = 202
+    gate_arguments = ["/sealed/python", "gate"]
+    wrapper_arguments = ["/sealed/python", "wrapper"]
+    gate = {
+        "pid": gate_pid,
+        "ppid": 1,
+        "pgid": gate_pid,
+        "sid": gate_pid,
+        "start_ticks": 1001,
+    }
+    child = {
+        "pid": wrapper_pid,
+        "ppid": gate_pid,
+        "pgid": wrapper_pid,
+        "sid": wrapper_pid,
+        "start_ticks": 1002,
+    }
+    receipt = {
+        "pane_gate_arguments": gate_arguments,
+        "wrapper_arguments": wrapper_arguments,
+        "python_executable": {"path": "/sealed/python"},
+    }
+    wrapper = {
+        "pane_gate_process": gate,
+        "wrapper_launch_process": child,
+        "wrapper_executable": build_preflight_file_identity(
+            path="/sealed/python",
+            device=1,
+            inode=2,
+            mode=0o100755,
+            size=1,
+        ),
+    }
+    identities = {gate_pid: gate, wrapper_pid: child}
+    commands = {
+        gate_pid: module._command_bytes(gate_arguments),
+        wrapper_pid: module._command_bytes(wrapper_arguments),
+    }
+    monkeypatch.setattr(
+        module,
+        "_launch_process_identity",
+        lambda pid: dict(identities[pid]),
+    )
+    monkeypatch.setattr(
+        module, "_process_command_bytes", lambda pid: commands[pid]
+    )
+    monkeypatch.setattr(
+        module.os,
+        "readlink",
+        lambda path: "/sealed/python"
+        if path in {f"/proc/{gate_pid}/exe", f"/proc/{wrapper_pid}/exe"}
+        else (_ for _ in ()).throw(AssertionError(path)),
+    )
+    module._validate_live_preflight_process_layers(
+        wrapper, receipt, "fixture"
+    )
+    old_single_process = dict(wrapper)
+    old_single_process["wrapper_launch_process"] = dict(gate)
+    with pytest.raises(
+        CanonicalScreeningError,
+        match="gate/wrapper exact process seal differs",
+    ):
+        module._validate_live_preflight_process_layers(
+            old_single_process, receipt, "fixture"
+        )
+    wrong_parent = dict(wrapper)
+    wrong_parent["wrapper_launch_process"] = {
+        **child,
+        "ppid": gate_pid + 1,
+    }
+    with pytest.raises(
+        CanonicalScreeningError,
+        match="gate/wrapper exact process seal differs",
+    ):
+        module._validate_live_preflight_process_layers(
+            wrong_parent, receipt, "fixture"
+        )
+    commands[wrapper_pid] = b"/sealed/python\0different-wrapper\0"
+    with pytest.raises(
+        CanonicalScreeningError,
+        match="gate/wrapper exact process seal differs",
+    ):
+        module._validate_live_preflight_process_layers(
+            wrapper, receipt, "fixture"
+        )
+
+
+def test_preflight_tmux_assertions_never_bind_pane_to_wrapper_process() -> None:
+    module = _raw_controller_module()
+    tree = ast.parse(inspect.getsource(module))
+    violations = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_assert_tmux_process_identity"
+            and len(node.args) >= 4
+        ):
+            for child in ast.walk(node.args[3]):
+                if (
+                    isinstance(child, ast.Constant)
+                    and child.value == "wrapper_process"
+                ):
+                    violations.append(node.lineno)
+    assert violations == []
 
 
 def test_cpu_preflight_monitor_dispatch_never_uses_gpu_control(
@@ -9166,7 +13326,7 @@ def test_preflight_observer_early_exit_fails_ready_barrier(
         )
 
 
-def test_preflight_tmux_is_wrapper_managed_without_external_monitor(
+def test_preflight_tmux_is_launcher_managed_without_external_monitor(
     tmp_path: Path,
 ) -> None:
     module = _controller_module()
@@ -9178,6 +13338,10 @@ def test_preflight_tmux_is_wrapper_managed_without_external_monitor(
     )
     assert commands["monitor"] == []
     assert any(
+        item.endswith("run_canonical_preflight_launcher.py")
+        for item in commands["controller"]
+    )
+    assert not any(
         item.endswith("run_canonical_preflight_wrapper.py")
         for item in commands["controller"]
     )
@@ -9205,41 +13369,43 @@ def test_cpu_preflight_monitor_completes_without_gpu_control_artifacts(
     )
     control = paths["preflight_control"]
     sealed_pid = os.getpid()
-    sealed_process = {
-        "pid": sealed_pid,
-        "pgid": sealed_pid,
-        "start_ticks": 20,
-    }
+    sealed_process = _test_process_identity(
+        sealed_pid,
+        ppid=os.getppid(),
+        pgid=sealed_pid,
+        sid=sealed_pid,
+        start_ticks=20,
+    )
+    gate_pid = sealed_pid + 10000
+    wrapper_pid = sealed_pid + 20000
     controller_tmux = {
         "session": module.PREFLIGHT_CONTROLLER_SESSION,
         "pane": "%0",
-        "pane_pid": sealed_pid,
+        "pane_pid": gate_pid,
         "pane_current_command": "python",
     }
     observer_tmux = {
         **controller_tmux,
         "session": module.PREFLIGHT_OBSERVER_SESSION,
         "pane": "%1",
+        "pane_pid": sealed_pid,
     }
-    tmux_server = {
-        "server_pid": sealed_pid,
-        "socket_path": str((tmp_path / "tmux.sock").resolve()),
-    }
-    wrapper = {
-        "schema_version": 1,
-        "contract_type": "safa_canonical_preflight_wrapper_claim_v2",
-        "policy_sha256": policy["policy_sha256"],
-        "controller_session": module.PREFLIGHT_CONTROLLER_SESSION,
-        "observer_session": module.PREFLIGHT_OBSERVER_SESSION,
-        "controller_tmux": controller_tmux,
-        "controller_tmux_server": tmux_server,
-        "wrapper_process": sealed_process,
-    }
-    wrapper["wrapper_claim_sha256"] = canonical_digest(
-        wrapper, "wrapper_claim_sha256"
+    tmux_server = _test_tmux_server_identity(
+        tmp_path / "tmux.sock",
+        server_pid=sealed_pid,
+        server_process=sealed_process,
     )
-    wrapper_path = control / "wrapper_claim.json"
-    write_exclusive_json(wrapper_path, wrapper)
+    wrapper, wrapper_path, wrapper_seals = (
+        _write_preflight_wrapper_v3_fixture(
+            module,
+            policy,
+            paths,
+            gate_pid=gate_pid,
+            wrapper_pid=wrapper_pid,
+            controller_tmux=controller_tmux,
+            tmux_server=tmux_server,
+        )
+    )
     observer_launch, observer_launch_path = (
         _write_preflight_observer_provenance_fixture(
             module,
@@ -9275,6 +13441,9 @@ def test_cpu_preflight_monitor_completes_without_gpu_control_artifacts(
         "schema_version": 1,
         "contract_type": "safa_canonical_preflight_controller_ready_v1",
         "policy_sha256": policy["policy_sha256"],
+        "verified_implementations": (
+            _test_verified_preflight_implementations()
+        ),
         "controller_session": module.PREFLIGHT_CONTROLLER_SESSION,
         "observer_session": module.PREFLIGHT_OBSERVER_SESSION,
         "request_count": 1,
@@ -9424,11 +13593,20 @@ def test_cpu_preflight_monitor_completes_without_gpu_control_artifacts(
     monkeypatch.setattr(
         module, "_validate_tmux_owner_seal", lambda *_args: None
     )
-    monkeypatch.setattr(module, "_process_identity", lambda pid: {
-        "pid": pid,
-        "pgid": pid,
-        "start_ticks": 20,
-    })
+    monkeypatch.setattr(
+        module,
+        "_process_identity",
+        lambda pid: (
+            dict(wrapper_seals["gate"])
+            if pid == gate_pid
+            else dict(sealed_process)
+            if pid == sealed_pid
+            else _test_process_identity(pid, start_ticks=20)
+        ),
+    )
+    _mock_preflight_wrapper_process_seals(
+        module, monkeypatch, wrapper_seals
+    )
     monkeypatch.setattr(module, "RuntimeResourceGuard", FakeGuard)
     monkeypatch.setattr(
         module,
@@ -9461,36 +13639,50 @@ def test_preflight_wrapper_wrong_session_or_pid_fails_closed(
     }
     paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
     parent_pid = os.getppid()
-    wrapper = {
-        "schema_version": 1,
-        "contract_type": "safa_canonical_preflight_wrapper_claim_v2",
-        "policy_sha256": policy["policy_sha256"],
-        "config": policy["policy_file"],
-        "checkpoint_plan": {},
-        "preflight_request_manifest": {},
-        "controller_session": (
-            "wrong"
-            if mutation == "session"
-            else module.PREFLIGHT_CONTROLLER_SESSION
-        ),
-        "controller_tmux": {
-            "session": module.PREFLIGHT_CONTROLLER_SESSION,
-            "pane": "%0",
-            "pane_pid": parent_pid,
-            "pane_current_command": "python",
-        },
-        "observer_session": module.PREFLIGHT_OBSERVER_SESSION,
-        "command": module._expected_preflight_controller_command(
-            policy, paths
-        ),
-        "observer_command": module._expected_preflight_observer_command(
-            policy, paths
-        ),
-        "wrapper_pid": parent_pid + (1 if mutation == "pid" else 0),
-        "wrapper_process": module._process_identity(parent_pid),
-        "started_at": "2026-01-01T00:00:00+00:00",
-        "external_timeout_seconds": None,
+    wrapper_pid = parent_pid + (1 if mutation == "pid" else 0)
+    gate_pid = max(1, parent_pid - 1)
+    wrapper_process = {
+        "pid": wrapper_pid,
+        "ppid": gate_pid,
+        "pgid": wrapper_pid,
+        "sid": wrapper_pid,
+        "start_ticks": 2,
     }
+    wrapper = _shared_launch_contract_values()["claim"]
+    wrapper.update(
+        {
+            "policy_sha256": policy["policy_sha256"],
+            "config": policy["policy_file"],
+            "controller_session": (
+                "wrong"
+                if mutation == "session"
+                else module.PREFLIGHT_CONTROLLER_SESSION
+            ),
+            "controller_tmux": {
+                "session": module.PREFLIGHT_CONTROLLER_SESSION,
+                "pane": "%0",
+                "pane_pid": gate_pid,
+                "pane_current_command": "python",
+            },
+            "observer_session": module.PREFLIGHT_OBSERVER_SESSION,
+            "command": module._expected_preflight_controller_command(
+                policy, paths
+            ),
+            "observer_command": module._expected_preflight_observer_command(
+                policy, paths
+            ),
+            "wrapper_pid": wrapper_pid,
+            "wrapper_process": wrapper_process,
+            "wrapper_launch_process": dict(wrapper_process),
+            "pane_gate_process": {
+                "pid": gate_pid,
+                "ppid": 1,
+                "pgid": gate_pid,
+                "sid": gate_pid,
+                "start_ticks": 1,
+            },
+        }
+    )
     wrapper["wrapper_claim_sha256"] = canonical_digest(
         wrapper, "wrapper_claim_sha256"
     )
@@ -9517,35 +13709,37 @@ def test_preflight_controller_exit_without_terminal_writes_failed_observer_termi
     paths = module._paths(tmp_path / "campaign", policy["policy_sha256"])
     control = paths["preflight_control"]
     sealed_pid = os.getpid()
-    sealed_process = {
-        "pid": sealed_pid,
-        "pgid": sealed_pid,
-        "start_ticks": 20,
-    }
-    tmux_server = {
-        "server_pid": sealed_pid,
-        "socket_path": str((tmp_path / "tmux.sock").resolve()),
-    }
-    wrapper = {
-        "schema_version": 1,
-        "contract_type": "safa_canonical_preflight_wrapper_claim_v2",
-        "policy_sha256": policy["policy_sha256"],
-        "controller_session": module.PREFLIGHT_CONTROLLER_SESSION,
-        "observer_session": module.PREFLIGHT_OBSERVER_SESSION,
-        "controller_tmux": {
-            "session": module.PREFLIGHT_CONTROLLER_SESSION,
-            "pane": "%0",
-            "pane_pid": sealed_pid,
-            "pane_current_command": "python",
-        },
-        "controller_tmux_server": tmux_server,
-        "wrapper_process": sealed_process,
-    }
-    wrapper["wrapper_claim_sha256"] = canonical_digest(
-        wrapper, "wrapper_claim_sha256"
+    sealed_process = _test_process_identity(
+        sealed_pid,
+        ppid=os.getppid(),
+        pgid=sealed_pid,
+        sid=sealed_pid,
+        start_ticks=20,
     )
-    wrapper_path = control / "wrapper_claim.json"
-    write_exclusive_json(wrapper_path, wrapper)
+    gate_pid = sealed_pid + 10000
+    wrapper_pid = sealed_pid + 20000
+    tmux_server = _test_tmux_server_identity(
+        tmp_path / "tmux.sock",
+        server_pid=sealed_pid,
+        server_process=sealed_process,
+    )
+    controller_tmux = {
+        "session": module.PREFLIGHT_CONTROLLER_SESSION,
+        "pane": "%0",
+        "pane_pid": gate_pid,
+        "pane_current_command": "python",
+    }
+    wrapper, wrapper_path, wrapper_seals = (
+        _write_preflight_wrapper_v3_fixture(
+            module,
+            policy,
+            paths,
+            gate_pid=gate_pid,
+            wrapper_pid=wrapper_pid,
+            controller_tmux=controller_tmux,
+            tmux_server=tmux_server,
+        )
+    )
     observer_tmux = {
         "session": module.PREFLIGHT_OBSERVER_SESSION,
         "pane": "%1",
@@ -9583,7 +13777,13 @@ def test_preflight_controller_exit_without_terminal_writes_failed_observer_termi
     monkeypatch.setattr(
         module,
         "_process_identity",
-        lambda pid: {"pid": pid, "pgid": pid, "start_ticks": 20},
+        lambda pid: (
+            dict(wrapper_seals["gate"])
+            if pid == gate_pid
+            else dict(sealed_process)
+            if pid == sealed_pid
+            else _test_process_identity(pid, start_ticks=20)
+        ),
     )
     monkeypatch.setattr(
         module,
@@ -9598,16 +13798,16 @@ def test_preflight_controller_exit_without_terminal_writes_failed_observer_termi
     monkeypatch.setattr(
         module,
         "_tmux_pane_identity",
-        lambda pane: {
-            "session": (
-                module.PREFLIGHT_CONTROLLER_SESSION
-                if pane == "%0"
-                else module.PREFLIGHT_OBSERVER_SESSION
-            ),
-            "pane": pane,
-            "pane_pid": sealed_pid,
-            "pane_current_command": "python",
-        },
+        lambda pane: (
+            dict(controller_tmux)
+            if pane == "%0"
+            else {
+                "session": module.PREFLIGHT_OBSERVER_SESSION,
+                "pane": pane,
+                "pane_pid": sealed_pid,
+                "pane_current_command": "python",
+            }
+        ),
     )
     monkeypatch.setattr(
         module,
@@ -9616,6 +13816,9 @@ def test_preflight_controller_exit_without_terminal_writes_failed_observer_termi
     )
     monkeypatch.setattr(
         module, "_validate_tmux_owner_seal", lambda *_args: None
+    )
+    _mock_preflight_wrapper_process_seals(
+        module, monkeypatch, wrapper_seals
     )
     monkeypatch.setattr(
         module,
@@ -9748,8 +13951,7 @@ def test_preflight_wrapper_real_tmux_subprocess_lifecycle(
         f"integration:{observer_mode}".encode()
     ).hexdigest()
     policy_root = tmp_path / "campaign" / "by_policy" / policy_sha256
-    config = tmp_path / "policy.json"
-    config.write_text("{}\n", encoding="utf-8")
+    config = repo_root / "configs/closeout/canonical_screening_512_v1.json"
     _prepare_wrapper_contract_inputs(wrapper, policy_root)
     sessions = (
         wrapper.CONTROLLER_SESSION,
@@ -9890,8 +14092,7 @@ def test_preflight_wrapper_terminal_validation_failure_closes_durably(
         f"terminal-validation:{observer_mode}".encode()
     ).hexdigest()
     policy_root = tmp_path / "campaign" / "by_policy" / policy_sha256
-    config = tmp_path / "policy.json"
-    config.write_text("{}\n", encoding="utf-8")
+    config = repo_root / "configs/closeout/canonical_screening_512_v1.json"
     _prepare_wrapper_contract_inputs(wrapper, policy_root)
     sessions = (wrapper.CONTROLLER_SESSION, wrapper.OBSERVER_SESSION)
     command = [
@@ -10012,8 +14213,7 @@ def test_preflight_wrapper_uses_first_strict_terminal_snapshot(
         f"terminal-snapshot:{observer_mode}".encode()
     ).hexdigest()
     policy_root = tmp_path / "campaign" / "by_policy" / policy_sha256
-    config = tmp_path / "policy.json"
-    config.write_text("{}\n", encoding="utf-8")
+    config = repo_root / "configs/closeout/canonical_screening_512_v1.json"
     _prepare_wrapper_contract_inputs(wrapper, policy_root)
     sessions = (wrapper.CONTROLLER_SESSION, wrapper.OBSERVER_SESSION)
     command = [
@@ -10253,8 +14453,7 @@ def test_preflight_wrapper_post_popen_faults_close_durably(
         f"controller-close:{fault_mode}".encode()
     ).hexdigest()
     policy_root = tmp_path / "campaign" / "by_policy" / policy_sha256
-    config = tmp_path / "policy.json"
-    config.write_text("{}\n", encoding="utf-8")
+    config = repo_root / "configs/closeout/canonical_screening_512_v1.json"
     _prepare_wrapper_contract_inputs(wrapper, policy_root)
     sessions = (wrapper.CONTROLLER_SESSION, wrapper.OBSERVER_SESSION)
     command = [
@@ -10482,8 +14681,7 @@ def test_preflight_wrapper_observer_launch_write_fault_closes_owner(
     helper = repo_root / "tests/helpers/preflight_lifecycle_helper.py"
     policy_sha256 = hashlib.sha256(fault_mode.encode()).hexdigest()
     policy_root = tmp_path / "campaign" / "by_policy" / policy_sha256
-    config = tmp_path / "policy.json"
-    config.write_text("{}\n", encoding="utf-8")
+    config = repo_root / "configs/closeout/canonical_screening_512_v1.json"
     _prepare_wrapper_contract_inputs(wrapper, policy_root)
     sessions = (wrapper.CONTROLLER_SESSION, wrapper.OBSERVER_SESSION)
     command = [
@@ -10652,11 +14850,17 @@ def test_preflight_real_production_controller_observer_chain(
         ],
     )
     policy, policy_path, _ = _policy(tmp_path, ledger)
+    trust_config = (
+        repo_root
+        / "configs/closeout/canonical_screening_512_v1.json"
+    )
     policy["resources"]["resource_poll_seconds"] = 1
     policy["resources"]["cpu_window_seconds"] = 1
     policy["policy_file"] = {
-        "path": str(policy_path.resolve()),
-        "sha256": hashlib.sha256(policy_path.read_bytes()).hexdigest(),
+        "path": str(trust_config.resolve()),
+        "sha256": hashlib.sha256(
+            trust_config.read_bytes()
+        ).hexdigest(),
     }
     campaign_root = tmp_path / "campaign"
     paths = module._paths(campaign_root, policy["policy_sha256"])
@@ -10701,6 +14905,8 @@ def test_preflight_real_production_controller_observer_chain(
         str(repo_root / "scripts/run_canonical_checkpoint_screening.py"),
         "--fixture",
         str(fixture_path),
+        "--config",
+        str(trust_config),
         "--role",
         "controller",
     ]
@@ -10712,6 +14918,8 @@ def test_preflight_real_production_controller_observer_chain(
         str(repo_root / "scripts/run_canonical_checkpoint_screening.py"),
         "--fixture",
         str(fixture_path),
+        "--config",
+        str(trust_config),
         "--role",
         "observer",
     ]
@@ -10776,8 +14984,8 @@ def test_preflight_real_production_controller_observer_chain(
         str(policy_root),
         "--policy",
         policy["policy_sha256"],
-        "--config",
-        str(policy_path),
+            "--config",
+            str(trust_config),
         "--fixture",
         str(fixture_path),
     ]
@@ -11244,6 +15452,14 @@ def test_preflight_real_production_observer_provenance_timeout(
     ledger = tmp_path / "ledger.jsonl"
     _write_jsonl(ledger, [_row("config", None)])
     policy, _, _ = _policy(tmp_path, ledger)
+    trust_config = (
+        repo_root
+        / "configs/closeout/canonical_screening_512_v1.json"
+    )
+    policy["policy_file"] = {
+        "path": str(trust_config.resolve()),
+        "sha256": hashlib.sha256(trust_config.read_bytes()).hexdigest(),
+    }
     campaign_root = tmp_path / "campaign"
     paths = module._paths(campaign_root, policy["policy_sha256"])
     fixture_path = tmp_path / "provenance_fixture.json"
@@ -11255,6 +15471,8 @@ def test_preflight_real_production_observer_provenance_timeout(
         str(repo_root / "scripts/run_canonical_checkpoint_screening.py"),
         "--fixture",
         str(fixture_path),
+        "--config",
+        str(trust_config),
         "--role",
         "observer",
     ]
@@ -11394,6 +15612,7 @@ def test_controller_raw_import_executes_no_policy_bound_module() -> None:
         "m=importlib.util.module_from_spec(s);s.loader.exec_module(m);"
         "print(json.dumps(sorted(x for x in ("
         "'safa.closeout.canonical_screening',"
+        "'safa.closeout.preflight_launch_contract',"
         "'safa.closeout.canonical_screening_worker') if x in sys.modules)))"
     )
     completed = subprocess.run(
@@ -11414,6 +15633,8 @@ def test_controller_raw_import_executes_no_policy_bound_module() -> None:
         "canonical_quality",
         "screening_contracts",
         "screening_worker",
+        "preflight_verified_loader",
+        "preflight_launch_contract",
         "controller",
         "ram_probe_launcher",
         "preflight_wrapper",
@@ -11476,6 +15697,169 @@ def test_controller_tampered_worker_fails_before_dynamic_import(
         text=True,
     )
     assert json.loads(completed.stdout) == []
+
+
+def test_controller_preflight_contract_ignores_ambient_same_name_module(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _raw_controller_module()
+    ambient = types.ModuleType(
+        "safa.closeout.preflight_launch_contract"
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "safa.closeout.preflight_launch_contract",
+        ambient,
+    )
+    policy_path = (
+        Path(__file__).parents[1]
+        / "configs/closeout/canonical_screening_512_v1.json"
+    )
+    module._install_verified_preflight_contract_api(policy_path)
+    assert module._PREFLIGHT_CONTRACT_MODULE is not ambient
+    assert module._PREFLIGHT_CONTRACT_MODULE.__file__ == str(
+        (
+            Path(__file__).parents[1]
+            / "src/safa/closeout/preflight_launch_contract.py"
+        ).resolve()
+    )
+
+
+def test_controller_preflight_contract_rejects_noncanonical_repo_path(
+    tmp_path: Path,
+) -> None:
+    module = _raw_controller_module()
+    root = Path(__file__).parents[1]
+    config = json.loads(
+        (
+            root / "configs/closeout/canonical_screening_512_v1.json"
+        ).read_text(encoding="utf-8")
+    )
+    wrong_path = root / "src/safa/closeout/canonical_screening.py"
+    config["implementations"]["preflight_launch_contract"] = {
+        "path": str(wrong_path.resolve()),
+        "sha256": hashlib.sha256(wrong_path.read_bytes()).hexdigest(),
+    }
+    config_path = tmp_path / "wrong-preflight-path.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    with pytest.raises(
+        module.ControllerBootstrapError,
+        match="exact repository path",
+    ):
+        module._install_verified_preflight_contract_api(config_path)
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    (
+        (b"raise RuntimeError('broken import')\n", "import failed"),
+        (
+            b"PreflightLaunchContractError = RuntimeError\n",
+            "omit controller API",
+        ),
+    ),
+)
+def test_controller_preflight_contract_failure_is_terminal_before_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: bytes,
+    message: str,
+) -> None:
+    module = _raw_controller_module()
+    root = Path(__file__).parents[1]
+    policy_path = (
+        root / "configs/closeout/canonical_screening_512_v1.json"
+    )
+    campaign_root = tmp_path / "campaign"
+    ready_path = tmp_path / "observer_bootstrap.json"
+    original_reader = module._stdlib_read_sealed_module_source
+    _actual_source, seal = original_reader(
+        root / "src/safa/closeout/preflight_launch_contract.py",
+        json.loads(policy_path.read_text(encoding="utf-8"))[
+            "implementations"
+        ]["preflight_launch_contract"]["sha256"],
+    )
+    monkeypatch.setattr(
+        module,
+        "_stdlib_read_sealed_module_source",
+        lambda _path, _sha256: (source, seal),
+    )
+    monkeypatch.setenv(
+        module.OBSERVER_BOOTSTRAP_PATH_ENV, str(ready_path)
+    )
+    monkeypatch.setenv(
+        module.OBSERVER_BOOTSTRAP_POLICY_ENV, "1" * 64
+    )
+    monkeypatch.setenv(
+        module.OBSERVER_BOOTSTRAP_WRAPPER_ENV,
+        json.dumps(_shared_binding("wrapper")),
+    )
+    monkeypatch.setenv(
+        module.OBSERVER_BOOTSTRAP_NONCE_ENV, "2" * 64
+    )
+    with pytest.raises(
+        module.ControllerBootstrapError, match=message
+    ):
+        module.main(
+            [
+                "--config",
+                str(policy_path),
+                "--phase",
+                "plan",
+                "--campaign-root",
+                str(campaign_root),
+                "--execute",
+            ]
+    )
+    assert not ready_path.exists()
+    assert not (
+        campaign_root / "preflight_control/wrapper_claim.json"
+    ).exists()
+    terminal_path = (
+        campaign_root
+        / "bootstrap_control/plan/main_bootstrap_terminal.json"
+    )
+    terminal = load_json(
+        terminal_path, "preflight contract bootstrap terminal"
+    )
+    assert terminal["status"] == "failed"
+    assert message in terminal["failure"]["message"]
+
+
+def test_controller_rechecks_preflight_contract_after_screening_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _raw_controller_module()
+    root = Path(__file__).parents[1]
+    policy_path = (
+        root / "configs/closeout/canonical_screening_512_v1.json"
+    )
+    original_reader = module._stdlib_read_sealed_module_source
+    calls = {"count": 0}
+
+    def mutate_after_install(
+        path: Path, expected_sha256: str
+    ) -> tuple[bytes, tuple[Any, ...]]:
+        source, seal = original_reader(path, expected_sha256)
+        calls["count"] += 1
+        if calls["count"] >= 3:
+            seal = (*seal[:-2], int(seal[-2]) + 1, seal[-1])
+        return source, seal
+
+    monkeypatch.setattr(
+        module,
+        "_stdlib_read_sealed_module_source",
+        mutate_after_install,
+    )
+    with pytest.raises(
+        module.ControllerBootstrapError,
+        match="changed after verified import",
+    ):
+        module._install_verified_contract_api(
+            policy_path,
+            verify_historical_output_evidence=False,
+        )
+    assert calls["count"] >= 3
 
 
 def test_real_worker_bootstrap_imports_no_heavy_modules() -> None:

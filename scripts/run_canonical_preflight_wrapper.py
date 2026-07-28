@@ -16,8 +16,29 @@ import stat
 import subprocess
 import sys
 import time
-from typing import Any, Callable, Mapping, Sequence
+import types
+from typing import Any, Callable, Mapping, Sequence, TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from safa.closeout.preflight_launch_contract import (
+        build_artifact_binding,
+        build_claim_v3,
+        build_file_identity,
+        build_pane_owner_seal,
+        build_process_identity,
+        build_tmux_server_identity,
+        build_verified_implementations,
+        validate_artifact_binding,
+        validate_executable_identity,
+        validate_file_identity,
+        validate_gate_ready,
+        validate_ownership_chain,
+        validate_pane_owner_seal,
+        validate_tmux_server_identity,
+        validate_tmux_started,
+        validate_verified_implementations,
+        validate_wrapper_started,
+    )
 
 CONTROLLER_SESSION = "safa-screening-preflight-controller"
 OBSERVER_SESSION_PREFIX = "safa-screening-preflight-monitor"
@@ -58,11 +79,284 @@ TMUX_CONDITIONAL_REMAIN_REJECTED = (
 )
 TMUX_OWNER_ENV = "SAFA_OWNER_NONCE"
 TMUX_OWNER_NONCE_HEX_LENGTH = 64
+LAUNCH_RECEIPT_PATH_ENV = "SAFA_PREFLIGHT_LAUNCH_RECEIPT_PATH"
+LAUNCH_ACCEPTED_PATH_ENV = "SAFA_PREFLIGHT_LAUNCH_ACCEPTED_PATH"
+LAUNCH_RELEASE_PATH_ENV = "SAFA_PREFLIGHT_LAUNCH_RELEASE_PATH"
+PANE_LOG_PATH_ENV = "SAFA_PREFLIGHT_PANE_LOG_PATH"
+LAUNCH_ACCEPTED_WAIT_SECONDS = 30.0
 OBSERVER_BOOTSTRAP_PATH_ENV = "SAFA_PREFLIGHT_OBSERVER_BOOTSTRAP_PATH"
 OBSERVER_BOOTSTRAP_POLICY_ENV = "SAFA_PREFLIGHT_OBSERVER_POLICY_SHA256"
 OBSERVER_BOOTSTRAP_WRAPPER_ENV = "SAFA_PREFLIGHT_WRAPPER_CLAIM"
 OBSERVER_BOOTSTRAP_NONCE_ENV = "SAFA_PREFLIGHT_OBSERVER_OWNER_NONCE"
 OBSERVER_GATE_MODE = "--observer-bootstrap-gate"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+_VERIFIED_LOADER_RELATIVE_PATH = (
+    "src/safa/closeout/verified_preflight_module_loader.py"
+)
+_SHARED_CONTRACT_RELATIVE_PATH = (
+    "src/safa/closeout/preflight_launch_contract.py"
+)
+_VERIFIED_LOADER_EXPORTS = (
+    "VerifiedPreflightModuleError",
+    "load_verified_preflight_module",
+    "reverify_verified_preflight_module",
+)
+_SHARED_CONTRACT_EXPORTS = (
+    "PreflightLaunchContractError",
+    "build_artifact_binding",
+    "build_claim_v3",
+    "build_file_identity",
+    "build_pane_owner_seal",
+    "build_process_identity",
+    "build_tmux_server_identity",
+    "build_tmux_started",
+    "build_verified_implementations",
+    "validate_artifact_binding",
+    "validate_claim_v3",
+    "validate_executable_identity",
+    "validate_file_identity",
+    "validate_gate_ready",
+    "validate_ownership_chain",
+    "validate_pane_owner_seal",
+    "validate_tmux_server_identity",
+    "validate_tmux_started",
+    "validate_verified_implementations",
+    "validate_wrapper_started",
+)
+_VERIFIED_LOADER_HANDLE: dict[str, Any] | None = None
+_SHARED_CONTRACT_HANDLE: dict[str, Any] | None = None
+
+
+def _bootstrap_read_file(
+    path: Path,
+    expected_sha256: str | None,
+    label: str,
+) -> tuple[bytes, dict[str, Any]]:
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_CLOEXEC"):
+        raise RuntimeError(
+            "preflight bootstrap requires no-follow descriptors"
+        )
+    if (
+        not path.is_absolute()
+        or path.resolve(strict=True) != path
+        or path.is_symlink()
+    ):
+        raise RuntimeError(f"{label} path is not exact")
+    descriptor = os.open(
+        path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    )
+    try:
+        before = os.fstat(descriptor)
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    source = b"".join(chunks)
+    identity = {
+        "path": str(path),
+        "device": int(before.st_dev),
+        "inode": int(before.st_ino),
+        "mode": int(before.st_mode),
+        "size": int(before.st_size),
+    }
+    if (
+        identity
+        != {
+            "path": str(path),
+            "device": int(after.st_dev),
+            "inode": int(after.st_ino),
+            "mode": int(after.st_mode),
+            "size": int(after.st_size),
+        }
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_size != len(source)
+        or (
+            expected_sha256 is not None
+            and hashlib.sha256(source).hexdigest()
+            != expected_sha256
+        )
+    ):
+        raise RuntimeError(f"{label} identity or SHA-256 differs")
+    return source, identity
+
+
+def _bootstrap_implementation(
+    policy: Mapping[str, Any],
+    name: str,
+    relative_path: str,
+) -> tuple[Path, str]:
+    implementations = policy.get("implementations")
+    raw = (
+        implementations.get(name)
+        if isinstance(implementations, Mapping)
+        else None
+    )
+    if (
+        not isinstance(raw, Mapping)
+        or set(raw) != {"path", "sha256"}
+        or raw.get("path") != relative_path
+        or not isinstance(raw.get("sha256"), str)
+        or len(str(raw["sha256"])) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in str(raw["sha256"])
+        )
+    ):
+        raise RuntimeError(
+            f"preflight bootstrap implementation differs: {name}"
+        )
+    path = REPO_ROOT / relative_path
+    if path.parent.resolve(strict=True) != path.parent:
+        raise RuntimeError(
+            f"preflight bootstrap parent path differs: {name}"
+        )
+    return path, str(raw["sha256"])
+
+
+def _reverify_verified_loader() -> dict[str, Any]:
+    if _VERIFIED_LOADER_HANDLE is None:
+        raise RuntimeError("verified preflight loader is not installed")
+    handle = _VERIFIED_LOADER_HANDLE
+    config_source, config_identity = _bootstrap_read_file(
+        Path(handle["config_path"]),
+        handle["config_sha256"],
+        "preflight policy",
+    )
+    _caller_source, caller_identity = _bootstrap_read_file(
+        Path(handle["caller_path"]),
+        handle["caller_sha256"],
+        "preflight wrapper",
+    )
+    _loader_source, loader_identity = _bootstrap_read_file(
+        Path(handle["loader_path"]),
+        handle["loader_sha256"],
+        "verified preflight loader",
+    )
+    module = handle["module"]
+    exports = handle["exports"]
+    if (
+        hashlib.sha256(config_source).hexdigest()
+        != handle["config_sha256"]
+        or config_identity != handle["config_identity"]
+        or caller_identity != handle["caller_identity"]
+        or loader_identity != handle["loader_identity"]
+        or any(
+            getattr(module, name, None) is not value
+            for name, value in exports.items()
+        )
+    ):
+        raise RuntimeError(
+            "verified preflight loader changed after bootstrap"
+        )
+    return {
+        "path": handle["loader_path"],
+        "sha256": handle["loader_sha256"],
+        "file_identity": dict(loader_identity),
+    }
+
+
+def _install_verified_preflight_apis(config: Path) -> dict[str, Any]:
+    global _VERIFIED_LOADER_HANDLE
+    global _SHARED_CONTRACT_HANDLE
+    config = config.resolve(strict=True)
+    config_source, config_identity = _bootstrap_read_file(
+        config, None, "preflight policy"
+    )
+    try:
+        policy = json.loads(config_source.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("preflight policy is not valid JSON") from exc
+    if not isinstance(policy, dict):
+        raise RuntimeError("preflight policy is not a mapping")
+    caller_path, caller_sha256 = _bootstrap_implementation(
+        policy,
+        "preflight_wrapper",
+        "scripts/run_canonical_preflight_wrapper.py",
+    )
+    _caller_source, caller_identity = _bootstrap_read_file(
+        caller_path, caller_sha256, "preflight wrapper"
+    )
+    if caller_path != Path(__file__).resolve():
+        raise RuntimeError("policy does not bind this preflight wrapper")
+    loader_path, loader_sha256 = _bootstrap_implementation(
+        policy,
+        "preflight_verified_loader",
+        _VERIFIED_LOADER_RELATIVE_PATH,
+    )
+    loader_source, loader_identity = _bootstrap_read_file(
+        loader_path,
+        loader_sha256,
+        "verified preflight loader",
+    )
+    loader_module = types.ModuleType(
+        f"_safa_verified_preflight_loader_{loader_sha256}"
+    )
+    loader_module.__file__ = str(loader_path)
+    loader_module.__package__ = "safa.closeout"
+    try:
+        exec(
+            compile(loader_source, str(loader_path), "exec"),
+            loader_module.__dict__,
+        )
+    except BaseException as exc:
+        raise RuntimeError(
+            "verified preflight loader execution failed"
+        ) from exc
+    loader_exports = {}
+    for name in _VERIFIED_LOADER_EXPORTS:
+        if not hasattr(loader_module, name):
+            raise RuntimeError("verified preflight loader API differs")
+        loader_exports[name] = getattr(loader_module, name)
+    _VERIFIED_LOADER_HANDLE = {
+        "module": loader_module,
+        "exports": loader_exports,
+        "config_path": str(config),
+        "config_sha256": hashlib.sha256(config_source).hexdigest(),
+        "config_identity": config_identity,
+        "caller_path": str(caller_path),
+        "caller_sha256": caller_sha256,
+        "caller_identity": caller_identity,
+        "loader_path": str(loader_path),
+        "loader_sha256": loader_sha256,
+        "loader_identity": loader_identity,
+    }
+    _reverify_verified_loader()
+    shared_handle = loader_exports[
+        "load_verified_preflight_module"
+    ](
+        config_path=str(config),
+        repo_root=str(REPO_ROOT),
+        caller_name="preflight_wrapper",
+        caller_relative_path=(
+            "scripts/run_canonical_preflight_wrapper.py"
+        ),
+        target_name="preflight_launch_contract",
+        target_relative_path=_SHARED_CONTRACT_RELATIVE_PATH,
+        expected_exports=_SHARED_CONTRACT_EXPORTS,
+    )
+    for name in _SHARED_CONTRACT_EXPORTS:
+        globals()[name] = shared_handle["exports"][name]
+    _SHARED_CONTRACT_HANDLE = shared_handle
+    return _reverify_verified_preflight_apis()
+
+
+def _reverify_verified_preflight_apis() -> dict[str, Any]:
+    loader_binding = _reverify_verified_loader()
+    if _SHARED_CONTRACT_HANDLE is None or _VERIFIED_LOADER_HANDLE is None:
+        raise RuntimeError("verified preflight contract is not installed")
+    shared_binding = _VERIFIED_LOADER_HANDLE["exports"][
+        "reverify_verified_preflight_module"
+    ](_SHARED_CONTRACT_HANDLE)
+    value = build_verified_implementations(
+        verified_loader=loader_binding,
+        preflight_launch_contract=shared_binding,
+    )
+    return validate_verified_implementations(value)
 
 
 class TmuxTargetAbsent(RuntimeError):
@@ -131,11 +425,11 @@ def _json_binding(path: Path, digest_field: str) -> dict[str, str]:
         or _canonical_digest(value, digest_field) != canonical
     ):
         raise RuntimeError(f"wrapper artifact canonical digest differs: {path}")
-    return {
-        "path": str(path.resolve()),
-        "sha256": _sha256_file(path),
-        "canonical_sha256": canonical,
-    }
+    return build_artifact_binding(
+        path=str(path.resolve()),
+        sha256=_sha256_file(path),
+        canonical_sha256=canonical,
+    )
 
 
 def _optional_binding(path: Path) -> dict[str, str] | None:
@@ -248,7 +542,9 @@ def _read_process_stat(
         )
     try:
         state = fields[0]
+        stat_ppid = int(fields[1])
         stat_pgid = int(fields[2])
+        stat_sid = int(fields[3])
         start_ticks = int(fields[19])
     except (IndexError, ValueError) as exc:
         raise RuntimeError(
@@ -257,18 +553,22 @@ def _read_process_stat(
     if (
         stat_pid != pid
         or len(state) != 1
+        or stat_ppid <= 0
         or stat_pgid <= 0
+        or stat_sid <= 0
         or start_ticks <= 0
     ):
         raise RuntimeError(
             f"process identity stat is malformed for PID {pid}"
         )
     return (
-        {
-            "pid": stat_pid,
-            "pgid": stat_pgid,
-            "start_ticks": start_ticks,
-        },
+        build_process_identity(
+            pid=stat_pid,
+            ppid=stat_ppid,
+            pgid=stat_pgid,
+            sid=stat_sid,
+            start_ticks=start_ticks,
+        ),
         state,
     )
 
@@ -487,19 +787,18 @@ def _tmux_server_identity(target: str | None = None) -> dict[str, Any]:
     ]
     if len(rows) != 1 or len(rows[0]) != 2:
         raise RuntimeError("tmux server identity is malformed")
-    identity = {
-        "server_pid": int(rows[0][0]),
-        "socket_path": rows[0][1],
-    }
-    if (
-        set(identity) != {"server_pid", "socket_path"}
-        or type(identity["server_pid"]) is not int
-        or identity["server_pid"] <= 1
-        or not isinstance(identity["socket_path"], str)
-        or not Path(identity["socket_path"]).is_absolute()
-    ):
-        raise RuntimeError("tmux server identity is invalid")
-    return identity
+    server_pid = int(rows[0][0])
+    server_process = _require_process_identity(
+        server_pid, "tmux server"
+    )
+    socket_identity = _tmux_socket_identity(rows[0][1])
+    return build_tmux_server_identity(
+        server_pid=server_pid,
+        server_process=server_process,
+        socket_path=str(socket_identity["socket_path"]),
+        socket_device=int(socket_identity["socket_device"]),
+        socket_inode=int(socket_identity["socket_inode"]),
+    )
 
 
 def _tmux_socket_identity(socket_path: str) -> dict[str, Any]:
@@ -586,18 +885,26 @@ def _build_tmux_owner_seal(
     socket_identity = _tmux_socket_identity(
         str(tmux_server["socket_path"])
     )
-    seal = {
-        "server_pid": int(tmux_server["server_pid"]),
-        "server_start_ticks": int(server_process["start_ticks"]),
-        **socket_identity,
-        "session": str(tmux_identity["session"]),
-        "pane": str(tmux_identity["pane"]),
-        "pane_pid": int(tmux_identity["pane_pid"]),
-        "owner_nonce": _tmux_owner_nonce(
+    pane_process = _launch_process_identity(
+        int(tmux_identity["pane_pid"])
+    )
+    seal = build_pane_owner_seal(
+        server_pid=int(tmux_server["server_pid"]),
+        server_start_ticks=int(server_process["start_ticks"]),
+        socket_path=str(socket_identity["socket_path"]),
+        socket_device=int(socket_identity["socket_device"]),
+        socket_inode=int(socket_identity["socket_inode"]),
+        session=str(tmux_identity["session"]),
+        pane=str(tmux_identity["pane"]),
+        pane_pid=int(tmux_identity["pane_pid"]),
+        pane_process=pane_process,
+        owner_nonce=_tmux_owner_nonce(
             str(tmux_identity["session"]),
             str(tmux_server["socket_path"]),
         ),
-    }
+        tmux_identity=tmux_identity,
+        tmux_server=tmux_server,
+    )
     if seal["owner_nonce"] != expected_owner_nonce:
         raise RuntimeError("tmux owner nonce differs after launch")
     _validate_tmux_owner_seal(seal, tmux_identity, tmux_server)
@@ -609,20 +916,14 @@ def _validate_tmux_owner_seal(
     tmux_identity: Mapping[str, Any],
     tmux_server: Mapping[str, Any],
 ) -> None:
-    expected_keys = {
-        "server_pid",
-        "server_start_ticks",
-        "socket_path",
-        "socket_device",
-        "socket_inode",
-        "session",
-        "pane",
-        "pane_pid",
-        "owner_nonce",
-    }
+    validate_pane_owner_seal(
+        owner_seal,
+        tmux_identity=tmux_identity,
+        tmux_server=tmux_server,
+        label="wrapper pane owner seal",
+    )
     if (
-        set(owner_seal) != expected_keys
-        or owner_seal.get("server_pid") != tmux_server.get("server_pid")
+        owner_seal.get("server_pid") != tmux_server.get("server_pid")
         or owner_seal.get("socket_path") != tmux_server.get("socket_path")
         or owner_seal.get("session") != tmux_identity.get("session")
         or owner_seal.get("pane") != tmux_identity.get("pane")
@@ -653,6 +954,16 @@ def _validate_tmux_owner_host_identity(
         "socket_inode": owner_seal["socket_inode"],
     }:
         raise RuntimeError("tmux owner socket identity differs")
+    try:
+        pane_process = _launch_process_identity(
+            int(owner_seal["pane_pid"])
+        )
+    except (FileNotFoundError, ProcessLookupError) as exc:
+        raise RuntimeError(
+            "tmux owner pane process is absent"
+        ) from exc
+    if pane_process != owner_seal["pane_process"]:
+        raise RuntimeError("tmux owner pane process identity differs")
 
 
 def _read_strict_json_contract(
@@ -740,6 +1051,9 @@ def _observer_gate_ready(
             "safa_canonical_preflight_observer_gate_ready_v1"
         ),
         "policy_sha256": policy_sha256,
+        "verified_implementations": (
+            _reverify_verified_preflight_apis()
+        ),
         "wrapper_claim": dict(wrapper_binding),
         "observer_session": expected_session,
         "owner_nonce": owner_nonce,
@@ -762,17 +1076,16 @@ def _observer_gate_ready(
     release = _read_strict_json_contract(
         release_path, "observer_gate_release_sha256"
     )
-    ready_binding = {
-        "path": str(ready_path.resolve()),
-        "sha256": _sha256_file(ready_path),
-        "canonical_sha256": ready["observer_gate_ready_sha256"],
-    }
+    ready_binding = _json_binding(
+        ready_path, "observer_gate_ready_sha256"
+    )
     if (
         set(release)
         != {
             "schema_version",
             "contract_type",
             "policy_sha256",
+            "verified_implementations",
             "wrapper_claim",
             "observer_gate_ready",
             "observer_session",
@@ -785,6 +1098,8 @@ def _observer_gate_ready(
         or release.get("contract_type")
         != "safa_canonical_preflight_observer_gate_release_v1"
         or release.get("policy_sha256") != policy_sha256
+        or release.get("verified_implementations")
+        != _reverify_verified_preflight_apis()
         or release.get("wrapper_claim") != dict(wrapper_binding)
         or release.get("observer_gate_ready") != ready_binding
         or release.get("observer_session") != expected_session
@@ -800,6 +1115,9 @@ def _observer_gate_ready(
         current_tmux != tmux_identity
         or current_server != tmux_server
         or _process_identity(process["pid"]) != process
+        or os.readlink(f"/proc/{process['pid']}/exe") != gate_executable
+        or _process_command_bytes(process["pid"])
+        != _command_bytes(gate_command)
         or _tmux_owner_nonce(
             expected_session,
             str(tmux_server["socket_path"]),
@@ -848,6 +1166,7 @@ def _validate_observer_gate_ready(
             "schema_version",
             "contract_type",
             "policy_sha256",
+            "verified_implementations",
             "wrapper_claim",
             "observer_session",
             "owner_nonce",
@@ -866,6 +1185,8 @@ def _validate_observer_gate_ready(
         or ready.get("contract_type")
         != "safa_canonical_preflight_observer_gate_ready_v1"
         or ready.get("policy_sha256") != policy_sha256
+        or ready.get("verified_implementations")
+        != _reverify_verified_preflight_apis()
         or ready.get("wrapper_claim") != dict(wrapper_binding)
         or ready.get("observer_session") != tmux_identity.get("session")
         or ready.get("owner_nonce") != owner_nonce
@@ -882,6 +1203,8 @@ def _validate_observer_gate_ready(
         != os.readlink(f"/proc/{ready['process']['pid']}/exe")
         or ready.get("gate_command")
         != _process_command(ready["process"]["pid"])
+        or _process_command_bytes(ready["process"]["pid"])
+        != _command_bytes(ready["gate_command"])
     ):
         raise RuntimeError(
             "CPU preflight observer bootstrap gate ready differs"
@@ -945,12 +1268,20 @@ def _probe_observer_gate(
         candidate_tmux = dict(tmux_identity)
         candidate_server = dict(tmux_server)
         candidate_seal = dict(owner_seal)
+        candidate_tmux_owner = {
+            key: candidate_tmux[key]
+            for key in ("session", "pane", "pane_pid")
+        }
         if best_owner_seal is None:
             best_tmux = candidate_tmux
             best_tmux_server = candidate_server
             best_owner_seal = candidate_seal
         elif (
-            candidate_tmux != best_tmux
+            candidate_tmux_owner
+            != {
+                key: best_tmux[key]
+                for key in ("session", "pane", "pane_pid")
+            }
             or candidate_server != best_tmux_server
             or candidate_seal != best_owner_seal
         ):
@@ -961,6 +1292,8 @@ def _probe_observer_gate(
                     "monotonic owner seal"
                 ),
             }
+        else:
+            best_tmux = candidate_tmux
         if owner_recorder is not None:
             owner_recorder(
                 candidate_tmux,
@@ -1252,6 +1585,13 @@ def _observer_gate_command(
     owner_nonce: str,
     observer_command: Sequence[str],
 ) -> list[str]:
+    try:
+        config_index = list(observer_command).index("--config") + 1
+        config_path = Path(str(observer_command[config_index])).resolve()
+    except (ValueError, IndexError) as exc:
+        raise RuntimeError(
+            "observer command omits exact config path"
+        ) from exc
     return [
         str(observer_command[0]),
         "-u",
@@ -1267,6 +1607,8 @@ def _observer_gate_command(
         str(release_path.resolve()),
         "--bootstrap-path",
         str(bootstrap_path.resolve()),
+        "--config",
+        str(config_path),
         "--policy-sha256",
         policy_sha256,
         "--wrapper-binding-json",
@@ -1632,8 +1974,9 @@ def _assert_tmux_process_identity(
     process_identity: Mapping[str, int],
 ) -> None:
     _validate_tmux_identity(tmux_identity, session)
-    if set(tmux_server) != {"server_pid", "socket_path"}:
-        raise RuntimeError("sealed tmux server identity is invalid")
+    validate_tmux_server_identity(
+        tmux_server, "sealed tmux server identity"
+    )
     pane = str(tmux_identity["pane"])
     current_server = _tmux_server_identity(pane)
     if current_server != dict(tmux_server):
@@ -1682,6 +2025,81 @@ def _process_command(pid: int) -> list[str]:
     return command
 
 
+def _process_command_bytes(pid: int) -> bytes:
+    try:
+        value = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except (FileNotFoundError, ProcessLookupError) as exc:
+        raise RuntimeError(
+            f"process command bytes are absent for PID {pid}"
+        ) from exc
+    except PermissionError as exc:
+        raise RuntimeError(
+            f"process command bytes permission denied for PID {pid}"
+        ) from exc
+    if not value or not value.endswith(b"\0"):
+        raise RuntimeError(
+            f"process command bytes are malformed for PID {pid}"
+        )
+    return value
+
+
+def _command_bytes(arguments: Sequence[str]) -> bytes:
+    if not arguments or any(not isinstance(item, str) for item in arguments):
+        raise RuntimeError("expected process arguments are invalid")
+    return b"\0".join(os.fsencode(item) for item in arguments) + b"\0"
+
+
+def _process_executable_identity(pid: int) -> dict[str, Any]:
+    proc_path = f"/proc/{pid}/exe"
+    descriptor = os.open(proc_path, os.O_RDONLY)
+    try:
+        value = os.fstat(descriptor)
+        raw_target = os.readlink(proc_path)
+    finally:
+        os.close(descriptor)
+    if not stat.S_ISREG(value.st_mode):
+        raise RuntimeError(
+            f"process executable target is not regular for PID {pid}"
+        )
+    target = Path(raw_target).resolve(strict=True)
+    target_value = target.stat()
+    if (
+        target_value.st_dev != value.st_dev
+        or target_value.st_ino != value.st_ino
+    ):
+        raise RuntimeError(
+            f"process executable target changed for PID {pid}"
+        )
+    return build_file_identity(
+        path=str(target),
+        device=int(value.st_dev),
+        inode=int(value.st_ino),
+        mode=int(value.st_mode),
+        size=int(value.st_size),
+    )
+
+
+def _launch_process_identity(pid: int) -> dict[str, int]:
+    raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    closing = raw.rfind(")")
+    if closing < 0:
+        raise RuntimeError(
+            f"launch process stat is malformed for PID {pid}"
+        )
+    fields = raw[closing + 2 :].split()
+    if len(fields) < 20:
+        raise RuntimeError(
+            f"launch process stat is incomplete for PID {pid}"
+        )
+    return build_process_identity(
+        pid=pid,
+        ppid=int(fields[1]),
+        pgid=int(fields[2]),
+        sid=int(fields[3]),
+        start_ticks=int(fields[19]),
+    )
+
+
 def _wait_tmux_process_identity(
     session: str,
     expected_owner_nonce: str,
@@ -1709,11 +2127,13 @@ def _wait_tmux_process_identity(
         "schema_version",
         "contract_type",
         "policy_sha256",
+        "verified_implementations",
         "wrapper_claim",
         "observer_session",
         "owner_nonce",
         "process",
         "executable",
+        "executable_identity",
         "command",
         "tmux",
         "published_at",
@@ -1725,6 +2145,8 @@ def _wait_tmux_process_identity(
         or bootstrap.get("contract_type")
         != "safa_canonical_preflight_observer_bootstrap_v1"
         or bootstrap.get("policy_sha256") != policy_sha256
+        or bootstrap.get("verified_implementations")
+        != _reverify_verified_preflight_apis()
         or bootstrap.get("wrapper_claim") != dict(wrapper_binding)
         or bootstrap.get("observer_session") != session
         or bootstrap.get("owner_nonce") != expected_owner_nonce
@@ -1733,6 +2155,10 @@ def _wait_tmux_process_identity(
         != _canonical_digest(bootstrap, "observer_bootstrap_sha256")
     ):
         raise RuntimeError("tmux observer bootstrap contract mismatch")
+    validate_executable_identity(
+        bootstrap["executable_identity"],
+        "observer bootstrap executable identity",
+    )
     tmux_identity = bootstrap["tmux"]
     process_identity = bootstrap["process"]
     _validate_tmux_identity(tmux_identity, session)
@@ -1741,8 +2167,12 @@ def _wait_tmux_process_identity(
         or process_identity != _process_identity(process_identity["pid"])
         or bootstrap["executable"]
         != os.readlink(f"/proc/{process_identity['pid']}/exe")
+        or bootstrap["executable_identity"]
+        != _process_executable_identity(process_identity["pid"])
         or bootstrap["command"]
         != _process_command(process_identity["pid"])
+        or _process_command_bytes(process_identity["pid"])
+        != _command_bytes(bootstrap["command"])
     ):
         raise RuntimeError("tmux observer bootstrap process differs")
     tmux_server = _tmux_server_identity(tmux_identity["pane"])
@@ -1966,8 +2396,9 @@ def _terminate_bound_observer(
     sealed_process = dict(observer_process)
     pane = str(sealed_tmux["pane"])
     _validate_tmux_identity(sealed_tmux, OBSERVER_SESSION)
-    if set(sealed_server) != {"server_pid", "socket_path"}:
-        raise RuntimeError("sealed tmux server identity is invalid")
+    validate_tmux_server_identity(
+        sealed_server, "sealed tmux server identity"
+    )
     _validate_tmux_owner_seal(
         sealed_owner, sealed_tmux, sealed_server
     )
@@ -2432,15 +2863,12 @@ def _read_observer_terminal(
         digest_field: str,
         label: str,
     ) -> dict[str, Any]:
-        if (
-            not isinstance(binding, Mapping)
-            or set(binding)
-            != {"path", "sha256", "canonical_sha256"}
-            or not all(
-                isinstance(binding.get(field), str)
-                for field in ("path", "sha256", "canonical_sha256")
+        try:
+            binding = validate_artifact_binding(
+                binding,
+                f"CPU preflight observer terminal {label} binding",
             )
-        ):
+        except RuntimeError:
             raise RuntimeError(
                 f"CPU preflight observer terminal {label} binding differs"
             )
@@ -2620,11 +3048,11 @@ def _read_observer_terminal(
             raise RuntimeError(
                 "CPU preflight observer terminal ready identity differs"
             )
-    return value, {
-        "path": str(path.resolve()),
-        "sha256": hashlib.sha256(content).hexdigest(),
-        "canonical_sha256": canonical,
-    }
+    return value, build_artifact_binding(
+        path=str(path.resolve()),
+        sha256=hashlib.sha256(content).hexdigest(),
+        canonical_sha256=canonical,
+    )
 
 
 def _wait_observer_terminal(
@@ -2661,7 +3089,7 @@ def _validate_terminal_stop_binding(
     observer_stop_binding: dict[str, str] | None,
 ) -> dict[str, str] | None:
     if observer_stop_binding is None and observer_stop_path.is_file():
-        stop = _validate_observer_stop(
+        _validate_observer_stop(
             observer_stop_path,
             policy_sha256=policy_sha256,
             wrapper_binding=wrapper_binding,
@@ -2670,11 +3098,9 @@ def _validate_terminal_stop_binding(
             process_start_binding=process_start_binding,
             require_live_identity=False,
         )
-        observer_stop_binding = {
-            "path": str(observer_stop_path.resolve()),
-            "sha256": _sha256_file(observer_stop_path),
-            "canonical_sha256": stop["observer_stop_sha256"],
-        }
+        observer_stop_binding = _json_binding(
+            observer_stop_path, "observer_stop_sha256"
+        )
     if observer_stop_binding is not None:
         if terminal_value.get("observer_stop") != observer_stop_binding:
             raise RuntimeError(
@@ -2683,6 +3109,380 @@ def _validate_terminal_stop_binding(
     elif terminal_value.get("status") == "failed":
         raise RuntimeError("failed CPU preflight observer terminal has no stop")
     return observer_stop_binding
+
+
+def _launcher_git_state(repo_root: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for name, arguments in (
+        ("head_sha", ("rev-parse", "HEAD")),
+        ("origin_master_sha", ("rev-parse", "origin/master")),
+        ("branch", ("branch", "--show-current")),
+    ):
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), *arguments],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0 or result.stderr.strip():
+            raise RuntimeError(
+                f"wrapper Git {name} query failed: "
+                f"{result.stderr.strip()}"
+            )
+        values[name] = result.stdout.strip()
+    if (
+        values["branch"] != "master"
+        or values["head_sha"] != values["origin_master_sha"]
+    ):
+        raise RuntimeError("wrapper Git state differs from master/origin")
+    return values
+
+
+def _wrapper_file_identity(path: Path) -> dict[str, Any]:
+    value = path.stat()
+    return build_file_identity(
+        path=str(path.resolve()),
+        device=int(value.st_dev),
+        inode=int(value.st_ino),
+        mode=int(value.st_mode),
+        size=int(value.st_size),
+    )
+
+
+def _open_regular_json_with_identity(
+    path: Path, label: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        value = os.fstat(descriptor)
+        if not stat.S_ISREG(value.st_mode):
+            raise RuntimeError(f"{label} is not a regular file")
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = -1
+            payload = json.load(handle)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{label} is malformed")
+    return payload, build_file_identity(
+        path=str(path.resolve()),
+        device=int(value.st_dev),
+        inode=int(value.st_ino),
+        mode=int(value.st_mode),
+        size=int(value.st_size),
+    )
+
+
+def _opened_file_identity(path: Path) -> dict[str, Any]:
+    _payload, identity = _open_regular_json_with_identity(
+        path, "opened file"
+    )
+    return identity
+
+
+def _validate_preflight_launch_receipt(
+    *,
+    repo_root: Path,
+    policy_root: Path,
+    policy_sha256: str,
+    config: Path,
+    controller_tmux: Mapping[str, Any],
+    controller_tmux_server: Mapping[str, Any],
+) -> dict[str, Any]:
+    raw_receipt_path = os.environ.get(LAUNCH_RECEIPT_PATH_ENV)
+    raw_accepted_path = os.environ.get(LAUNCH_ACCEPTED_PATH_ENV)
+    raw_release_path = os.environ.get(LAUNCH_RELEASE_PATH_ENV)
+    raw_log_path = os.environ.get(PANE_LOG_PATH_ENV)
+    if (
+        raw_receipt_path is None
+        or raw_accepted_path is None
+        or raw_release_path is None
+        or raw_log_path is None
+    ):
+        raise RuntimeError(
+            "formal preflight launcher environment is incomplete"
+        )
+    receipt_path = Path(raw_receipt_path).resolve()
+    accepted_path = Path(raw_accepted_path).resolve()
+    release_path = Path(raw_release_path).resolve()
+    log_path = Path(raw_log_path).resolve()
+    receipt, receipt_identity = _open_regular_json_with_identity(
+        receipt_path, "preflight launch receipt"
+    )
+    validate_file_identity(
+        receipt_identity, "wrapper launch receipt identity"
+    )
+    attempt_id = receipt.get("attempt_id")
+    expected_attempt_root = (
+        policy_root.parents[1]
+        / "preflight_launch_attempts"
+        / "by_policy"
+        / policy_sha256
+        / str(attempt_id)
+    ).resolve()
+    expected_keys = {
+        "schema_version",
+        "contract_type",
+        "attempt_id",
+        "started_registry",
+        "policy_sha256",
+        "git",
+        "bindings",
+        "verified_implementations",
+        "python_executable",
+        "controller_session",
+        "controller_owner_nonce",
+        "observer_session",
+        "wrapper_arguments",
+        "pane_gate_arguments",
+        "tmux_arguments",
+        "shell",
+        "pane_log",
+        "wrapper_claim_path",
+        "wrapper_started_path",
+        "gate_execution_terminal_path",
+        "started_at",
+        "launch_receipt_sha256",
+    }
+    gate_ready_path = expected_attempt_root / "pane_gate_ready.json"
+    tmux_started_path = expected_attempt_root / "launch_tmux_started.json"
+    wrapper_started_path = expected_attempt_root / "wrapper_started.json"
+    gate_execution_terminal_path = (
+        expected_attempt_root / "gate_execution_terminal.json"
+    )
+    gate_ready_binding = _json_binding(
+        gate_ready_path, "pane_gate_ready_sha256"
+    )
+    tmux_started_binding = _json_binding(
+        tmux_started_path, "launch_tmux_started_sha256"
+    )
+    process_arguments = _process_command(os.getpid())
+    executable_path = str(
+        Path(os.readlink(f"/proc/{os.getpid()}/exe")).resolve()
+    )
+    executable = _process_executable_identity(os.getpid())
+    config_binding = {
+        "path": str(config.resolve()),
+        "sha256": _sha256_file(config),
+    }
+    receipt_binding = _json_binding(
+        receipt_path, "launch_receipt_sha256"
+    )
+    live_implementations = _reverify_verified_preflight_apis()
+    tmux_started = json.loads(
+        tmux_started_path.read_text(encoding="utf-8")
+    )
+    validate_tmux_started(
+        tmux_started,
+        verified_implementations=live_implementations,
+        tmux_identity=controller_tmux,
+        tmux_server=controller_tmux_server,
+        label="wrapper launch tmux started",
+    )
+    sealed_implementations = validate_verified_implementations(
+        receipt.get("verified_implementations"),
+        "wrapper launch receipt verified implementations",
+    )
+    log_identity = _wrapper_file_identity(log_path)
+    if (
+        set(receipt) != expected_keys
+        or receipt.get("schema_version") != 1
+        or receipt.get("contract_type")
+        != "safa_canonical_preflight_launch_receipt_v1"
+        or not isinstance(attempt_id, str)
+        or len(attempt_id) != 64
+        or any(character not in "0123456789abcdef" for character in attempt_id)
+        or receipt_path != expected_attempt_root / "launch_receipt.json"
+        or accepted_path != expected_attempt_root / "launch_accepted.json"
+        or release_path
+        != expected_attempt_root / "launch_ownership_release.json"
+        or log_path != expected_attempt_root / "pane.log"
+        or receipt.get("wrapper_started_path")
+        != str(wrapper_started_path)
+        or receipt.get("gate_execution_terminal_path")
+        != str(gate_execution_terminal_path)
+        or receipt.get("policy_sha256") != policy_sha256
+        or receipt.get("controller_session") != CONTROLLER_SESSION
+        or receipt.get("controller_owner_nonce")
+        != _validate_tmux_owner_nonce(
+            os.environ.get(TMUX_OWNER_ENV)
+        )
+        or receipt.get("observer_session") != OBSERVER_SESSION
+        or receipt.get("wrapper_arguments") != process_arguments
+        or receipt.get("shell") is not False
+        or receipt.get("pane_log") != log_identity
+        or receipt.get("git") != _launcher_git_state(repo_root)
+        or receipt.get("bindings", {}).get("config")
+        != config_binding
+        or sealed_implementations != live_implementations
+        or receipt.get("bindings", {}).get("wrapper")
+        != {
+            "path": str(Path(__file__).resolve()),
+            "sha256": _sha256_file(Path(__file__).resolve()),
+        }
+        or receipt.get("python_executable", {}).get("path")
+        != executable_path
+        or receipt.get("python_executable", {}).get("sha256")
+        != _sha256_file(Path(executable_path))
+        or receipt.get("launch_receipt_sha256")
+        != _canonical_digest(receipt, "launch_receipt_sha256")
+    ):
+        raise RuntimeError("formal preflight launch receipt differs")
+    deadline = time.monotonic() + LAUNCH_ACCEPTED_WAIT_SECONDS
+    while not wrapper_started_path.is_file():
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "formal preflight wrapper-start evidence timed out"
+            )
+        time.sleep(0.005)
+    wrapper_started = json.loads(
+        wrapper_started_path.read_text(encoding="utf-8")
+    )
+    wrapper_launch_process = _launch_process_identity(os.getpid())
+    gate_ready = json.loads(
+        gate_ready_path.read_text(encoding="utf-8")
+    )
+    validate_gate_ready(
+        gate_ready,
+        verified_implementations=live_implementations,
+        label="wrapper pane gate ready",
+    )
+    validate_wrapper_started(
+        wrapper_started,
+        verified_implementations=live_implementations,
+        gate_ready=gate_ready,
+        label="wrapper start evidence",
+    )
+    if (
+        not isinstance(wrapper_started, dict)
+        or gate_ready.get("launch_receipt") != receipt_binding
+        or gate_ready.get("launch_receipt_identity")
+        != receipt_identity
+        or gate_ready.get("verified_implementations")
+        != live_implementations
+        or tmux_started.get("launch_receipt") != receipt_binding
+        or tmux_started.get("launch_receipt_identity")
+        != receipt_identity
+        or tmux_started.get("verified_implementations")
+        != live_implementations
+        or tmux_started.get("pane_gate_ready")
+        != gate_ready_binding
+        or tmux_started.get("owner_seal", {}).get("pane_process")
+        != gate_ready.get("process")
+        or gate_ready.get("wrapper_arguments")
+        != process_arguments
+        or gate_ready.get("pane_gate_ready_sha256")
+        != _canonical_digest(gate_ready, "pane_gate_ready_sha256")
+        or wrapper_started.get("launch_receipt") != receipt_binding
+        or wrapper_started.get("launch_receipt_identity")
+        != receipt_identity
+        or wrapper_started.get("verified_implementations")
+        != live_implementations
+        or wrapper_started.get("pane_gate_ready")
+        != gate_ready_binding
+        or wrapper_started.get("pane_gate_process")
+        != gate_ready.get("process")
+        or gate_ready.get("process")
+        != _launch_process_identity(os.getppid())
+        or gate_ready.get("process", {}).get("pgid") != os.getppid()
+        or gate_ready.get("process", {}).get("sid") != os.getppid()
+        or _process_command_bytes(os.getppid())
+        != _command_bytes(receipt["pane_gate_arguments"])
+        or str(Path(os.readlink(f"/proc/{os.getppid()}/exe")).resolve())
+        != receipt["python_executable"]["path"]
+        or wrapper_started.get("wrapper_arguments")
+        != process_arguments
+        or wrapper_started.get("wrapper_process")
+        != wrapper_launch_process
+        or wrapper_launch_process.get("ppid")
+        != wrapper_started.get("pane_gate_process", {}).get("pid")
+        or wrapper_launch_process.get("pgid") != os.getpid()
+        or wrapper_launch_process.get("sid") != os.getpid()
+        or wrapper_started.get("wrapper_executable") != executable
+        or _process_command_bytes(os.getpid())
+        != _command_bytes(process_arguments)
+        or wrapper_started.get("wrapper_started_sha256")
+        != _canonical_digest(
+            wrapper_started, "wrapper_started_sha256"
+        )
+        or _opened_file_identity(receipt_path) != receipt_identity
+    ):
+        raise RuntimeError("formal preflight wrapper-start evidence differs")
+    return {
+        "attempt_id": attempt_id,
+        "receipt": receipt,
+        "receipt_binding": receipt_binding,
+        "receipt_identity": receipt_identity,
+        "verified_implementations": live_implementations,
+        "gate_ready_binding": gate_ready_binding,
+        "gate_ready": gate_ready,
+        "tmux_started_binding": tmux_started_binding,
+        "wrapper_started_binding": _json_binding(
+            wrapper_started_path, "wrapper_started_sha256"
+        ),
+        "wrapper_started": wrapper_started,
+        "gate_process": wrapper_started["pane_gate_process"],
+        "wrapper_launch_process": wrapper_launch_process,
+        "accepted_path": accepted_path,
+        "release_path": release_path,
+        "wrapper_arguments": process_arguments,
+        "wrapper_executable": executable,
+        "pane_log": log_identity,
+        "git": dict(receipt["git"]),
+    }
+
+
+def _wait_preflight_launch_release(
+    *,
+    launch: Mapping[str, Any],
+    wrapper_binding: Mapping[str, str],
+) -> dict[str, Any]:
+    accepted_path = Path(str(launch["accepted_path"]))
+    release_path = Path(str(launch["release_path"]))
+    terminal_path = accepted_path.with_name("launch_terminal.json")
+    deadline = time.monotonic() + LAUNCH_ACCEPTED_WAIT_SECONDS
+    while not release_path.is_file():
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "formal preflight launch acceptance timed out"
+            )
+        time.sleep(0.02)
+    accepted = json.loads(
+        accepted_path.read_text(encoding="utf-8")
+    )
+    terminal = json.loads(
+        terminal_path.read_text(encoding="utf-8")
+    )
+    release = json.loads(
+        release_path.read_text(encoding="utf-8")
+    )
+    validate_ownership_chain(
+        accepted,
+        terminal,
+        release,
+        receipt_binding=launch["receipt_binding"],
+        receipt_identity=launch["receipt_identity"],
+        wrapper_binding=wrapper_binding,
+        accepted_binding=_json_binding(
+            accepted_path, "launch_accepted_sha256"
+        ),
+        terminal_binding=_json_binding(
+            terminal_path, "launch_terminal_sha256"
+        ),
+        verified_implementations=launch[
+            "verified_implementations"
+        ],
+        label="formal preflight launch ownership chain",
+    )
+    if (
+        accepted.get("attempt_id") != launch["attempt_id"]
+        or _opened_file_identity(
+            Path(str(launch["receipt_identity"]["path"]))
+        )
+        != launch["receipt_identity"]
+    ):
+        raise RuntimeError("formal preflight launch release differs")
+    return release
 
 
 def _run_wrapped_controller_owned(
@@ -2695,6 +3495,9 @@ def _run_wrapped_controller_owned(
     observer_command: Sequence[str],
     emergency_state: dict[str, Any],
 ) -> dict[str, Any]:
+    verified_implementations = _install_verified_preflight_apis(
+        config
+    )
     control = policy_root.resolve() / "preflight_control"
     wrapper_claim_path = control / "wrapper_claim.json"
     process_log_path = control / "controller_process.log"
@@ -2729,6 +3532,14 @@ def _run_wrapped_controller_owned(
     controller_tmux_server = _tmux_server_identity(
         controller_tmux["pane"]
     )
+    launch = _validate_preflight_launch_receipt(
+        repo_root=repo_root,
+        policy_root=policy_root,
+        policy_sha256=policy_sha256,
+        config=config,
+        controller_tmux=controller_tmux,
+        controller_tmux_server=controller_tmux_server,
+    )
     wrapper_process = _require_process_identity(
         os.getpid(), "CPU preflight wrapper"
     )
@@ -2736,42 +3547,69 @@ def _run_wrapped_controller_owned(
         CONTROLLER_SESSION,
         controller_tmux,
         controller_tmux_server,
-        wrapper_process,
+        launch["gate_process"],
     )
-    claim = {
-        "schema_version": 1,
-        "contract_type": "safa_canonical_preflight_wrapper_claim_v2",
-        "policy_sha256": policy_sha256,
-        "config": {
+    verified_implementations = _reverify_verified_preflight_apis()
+    if verified_implementations != launch["verified_implementations"]:
+        raise RuntimeError(
+            "verified implementations changed before wrapper claim"
+        )
+    claim = build_claim_v3(
+        attempt_id=launch["attempt_id"],
+        preflight_launch_receipt=launch["receipt_binding"],
+        preflight_launch_receipt_identity=launch["receipt_identity"],
+        verified_implementations=verified_implementations,
+        pane_gate_ready=launch["gate_ready_binding"],
+        preflight_launch_tmux_started=launch["tmux_started_binding"],
+        preflight_wrapper_started=launch["wrapper_started_binding"],
+        pane_gate_process=launch["gate_process"],
+        wrapper_arguments=launch["wrapper_arguments"],
+        wrapper_executable=launch["wrapper_executable"],
+        pane_log=launch["pane_log"],
+        git=launch["git"],
+        policy_sha256=policy_sha256,
+        config={
             "path": str(config.resolve()),
             "sha256": _sha256_file(config),
         },
-        "checkpoint_plan": _json_binding(plan_path, "checkpoint_plan_sha256"),
-        "preflight_request_manifest": _json_binding(
+        checkpoint_plan=_json_binding(
+            plan_path, "checkpoint_plan_sha256"
+        ),
+        preflight_request_manifest=_json_binding(
             request_manifest_path, "preflight_request_manifest_sha256"
         ),
-        "controller_session": controller_session,
-        "controller_tmux": controller_tmux,
-        "controller_tmux_server": controller_tmux_server,
-        "observer_session": OBSERVER_SESSION,
-        "command": list(command),
-        "observer_command": list(observer_command),
-        "wrapper_pid": os.getpid(),
-        "wrapper_process": wrapper_process,
-        "started_at": started_at,
-        "external_timeout_seconds": None,
-    }
-    claim["wrapper_claim_sha256"] = _canonical_digest(
-        claim, "wrapper_claim_sha256"
+        controller_session=controller_session,
+        controller_tmux=controller_tmux,
+        controller_tmux_server=controller_tmux_server,
+        observer_session=OBSERVER_SESSION,
+        command=list(command),
+        observer_command=list(observer_command),
+        wrapper_pid=os.getpid(),
+        wrapper_process=wrapper_process,
+        wrapper_launch_process=launch["wrapper_launch_process"],
+        started_at=started_at,
+        external_timeout_seconds=None,
+        gate_ready=launch["gate_ready"],
+        wrapper_started=launch["wrapper_started"],
     )
+    if (
+        _reverify_verified_preflight_apis()
+        != claim["verified_implementations"]
+    ):
+        raise RuntimeError(
+            "verified implementations changed after claim construction"
+        )
     _write_exclusive(wrapper_claim_path, claim)
-    wrapper_binding = {
-        "path": str(wrapper_claim_path.resolve()),
-        "sha256": _sha256_file(wrapper_claim_path),
-        "canonical_sha256": claim["wrapper_claim_sha256"],
-    }
+    wrapper_binding = _json_binding(
+        wrapper_claim_path, "wrapper_claim_sha256"
+    )
     emergency_state["claim"] = claim
     emergency_state["wrapper_binding"] = wrapper_binding
+    emergency_state["launch"] = launch
+    _wait_preflight_launch_release(
+        launch=launch,
+        wrapper_binding=wrapper_binding,
+    )
     observer_launch_failure: dict[str, str] | None = None
     observer_owner_nonce = secrets.token_hex(
         TMUX_OWNER_NONCE_HEX_LENGTH // 2
@@ -2810,11 +3648,25 @@ def _run_wrapped_controller_owned(
         }
         previous = emergency_state.get("provisional_observer")
         if previous is not None:
-            for field in ("tmux", "tmux_server", "owner_seal"):
-                if previous.get(field) != candidate[field]:
-                    raise RuntimeError(
-                        "emergency observer owner identity changed"
-                    )
+            previous_tmux = previous.get("tmux")
+            if (
+                not isinstance(previous_tmux, Mapping)
+                or {
+                    key: previous_tmux.get(key)
+                    for key in ("session", "pane", "pane_pid")
+                }
+                != {
+                    key: candidate["tmux"][key]
+                    for key in ("session", "pane", "pane_pid")
+                }
+                or previous.get("tmux_server")
+                != candidate["tmux_server"]
+                or previous.get("owner_seal")
+                != candidate["owner_seal"]
+            ):
+                raise RuntimeError(
+                    "emergency observer owner identity changed"
+                )
             previous_process = previous.get("process")
             if (
                 previous_process is not None
@@ -2891,19 +3743,18 @@ def _run_wrapped_controller_owned(
         _set_observer_remain_on_exit(
             provisional_tmux_owner_seal
         )
-        observer_gate_ready_binding = {
-            "path": str(observer_gate_ready_path.resolve()),
-            "sha256": _sha256_file(observer_gate_ready_path),
-            "canonical_sha256": observer_gate_ready[
-                "observer_gate_ready_sha256"
-            ],
-        }
+        observer_gate_ready_binding = _json_binding(
+            observer_gate_ready_path, "observer_gate_ready_sha256"
+        )
         observer_gate_release = {
             "schema_version": 1,
             "contract_type": (
                 "safa_canonical_preflight_observer_gate_release_v1"
             ),
             "policy_sha256": policy_sha256,
+            "verified_implementations": (
+                _reverify_verified_preflight_apis()
+            ),
             "wrapper_claim": wrapper_binding,
             "observer_gate_ready": observer_gate_ready_binding,
             "observer_session": OBSERVER_SESSION,
@@ -2941,7 +3792,14 @@ def _run_wrapped_controller_owned(
             "process": observer_process,
         }
         if (
-            observer_tmux != provisional_tmux
+            {
+                key: observer_tmux[key]
+                for key in ("session", "pane", "pane_pid")
+            }
+            != {
+                key: provisional_tmux[key]
+                for key in ("session", "pane", "pane_pid")
+            }
             or observer_tmux_server != provisional_tmux_server
             or observer_tmux_owner_seal
             != provisional_tmux_owner_seal
@@ -2988,6 +3846,9 @@ def _run_wrapped_controller_owned(
             else "safa_canonical_preflight_observer_launch_failed_v1"
         ),
         "policy_sha256": policy_sha256,
+        "verified_implementations": (
+            _reverify_verified_preflight_apis()
+        ),
         "wrapper_claim": wrapper_binding,
         "wrapper_claim_sha256": claim["wrapper_claim_sha256"],
         "observer_session": OBSERVER_SESSION,
@@ -2995,13 +3856,9 @@ def _run_wrapped_controller_owned(
         "observer_bootstrap": (
             None
             if observer_bootstrap is None
-            else {
-                "path": str(observer_bootstrap_path.resolve()),
-                "sha256": _sha256_file(observer_bootstrap_path),
-                "canonical_sha256": observer_bootstrap[
-                    "observer_bootstrap_sha256"
-                ],
-            }
+            else _json_binding(
+                observer_bootstrap_path, "observer_bootstrap_sha256"
+            )
         ),
         "tmux": observer_tmux,
         "tmux_server": observer_tmux_server,
@@ -3010,24 +3867,17 @@ def _run_wrapped_controller_owned(
         "observer_gate_ready": (
             None
             if observer_gate_ready is None
-            else {
-                "path": str(observer_gate_ready_path.resolve()),
-                "sha256": _sha256_file(observer_gate_ready_path),
-                "canonical_sha256": observer_gate_ready[
-                    "observer_gate_ready_sha256"
-                ],
-            }
+            else _json_binding(
+                observer_gate_ready_path, "observer_gate_ready_sha256"
+            )
         ),
         "observer_gate_release": (
             None
             if observer_gate_release is None
-            else {
-                "path": str(observer_gate_release_path.resolve()),
-                "sha256": _sha256_file(observer_gate_release_path),
-                "canonical_sha256": observer_gate_release[
-                    "observer_gate_release_sha256"
-                ],
-            }
+            else _json_binding(
+                observer_gate_release_path,
+                "observer_gate_release_sha256",
+            )
         ),
         "status": observer_launch_status,
         "failure": observer_launch_failure,
@@ -3054,13 +3904,9 @@ def _run_wrapped_controller_owned(
     )
     try:
         _write_exclusive(observer_launch_path, observer_launch)
-        observer_launch_binding: dict[str, str] | None = {
-            "path": str(observer_launch_path.resolve()),
-            "sha256": _sha256_file(observer_launch_path),
-            "canonical_sha256": observer_launch[
-                "observer_launch_sha256"
-            ],
-        }
+        observer_launch_binding: dict[str, str] | None = _json_binding(
+            observer_launch_path, "observer_launch_sha256"
+        )
         emergency_state["observer_launch_binding"] = (
             observer_launch_binding
         )
@@ -3177,13 +4023,9 @@ def _run_wrapped_controller_owned(
         )
         try:
             _write_exclusive(observer_cleanup_path, launch_cleanup)
-            observer_cleanup_binding = {
-                "path": str(observer_cleanup_path.resolve()),
-                "sha256": _sha256_file(observer_cleanup_path),
-                "canonical_sha256": launch_cleanup[
-                    "observer_cleanup_sha256"
-                ],
-            }
+            observer_cleanup_binding = _json_binding(
+                observer_cleanup_path, "observer_cleanup_sha256"
+            )
         except BaseException as exc:
             durable_launch_failure = _merge_launch_failure(
                 durable_launch_failure,
@@ -3215,13 +4057,9 @@ def _run_wrapped_controller_owned(
         )
         try:
             _write_exclusive(process_start_path, not_started)
-            not_started_binding = {
-                "path": str(process_start_path.resolve()),
-                "sha256": _sha256_file(process_start_path),
-                "canonical_sha256": not_started[
-                    "controller_process_start_sha256"
-                ],
-            }
+            not_started_binding = _json_binding(
+                process_start_path, "controller_process_start_sha256"
+            )
         except BaseException as exc:
             durable_launch_failure = _merge_launch_failure(
                 durable_launch_failure,
@@ -3259,13 +4097,9 @@ def _run_wrapped_controller_owned(
         )
         try:
             _write_exclusive(process_exit_path, not_started_exit)
-            process_exit_binding = {
-                "path": str(process_exit_path.resolve()),
-                "sha256": _sha256_file(process_exit_path),
-                "canonical_sha256": not_started_exit[
-                    "controller_process_exit_sha256"
-                ],
-            }
+            process_exit_binding = _json_binding(
+                process_exit_path, "controller_process_exit_sha256"
+            )
         except BaseException as exc:
             durable_launch_failure = _merge_launch_failure(
                 durable_launch_failure,
@@ -3371,6 +4205,9 @@ def _run_wrapped_controller_owned(
             "schema_version": 1,
             "contract_type": "safa_canonical_preflight_controller_process_start_v1",
             "policy_sha256": policy_sha256,
+            "verified_implementations": (
+                _reverify_verified_preflight_apis()
+            ),
             "wrapper_claim": wrapper_binding,
             "observer_launch": observer_launch_binding,
             "command": list(command),
@@ -3403,13 +4240,9 @@ def _run_wrapped_controller_owned(
             )
             raise
         try:
-            controller_process_start_binding = {
-                "path": str(process_start_path.resolve()),
-                "sha256": _sha256_file(process_start_path),
-                "canonical_sha256": controller_process_start[
-                    "controller_process_start_sha256"
-                ],
-            }
+            controller_process_start_binding = _json_binding(
+                process_start_path, "controller_process_start_sha256"
+            )
         except BaseException as exc:
             launch_failure = _merge_launch_failure(
                 launch_failure,
@@ -3435,11 +4268,9 @@ def _run_wrapped_controller_owned(
                         observer_process=observer_process,
                         process_start_binding=controller_process_start_binding,
                     )
-                    observer_stop_binding = {
-                        "path": str(observer_stop_path.resolve()),
-                        "sha256": _sha256_file(observer_stop_path),
-                        "canonical_sha256": stop["observer_stop_sha256"],
-                    }
+                    observer_stop_binding = _json_binding(
+                        observer_stop_path, "observer_stop_sha256"
+                    )
                     launch_failure = _merge_launch_failure(
                         launch_failure,
                         stage="controller_monitor_observer_hard_stop",
@@ -3506,13 +4337,10 @@ def _run_wrapped_controller_owned(
                 _write_exclusive(
                     process_closure_path, controller_process_closure
                 )
-                controller_process_closure_binding = {
-                    "path": str(process_closure_path.resolve()),
-                    "sha256": _sha256_file(process_closure_path),
-                    "canonical_sha256": controller_process_closure[
-                        "controller_process_closure_sha256"
-                    ],
-                }
+                controller_process_closure_binding = _json_binding(
+                    process_closure_path,
+                    "controller_process_closure_sha256",
+                )
             except BaseException as exc:
                 launch_failure = _merge_launch_failure(
                     launch_failure,
@@ -3559,11 +4387,9 @@ def _run_wrapped_controller_owned(
                     process_start_binding=controller_process_start_binding,
                     require_live_identity=False,
                 )
-                observer_stop_binding = {
-                    "path": str(observer_stop_path.resolve()),
-                    "sha256": _sha256_file(observer_stop_path),
-                    "canonical_sha256": stop["observer_stop_sha256"],
-                }
+                observer_stop_binding = _json_binding(
+                    observer_stop_path, "observer_stop_sha256"
+                )
             except BaseException as exc:
                 launch_failure = _merge_launch_failure(
                     launch_failure,
@@ -3575,6 +4401,9 @@ def _run_wrapped_controller_owned(
             "schema_version": 1,
             "contract_type": "safa_canonical_preflight_controller_process_exit_v2",
             "policy_sha256": policy_sha256,
+            "verified_implementations": (
+                _reverify_verified_preflight_apis()
+            ),
             "wrapper_claim_sha256": claim["wrapper_claim_sha256"],
             "observer_launch": observer_launch_binding,
             "controller_process_start": controller_process_start_binding,
@@ -3616,13 +4445,9 @@ def _run_wrapped_controller_owned(
             process_exit_binding = None
         else:
             try:
-                process_exit_binding = {
-                    "path": str(process_exit_path.resolve()),
-                    "sha256": _sha256_file(process_exit_path),
-                    "canonical_sha256": process_exit[
-                        "controller_process_exit_sha256"
-                    ],
-                }
+                process_exit_binding = _json_binding(
+                    process_exit_path, "controller_process_exit_sha256"
+                )
             except BaseException as exc:
                 launch_failure = _merge_launch_failure(
                     launch_failure,
@@ -3778,13 +4603,9 @@ def _run_wrapped_controller_owned(
         )
         try:
             _write_exclusive(observer_cleanup_path, cleanup)
-            observer_cleanup_binding = {
-                "path": str(observer_cleanup_path.resolve()),
-                "sha256": _sha256_file(observer_cleanup_path),
-                "canonical_sha256": cleanup[
-                    "observer_cleanup_sha256"
-                ],
-            }
+            observer_cleanup_binding = _json_binding(
+                observer_cleanup_path, "observer_cleanup_sha256"
+            )
         except BaseException as exc:
             launch_failure = _merge_launch_failure(
                 launch_failure,
@@ -3841,13 +4662,9 @@ def _run_wrapped_controller_owned(
         )
         try:
             _write_exclusive(observer_cleanup_path, cleanup)
-            observer_cleanup_binding = {
-                "path": str(observer_cleanup_path.resolve()),
-                "sha256": _sha256_file(observer_cleanup_path),
-                "canonical_sha256": cleanup[
-                    "observer_cleanup_sha256"
-                ],
-            }
+            observer_cleanup_binding = _json_binding(
+                observer_cleanup_path, "observer_cleanup_sha256"
+            )
         except BaseException as exc:
             launch_failure = _merge_launch_failure(
                 launch_failure,
@@ -4287,6 +5104,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--campaign-root", required=True, type=Path)
     parser.add_argument("--policy-sha256", required=True)
     parser.add_argument("--python", required=True)
+    parser.add_argument("--launch-receipt", required=True, type=Path)
+    parser.add_argument("--attempt-id", required=True)
+    parser.add_argument("--launch-accepted", required=True, type=Path)
+    parser.add_argument("--launch-release", required=True, type=Path)
+    parser.add_argument("--pane-log", required=True, type=Path)
     return parser.parse_args(argv)
 
 
@@ -4297,6 +5119,7 @@ def parse_gate_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--ready-path", required=True, type=Path)
     parser.add_argument("--release-path", required=True, type=Path)
     parser.add_argument("--bootstrap-path", required=True, type=Path)
+    parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--policy-sha256", required=True)
     parser.add_argument("--wrapper-binding-json", required=True)
     parser.add_argument("--observer-command-json", required=True)
@@ -4307,6 +5130,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     if raw_argv and raw_argv[0] == OBSERVER_GATE_MODE:
         gate_args = parse_gate_args(raw_argv[1:])
+        _install_verified_preflight_apis(
+            gate_args.config.resolve()
+        )
         wrapper_binding = json.loads(
             gate_args.wrapper_binding_json
         )
@@ -4333,6 +5159,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             observer_command=observer_command,
         )
     args = parse_args(raw_argv)
+    if (
+        os.environ.get(LAUNCH_RECEIPT_PATH_ENV)
+        != str(args.launch_receipt.resolve())
+        or os.environ.get(LAUNCH_ACCEPTED_PATH_ENV)
+        != str(args.launch_accepted.resolve())
+        or os.environ.get(LAUNCH_RELEASE_PATH_ENV)
+        != str(args.launch_release.resolve())
+        or os.environ.get(PANE_LOG_PATH_ENV)
+        != str(args.pane_log.resolve())
+        or len(args.attempt_id) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in args.attempt_id
+        )
+    ):
+        raise RuntimeError(
+            "formal preflight launcher CLI/environment differs"
+        )
+    receipt = json.loads(
+        args.launch_receipt.read_text(encoding="utf-8")
+    )
+    if receipt.get("attempt_id") != args.attempt_id:
+        raise RuntimeError("formal preflight attempt ID differs")
     repo_root = args.repo_root.resolve()
     config = args.config.resolve()
     campaign_root = args.campaign_root.resolve()

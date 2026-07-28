@@ -11,8 +11,11 @@ import importlib
 import json
 import os
 from pathlib import Path
+import signal
+import stat
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from typing import Any, Mapping
@@ -67,6 +70,50 @@ def binding(path: Path, field: str) -> dict[str, str]:
     }
 
 
+def file_identity(path: Path) -> dict[str, Any]:
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        value = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if not stat.S_ISREG(value.st_mode):
+        raise RuntimeError("fixture identity target is not regular")
+    return {
+        "path": str(path.resolve()),
+        "device": int(value.st_dev),
+        "inode": int(value.st_ino),
+        "mode": int(value.st_mode),
+        "size": int(value.st_size),
+    }
+
+
+def verified_implementations(config: Path) -> dict[str, Any]:
+    policy = load(config)
+    root = config.resolve().parents[2]
+    result: dict[str, Any] = {}
+    for output_name, implementation_name in (
+        ("verified_loader", "preflight_verified_loader"),
+        (
+            "preflight_launch_contract",
+            "preflight_launch_contract",
+        ),
+    ):
+        raw = policy["implementations"][implementation_name]
+        path = (root / raw["path"]).resolve(strict=True)
+        observed_sha256 = file_sha(path)
+        if observed_sha256 != raw["sha256"]:
+            raise RuntimeError(
+                f"fixture verified implementation differs: "
+                f"{implementation_name}"
+            )
+        result[output_name] = {
+            "path": str(path),
+            "sha256": observed_sha256,
+            "file_identity": file_identity(path),
+        }
+    return result
+
+
 def process_identity(pid: int) -> dict[str, int]:
     raw_stat = Path(f"/proc/{pid}/stat").read_text()
     closing = raw_stat.rfind(")")
@@ -75,7 +122,24 @@ def process_identity(pid: int) -> dict[str, int]:
     fields = raw_stat[closing + 2 :].split()
     return {
         "pid": pid,
+        "ppid": int(fields[1]),
         "pgid": int(fields[2]),
+        "sid": int(fields[3]),
+        "start_ticks": int(fields[19]),
+    }
+
+
+def launch_process_identity(pid: int) -> dict[str, int]:
+    raw_stat = Path(f"/proc/{pid}/stat").read_text()
+    closing = raw_stat.rfind(")")
+    if closing < 0:
+        raise RuntimeError("fixture launch process stat is malformed")
+    fields = raw_stat[closing + 2 :].split()
+    return {
+        "pid": pid,
+        "ppid": int(fields[1]),
+        "pgid": int(fields[2]),
+        "sid": int(fields[3]),
         "start_ticks": int(fields[19]),
     }
 
@@ -118,7 +182,650 @@ def current_observer_session() -> str:
     )
 
 
-def publish_observer_bootstrap() -> None:
+def install_synthetic_launcher_contract(
+    *,
+    module: Any,
+    repo_root: Path,
+    policy_root: Path,
+    policy_sha256: str,
+    config: Path,
+) -> threading.Thread:
+    campaign_root = policy_root.parents[1]
+    attempt_id = hashlib.sha256(
+        f"{policy_root.resolve()}:{os.getpid()}".encode()
+    ).hexdigest()
+    owner_nonce = hashlib.sha256(
+        f"owner:{attempt_id}".encode()
+    ).hexdigest()
+    attempt_root = (
+        campaign_root
+        / "preflight_launch_attempts"
+        / "by_policy"
+        / policy_sha256
+        / attempt_id
+    )
+    attempt_root.mkdir(parents=True, exist_ok=False)
+    started_path = (
+        campaign_root
+        / "preflight_launch_attempts"
+        / "started"
+        / f"{attempt_id}.json"
+    )
+    started = {
+        "schema_version": 1,
+        "contract_type": (
+            "safa_canonical_preflight_launch_started_registry_v1"
+        ),
+        "attempt_id": attempt_id,
+        "policy_sha256": policy_sha256,
+        "reserved_at": utc_now(),
+    }
+    started["launch_started_registry_sha256"] = digest(
+        started, "launch_started_registry_sha256"
+    )
+    write_exclusive(started_path, started)
+    log_path = attempt_root / "pane.log"
+    descriptor = os.open(
+        log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644
+    )
+    os.fsync(descriptor)
+    os.close(descriptor)
+    log_stat = log_path.stat()
+    receipt_path = attempt_root / "launch_receipt.json"
+    accepted_path = attempt_root / "launch_accepted.json"
+    release_path = attempt_root / "launch_ownership_release.json"
+    claim_path = policy_root / "preflight_control/wrapper_claim.json"
+    command = [
+        item.decode("utf-8")
+        for item in Path(f"/proc/{os.getpid()}/cmdline")
+        .read_bytes()
+        .split(b"\0")
+        if item
+    ]
+    git: dict[str, str] = {}
+    for name, arguments in (
+        ("head_sha", ("rev-parse", "HEAD")),
+        ("origin_master_sha", ("rev-parse", "origin/master")),
+        ("branch", ("branch", "--show-current")),
+    ):
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        git[name] = result.stdout.strip()
+    proc_executable = Path(
+        os.readlink(f"/proc/{os.getpid()}/exe")
+    ).resolve()
+    wrapper_path = Path(module.__file__).resolve()
+    receipt = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_preflight_launch_receipt_v1",
+        "attempt_id": attempt_id,
+        "started_registry": binding(
+            started_path, "launch_started_registry_sha256"
+        ),
+        "policy_sha256": policy_sha256,
+        "git": git,
+        "bindings": {
+            "config": {
+                "path": str(config.resolve()),
+                "sha256": file_sha(config),
+            },
+            "launcher": {
+                "path": str(wrapper_path),
+                "sha256": file_sha(wrapper_path),
+            },
+            "wrapper": {
+                "path": str(wrapper_path),
+                "sha256": file_sha(wrapper_path),
+            },
+            "controller": {
+                "path": str(wrapper_path),
+                "sha256": file_sha(wrapper_path),
+            },
+        },
+        "python_executable": {
+            "path": str(proc_executable),
+            "sha256": file_sha(proc_executable),
+        },
+        "controller_session": module.CONTROLLER_SESSION,
+        "controller_owner_nonce": owner_nonce,
+        "observer_session": module.OBSERVER_SESSION,
+        "wrapper_arguments": command,
+        "pane_gate_arguments": [sys.executable, "fixture-pane-gate"],
+        "tmux_arguments": ["tmux", "new-session", "fixture"],
+        "shell": False,
+        "pane_log": {
+            "path": str(log_path.resolve()),
+            "device": int(log_stat.st_dev),
+            "inode": int(log_stat.st_ino),
+            "mode": int(log_stat.st_mode),
+            "size": int(log_stat.st_size),
+        },
+        "wrapper_claim_path": str(claim_path.resolve()),
+        "started_at": utc_now(),
+    }
+    receipt["launch_receipt_sha256"] = digest(
+        receipt, "launch_receipt_sha256"
+    )
+    write_exclusive(receipt_path, receipt)
+    receipt_identity = file_identity(receipt_path)
+    receipt_binding = binding(
+        receipt_path, "launch_receipt_sha256"
+    )
+    gate_ready_path = attempt_root / "pane_gate_ready.json"
+    current_process = process_identity(os.getpid())
+    gate_ready = {
+        "schema_version": 1,
+        "contract_type": (
+            "safa_canonical_preflight_pane_gate_ready_v1"
+        ),
+        "launch_receipt": receipt_binding,
+        "launch_receipt_identity": receipt_identity,
+        "process": current_process,
+        "wrapper_arguments": command,
+        "ready_at": utc_now(),
+    }
+    gate_ready["pane_gate_ready_sha256"] = digest(
+        gate_ready, "pane_gate_ready_sha256"
+    )
+    write_exclusive(gate_ready_path, gate_ready)
+    tmux_started_path = attempt_root / "launch_tmux_started.json"
+    tmux_started = {
+        "schema_version": 1,
+        "contract_type": (
+            "safa_canonical_preflight_launch_tmux_started_v1"
+        ),
+        "launch_receipt": receipt_binding,
+        "launch_receipt_identity": receipt_identity,
+        "pane_gate_ready": binding(
+            gate_ready_path, "pane_gate_ready_sha256"
+        ),
+        "tmux_client": {
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+        },
+        "owner_seal": {"pane_process": current_process},
+        "remain_on_exit": "on",
+        "started_at": utc_now(),
+    }
+    tmux_started["launch_tmux_started_sha256"] = digest(
+        tmux_started, "launch_tmux_started_sha256"
+    )
+    write_exclusive(tmux_started_path, tmux_started)
+    os.environ[module.TMUX_OWNER_ENV] = owner_nonce
+    os.environ[module.LAUNCH_RECEIPT_PATH_ENV] = str(receipt_path.resolve())
+    os.environ[module.LAUNCH_ACCEPTED_PATH_ENV] = str(
+        accepted_path.resolve()
+    )
+    os.environ[module.LAUNCH_RELEASE_PATH_ENV] = str(
+        release_path.resolve()
+    )
+    os.environ[module.PANE_LOG_PATH_ENV] = str(log_path.resolve())
+
+    def accept_claim() -> None:
+        deadline = time.monotonic() + 45
+        while not claim_path.is_file():
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(0.02)
+        claim_binding = binding(
+            claim_path, "wrapper_claim_sha256"
+        )
+        accepted = {
+            "schema_version": 1,
+            "contract_type": (
+                "safa_canonical_preflight_launch_accepted_v1"
+            ),
+            "attempt_id": attempt_id,
+            "launch_receipt": receipt_binding,
+            "launch_receipt_identity": receipt_identity,
+            "wrapper_claim": claim_binding,
+            "startup_window_closed": False,
+        }
+        accepted["launch_accepted_sha256"] = digest(
+            accepted, "launch_accepted_sha256"
+        )
+        write_exclusive(accepted_path, accepted)
+        terminal_path = attempt_root / "launch_terminal.json"
+        terminal = {
+            "schema_version": 1,
+            "contract_type": (
+                "safa_canonical_preflight_launch_terminal_v1"
+            ),
+            "launch_receipt": receipt_binding,
+            "launch_receipt_identity": receipt_identity,
+            "wrapper_claim": claim_binding,
+            "status": "ownership_transferred",
+            "failure": None,
+        }
+        terminal["launch_terminal_sha256"] = digest(
+            terminal, "launch_terminal_sha256"
+        )
+        write_exclusive(terminal_path, terminal)
+        release = {
+            "schema_version": 1,
+            "contract_type": (
+                "safa_canonical_preflight_launch_ownership_release_v1"
+            ),
+            "launch_receipt": receipt_binding,
+            "launch_receipt_identity": receipt_identity,
+            "launch_accepted": binding(
+                accepted_path, "launch_accepted_sha256"
+            ),
+            "launch_terminal": binding(
+                terminal_path, "launch_terminal_sha256"
+            ),
+            "wrapper_claim": claim_binding,
+            "startup_window_closed": True,
+        }
+        release["launch_ownership_release_sha256"] = digest(
+            release, "launch_ownership_release_sha256"
+        )
+        write_exclusive(release_path, release)
+
+    thread = threading.Thread(target=accept_claim, daemon=True)
+    thread.start()
+    return thread
+
+
+def prepare_supervised_launcher_contract(
+    *,
+    module: Any,
+    repo_root: Path,
+    policy_root: Path,
+    policy_sha256: str,
+    config: Path,
+    wrapper_arguments: list[str],
+) -> dict[str, Any]:
+    module._install_verified_preflight_apis(config)
+    verified = module._reverify_verified_preflight_apis()
+    campaign_root = policy_root.parents[1]
+    attempt_id = hashlib.sha256(
+        (
+            f"supervised:{policy_root.resolve()}:{os.getpid()}:"
+            f"{wrapper_arguments}"
+        ).encode()
+    ).hexdigest()
+    owner_nonce = hashlib.sha256(
+        f"owner:{attempt_id}".encode()
+    ).hexdigest()
+    attempt_root = (
+        campaign_root
+        / "preflight_launch_attempts"
+        / "by_policy"
+        / policy_sha256
+        / attempt_id
+    )
+    attempt_root.mkdir(parents=True, exist_ok=False)
+    started_path = (
+        campaign_root
+        / "preflight_launch_attempts"
+        / "started"
+        / f"{attempt_id}.json"
+    )
+    started = {
+        "schema_version": 1,
+        "contract_type": (
+            "safa_canonical_preflight_launch_started_registry_v1"
+        ),
+        "attempt_id": attempt_id,
+        "policy_sha256": policy_sha256,
+        "reserved_at": utc_now(),
+    }
+    started["launch_started_registry_sha256"] = digest(
+        started, "launch_started_registry_sha256"
+    )
+    write_exclusive(started_path, started)
+    log_path = attempt_root / "pane.log"
+    descriptor = os.open(
+        log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644
+    )
+    os.fsync(descriptor)
+    os.close(descriptor)
+    log_stat = log_path.stat()
+    receipt_path = attempt_root / "launch_receipt.json"
+    accepted_path = attempt_root / "launch_accepted.json"
+    release_path = attempt_root / "launch_ownership_release.json"
+    claim_path = policy_root / "preflight_control/wrapper_claim.json"
+    gate_ready_path = attempt_root / "pane_gate_ready.json"
+    tmux_started_path = attempt_root / "launch_tmux_started.json"
+    wrapper_started_path = attempt_root / "wrapper_started.json"
+    gate_terminal_path = attempt_root / "gate_execution_terminal.json"
+    git: dict[str, str] = {}
+    for name, arguments in (
+        ("head_sha", ("rev-parse", "HEAD")),
+        ("origin_master_sha", ("rev-parse", "origin/master")),
+        ("branch", ("branch", "--show-current")),
+    ):
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        git[name] = result.stdout.strip()
+    proc_executable = Path(
+        os.readlink(f"/proc/{os.getpid()}/exe")
+    ).resolve()
+    wrapper_path = Path(module.__file__).resolve()
+    gate_process = launch_process_identity(os.getpid())
+    gate_arguments = [
+        item.decode("utf-8")
+        for item in Path(f"/proc/{os.getpid()}/cmdline")
+        .read_bytes()
+        .split(b"\0")
+        if item
+    ]
+    receipt = {
+        "schema_version": 1,
+        "contract_type": "safa_canonical_preflight_launch_receipt_v1",
+        "attempt_id": attempt_id,
+        "started_registry": binding(
+            started_path, "launch_started_registry_sha256"
+        ),
+        "policy_sha256": policy_sha256,
+        "git": git,
+        "bindings": {
+            "config": {
+                "path": str(config.resolve()),
+                "sha256": file_sha(config),
+            },
+            "launcher": {
+                "path": str(wrapper_path),
+                "sha256": file_sha(wrapper_path),
+            },
+            "wrapper": {
+                "path": str(wrapper_path),
+                "sha256": file_sha(wrapper_path),
+            },
+            "controller": {
+                "path": str(wrapper_path),
+                "sha256": file_sha(wrapper_path),
+            },
+        },
+        "verified_implementations": verified,
+        "python_executable": {
+            "path": str(proc_executable),
+            "sha256": file_sha(proc_executable),
+        },
+        "controller_session": module.CONTROLLER_SESSION,
+        "controller_owner_nonce": owner_nonce,
+        "observer_session": module.OBSERVER_SESSION,
+        "wrapper_arguments": wrapper_arguments,
+        "pane_gate_arguments": gate_arguments,
+        "tmux_arguments": ["tmux", "new-session", "fixture"],
+        "shell": False,
+        "pane_log": {
+            "path": str(log_path.resolve()),
+            "device": int(log_stat.st_dev),
+            "inode": int(log_stat.st_ino),
+            "mode": int(log_stat.st_mode),
+            "size": int(log_stat.st_size),
+        },
+        "wrapper_claim_path": str(claim_path.resolve()),
+        "wrapper_started_path": str(wrapper_started_path.resolve()),
+        "gate_execution_terminal_path": str(
+            gate_terminal_path.resolve()
+        ),
+        "started_at": utc_now(),
+    }
+    receipt["launch_receipt_sha256"] = digest(
+        receipt, "launch_receipt_sha256"
+    )
+    write_exclusive(receipt_path, receipt)
+    receipt_identity = file_identity(receipt_path)
+    receipt_binding = binding(
+        receipt_path, "launch_receipt_sha256"
+    )
+    gate_ready = {
+        "schema_version": 1,
+        "contract_type": (
+            "safa_canonical_preflight_pane_gate_ready_v1"
+        ),
+        "launch_receipt": receipt_binding,
+        "launch_receipt_identity": receipt_identity,
+        "verified_implementations": verified,
+        "process": gate_process,
+        "wrapper_arguments": wrapper_arguments,
+        "ready_at": utc_now(),
+    }
+    gate_ready["pane_gate_ready_sha256"] = digest(
+        gate_ready, "pane_gate_ready_sha256"
+    )
+    write_exclusive(gate_ready_path, gate_ready)
+    subprocess.run(
+        [
+            "tmux",
+            "set-environment",
+            "-t",
+            module.CONTROLLER_SESSION,
+            module.TMUX_OWNER_ENV,
+            owner_nonce,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    controller_tmux = module._tmux_identity(
+        module.CONTROLLER_SESSION
+    )
+    controller_tmux_server = module._tmux_server_identity(
+        controller_tmux["pane"]
+    )
+    tmux_owner_seal = module._build_tmux_owner_seal(
+        controller_tmux,
+        controller_tmux_server,
+        owner_nonce,
+    )
+    tmux_started = module.build_tmux_started(
+        launch_receipt=receipt_binding,
+        launch_receipt_identity=receipt_identity,
+        verified_implementations=verified,
+        pane_gate_ready=binding(
+            gate_ready_path, "pane_gate_ready_sha256"
+        ),
+        tmux_client={"returncode": 0, "stdout": "", "stderr": ""},
+        owner_seal=tmux_owner_seal,
+        started_at=utc_now(),
+        tmux_identity=controller_tmux,
+        tmux_server=controller_tmux_server,
+    )
+    write_exclusive(tmux_started_path, tmux_started)
+    environment = {
+        module.TMUX_OWNER_ENV: owner_nonce,
+        module.LAUNCH_RECEIPT_PATH_ENV: str(receipt_path.resolve()),
+        module.LAUNCH_ACCEPTED_PATH_ENV: str(accepted_path.resolve()),
+        module.LAUNCH_RELEASE_PATH_ENV: str(release_path.resolve()),
+        module.PANE_LOG_PATH_ENV: str(log_path.resolve()),
+    }
+    return {
+        "attempt_root": attempt_root,
+        "receipt_path": receipt_path,
+        "accepted_path": accepted_path,
+        "release_path": release_path,
+        "claim_path": claim_path,
+        "gate_ready_path": gate_ready_path,
+        "wrapper_started_path": wrapper_started_path,
+        "tmux_started_path": tmux_started_path,
+        "log_path": log_path,
+        "controller_pane": controller_tmux,
+        "wrapper_arguments": wrapper_arguments,
+        "gate_process": gate_process,
+        "environment": environment,
+        "receipt_identity": receipt_identity,
+        "verified_implementations": verified,
+    }
+
+
+def complete_supervised_launcher_contract(
+    context: Mapping[str, Any], child_pid: int
+) -> threading.Thread:
+    verified = dict(context["verified_implementations"])
+    wrapper_arguments = list(context["wrapper_arguments"])
+    process = launch_process_identity(child_pid)
+    deadline = time.monotonic() + 5
+    while True:
+        command = [
+            item.decode("utf-8")
+            for item in Path(f"/proc/{child_pid}/cmdline")
+            .read_bytes()
+            .split(b"\0")
+            if item
+        ]
+        if command == wrapper_arguments:
+            break
+        if time.monotonic() >= deadline:
+            raise RuntimeError("fixture child command did not stabilize")
+        time.sleep(0.005)
+    executable_path = Path(
+        os.readlink(f"/proc/{child_pid}/exe")
+    ).resolve()
+    executable_stat = executable_path.stat()
+    executable = {
+        "path": str(executable_path),
+        "device": int(executable_stat.st_dev),
+        "inode": int(executable_stat.st_ino),
+        "mode": int(executable_stat.st_mode),
+        "size": int(executable_stat.st_size),
+    }
+    wrapper_started = {
+        "schema_version": 1,
+        "contract_type": (
+            "safa_canonical_preflight_wrapper_started_v1"
+        ),
+        "launch_receipt": binding(
+            context["receipt_path"], "launch_receipt_sha256"
+        ),
+        "launch_receipt_identity": dict(
+            context["receipt_identity"]
+        ),
+        "verified_implementations": verified,
+        "pane_gate_ready": binding(
+            context["gate_ready_path"], "pane_gate_ready_sha256"
+        ),
+        "pane_gate_process": dict(context["gate_process"]),
+        "wrapper_arguments": wrapper_arguments,
+        "wrapper_process": process,
+        "wrapper_executable": executable,
+        "started_at": utc_now(),
+    }
+    wrapper_started["wrapper_started_sha256"] = digest(
+        wrapper_started, "wrapper_started_sha256"
+    )
+    write_exclusive(
+        context["wrapper_started_path"], wrapper_started
+    )
+
+    def accept_claim() -> None:
+        claim_path = Path(context["claim_path"])
+        deadline = time.monotonic() + 45
+        while not claim_path.is_file():
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(0.02)
+        claim_binding = binding(
+            claim_path, "wrapper_claim_sha256"
+        )
+        receipt_binding = binding(
+            context["receipt_path"], "launch_receipt_sha256"
+        )
+        accepted = {
+            "schema_version": 1,
+            "contract_type": (
+                "safa_canonical_preflight_launch_accepted_v1"
+            ),
+            "attempt_id": load(context["receipt_path"])["attempt_id"],
+            "launch_receipt": receipt_binding,
+            "launch_receipt_identity": dict(
+                context["receipt_identity"]
+            ),
+            "verified_implementations": verified,
+            "wrapper_claim": claim_binding,
+            "tmux_started": binding(
+                context["tmux_started_path"],
+                "launch_tmux_started_sha256",
+            ),
+            "pane": dict(context["controller_pane"]),
+            "pane_log_path": str(
+                Path(context["log_path"]).resolve()
+            ),
+            "startup_window_closed": False,
+            "started_at": load(context["receipt_path"])["started_at"],
+            "accepted_at": utc_now(),
+        }
+        accepted["launch_accepted_sha256"] = digest(
+            accepted, "launch_accepted_sha256"
+        )
+        write_exclusive(context["accepted_path"], accepted)
+        terminal_path = Path(context["accepted_path"]).with_name(
+            "launch_terminal.json"
+        )
+        terminal = {
+            "schema_version": 1,
+            "contract_type": (
+                "safa_canonical_preflight_launch_terminal_v1"
+            ),
+            "launch_receipt": receipt_binding,
+            "launch_receipt_identity": dict(
+                context["receipt_identity"]
+            ),
+            "verified_implementations": verified,
+            "launch_accepted": binding(
+                context["accepted_path"], "launch_accepted_sha256"
+            ),
+            "wrapper_claim": claim_binding,
+            "tmux_started": binding(
+                context["tmux_started_path"],
+                "launch_tmux_started_sha256",
+            ),
+            "status": "ownership_transferred",
+            "failure": None,
+            "tmux_client": None,
+            "pane": dict(context["controller_pane"]),
+            "pane_log": file_identity(Path(context["log_path"])),
+            "session_residual": True,
+            "started_at": load(context["receipt_path"])["started_at"],
+            "completed_at": utc_now(),
+        }
+        terminal["launch_terminal_sha256"] = digest(
+            terminal, "launch_terminal_sha256"
+        )
+        write_exclusive(terminal_path, terminal)
+        release = {
+            "schema_version": 1,
+            "contract_type": (
+                "safa_canonical_preflight_launch_ownership_release_v1"
+            ),
+            "launch_receipt": receipt_binding,
+            "launch_receipt_identity": dict(
+                context["receipt_identity"]
+            ),
+            "verified_implementations": verified,
+            "launch_accepted": binding(
+                context["accepted_path"], "launch_accepted_sha256"
+            ),
+            "launch_terminal": binding(
+                terminal_path, "launch_terminal_sha256"
+            ),
+            "wrapper_claim": claim_binding,
+            "startup_window_closed": True,
+            "released_at": utc_now(),
+        }
+        release["launch_ownership_release_sha256"] = digest(
+            release, "launch_ownership_release_sha256"
+        )
+        write_exclusive(context["release_path"], release)
+
+    thread = threading.Thread(target=accept_claim, daemon=True)
+    thread.start()
+    return thread
+
+
+def publish_observer_bootstrap(config: Path) -> None:
     raw_path = os.environ.get("SAFA_PREFLIGHT_OBSERVER_BOOTSTRAP_PATH")
     if raw_path is None:
         return
@@ -147,11 +854,15 @@ def publish_observer_bootstrap() -> None:
         "schema_version": 1,
         "contract_type": "safa_canonical_preflight_observer_bootstrap_v1",
         "policy_sha256": policy_sha256,
+        "verified_implementations": verified_implementations(config),
         "wrapper_claim": wrapper_binding,
         "observer_session": observer_session,
         "owner_nonce": owner_nonce,
         "process": process,
         "executable": executable,
+        "executable_identity": file_identity(
+            Path(executable).resolve(strict=True)
+        ),
         "command": command,
         "tmux": tmux,
         "published_at": utc_now(),
@@ -162,8 +873,10 @@ def publish_observer_bootstrap() -> None:
     write_exclusive(path, value)
 
 
-def observer(root: Path, mode: str, policy: str) -> int:
-    publish_observer_bootstrap()
+def observer(
+    root: Path, mode: str, policy: str, config: Path
+) -> int:
+    publish_observer_bootstrap(config)
     observer_session = current_observer_session()
     control = root / "preflight_control"
     launch_path = control / "observer_launch.json"
@@ -681,6 +1394,8 @@ def wrapper(args: argparse.Namespace) -> int:
                 raise RuntimeError("fixture snapshot validator failure")
 
             module._validate_terminal_stop_binding = reject_snapshot
+    if not args.supervised_child:
+        raise RuntimeError("wrapper fixture child is not supervised")
     value = module.run_wrapped_controller(
         repo_root=args.repo_root,
         policy_root=args.policy_root,
@@ -691,6 +1406,8 @@ def wrapper(args: argparse.Namespace) -> int:
             sys.executable,
             str(helper),
             "observer",
+            "--config",
+            str(args.config),
             "--policy-root",
             str(args.policy_root),
             "--policy",
@@ -739,6 +1456,10 @@ def controlled_probes(module: Any, *, violate_memory: bool) -> None:
 def production_role(args: argparse.Namespace) -> int:
     fixture = load(args.fixture)
     module = load_module(args.controller_module)
+    module._install_verified_preflight_contract_api(
+        module.REPO_ROOT
+        / "configs/closeout/canonical_screening_512_v1.json"
+    )
     if args.role == "observer":
         module._publish_preflight_observer_bootstrap_from_environment()
     contracts = importlib.import_module("safa.closeout.canonical_screening")
@@ -1130,6 +1851,10 @@ def production_wrapper(args: argparse.Namespace) -> int:
         module._terminate_bound_observer = (
             terminate_with_absent_snapshot
         )
+    if not args.supervised_child:
+        raise RuntimeError(
+            "production wrapper fixture child is not supervised"
+        )
     try:
         value = module.run_wrapped_controller(
             repo_root=args.repo_root,
@@ -1153,6 +1878,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="action", required=True)
     observe = sub.add_parser("observer")
+    observe.add_argument("--config", type=Path, required=True)
     observe.add_argument("--policy-root", type=Path, required=True)
     observe.add_argument("--policy", required=True)
     observe.add_argument(
@@ -1240,9 +1966,11 @@ def parse_args() -> argparse.Namespace:
     wrap.add_argument("--controller-seconds", type=float, default=0.2)
     wrap.add_argument("--controller-exit", type=int, default=0)
     wrap.add_argument("--terminal-timeout", type=float, default=3.0)
+    wrap.add_argument("--supervised-child", action="store_true")
     production = sub.add_parser("production-role")
     production.add_argument("--controller-module", type=Path, required=True)
     production.add_argument("--fixture", type=Path, required=True)
+    production.add_argument("--config", type=Path, required=True)
     production.add_argument(
         "--role", choices=("controller", "observer"), required=True
     )
@@ -1253,17 +1981,64 @@ def parse_args() -> argparse.Namespace:
     production_wrap.add_argument("--policy", required=True)
     production_wrap.add_argument("--config", type=Path, required=True)
     production_wrap.add_argument("--fixture", type=Path, required=True)
+    production_wrap.add_argument(
+        "--supervised-child", action="store_true"
+    )
     return parser.parse_args()
+
+
+def supervise_wrapper_action(args: argparse.Namespace) -> int:
+    module = load_module(args.wrapper_module)
+    child_arguments = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        *sys.argv[1:],
+        "--supervised-child",
+    ]
+    context = prepare_supervised_launcher_contract(
+        module=module,
+        repo_root=args.repo_root,
+        policy_root=args.policy_root,
+        policy_sha256=args.policy,
+        config=args.config,
+        wrapper_arguments=child_arguments,
+    )
+    environment = os.environ.copy()
+    environment.update(context["environment"])
+    child = subprocess.Popen(
+        child_arguments,
+        shell=False,
+        preexec_fn=os.setsid,
+        env=environment,
+    )
+    try:
+        complete_supervised_launcher_contract(context, child.pid)
+        return child.wait()
+    except BaseException:
+        if child.poll() is None:
+            os.killpg(child.pid, signal.SIGTERM)
+            try:
+                child.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                os.killpg(child.pid, signal.SIGKILL)
+                child.wait(timeout=1)
+        raise
 
 
 def main() -> int:
     args = parse_args()
     if args.action == "observer":
-        return observer(args.policy_root, args.mode, args.policy)
+        return observer(
+            args.policy_root, args.mode, args.policy, args.config
+        )
     if args.action == "production-role":
         return production_role(args)
     if args.action == "production-wrapper":
+        if not args.supervised_child:
+            return supervise_wrapper_action(args)
         return production_wrapper(args)
+    if not args.supervised_child:
+        return supervise_wrapper_action(args)
     return wrapper(args)
 
 

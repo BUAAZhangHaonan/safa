@@ -332,7 +332,15 @@
     },
     "screening_contracts": {
       "path": "src/safa/closeout/canonical_screening.py",
-        "sha256": "745d7c6a845f3ec5c60f8e1aa8b2d3d650ff0be1065860bb4ac5728fa1948c95"
+        "sha256": "4e3fb2dd8dab8523add51e1eecb26c556b5918123e9f639a3fae12690c50ff96"
+    },
+    "preflight_launch_contract": {
+      "path": "src/safa/closeout/preflight_launch_contract.py",
+      "sha256": "88a7278a28499c51f404893d0a38c870efb620ffe546d7e255cb533d79027992"
+    },
+    "preflight_verified_loader": {
+      "path": "src/safa/closeout/verified_preflight_module_loader.py",
+      "sha256": "fdcc23e389abbf2946da7341014db7f6903eabc287a96a5a59d5b1c54ae4000d"
     },
     "screening_worker": {
       "path": "src/safa/closeout/canonical_screening_worker.py",
@@ -340,15 +348,19 @@
     },
     "controller": {
       "path": "scripts/run_canonical_checkpoint_screening.py",
-      "sha256": "c12c1959caa575ae1dd9ec06dc0a7dfad7a7edce37290d95005c54c59f11f08f"
+      "sha256": "f88b16c2011b35394c621816a72e4f3ed5e05d174f1c817fca0029e04c7462da"
     },
     "ram_probe_launcher": {
       "path": "scripts/run_canonical_screening_ram_probe.py",
       "sha256": "f745fe38b8784a79668785d50bb4ccf1230db6ada4baa4b7560639aae9b1b211"
     },
+    "preflight_launcher": {
+      "path": "scripts/run_canonical_preflight_launcher.py",
+      "sha256": "bc6d157fa1f999994fdb9e4e320ca98fae6581faa1533de68c1d5198b777d739"
+    },
     "preflight_wrapper": {
       "path": "scripts/run_canonical_preflight_wrapper.py",
-      "sha256": "0f6cdb4b83a17604558ce04235f4182b206372c3a1fd74b3caced7ee841190be"
+      "sha256": "d9dcc256c902b9e3a1c7d08149fab611a4fb79624ec3a6f12f9e6a4ba13d8eb9"
     },
     "gpu_wrapper": {
       "path": "scripts/run_canonical_gpu_wrapper.py",
