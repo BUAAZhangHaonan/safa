@@ -327,7 +327,7 @@ def test_postclaim_v5_profile_is_one_exact_non_mixing_stack() -> None:
     )
 
 
-def test_postclaim_node1_contract_is_pure_and_disconnected() -> None:
+def test_postclaim_contract_is_pure_and_node2_is_unreachable() -> None:
     path = Path(contract.__file__)
     tree = ast.parse(path.read_text(encoding="utf-8"))
     imported_roots: set[str] = set()
@@ -347,7 +347,7 @@ def test_postclaim_node1_contract_is_pure_and_disconnected() -> None:
     launcher_tree = ast.parse(
         launcher_path.read_text(encoding="utf-8")
     )
-    production_calls = {
+    all_calls = {
         node.func.id
         for node in ast.walk(launcher_tree)
         if isinstance(node, ast.Call)
@@ -362,4 +362,42 @@ def test_postclaim_node1_contract_is_pure_and_disconnected() -> None:
             "validate_launch_receipt_v5",
         }
     }
-    assert production_calls == set()
+    assert all_calls == {
+        "build_lifecycle_raw_wait_v3",
+        "validate_lifecycle_raw_wait_v3",
+        "build_lifecycle_raw_wait_publish_failure_v1",
+        "validate_lifecycle_raw_wait_publish_failure_v1",
+        "validate_launch_receipt_v5",
+    }
+    assert "build_launch_receipt_v5" not in all_calls
+    functions = {
+        node.name: node
+        for node in launcher_tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    edges = {
+        name: {
+            call.func.id
+            for call in ast.walk(node)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id in functions
+        }
+        for name, node in functions.items()
+    }
+    reachable: set[str] = set()
+    pending = ["main", "launch_preflight"]
+    while pending:
+        name = pending.pop()
+        if name in reachable:
+            continue
+        reachable.add(name)
+        pending.extend(edges.get(name, set()) - reachable)
+    node2_functions = {
+        "_write_lifecycle_raw_wait_v3",
+        "_write_lifecycle_raw_wait_publish_failure_v1",
+        "_require_empty_lifecycle_raw_wait_publish_fault_channel",
+        "_publish_gate_raw_wait_after_reap",
+        "_gate_wait_supervisor_v5_reap_and_publish_unconnected",
+    }
+    assert node2_functions.isdisjoint(reachable)

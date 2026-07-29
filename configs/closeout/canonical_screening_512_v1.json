@@ -356,7 +356,7 @@
     },
     "preflight_launcher": {
       "path": "scripts/run_canonical_preflight_launcher.py",
-      "sha256": "43a0c62906d6e77f8661ffe61d57a8e7ae45548f89fd1b576eae4924ece8e617"
+      "sha256": "fa0ee1257f722188a04ad3ca8388eeb89162b93e55ffbcaa64ef54c9d6500357"
     },
     "preflight_wrapper": {
       "path": "scripts/run_canonical_preflight_wrapper.py",

@@ -36,6 +36,8 @@ if TYPE_CHECKING:
         build_finalization_secondary_failure,
         build_gate_ready,
         build_invalid_claim_evidence,
+        build_lifecycle_raw_wait_publish_failure_v1,
+        build_lifecycle_raw_wait_v3,
         build_lifecycle_wait_status,
         build_launch_accepted,
         build_launch_terminal_v2,
@@ -57,8 +59,11 @@ if TYPE_CHECKING:
         validate_artifact_binding,
         validate_file_identity,
         validate_gate_ready,
+        validate_launch_receipt_v5,
         validate_launch_receipt_schema,
         validate_launch_terminal_v2,
+        validate_lifecycle_raw_wait_publish_failure_v1,
+        validate_lifecycle_raw_wait_v3,
         validate_lifecycle_wait_status,
         validate_ownership_chain,
         validate_pane_fault_consumer_chain,
@@ -1882,6 +1887,10 @@ class LauncherExclusivePublishError(RuntimeError):
         )
 
 
+class LifecycleRawWaitPublishError(LauncherExclusivePublishError):
+    """A raw wait channel publication has one typed terminal state."""
+
+
 class LauncherTerminalPublishError(OSError):
     """A terminal publication failed before a typed commit state existed."""
 
@@ -1905,6 +1914,503 @@ class LauncherTerminalPublishError(OSError):
                 message=str(failure),
             )
         )
+
+
+def _write_lifecycle_raw_wait_v3(
+    descriptor: int,
+    directory_descriptor: int,
+    binding: Mapping[str, Any],
+    value: Mapping[str, Any],
+    *,
+    role: str,
+) -> dict[str, Any]:
+    """Publish one raw wait frame without reusing v4 adjudication."""
+    record = validate_lifecycle_raw_wait_v3(
+        value,
+        role=role,
+        label=f"{role} lifecycle raw wait writer",
+    )
+    if record["wait_channel"] != dict(binding):
+        raise RuntimeError(
+            "lifecycle raw wait channel binding differs before write"
+        )
+    body, commit, frame = _build_lifecycle_wait_channel_frame(
+        record
+    )
+    payload_seal = {
+        "size": len(frame),
+        "sha256": hashlib.sha256(frame).hexdigest(),
+        "body_size": len(body),
+        "body_sha256": hashlib.sha256(body).hexdigest(),
+        "commit_size": len(commit),
+        "commit_sha256": hashlib.sha256(commit).hexdigest(),
+        "record_sha256": record["lifecycle_raw_wait_sha256"],
+    }
+    directory = os.fstat(directory_descriptor)
+    directory_seal = {
+        "device": int(directory.st_dev),
+        "inode": int(directory.st_ino),
+        "uid": int(directory.st_uid),
+        "mode": int(stat.S_IMODE(directory.st_mode)),
+    }
+    committed = False
+
+    def typed_failure(
+        commit_state: str,
+        stage: str,
+        message: str,
+        cause: BaseException | None = None,
+    ) -> LifecycleRawWaitPublishError:
+        return LifecycleRawWaitPublishError(
+            commit_state,
+            message,
+            stage=stage,
+            directory_seal=directory_seal,
+            payload=payload_seal,
+            temporary=None,
+            error_number=(
+                cause.errno if isinstance(cause, OSError) else None
+            ),
+            quarantined=commit_state
+            in {
+                "durability_unknown_quarantined",
+                "committed_cleanup_error",
+            },
+        )
+
+    try:
+        if (
+            fcntl.fcntl(descriptor, fcntl.F_GETFL)
+            & os.O_DSYNC
+        ) == 0:
+            raise typed_failure(
+                "precommit_failed_clean",
+                "descriptor_flags",
+                "lifecycle raw wait channel descriptor is not O_DSYNC",
+            )
+        try:
+            before = _require_named_lifecycle_wait_channel(
+                descriptor,
+                binding,
+                directory_descriptor=directory_descriptor,
+            )
+        except BaseException as exc:
+            raise typed_failure(
+                "collision",
+                "prewrite_identity",
+                "lifecycle raw wait channel identity differs",
+                exc,
+            ) from exc
+        if before.st_size != 0:
+            try:
+                existing = os.pread(
+                    descriptor, before.st_size, 0
+                )
+                after = _require_named_lifecycle_wait_channel(
+                    descriptor,
+                    binding,
+                    directory_descriptor=directory_descriptor,
+                    expected_size=before.st_size,
+                )
+            except BaseException as exc:
+                raise typed_failure(
+                    "collision",
+                    "existing_raw_wait_verify",
+                    "existing lifecycle raw wait cannot be verified",
+                    exc,
+                ) from exc
+            if (
+                before.st_dev == after.st_dev
+                and before.st_ino == after.st_ino
+                and before.st_mode == after.st_mode
+                and before.st_uid == after.st_uid
+                and before.st_nlink == after.st_nlink
+                and before.st_size == after.st_size
+                and existing == frame
+            ):
+                return record
+            raise typed_failure(
+                "collision",
+                "prewrite_nonempty",
+                "lifecycle raw wait channel is already claimed",
+            )
+        _pwrite_all(
+            descriptor,
+            body,
+            0,
+            label="lifecycle raw wait channel body",
+        )
+        os.fsync(descriptor)
+        _require_named_lifecycle_wait_channel(
+            descriptor,
+            binding,
+            directory_descriptor=directory_descriptor,
+            expected_size=len(body),
+        )
+        if os.pread(descriptor, len(body), 0) != body:
+            raise RuntimeError(
+                "lifecycle raw wait channel body differs"
+            )
+        _pwrite_all(
+            descriptor,
+            commit,
+            len(body),
+            label="lifecycle raw wait channel commit",
+        )
+        # O_DSYNC makes the successful commit write the durability
+        # boundary. No fallible protocol action may precede this write.
+        committed = True
+        _require_named_lifecycle_wait_channel(
+            descriptor,
+            binding,
+            directory_descriptor=directory_descriptor,
+            expected_size=len(frame),
+        )
+        if os.pread(descriptor, len(frame), 0) != frame:
+            raise RuntimeError(
+                "lifecycle raw wait channel frame differs"
+            )
+        return record
+    except LifecycleRawWaitPublishError:
+        raise
+    except BaseException as exc:
+        try:
+            observed = os.fstat(descriptor)
+            clean = (
+                observed.st_dev == binding["device"]
+                and observed.st_ino == binding["inode"]
+                and observed.st_size == 0
+            )
+        except BaseException:
+            clean = False
+        state = (
+            "committed_cleanup_error"
+            if committed
+            else (
+                "precommit_failed_clean"
+                if clean
+                else "durability_unknown_quarantined"
+            )
+        )
+        raise typed_failure(
+            state,
+            (
+                "postcommit_verify"
+                if committed
+                else "raw_wait_publish"
+            ),
+            str(exc),
+            exc,
+        ) from exc
+
+
+def _write_lifecycle_raw_wait_publish_failure_v1(
+    descriptor: int,
+    binding: Mapping[str, Any],
+    *,
+    role: str,
+    policy_sha256: str,
+    attempt_id: str,
+    source_artifact: Mapping[str, Any],
+    target_channel: Mapping[str, Any],
+    publisher: Mapping[str, Any],
+    supervisor_owner_seal: Mapping[str, Any],
+    child_process: Mapping[str, Any],
+    intended_raw_wait_sha256: str,
+    failure: LifecycleRawWaitPublishError,
+) -> dict[str, Any]:
+    publish_failure = build_publish_failure_record(
+        commit_state=failure.commit_state,
+        stage=failure.stage,
+        message=str(failure),
+        directory_seal=failure.directory_seal,
+        payload=failure.payload,
+        temporary=failure.temporary,
+        error_number=failure.error_number,
+        secondary_failures=list(failure.secondary_failures),
+    )
+    record = build_lifecycle_raw_wait_publish_failure_v1(
+        role=role,
+        policy_sha256=policy_sha256,
+        attempt_id=attempt_id,
+        source_artifact=source_artifact,
+        target_channel=target_channel,
+        fault_channel=binding,
+        publisher=publisher,
+        supervisor_owner_seal=supervisor_owner_seal,
+        child_process=child_process,
+        intended_raw_wait_sha256=intended_raw_wait_sha256,
+        publish_failure=publish_failure,
+        recorded_at=_utc_now(),
+    )
+    record = validate_lifecycle_raw_wait_publish_failure_v1(
+        record,
+        role=role,
+        label=f"{role} lifecycle raw wait publish fault writer",
+    )
+    payload = _canonical_json_bytes(record)
+    frame = (
+        FAULT_CHANNEL_PREFIX
+        + f"{len(payload):08x}\n".encode("ascii")
+        + payload
+        + FAULT_CHANNEL_SHA_PREFIX
+        + hashlib.sha256(payload).hexdigest().encode("ascii")
+        + b"\n"
+    )
+    if len(frame) > FAULT_CHANNEL_MAX_RECORD_BYTES:
+        raise RuntimeError(
+            "lifecycle raw wait publish fault exceeds bound"
+        )
+    path = Path(str(binding["path"]))
+    before = os.fstat(descriptor)
+    named = path.lstat()
+    if (
+        before.st_dev != binding["device"]
+        or before.st_ino != binding["inode"]
+        or before.st_mode != binding["mode"]
+        or before.st_uid != binding["uid"]
+        or before.st_nlink != 1
+        or before.st_size != 0
+        or named.st_dev != before.st_dev
+        or named.st_ino != before.st_ino
+        or named.st_mode != before.st_mode
+        or named.st_uid != before.st_uid
+        or named.st_nlink != before.st_nlink
+        or named.st_size != before.st_size
+    ):
+        raise RuntimeError(
+            "lifecycle raw wait publish fault channel changed"
+        )
+    _pwrite_all(
+        descriptor,
+        frame,
+        0,
+        label="lifecycle raw wait publish fault channel",
+    )
+    os.fsync(descriptor)
+    after = os.fstat(descriptor)
+    named_after = path.lstat()
+    if (
+        after.st_dev != before.st_dev
+        or after.st_ino != before.st_ino
+        or after.st_mode != before.st_mode
+        or after.st_uid != before.st_uid
+        or after.st_nlink != before.st_nlink
+        or after.st_size != len(frame)
+        or named_after.st_dev != after.st_dev
+        or named_after.st_ino != after.st_ino
+        or named_after.st_size != after.st_size
+        or os.pread(descriptor, len(frame), 0) != frame
+    ):
+        raise RuntimeError(
+            "lifecycle raw wait publish fault write differs"
+        )
+    return record
+
+
+def _require_empty_lifecycle_raw_wait_publish_fault_channel(
+    descriptor: int,
+    binding: Mapping[str, Any],
+    *,
+    intended_raw_wait_sha256: str,
+) -> None:
+    path = Path(str(binding["path"]))
+    try:
+        opened = os.fstat(descriptor)
+        named = path.lstat()
+    except BaseException as exc:
+        raise LifecycleRawWaitPublishError(
+            "collision",
+            "raw wait publish fault authority cannot be verified",
+            stage="preexisting_publish_fault_identity",
+            directory_seal={
+                "device": int(binding["directory_device"]),
+                "inode": int(binding["directory_inode"]),
+            },
+            payload={
+                "intended_raw_wait_sha256": (
+                    intended_raw_wait_sha256
+                )
+            },
+            temporary=None,
+            error_number=(
+                exc.errno if isinstance(exc, OSError) else None
+            ),
+            quarantined=False,
+        ) from exc
+    if (
+        opened.st_dev != binding["device"]
+        or opened.st_ino != binding["inode"]
+        or opened.st_mode != binding["mode"]
+        or opened.st_uid != binding["uid"]
+        or opened.st_nlink != 1
+        or named.st_dev != opened.st_dev
+        or named.st_ino != opened.st_ino
+        or named.st_mode != opened.st_mode
+        or named.st_uid != opened.st_uid
+        or named.st_nlink != opened.st_nlink
+        or named.st_size != opened.st_size
+        or opened.st_size != 0
+    ):
+        raise LifecycleRawWaitPublishError(
+            "collision",
+            "raw wait publish fault channel is not empty and exact",
+            stage="preexisting_publish_fault",
+            directory_seal={
+                "device": int(binding["directory_device"]),
+                "inode": int(binding["directory_inode"]),
+            },
+            payload={
+                "intended_raw_wait_sha256": (
+                    intended_raw_wait_sha256
+                )
+            },
+            temporary=None,
+            error_number=None,
+            quarantined=False,
+        )
+
+
+def _publish_gate_raw_wait_after_reap(
+    *,
+    channel_descriptor: int,
+    directory_descriptor: int,
+    fault_descriptor: int,
+    receipt_path: Path,
+    receipt: Mapping[str, Any],
+    attempt_id: str,
+    owner_seal: Mapping[str, Any],
+    child_process: Mapping[str, Any],
+    info: Any,
+    waited_pid: int,
+    raw_status: int,
+    started_at: str,
+    reaped_at: str,
+) -> dict[str, Any]:
+    source_artifact = _sealed_lifecycle_artifact(
+        receipt_path,
+        digest_field="launch_receipt_sha256",
+        kind="launch_receipt",
+    )
+    record = build_lifecycle_raw_wait_v3(
+        role="gate",
+        policy_sha256=str(receipt["policy_sha256"]),
+        attempt_id=attempt_id,
+        source_artifact=source_artifact,
+        wait_channel=receipt["gate_lifecycle_wait_channel"],
+        publisher=receipt["gate_lifecycle_wait_publisher"],
+        supervisor_owner_seal=owner_seal,
+        child_process=child_process,
+        waitid_si_pid=int(info.si_pid),
+        waitid_si_code=int(info.si_code),
+        waitid_si_status=int(info.si_status),
+        waited_pid=waited_pid,
+        wait_status_raw=raw_status,
+        started_at=started_at,
+        reaped_at=reaped_at,
+    )
+    _require_empty_lifecycle_raw_wait_publish_fault_channel(
+        fault_descriptor,
+        receipt["gate_lifecycle_wait_publish_fault_channel"],
+        intended_raw_wait_sha256=record[
+            "lifecycle_raw_wait_sha256"
+        ],
+    )
+    try:
+        return _write_lifecycle_raw_wait_v3(
+            channel_descriptor,
+            directory_descriptor,
+            receipt["gate_lifecycle_wait_channel"],
+            record,
+            role="gate",
+        )
+    except LifecycleRawWaitPublishError as failure:
+        if failure.commit_state == "precommit_failed_clean":
+            try:
+                _write_lifecycle_raw_wait_publish_failure_v1(
+                    fault_descriptor,
+                    receipt[
+                        "gate_lifecycle_wait_publish_fault_channel"
+                    ],
+                    role="gate",
+                    policy_sha256=str(receipt["policy_sha256"]),
+                    attempt_id=attempt_id,
+                    source_artifact=source_artifact,
+                    target_channel=receipt[
+                        "gate_lifecycle_wait_channel"
+                    ],
+                    publisher=receipt[
+                        "gate_lifecycle_wait_publisher"
+                    ],
+                    supervisor_owner_seal=owner_seal,
+                    child_process=child_process,
+                    intended_raw_wait_sha256=record[
+                        "lifecycle_raw_wait_sha256"
+                    ],
+                    failure=failure,
+                )
+            except BaseException as secondary:
+                failure.add_secondary_failure(
+                    stage="raw_wait_publish_fault",
+                    failure=secondary,
+                )
+        raise
+
+
+def _gate_wait_supervisor_v5_reap_and_publish_unconnected(
+    *,
+    child: subprocess.Popen[Any],
+    channel_descriptor: int,
+    directory_descriptor: int,
+    fault_descriptor: int,
+    receipt_path: Path,
+    receipt: Mapping[str, Any],
+    attempt_id: str,
+    owner_seal: Mapping[str, Any],
+    child_process: Mapping[str, Any],
+    gate_worker_arguments: Sequence[str],
+    started_at: str,
+    post_raw_adjudicator: Callable[[Any, int, int], Any],
+) -> tuple[Any, int, int, dict[str, Any], Any]:
+    """Exercise the v5 gate boundary without production dispatch."""
+    validate_launch_receipt_v5(
+        receipt,
+        expected_gate_worker_arguments=gate_worker_arguments,
+        expected_consumer_worker_arguments=(
+            _expected_consumer_worker_arguments_from_receipt(receipt)
+        ),
+        label="unconnected gate wait supervisor receipt v5",
+    )
+    if receipt.get("attempt_id") != attempt_id:
+        raise RuntimeError(
+            "unconnected gate wait supervisor attempt differs"
+        )
+    info, waited_pid, raw_status = _waitid_then_waitpid(child)
+    raw_wait = _publish_gate_raw_wait_after_reap(
+        channel_descriptor=channel_descriptor,
+        directory_descriptor=directory_descriptor,
+        fault_descriptor=fault_descriptor,
+        receipt_path=receipt_path,
+        receipt=receipt,
+        attempt_id=attempt_id,
+        owner_seal=owner_seal,
+        child_process=child_process,
+        info=info,
+        waited_pid=waited_pid,
+        raw_status=raw_status,
+        started_at=started_at,
+        reaped_at=_utc_now(),
+    )
+    adjudication = post_raw_adjudicator(
+        info, waited_pid, raw_status
+    )
+    return (
+        info,
+        waited_pid,
+        raw_status,
+        raw_wait,
+        adjudication,
+    )
 
 
 class LauncherGateFaultError(RuntimeError):
