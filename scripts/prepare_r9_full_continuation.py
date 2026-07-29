@@ -514,8 +514,14 @@ def _run_e2e(driver) -> dict:
     scheduler, gpu_bindings, peer_status_store = driver.build_resource_scheduler(
         campaign_runtime
     )
+    e2e_bootstrap = driver._mapping(
+        campaign_runtime.get("full_e2e_bootstrap"), "Full E2E bootstrap"
+    )
+    resource_policy = driver._mapping(
+        e2e_bootstrap.get("resource_policy"), "Full E2E resource policy"
+    )
     runtime_guard = driver.FullRuntimeGuard(
-        plan["e2e_request"]["resource_policy"],
+        resource_policy,
         monitor_path=root / "monitor/resource_samples.jsonl",
     )
     scheduler_admission = _pre_admit_e2e_plan(

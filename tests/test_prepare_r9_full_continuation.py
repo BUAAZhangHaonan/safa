@@ -46,6 +46,60 @@ def test_e2e_run_requires_tmux_before_any_gpu_work(
         cli._run_e2e(object())
 
 
+def test_e2e_run_uses_bound_runtime_resource_policy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class StopAfterGuard(RuntimeError):
+        pass
+
+    captured: dict[str, dict] = {}
+
+    class Guard:
+        def __init__(self, policy: dict, *, monitor_path: Path) -> None:
+            captured["policy"] = policy
+            captured["monitor_path"] = {"path": str(monitor_path)}
+            raise StopAfterGuard
+
+    class Driver:
+        REPO_ROOT = tmp_path
+        FULL_CONTINUATION_CHILD_CAMPAIGN_ID = "r9-report-only-formal-v9"
+        FullRuntimeGuard = Guard
+
+        @staticmethod
+        def _full_admission_preflight() -> dict:
+            return {}
+
+        @staticmethod
+        def build_resource_scheduler(runtime: dict):
+            del runtime
+            return object(), {}, object()
+
+        @staticmethod
+        def _mapping(value, label: str) -> dict:
+            if not isinstance(value, dict):
+                raise ValueError(label)
+            return dict(value)
+
+    policy = {"gpu_indices": [0, 1, 2, 3], "retry_count": 0}
+    runtime = {"full_e2e_bootstrap": {"resource_policy": policy}}
+    plan = {
+        "full_e2e_plan_sha256": "a" * 64,
+        "e2e_request": {"path": "frozen.yaml", "file_sha256": "b" * 64},
+    }
+    monkeypatch.setenv("TMUX", "test")
+    monkeypatch.setattr(
+        cli,
+        "_load_effective_runtime",
+        lambda driver, *, allow_provisional: runtime,
+    )
+    monkeypatch.setattr(cli, "_load_e2e_plan", lambda driver: plan)
+
+    with pytest.raises(StopAfterGuard):
+        cli._run_e2e(Driver)
+
+    assert captured["policy"] == policy
+
+
 def test_e2e_prepare_dry_run_has_zero_writes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
