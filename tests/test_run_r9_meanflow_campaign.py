@@ -2795,6 +2795,46 @@ def test_launch_ordinals_are_stable_across_phase_invocation_modes() -> None:
     assert driver._stable_launch_ordinal("full", 0) == 40_000
 
 
+def test_full_admission_ignores_temperatures_for_unselected_gpus() -> None:
+    class Probe:
+        @staticmethod
+        def ram_snapshot():
+            return SimpleNamespace(used_bytes=10, total_bytes=100)
+
+        @staticmethod
+        def gpu_snapshots():
+            return tuple(
+                SimpleNamespace(
+                    index=index,
+                    uuid=f"GPU-{index}",
+                    total_bytes=4 * 1024**3,
+                    free_bytes=3 * 1024**3,
+                )
+                for index in range(4)
+            )
+
+    admission = driver._full_admission_preflight(
+        resource_probe=Probe(),
+        compute_apps=(),
+        temperatures={
+            "GPU-0": 40,
+            "GPU-1": 40,
+            "GPU-2": 40,
+            "GPU-3": 40,
+            "GPU-4": 95,
+        },
+        disk_usage=SimpleNamespace(used=10, total=100),
+        swap_io_delta=(0, 0),
+    )
+
+    assert admission["temperatures_c"] == {
+        "GPU-0": 40,
+        "GPU-1": 40,
+        "GPU-2": 40,
+        "GPU-3": 40,
+    }
+
+
 def test_full_runtime_guard_hard_stops_on_sustained_host_cpu(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

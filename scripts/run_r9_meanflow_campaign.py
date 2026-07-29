@@ -3266,11 +3266,16 @@ def _full_admission_preflight(
             "Full admission found unknown GPU compute PIDs: "
             + ",".join(f"{uuid}:{pid}" for uuid, pid in unknown)
         )
-    observed_temperatures = (
+    all_temperatures = (
         dict(temperatures)
         if temperatures is not None
         else _query_gpu_temperatures()
     )
+    observed_temperatures = {
+        uuid: all_temperatures[uuid]
+        for uuid in selected_uuids
+        if uuid in all_temperatures
+    }
     if set(observed_temperatures) != selected_uuids:
         raise ResourceContractError("Full admission GPU temperature set changed")
     if any(value > 85 for value in observed_temperatures.values()):
