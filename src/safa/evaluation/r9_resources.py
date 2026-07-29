@@ -193,6 +193,19 @@ class LockAcquireResult:
 
 
 @dataclass(frozen=True)
+class LegacyLeaseRecovery:
+    """Evidence emitted by the one-off recovery of an abandoned lease."""
+
+    lock_path: Path
+    receipt_path: Path
+    raw_lease_sha256: str
+    stale_lease: SlotLease
+    legacy_pid: int
+    legacy_process_start_ticks: int
+    observed_process_start_ticks: int | None
+
+
+@dataclass(frozen=True)
 class WorkerRequest:
     worker_id: str
     gpu_index: int
@@ -493,6 +506,85 @@ class FcntlSlotLockBackend:
             raise ResourceContractError("slot index exceeds the R9 per-GPU limit")
         uuid_digest = hashlib.sha256(gpu_uuid.encode("utf-8")).hexdigest()[:24]
         return self.root / f"gpu_{uuid_digest}.slot_{slot_index}.lock"
+
+    def recover_legacy_lease(
+        self,
+        *,
+        expected_stale: SlotLease,
+        expected_raw_sha256: str,
+        legacy_pid: int,
+        legacy_process_start_ticks: int,
+        receipt_path: Path,
+        proc_root: Path = Path("/proc"),
+    ) -> LegacyLeaseRecovery:
+        """Clear one audited legacy lease after durable recovery evidence exists.
+
+        This is deliberately separate from normal terminal-peer reclaim.  The
+        caller must bind the exact stale bytes, lease, and departed process
+        identity; this method never creates a worker-status record.
+        """
+
+        _require_sha256(expected_raw_sha256, "legacy raw lease SHA256")
+        _require_positive_int(legacy_pid, "legacy worker PID")
+        _require_positive_int(
+            legacy_process_start_ticks, "legacy worker process start ticks"
+        )
+        key = (expected_stale.gpu_uuid, expected_stale.slot_index)
+        if key in self._held:
+            raise SlotUnavailableError("legacy slot is held locally")
+        lock_path = self.lock_path(
+            gpu_uuid=expected_stale.gpu_uuid,
+            slot_index=expected_stale.slot_index,
+        )
+        fd = os.open(lock_path, os.O_RDWR)
+        if not _try_flock(fd):
+            os.close(fd)
+            raise SlotUnavailableError("legacy slot is held by another process")
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            raw = os.read(fd, 64 * 1024)
+            actual_raw_sha256 = hashlib.sha256(raw).hexdigest()
+            if actual_raw_sha256 != expected_raw_sha256:
+                raise ResourceContractError("legacy slot lease bytes changed")
+            try:
+                actual = SlotLease.from_payload(json.loads(raw.decode("utf-8")))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ResourceContractError("legacy slot lease file is corrupt") from error
+            if actual != expected_stale:
+                raise ResourceContractError("legacy slot lease payload changed")
+            observed_ticks = _read_process_start_ticks(proc_root, legacy_pid)
+            if observed_ticks == legacy_process_start_ticks:
+                raise ResourceContractError("legacy worker process is still live")
+            receipt = {
+                "schema_version": 1,
+                "contract_type": "safa_r9_legacy_slot_recovery_v1",
+                "lock_path": str(lock_path),
+                "raw_lease_sha256": actual_raw_sha256,
+                "stale_lease": actual.to_payload(),
+                "legacy_pid": legacy_pid,
+                "legacy_process_start_ticks": legacy_process_start_ticks,
+                "observed_process_start_ticks": observed_ticks,
+            }
+            receipt["recovery_receipt_sha256"] = _canonical_json_sha256(receipt)
+            _write_exclusive_bytes(
+                Path(receipt_path),
+                json.dumps(
+                    receipt, sort_keys=True, separators=(",", ":"), allow_nan=False
+                ).encode("utf-8")
+                + b"\n",
+            )
+            _clear_lease_fd(fd)
+        finally:
+            _unlock_and_close(fd)
+        return LegacyLeaseRecovery(
+            lock_path=lock_path,
+            receipt_path=Path(receipt_path),
+            raw_lease_sha256=actual_raw_sha256,
+            stale_lease=actual,
+            legacy_pid=legacy_pid,
+            legacy_process_start_ticks=legacy_process_start_ticks,
+            observed_process_start_ticks=observed_ticks,
+        )
 
     def try_acquire(self, lease: SlotLease) -> LockAcquireResult:
         key = (lease.gpu_uuid, lease.slot_index)
@@ -1168,6 +1260,26 @@ def _write_all(fd: int, payload: bytes) -> None:
         if written <= 0:
             raise OSError("slot lease write made no progress")
         remaining = remaining[written:]
+
+
+def _canonical_json_sha256(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def _write_exclusive_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        _write_all(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _fsync_directory(path.parent)
 
 
 def _fsync_directory(path: Path) -> None:

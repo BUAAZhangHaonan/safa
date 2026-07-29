@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -377,6 +378,32 @@ def test_stale_lease_requires_terminal_peer_before_exact_reclaim(
     )
     assert reclaimed.status is LockAcquireStatus.RECLAIMED
     backend.release(new)
+
+
+def test_legacy_recovery_writes_receipt_before_clearing_exact_stale_lease(
+    tmp_path: Path,
+) -> None:
+    backend = FcntlSlotLockBackend(tmp_path / "locks")
+    stale = _lease("evaluator-smoke:arcface", campaign="r9-report-only-formal-v9")
+    _write_unlocked_lease(backend, stale)
+    lock_path = backend.lock_path(gpu_uuid=stale.gpu_uuid, slot_index=stale.slot_index)
+    raw_sha256 = hashlib.sha256(lock_path.read_bytes()).hexdigest()
+    receipt_path = tmp_path / "receipts" / "legacy.json"
+
+    recovered = backend.recover_legacy_lease(
+        expected_stale=stale,
+        expected_raw_sha256=raw_sha256,
+        legacy_pid=707,
+        legacy_process_start_ticks=7_070,
+        receipt_path=receipt_path,
+        proc_root=tmp_path / "proc",
+    )
+
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert recovered.raw_lease_sha256 == raw_sha256
+    assert receipt["raw_lease_sha256"] == raw_sha256
+    assert receipt["stale_lease"] == stale.to_payload()
+    assert lock_path.read_bytes() == b""
 
 
 def test_scheduler_admits_four_slots_on_each_of_four_uuid_bound_gpus(

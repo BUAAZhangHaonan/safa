@@ -15,6 +15,7 @@ from typing import Sequence
 
 import yaml
 
+from safa.evaluation.r9_resources import FcntlSlotLockBackend, SlotLease
 from safa.evaluation.r9_full_continuation_contracts import (
     full_continuation_contract_binding,
     full_selection_binding,
@@ -23,6 +24,22 @@ from safa.evaluation.r9_full_continuation_contracts import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DRIVER_PATH = REPO_ROOT / "scripts/run_r9_meanflow_campaign.py"
+_LEGACY_SLOT_ROOT = Path("/tmp/safa-r9-gpu-slots-v1")
+_LEGACY_SLOT_RAW_SHA256 = (
+    "f68981a937e02e05fbaab5248d92d274827ba509332f04bf6208222e53797d7b"
+)
+_LEGACY_SLOT_LEASE = SlotLease(
+    campaign_id="r9-report-only-formal-v9",
+    worker_id="evaluator-smoke:arcface",
+    gpu_uuid="GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6",
+    slot_index=0,
+    resource_contract_sha256=(
+        "5594e0ab1dd5c0727ba4b5eb4356a83de97069a3b30931e195648b86b924751d"
+    ),
+    launch_ordinal=0,
+    ram_slot_budget_bytes=1_721_296_896,
+)
+_LEGACY_WORKER_PID = 3_615_176
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -31,6 +48,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--phase",
         choices=(
             "evaluator-smoke-requests",
+            "legacy-lease-recovery",
             "e2e-prepare",
             "e2e-run",
             "e2e-finalize",
@@ -41,6 +59,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         required=True,
     )
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--legacy-worker-start-ticks", type=int)
     return parser.parse_args(argv)
 
 
@@ -57,6 +76,18 @@ def _driver():
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     driver = _driver()
+    if args.phase == "legacy-lease-recovery":
+        if not args.execute:
+            raise RuntimeError("legacy-lease-recovery requires --execute")
+        if args.legacy_worker_start_ticks is None:
+            raise RuntimeError(
+                "legacy-lease-recovery requires --legacy-worker-start-ticks"
+            )
+        result = _recover_legacy_lease(
+            driver, legacy_process_start_ticks=args.legacy_worker_start_ticks
+        )
+        print(json.dumps(result, sort_keys=True))
+        return 0
     if args.phase == "evaluator-smoke-requests":
         runtime, request_path, source = driver.load_full_continuation_request(
             allow_pre_e2e_profiles=True
@@ -185,6 +216,28 @@ def _e2e_root(driver) -> Path:
         / driver.FULL_CONTINUATION_CHILD_CAMPAIGN_ID
         / "full_e2e"
     )
+
+
+def _recover_legacy_lease(driver, *, legacy_process_start_ticks: int) -> dict:
+    recovery = FcntlSlotLockBackend(_LEGACY_SLOT_ROOT).recover_legacy_lease(
+        expected_stale=_LEGACY_SLOT_LEASE,
+        expected_raw_sha256=_LEGACY_SLOT_RAW_SHA256,
+        legacy_pid=_LEGACY_WORKER_PID,
+        legacy_process_start_ticks=legacy_process_start_ticks,
+        receipt_path=_e2e_root(driver) / "legacy_lease_recovery.json",
+    )
+    return {
+        "status": "legacy_lease_recovered",
+        "lock_path": str(recovery.lock_path),
+        "receipt_path": str(recovery.receipt_path),
+        "raw_lease_sha256": recovery.raw_lease_sha256,
+        "legacy_pid": recovery.legacy_pid,
+        "legacy_process_start_ticks": recovery.legacy_process_start_ticks,
+        "observed_process_start_ticks": recovery.observed_process_start_ticks,
+        "artifact_write_count": 1,
+        "generation_execution_count": 0,
+        "evaluator_execution_count": 0,
+    }
 
 
 def _provisional_runtime_path(driver) -> Path:
