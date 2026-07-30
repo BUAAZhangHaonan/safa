@@ -218,12 +218,86 @@ def test_materializer_rejects_duplicate_nonfinite_and_preserves_null() -> None:
     }
     with pytest.raises(TriangleScreeningError, match="finite"):
         module._identity_cosines(exact, label="ArcFace")
-    unavailable = {
-        "source_face_count": 0,
+    missing_candidate = {
+        "source_face_count": 1,
+        "native_face_count": 1,
+        "candidate_face_count": 0,
+        "source_native_cosine": 0.2,
+        "source_candidate_cosine": None,
+    }
+    assert module._identity_cosines(
+        missing_candidate, label="ArcFace"
+    ) == (0.2, None)
+    missing_native = {
+        "source_face_count": 1,
+        "native_face_count": 0,
+        "candidate_face_count": 1,
+        "source_native_cosine": None,
+        "source_candidate_cosine": 0.3,
+    }
+    assert module._identity_cosines(
+        missing_native, label="ArcFace"
+    ) == (None, 0.3)
+    all_exact = {
+        "source_face_count": 1,
         "native_face_count": 1,
         "candidate_face_count": 1,
+        "source_native_cosine": -0.2,
+        "source_candidate_cosine": 0.3,
     }
-    assert module._identity_cosines(unavailable, label="ArcFace") == (None, None)
-    unavailable["source_native_cosine"] = 0.1
-    with pytest.raises(TriangleScreeningError, match="must omit"):
-        module._identity_cosines(unavailable, label="ArcFace")
+    assert module._identity_cosines(all_exact, label="ArcFace") == (-0.2, 0.3)
+    for legacy_field in ("native_cosine", "candidate_cosine"):
+        legacy = dict(all_exact)
+        legacy[legacy_field] = legacy.pop(
+            "source_native_cosine"
+            if legacy_field == "native_cosine"
+            else "source_candidate_cosine"
+        )
+        with pytest.raises(TriangleScreeningError, match="forbidden legacy"):
+            module._identity_cosines(legacy, label="ArcFace")
+
+
+def test_ordered_native_representation_requires_exact_fixed32_order(
+    tmp_path: Path,
+) -> None:
+    module = _materializer()
+    with pytest.raises(TriangleScreeningError, match="missing authoritative"):
+        module._jsonl(tmp_path / "missing.jsonl")
+    expected = ["a", "b"]
+    rows = [{"sample_id": "a"}, {"sample_id": "b"}]
+    assert list(
+        module._ordered_index(
+            rows, expected_sample_ids=expected, label="shared native"
+        )
+    ) == expected
+    for invalid in (
+        [{"sample_id": "a"}],
+        [{"sample_id": "a"}, {"sample_id": "a"}],
+        list(reversed(rows)),
+    ):
+        with pytest.raises(TriangleScreeningError):
+            module._ordered_index(
+                invalid, expected_sample_ids=expected, label="shared native"
+            )
+
+
+def test_representation_mapping_is_typed_finite_and_has_no_legacy_fallback() -> None:
+    module = _materializer()
+    native = {"native_cosine": 0.4, "native_edev_cosine": 0.5}
+    candidate = {"e0_cosine": 0.6, "edev_cosine": 0.7}
+    assert module._representation_cosines(
+        native, candidate, candidate_label="arm"
+    ) == (0.4, 0.6, 0.5, 0.7)
+    legacy_candidate = {
+        "candidate_cosine": 0.6,
+        "candidate_edev_cosine": 0.7,
+    }
+    with pytest.raises(TriangleScreeningError, match="e0_cosine must be finite"):
+        module._representation_cosines(
+            native, legacy_candidate, candidate_label="arm"
+        )
+    nonfinite_native = dict(native, native_cosine=float("nan"))
+    with pytest.raises(TriangleScreeningError, match="native_cosine must be finite"):
+        module._representation_cosines(
+            nonfinite_native, candidate, candidate_label="arm"
+        )

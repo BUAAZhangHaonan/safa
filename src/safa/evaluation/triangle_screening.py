@@ -740,33 +740,37 @@ def _evaluate_arm(
     native_sharpness = _mean(numeric["native_sharpness"])
     privacy_available = source_exact_one == native_exact_one == exact_one == n
     arcface_deltas: list[float] = []
-    if privacy_available:
-        for row in ordered:
+    for row in ordered:
+        pair_values: list[float | None] = []
+        for field, pair_exact_one in (
+            (
+                "source_native_cosine",
+                row["source_face_count"] == row["native_face_count"] == 1,
+            ),
+            (
+                "source_candidate_cosine",
+                row["source_face_count"] == row["candidate_face_count"] == 1,
+            ),
+        ):
+            if pair_exact_one:
+                pair_values.append(
+                    _finite_number(
+                        row[field], f"{arm_id}.{row['sample_id']}.{field}"
+                    )
+                )
+            else:
+                if row[field] is not None:
+                    raise TriangleScreeningError(
+                        f"{arm_id}.{row['sample_id']}.{field} must be null "
+                        "when its role pair is not exact-one"
+                    )
+                pair_values.append(None)
+        if privacy_available:
+            source_native, source_candidate = pair_values
+            assert source_native is not None and source_candidate is not None
             arcface_deltas.append(
-                _finite_number(
-                    row["source_candidate_cosine"],
-                    f"{arm_id}.{row['sample_id']}.source_candidate_cosine",
-                )
-                - _finite_number(
-                    row["source_native_cosine"],
-                    f"{arm_id}.{row['sample_id']}.source_native_cosine",
-                )
+                source_candidate - source_native
             )
-    else:
-        for row in ordered:
-            if not (
-                row["source_face_count"]
-                == row["native_face_count"]
-                == row["candidate_face_count"]
-                == 1
-            ) and (
-                row["source_native_cosine"] is not None
-                or row["source_candidate_cosine"] is not None
-            ):
-                raise TriangleScreeningError(
-                    f"{arm_id}.{row['sample_id']} must use null ArcFace cosines "
-                    "when any required role is not exact-one"
-                )
     arcface_delta = _mean(arcface_deltas) if privacy_available else None
     if stage == 32:
         if any(value is not None for value in (fid, kid, native_fid, native_kid)):

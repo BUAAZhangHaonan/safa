@@ -169,7 +169,6 @@ def test_eligibility_join_is_exact_and_preserves_three_sources() -> None:
 def test_candidate_exact_one_equality_passes_and_511_fails() -> None:
     pass_rows = arm_rows(512)
     fail_rows = arm_rows(512, candidate_count=0)
-    fail_rows[-1]["source_native_cosine"] = None
     fail_rows[-1]["source_candidate_cosine"] = None
     results = evaluate_arms(
         [
@@ -249,20 +248,24 @@ def test_stage32_omits_fid_kid_and_uses_point_privacy() -> None:
 
 
 @pytest.mark.parametrize(
-    ("field", "count", "gate"),
+    ("field", "count", "gate", "source_native", "source_candidate"),
     [
-        ("candidate_face_count", 2, "candidate_exact_one"),
-        ("native_face_count", 0, "native_exact_one"),
-        ("source_face_count", 0, "source_exact_one"),
+        ("candidate_face_count", 2, "candidate_exact_one", 0.40, None),
+        ("native_face_count", 0, "native_exact_one", None, 0.40),
+        ("source_face_count", 0, "source_exact_one", None, None),
     ],
 )
 def test_non_exact_one_preserves_null_privacy_and_hard_fails(
-    field: str, count: int, gate: str
+    field: str,
+    count: int,
+    gate: str,
+    source_native: float | None,
+    source_candidate: float | None,
 ) -> None:
     rows = arm_rows(32)
     rows[0][field] = count
-    rows[0]["source_native_cosine"] = None
-    rows[0]["source_candidate_cosine"] = None
+    rows[0]["source_native_cosine"] = source_native
+    rows[0]["source_candidate_cosine"] = source_candidate
     result = evaluate_arms(
         [{"arm_id": "paper_eta_0p125", "rows": rows}],
         stage=32,

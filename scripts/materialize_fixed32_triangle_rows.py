@@ -59,6 +59,20 @@ def _indexed(
     return result
 
 
+def _ordered_index(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    expected_sample_ids: Sequence[str],
+    label: str,
+) -> dict[str, Mapping[str, Any]]:
+    result = _indexed(rows, label)
+    if list(result) != list(expected_sample_ids):
+        raise TriangleScreeningError(
+            f"{label} sample IDs/order disagree with fixed32"
+        )
+    return result
+
+
 def _quality_rows(path: Path, label: str) -> list[Mapping[str, Any]]:
     payload = _json(path)
     if not isinstance(payload, Mapping):
@@ -106,6 +120,13 @@ def _integer(row: Mapping[str, Any], field: str, label: str) -> int:
 def _identity_cosines(
     row: Mapping[str, Any], *, label: str
 ) -> tuple[float | None, float | None]:
+    legacy_fields = sorted(
+        field for field in ("native_cosine", "candidate_cosine") if field in row
+    )
+    if legacy_fields:
+        raise TriangleScreeningError(
+            f"{label} uses forbidden legacy ArcFace fields: {legacy_fields}"
+        )
     counts = tuple(
         _integer(row, field, label)
         for field in (
@@ -114,22 +135,39 @@ def _identity_cosines(
             "candidate_face_count",
         )
     )
-    if counts == (1, 1, 1):
-        values = (
-            _finite(row, "source_native_cosine", label),
-            _finite(row, "source_candidate_cosine", label),
-        )
-        if any(value < -1.0 or value > 1.0 for value in values):
-            raise TriangleScreeningError(f"{label} cosine must be in [-1,1]")
-        return values
-    if (
-        row.get("source_native_cosine") is not None
-        or row.get("source_candidate_cosine") is not None
+    values: list[float | None] = []
+    for field, pair_exact_one in (
+        ("source_native_cosine", counts[0] == counts[1] == 1),
+        ("source_candidate_cosine", counts[0] == counts[2] == 1),
     ):
-        raise TriangleScreeningError(
-            f"{label} must omit ArcFace cosines when any required role is not exact-one"
-        )
-    return None, None
+        if pair_exact_one:
+            value = _finite(row, field, label)
+            if value < -1.0 or value > 1.0:
+                raise TriangleScreeningError(f"{label}.{field} must be in [-1,1]")
+            values.append(value)
+        else:
+            if row.get(field) is not None:
+                raise TriangleScreeningError(
+                    f"{label}.{field} must be null when its role pair is not exact-one"
+                )
+            values.append(None)
+    return values[0], values[1]
+
+
+def _representation_cosines(
+    native_row: Mapping[str, Any],
+    candidate_row: Mapping[str, Any],
+    *,
+    candidate_label: str,
+) -> tuple[float, float, float, float]:
+    return (
+        _finite(native_row, "native_cosine", "shared native representation"),
+        _finite(candidate_row, "e0_cosine", candidate_label),
+        _finite(
+            native_row, "native_edev_cosine", "shared native representation"
+        ),
+        _finite(candidate_row, "edev_cosine", candidate_label),
+    )
 
 
 def _sha256(path: Path) -> str:
@@ -201,6 +239,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--runs-root", type=Path, required=True)
     parser.add_argument("--evaluation-root", type=Path, required=True)
     parser.add_argument("--selection-manifest", type=Path, required=True)
+    parser.add_argument("--native-representation-rows", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--baseline-arm-id")
     return parser.parse_args(argv)
@@ -232,6 +271,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     ):
         raise TriangleScreeningError("selection manifest must contain 32 unique IDs")
 
+    native_representation_path = args.native_representation_rows.resolve()
+    native_representation = _ordered_index(
+        _jsonl(native_representation_path),
+        expected_sample_ids=selection_ids,
+        label="shared native representation",
+    )
     runs_root = args.runs_root.resolve()
     evaluation_root = args.evaluation_root.resolve()
     native_quality_path = evaluation_root / "quality" / "native" / "quality.json"
@@ -281,6 +326,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             native_q = native_quality[sample_id]
             candidate_q = candidate_quality[sample_id]
             identity = arcface[sample_id]
+            native_rep = native_representation[sample_id]
+            native_e0, candidate_e0, native_edev, candidate_edev = (
+                _representation_cosines(
+                    native_rep, generated, candidate_label=arm_id
+                )
+            )
             source_native_cosine, source_candidate_cosine = _identity_cosines(
                 identity, label=f"{arm_id} ArcFace"
             )
@@ -289,12 +340,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "arm_id": arm_id,
                     "stage": 32,
                     "sample_id": sample_id,
-                    "native_e0": _finite(generated, "native_cosine", arm_id),
-                    "candidate_e0": _finite(generated, "candidate_cosine", arm_id),
-                    "native_edev": _finite(
-                        generated, "native_edev_cosine", arm_id
-                    ),
-                    "candidate_edev": _finite(generated, "edev_cosine", arm_id),
+                    "native_e0": native_e0,
+                    "candidate_e0": candidate_e0,
+                    "native_edev": native_edev,
+                    "candidate_edev": candidate_edev,
                     "native_niqe": _finite(native_q, "niqe", "native quality"),
                     "candidate_niqe": _finite(
                         candidate_q, "niqe", f"{arm_id} quality"
@@ -365,6 +414,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     },
                     "diagnostic_manifest_sha256": _sha256(diagnostic_path),
                     "selection_manifest_sha256": _sha256(selection_path),
+                    "native_representation_rows": {
+                        "path": str(native_representation_path),
+                        "sha256": _sha256(native_representation_path),
+                    },
                     "native_quality_output_sha256": _sha256(native_quality_path),
                     "arms": provenance,
                 },
