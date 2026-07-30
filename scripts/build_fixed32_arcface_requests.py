@@ -7,6 +7,12 @@ import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from safa.evaluation.triangle32_evaluation import (
+    LEGACY_ARM_IDS,
+    load_arm_set,
+    validate_generation_result,
+)
+from safa.evaluation.triangle_screening import TriangleScreeningError
 from safa.evaluation.r9_evaluator_worker import (
     ProductionEvaluatorConfig,
     build_worker_request,
@@ -20,12 +26,7 @@ DEFAULT_RUNTIME_CONFIG = (
     / "artifacts/r9_meanflow_flow_map_guidance/campaigns/"
     "r9-report-only-formal-v9/full/evaluator_runs/arcface/winner/request.json"
 )
-ARM_IDS = (
-    "eta0p125_baseline",
-    "eta0p125_disable_i1",
-    "eta0p125_disable_i2",
-    "eta0p125_disable_i3",
-)
+ARM_IDS = LEGACY_ARM_IDS
 
 
 class Fixed32ArcFaceRequestError(RuntimeError):
@@ -205,41 +206,25 @@ def build_requests(
     device: str,
 ) -> list[Path]:
     diagnostic_path = diagnostic_manifest.resolve()
-    diagnostic = _json(diagnostic_path, "fixed32 diagnostic manifest")
-    if (
-        diagnostic.get("contract_type")
-        != "safa_r10_triangle_fixed32_diagnostic_preparation_v1"
-        or diagnostic.get("registration") != "new_diagnostic_not_r9_continuation"
-    ):
-        raise Fixed32ArcFaceRequestError("fixed32 diagnostic manifest is invalid")
-    arms = diagnostic.get("arms")
-    if not isinstance(arms, list) or [
-        arm.get("arm_id") for arm in arms if isinstance(arm, Mapping)
-    ] != list(ARM_IDS):
-        raise Fixed32ArcFaceRequestError("fixed32 arm IDs/order disagree with the lock")
-    shared = diagnostic.get("shared")
-    if not isinstance(shared, Mapping):
-        raise Fixed32ArcFaceRequestError("fixed32 shared contract is missing")
+    try:
+        arm_set = load_arm_set(diagnostic_path)
+    except TriangleScreeningError as exc:
+        raise Fixed32ArcFaceRequestError(str(exc)) from exc
 
     selection_path = selection_manifest.resolve()
-    expected_manifest = _resolve_file(
-        shared.get("sample_id_manifest"), "locked fixed32 selection manifest"
-    )
-    if selection_path != expected_manifest:
+    if selection_path != arm_set.selection_manifest:
         raise Fixed32ArcFaceRequestError(
-            "selection manifest path disagrees with the diagnostic lock"
+            "selection manifest path disagrees with the arm-set lock"
         )
-    if _sha256(selection_path) != shared.get("sample_id_manifest_sha256"):
+    if _sha256(selection_path) != arm_set.selection_manifest_sha256:
         raise Fixed32ArcFaceRequestError(
-            "selection manifest digest disagrees with the diagnostic lock"
+            "selection manifest digest disagrees with the arm-set lock"
         )
     selection_ids = _ordered_ids(
         _jsonl(selection_path, "fixed32 selection manifest"),
         "fixed32 selection manifest",
     )
-    seed = shared.get("sampling_seed")
-    if isinstance(seed, bool) or not isinstance(seed, int):
-        raise Fixed32ArcFaceRequestError("fixed32 sampling seed is invalid")
+    seed = arm_set.seed
 
     template_path = template_request.resolve()
     template = _template(template_path)
@@ -247,13 +232,15 @@ def build_requests(
     resolved_runs_root = runs_root.resolve()
     resolved_output_root = output_root.resolve()
     requests: list[tuple[str, dict[str, Any]]] = []
-    for arm_id in ARM_IDS:
-        run_root = resolved_runs_root / arm_id
-        generation = _json(run_root / "generation_result.json", f"{arm_id} generation")
-        if generation.get("status") != "complete" or generation.get("sample_count") != 32:
-            raise Fixed32ArcFaceRequestError(f"{arm_id} generation is not complete")
+    for arm_id in arm_set.arm_ids:
+        try:
+            per_sample_path = validate_generation_result(
+                arm_set, resolved_runs_root, arm_id
+            )
+        except TriangleScreeningError as exc:
+            raise Fixed32ArcFaceRequestError(str(exc)) from exc
         samples = _samples(
-            run_root / "per_sample.jsonl",
+            per_sample_path,
             expected_ids=selection_ids,
             label=f"{arm_id} per-sample evidence",
         )
@@ -264,7 +251,11 @@ def build_requests(
         )
         request = ArcFaceEvaluationRequest(
             phase="diagnose",
-            logical_run_id=f"r10_triangle_fixed32__{arm_id}",
+            logical_run_id=(
+                f"r10_triangle_fixed32__{arm_id}"
+                if arm_set.arm_ids == ARM_IDS
+                else f"r10_triangle32__{arm_id}"
+            ),
             arm_id=arm_id,
             seed=seed,
             source_index_path=source_index_path,
@@ -284,7 +275,11 @@ def build_requests(
         output_paths.append(request_path)
     build_manifest = {
         "schema_version": 1,
-        "contract_type": "safa_r10_triangle_fixed32_arcface_request_build_v1",
+        "contract_type": (
+            "safa_r10_triangle_fixed32_arcface_request_build_v1"
+            if arm_set.arm_ids == ARM_IDS
+            else "safa_r10_triangle32_arcface_request_build_v1"
+        ),
         "diagnostic_manifest": {
             "path": str(diagnostic_path),
             "sha256": _sha256(diagnostic_path),

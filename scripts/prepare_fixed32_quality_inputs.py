@@ -8,15 +8,15 @@ from pathlib import Path
 import sys
 from typing import Any, Mapping, Sequence
 
+from safa.evaluation.triangle32_evaluation import (
+    LEGACY_ARM_IDS,
+    load_arm_set,
+    validate_generation_result,
+)
 from safa.evaluation.triangle_screening import TriangleScreeningError
 
 
-ARM_IDS = (
-    "eta0p125_baseline",
-    "eta0p125_disable_i1",
-    "eta0p125_disable_i2",
-    "eta0p125_disable_i3",
-)
+ARM_IDS = LEGACY_ARM_IDS
 
 
 def _rows(path: Path) -> list[Mapping[str, Any]]:
@@ -45,6 +45,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--runs-root", type=Path, required=True)
     parser.add_argument("--selection-manifest", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--arm-set-manifest", type=Path)
+    parser.add_argument("--native-per-sample", type=Path)
     return parser.parse_args(argv)
 
 
@@ -52,6 +54,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     runs_root = args.runs_root.resolve()
     selection_path = args.selection_manifest.resolve()
+    arm_set = load_arm_set(args.arm_set_manifest)
+    if (
+        arm_set.selection_manifest is not None
+        and (
+            selection_path != arm_set.selection_manifest
+            or _sha256(selection_path) != arm_set.selection_manifest_sha256
+        )
+    ):
+        raise TriangleScreeningError("selection manifest disagrees with arm-set lock")
     selection = _rows(selection_path)
     sample_ids = [row.get("sample_id") for row in selection]
     if (
@@ -61,14 +72,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     ):
         raise TriangleScreeningError("selection manifest must contain 32 unique IDs")
 
-    run_paths = {arm_id: runs_root / arm_id / "per_sample.jsonl" for arm_id in ARM_IDS}
+    run_paths = {
+        arm_id: validate_generation_result(arm_set, runs_root, arm_id)
+        for arm_id in arm_set.arm_ids
+    }
     run_rows = {arm_id: _rows(path) for arm_id, path in run_paths.items()}
     for arm_id, rows in run_rows.items():
         if [row.get("sample_id") for row in rows] != sample_ids:
             raise TriangleScreeningError(
                 f"{arm_id} per-sample order disagrees with fixed32"
             )
-    baseline = run_rows["eta0p125_baseline"]
+    native_source_path = (
+        args.native_per_sample.resolve()
+        if args.native_per_sample is not None
+        else run_paths[ARM_IDS[0]]
+    )
+    baseline = _rows(native_source_path)
+    if [row.get("sample_id") for row in baseline] != sample_ids:
+        raise TriangleScreeningError("native per-sample order disagrees with fixed32")
     native_view: list[dict[str, Any]] = []
     for row in baseline:
         native = row.get("native")
@@ -108,8 +129,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                             "per_sample_sha256": _sha256(run_paths[arm_id]),
                             "role_binding": "existing_generated_candidate",
                         }
-                        for arm_id in ARM_IDS
+                        for arm_id in arm_set.arm_ids
                     ],
+                    "arm_set_manifest": (
+                        None
+                        if arm_set.manifest_path is None
+                        else {
+                            "path": str(arm_set.manifest_path),
+                            "sha256": _sha256(arm_set.manifest_path),
+                        }
+                    ),
                 },
                 indent=2,
                 sort_keys=True,

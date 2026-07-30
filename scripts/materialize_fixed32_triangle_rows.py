@@ -9,6 +9,11 @@ from pathlib import Path
 import sys
 from typing import Any, Mapping, Sequence
 
+from safa.evaluation.triangle32_evaluation import (
+    canonical_digest,
+    load_arm_set,
+    validate_generation_result,
+)
 from safa.evaluation.triangle_screening import TriangleScreeningError
 
 
@@ -91,8 +96,10 @@ def _finite(row: Mapping[str, Any], field: str, label: str) -> float:
 
 def _integer(row: Mapping[str, Any], field: str, label: str) -> int:
     value = row.get(field)
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TriangleScreeningError(f"{label}.{field} must be an integer")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise TriangleScreeningError(
+            f"{label}.{field} must be a nonnegative integer"
+        )
     return value
 
 
@@ -108,10 +115,13 @@ def _identity_cosines(
         )
     )
     if counts == (1, 1, 1):
-        return (
+        values = (
             _finite(row, "source_native_cosine", label),
             _finite(row, "source_candidate_cosine", label),
         )
+        if any(value < -1.0 or value > 1.0 for value in values):
+            raise TriangleScreeningError(f"{label} cosine must be in [-1,1]")
+        return values
     if (
         row.get("source_native_cosine") is not None
         or row.get("source_candidate_cosine") is not None
@@ -126,6 +136,63 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _official_arcface(
+    request: Mapping[str, Any],
+    result: Mapping[str, Any],
+    *,
+    arm_id: str,
+    sample_ids: Sequence[str],
+) -> list[Mapping[str, Any]]:
+    if (
+        request.get("schema_version") != 1
+        or request.get("contract_type") != "safa_r9_phase_evaluator_request_v1"
+        or request.get("task") != "arcface"
+        or request.get("evaluator_request_sha256")
+        != canonical_digest(request, "evaluator_request_sha256")
+    ):
+        raise TriangleScreeningError(f"{arm_id} ArcFace request is not canonical")
+    payload = request.get("payload")
+    samples = payload.get("samples") if isinstance(payload, Mapping) else None
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("arm_id") != arm_id
+        or not isinstance(samples, list)
+        or [row.get("sample_id") for row in samples if isinstance(row, Mapping)]
+        != list(sample_ids)
+        or any(
+            not isinstance(row, Mapping)
+            or set(row)
+            != {
+                "sample_id",
+                "source",
+                "native",
+                "candidate",
+                "source_sha256",
+                "native_sha256",
+                "candidate_sha256",
+            }
+            for row in samples
+        )
+    ):
+        raise TriangleScreeningError(
+            f"{arm_id} ArcFace request is not exact three-role evidence"
+        )
+    if (
+        result.get("schema_version") != 1
+        or result.get("contract_type") != "safa_r9_phase_evaluator_output_v1"
+        or result.get("task") != "arcface"
+        or result.get("evaluator_request_sha256")
+        != request["evaluator_request_sha256"]
+        or result.get("evaluator_output_sha256")
+        != canonical_digest(result, "evaluator_output_sha256")
+        or not isinstance(result.get("result"), list)
+    ):
+        raise TriangleScreeningError(
+            f"{arm_id} ArcFace result is not the bound official evaluator output"
+        )
+    return result["result"]
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Materialize stage32 triangle rows from official evaluator outputs."
@@ -135,33 +202,27 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--evaluation-root", type=Path, required=True)
     parser.add_argument("--selection-manifest", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--baseline-arm-id")
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     diagnostic_path = args.diagnostic_manifest.resolve()
-    diagnostic = _json(diagnostic_path)
-    if (
-        not isinstance(diagnostic, Mapping)
-        or diagnostic.get("contract_type")
-        != "safa_r10_triangle_fixed32_diagnostic_preparation_v1"
-        or diagnostic.get("registration") != "new_diagnostic_not_r9_continuation"
-    ):
-        raise TriangleScreeningError("invalid fixed32 diagnostic manifest")
-    arms = diagnostic.get("arms")
-    if not isinstance(arms, list) or len(arms) != 4:
-        raise TriangleScreeningError("fixed32 diagnostic must contain four arms")
-    arm_ids = [arm.get("arm_id") for arm in arms if isinstance(arm, Mapping)]
-    if arm_ids != [
-        "eta0p125_baseline",
-        "eta0p125_disable_i1",
-        "eta0p125_disable_i2",
-        "eta0p125_disable_i3",
-    ]:
-        raise TriangleScreeningError("fixed32 arm IDs/order disagree with the lock")
+    arm_set = load_arm_set(diagnostic_path)
+    arm_ids = list(arm_set.arm_ids)
+    baseline_arm_id = args.baseline_arm_id or arm_set.baseline_arm_id
+    if baseline_arm_id not in arm_ids:
+        raise TriangleScreeningError(
+            "baseline arm ID must explicitly name an arm in the arm-set manifest"
+        )
 
     selection_path = args.selection_manifest.resolve()
+    if (
+        selection_path != arm_set.selection_manifest
+        or _sha256(selection_path) != arm_set.selection_manifest_sha256
+    ):
+        raise TriangleScreeningError("selection manifest disagrees with arm-set lock")
     selection_rows = _jsonl(selection_path)
     selection_ids = [row.get("sample_id") for row in selection_rows]
     if (
@@ -185,7 +246,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     materialized_arms: list[dict[str, Any]] = []
     provenance: list[dict[str, Any]] = []
     for arm_id in arm_ids:
-        run_path = runs_root / arm_id / "per_sample.jsonl"
+        run_path = validate_generation_result(arm_set, runs_root, arm_id)
         candidate_quality_path = (
             evaluation_root / "quality" / arm_id / "quality.json"
         )
@@ -197,19 +258,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         request = _json(arcface_request_path)
         result = _json(arcface_result_path)
-        if not isinstance(request, Mapping):
-            raise TriangleScreeningError(f"{arm_id} ArcFace request must be an object")
+        if not isinstance(request, Mapping) or not isinstance(result, Mapping):
+            raise TriangleScreeningError(f"{arm_id} ArcFace envelope must be an object")
         config = request.get("config")
         detector = config.get("arcface") if isinstance(config, Mapping) else None
         if not isinstance(detector, Mapping) or detector.get("model_name") != "buffalo_l":
             raise TriangleScreeningError(
                 f"{arm_id} ArcFace request must bind buffalo_l"
             )
-        if not isinstance(result, Mapping) or not isinstance(result.get("result"), list):
-            raise TriangleScreeningError(
-                f"{arm_id} ArcFace result must be the official evaluator output"
-            )
-        arcface = _indexed(result["result"], f"{arm_id} ArcFace")
+        arcface_rows = _official_arcface(
+            request, result, arm_id=arm_id, sample_ids=selection_ids
+        )
+        arcface = _indexed(arcface_rows, f"{arm_id} ArcFace")
         expected = set(selection_ids)
         if any(set(rows) != expected for rows in (run_rows, candidate_quality, arcface)):
             raise TriangleScreeningError(
@@ -281,7 +341,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             json.dumps(
                 {
                     "stage": 32,
-                    "baseline_arm_id": "eta0p125_baseline",
+                    "baseline_arm_id": baseline_arm_id,
                     "selection_manifest_path": str(selection_path),
                     "arms": materialized_arms,
                 },
