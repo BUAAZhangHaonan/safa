@@ -47,6 +47,14 @@ HEAVY_MODULE_ROOTS = (
     "onnxruntime",
     "diffusers",
 )
+TRIANGLE32_REQUEST_CONTRACT = "safa_r10_triangle32_worker_request_v1"
+TRIANGLE32_RESULT_CONTRACT = "safa_r10_triangle32_worker_result_v1"
+TRIANGLE32_SELECTION_PATH = (
+    "artifacts/r10_triangle_exploration/preparation_v1/prefix32.jsonl"
+)
+TRIANGLE32_SELECTION_SHA256 = (
+    "fc47ae9372f23667e6b59ab2f33b22bc6cc8405be0095aaee1565d1158be1b05"
+)
 
 
 def _utc_now() -> str:
@@ -59,6 +67,302 @@ def _assert_bound_file(value: Mapping[str, Any], label: str) -> Path:
     if not path.is_file() or sha256_file(path) != expected:
         raise CanonicalScreeningError(f"{label} file binding mismatch: {path}")
     return path
+
+
+def validate_triangle32_request(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    request = dict(value)
+    required = {
+        "schema_version",
+        "contract_type",
+        "mode",
+        "sample_count",
+        "seed",
+        "batch_size",
+        "retry_count",
+        "selection_rank",
+        "selected24",
+        "candidate_manifest",
+        "candidate",
+        "output_decoder_registry",
+        "output_contract",
+        "sample_manifest",
+        "native_per_sample",
+        "source_index",
+        "features",
+        "e0",
+        "edev",
+        "pixel_image_size",
+        "screening_worker",
+        "runner",
+        "quality_protocol_family",
+        "native_rgb_size",
+        "nfe",
+        "authorized_gpu",
+        "authorized_gpu_registry",
+        "output_dir",
+        "log_path",
+        "run_request_sha256",
+    }
+    if set(request) != required:
+        raise CanonicalScreeningError("triangle32 request fields are not canonical")
+    if (
+        request["schema_version"] != 1
+        or request["contract_type"] != TRIANGLE32_REQUEST_CONTRACT
+        or request["mode"] != "triangle32"
+        or request["sample_count"] != 32
+        or request["seed"] != 4549
+        or request["batch_size"] != 2
+        or request["retry_count"] != 0
+        or isinstance(request["selection_rank"], bool)
+        or not isinstance(request["selection_rank"], int)
+        or request["selection_rank"] not in range(1, 25)
+        or request["output_contract"] != request["candidate"].get("output_contract")
+        or request["quality_protocol_family"]
+        != request["output_contract"].get("quality_protocol_family")
+        or request["native_rgb_size"]
+        != [
+            request["output_contract"]["rgb_contract"]["height"],
+            request["output_contract"]["rgb_contract"]["width"],
+        ]
+        or request["nfe"] != request["output_contract"]["capability"]["nfe"]
+        or request["run_request_sha256"]
+        != canonical_digest(request, "run_request_sha256")
+    ):
+        raise CanonicalScreeningError("triangle32 request frozen fields differ")
+
+    worker_path = _assert_bound_file(
+        request["screening_worker"], "triangle32 screening worker"
+    )
+    runner_path = _assert_bound_file(request["runner"], "triangle32 runner")
+    repo_root = worker_path.parents[3]
+    if runner_path.parents[1] != repo_root:
+        raise CanonicalScreeningError("triangle32 runner repository binding differs")
+    expected_manifest = (repo_root / TRIANGLE32_SELECTION_PATH).resolve()
+    sample_manifest = _assert_bound_file(
+        request["sample_manifest"], "triangle32 sample manifest"
+    )
+    if (
+        sample_manifest != expected_manifest
+        or request["sample_manifest"]["sha256"] != TRIANGLE32_SELECTION_SHA256
+    ):
+        raise CanonicalScreeningError(
+            "triangle32 sample manifest binding is not the registered prefix32"
+        )
+    manifest_rows = load_jsonl(sample_manifest, "triangle32 sample manifest")
+    sample_ids = [row.get("sample_id") for row in manifest_rows]
+    if (
+        len(sample_ids) != 32
+        or any(not isinstance(item, str) or not item for item in sample_ids)
+        or len(set(sample_ids)) != 32
+    ):
+        raise CanonicalScreeningError(
+            "triangle32 sample manifest must contain 32 unique IDs"
+        )
+    native_path = _assert_bound_file(
+        request["native_per_sample"], "triangle32 native per-sample evidence"
+    )
+    native_rows = load_jsonl(native_path, "triangle32 native per-sample evidence")
+    if [row.get("sample_id") for row in native_rows] != sample_ids:
+        raise CanonicalScreeningError(
+            "triangle32 native evidence does not follow prefix32 order"
+        )
+    for row in native_rows:
+        native = Path(str(row.get("native", "")))
+        native = (
+            native.resolve()
+            if native.is_absolute()
+            else (repo_root / native).resolve()
+        )
+        if (
+            not native.is_file()
+            or row.get("generated") != row.get("native")
+            or row.get("candidate") != row.get("native")
+        ):
+            raise CanonicalScreeningError(
+                "triangle32 native evidence is not the immutable native view"
+            )
+
+    selected_path = _assert_bound_file(request["selected24"], "selected24")
+    selected = load_json(selected_path, "selected24")
+    rows = selected.get("selected")
+    rank = request["selection_rank"]
+    if (
+        selected.get("contract_type") != "safa_triangle_historical24_v1"
+        or selected.get("candidate_count") != 193
+        or selected.get("selected_count") != 24
+        or not isinstance(rows, list)
+        or len(rows) != 24
+        or rows[rank - 1].get("candidate_id")
+        != request["candidate"].get("candidate_id")
+    ):
+        raise CanonicalScreeningError("triangle32 selected24 binding differs")
+
+    manifest_path = _assert_bound_file(
+        request["candidate_manifest"], "triangle32 candidate manifest"
+    )
+    candidate_manifest = load_json(manifest_path, "triangle32 candidate manifest")
+    if (
+        candidate_manifest.get("contract_type")
+        != "safa_canonical_screening_candidate_manifest_v1"
+        or candidate_manifest.get("candidate_count") != 193
+        or candidate_manifest.get("candidate_manifest_sha256")
+        != request["candidate_manifest"]["canonical_sha256"]
+        or candidate_manifest.get("candidate_manifest_sha256")
+        != canonical_digest(candidate_manifest, "candidate_manifest_sha256")
+        or request["candidate"] not in candidate_manifest.get("candidates", [])
+    ):
+        raise CanonicalScreeningError(
+            "triangle32 candidate manifest/candidate binding differs"
+        )
+    candidate = request["candidate"]
+    checkpoint = Path(str(candidate["checkpoint_path"]))
+    checkpoint = (
+        checkpoint.resolve()
+        if checkpoint.is_absolute()
+        else (repo_root / checkpoint).resolve()
+    )
+    if (
+        not checkpoint.is_file()
+        or sha256_file(checkpoint) != candidate["checkpoint_sha256"]
+    ):
+        raise CanonicalScreeningError("triangle32 checkpoint binding differs")
+    preflight_path = Path(str(candidate["preflight_result_path"])).resolve()
+    if (
+        not preflight_path.is_file()
+        or sha256_file(preflight_path) != candidate["preflight_result_sha256"]
+    ):
+        raise CanonicalScreeningError("triangle32 preflight file binding differs")
+    preflight = load_json(preflight_path, "triangle32 preflight result")
+    strict_result = preflight.get("strict_result")
+    if (
+        preflight.get("contract_type")
+        != "safa_canonical_checkpoint_preflight_result_v1"
+        or preflight.get("preflight_request_sha256")
+        != candidate["preflight_request_sha256"]
+        or preflight.get("checkpoint_sha256") != candidate["checkpoint_sha256"]
+        or preflight.get("checkpoint_model") != candidate["checkpoint_model"]
+        or preflight.get("preflight_result_sha256")
+        != canonical_digest(preflight, "preflight_result_sha256")
+        or not isinstance(strict_result, Mapping)
+        or strict_result.get("status") != "valid"
+        or strict_result.get("output_contract") != candidate["output_contract"]
+    ):
+        raise CanonicalScreeningError("triangle32 strict preflight binding differs")
+
+    for name in (
+        "source_index",
+        "e0",
+        "edev",
+    ):
+        _assert_bound_file(request[name], f"triangle32 {name}")
+    feature_directory = Path(str(request["features"].get("directory", ""))).resolve()
+    if not feature_directory.is_dir():
+        raise CanonicalScreeningError("triangle32 feature directory is missing")
+    _assert_bound_file(request["features"]["manifest"], "triangle32 feature manifest")
+    _assert_bound_file(request["features"]["shard"], "triangle32 feature shard")
+    gpu = request["authorized_gpu"]
+    registry = request["authorized_gpu_registry"]
+    if (
+        not isinstance(gpu, Mapping)
+        or set(gpu) != {"physical_gpu_index", "physical_gpu_uuid"}
+        or gpu["physical_gpu_index"] not in range(4)
+        or not isinstance(gpu["physical_gpu_uuid"], str)
+        or not gpu["physical_gpu_uuid"].startswith("GPU-")
+        or not isinstance(registry, list)
+        or len(registry) != 4
+        or gpu not in registry
+        or [row.get("physical_gpu_index") for row in registry] != [0, 1, 2, 3]
+    ):
+        raise CanonicalScreeningError("triangle32 authorized GPU binding is invalid")
+    output_dir = Path(str(request["output_dir"])).resolve()
+    log_path = Path(str(request["log_path"])).resolve()
+    for path, label in ((output_dir, "output"), (log_path, "log")):
+        try:
+            path.relative_to(repo_root)
+        except ValueError as exc:
+            raise CanonicalScreeningError(
+                f"triangle32 {label} path escapes the repository"
+            ) from exc
+        if label == "output" and path.exists():
+            raise CanonicalScreeningError(
+                f"triangle32 {label} path already exists: {path}"
+            )
+    return request
+
+
+def execute_triangle32_request(
+    request_path: Path, gpu_index: int, gpu_uuid: str
+) -> dict[str, Any]:
+    if "TMUX" not in os.environ:
+        raise CanonicalScreeningError("triangle32 execution must run inside tmux")
+    request = validate_triangle32_request(
+        load_json(request_path, "triangle32 worker request")
+    )
+    authorized = request["authorized_gpu"]
+    if (
+        gpu_index != authorized["physical_gpu_index"]
+        or canonicalize_nvidia_gpu_uuid(gpu_uuid, "triangle32 GPU UUID")["canonical"]
+        != canonicalize_nvidia_gpu_uuid(
+            authorized["physical_gpu_uuid"], "triangle32 authorized GPU UUID"
+        )["canonical"]
+    ):
+        raise CanonicalScreeningError("triangle32 CLI GPU differs from request")
+    _assert_runtime_cuda_binding(request, gpu_index, gpu_uuid)
+    output_dir = Path(str(request["output_dir"])).resolve()
+    output_dir.mkdir(parents=True, exist_ok=False)
+    result: dict[str, Any] = {
+        "schema_version": 1,
+        "contract_type": TRIANGLE32_RESULT_CONTRACT,
+        "run_request_sha256": request["run_request_sha256"],
+        "candidate_id": request["candidate"]["candidate_id"],
+        "status": "failed",
+        "failure": None,
+        "generation_only": True,
+        "evaluation_status": "not_started",
+    }
+    try:
+        rows, _, _ = _run_generation(request, gpu_index, output_dir)
+        native_rows = {
+            row["sample_id"]: row
+            for row in load_jsonl(
+                Path(str(request["native_per_sample"]["path"])),
+                "triangle32 native evidence",
+            )
+        }
+        for row in rows:
+            native = native_rows[row["sample_id"]]
+            native_path = Path(str(native["native"]))
+            if not native_path.is_absolute():
+                native_path = _request_repo_root(request) / native_path
+            row["native"] = str(native_path.resolve())
+            row["native_sha256"] = sha256_file(native_path.resolve())
+            row["generated"] = row["candidate_path"]
+            row["source"] = row["source_path"]
+        _write_jsonl_exclusive(output_dir / "per_sample.jsonl", rows)
+        result.update(
+            {
+                "status": "completed",
+                "sample_count": len(rows),
+                "per_sample": {
+                    "path": str((output_dir / "per_sample.jsonl").resolve()),
+                    "sha256": sha256_file(output_dir / "per_sample.jsonl"),
+                },
+            }
+        )
+    except BaseException as exc:
+        result["failure"] = {"type": type(exc).__name__, "message": str(exc)}
+        result["worker_result_sha256"] = canonical_digest(
+            result, "worker_result_sha256"
+        )
+        write_exclusive_json(output_dir / "result.json", result)
+        raise
+    result["worker_result_sha256"] = canonical_digest(
+        result, "worker_result_sha256"
+    )
+    write_exclusive_json(output_dir / "result.json", result)
+    return result
 
 
 def _request_repo_root(request: Mapping[str, Any]) -> Path:
