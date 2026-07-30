@@ -55,9 +55,16 @@ def test_e2e_run_uses_bound_runtime_resource_policy(
     captured: dict[str, dict] = {}
 
     class Guard:
-        def __init__(self, policy: dict, *, monitor_path: Path) -> None:
+        def __init__(
+            self,
+            policy: dict,
+            *,
+            monitor_path: Path,
+            allowed_external_gpu_pids=None,
+        ) -> None:
             captured["policy"] = policy
             captured["monitor_path"] = {"path": str(monitor_path)}
+            captured["allowed_external_gpu_pids"] = allowed_external_gpu_pids
             raise StopAfterGuard
 
     class Driver:
@@ -67,7 +74,7 @@ def test_e2e_run_uses_bound_runtime_resource_policy(
 
         @staticmethod
         def _full_admission_preflight() -> dict:
-            return {}
+            return {"external_compute_pid_baseline": baseline}
 
         @staticmethod
         def build_resource_scheduler(runtime: dict):
@@ -81,6 +88,7 @@ def test_e2e_run_uses_bound_runtime_resource_policy(
             return dict(value)
 
     policy = {"gpu_indices": [0, 1, 2, 3], "retry_count": 0}
+    baseline = [{"gpu_uuid": "GPU-0", "pid": 123, "start_time_ticks": 456}]
     runtime = {"full_e2e_bootstrap": {"resource_policy": policy}}
     plan = {
         "full_e2e_plan_sha256": "a" * 64,

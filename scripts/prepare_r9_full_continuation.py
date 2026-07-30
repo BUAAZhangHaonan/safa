@@ -576,6 +576,7 @@ def _run_e2e(driver) -> dict:
     runtime_guard = driver.FullRuntimeGuard(
         resource_policy,
         monitor_path=root / "monitor/resource_samples.jsonl",
+        allowed_external_gpu_pids=admission.get("external_compute_pid_baseline"),
     )
     scheduler_admission = _pre_admit_e2e_plan(
         driver,

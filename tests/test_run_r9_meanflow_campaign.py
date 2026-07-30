@@ -2835,6 +2835,152 @@ def test_full_admission_ignores_temperatures_for_unselected_gpus() -> None:
     }
 
 
+def test_full_admission_external_pid_baseline_requires_explicit_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Probe:
+        @staticmethod
+        def ram_snapshot():
+            return SimpleNamespace(used_bytes=10, total_bytes=100)
+
+        @staticmethod
+        def gpu_snapshots():
+            return tuple(
+                SimpleNamespace(
+                    index=index,
+                    uuid=f"GPU-{index}",
+                    total_bytes=4 * 1024**3,
+                    free_bytes=3 * 1024**3,
+                )
+                for index in range(4)
+            )
+
+    common = {
+        "resource_probe": Probe(),
+        "compute_apps": (("GPU-3", 4242),),
+        "temperatures": {f"GPU-{index}": 40 for index in range(4)},
+        "disk_usage": SimpleNamespace(used=10, total=100),
+        "swap_io_delta": (0, 0),
+    }
+    monkeypatch.delenv(driver.FULL_ADMISSION_EXTERNAL_PID_BASELINE_ENV, raising=False)
+    with pytest.raises(driver.ResourceContractError, match="unknown GPU compute PIDs"):
+        driver._full_admission_preflight(**common)
+
+    monkeypatch.setenv(driver.FULL_ADMISSION_EXTERNAL_PID_BASELINE_ENV, "1")
+    monkeypatch.setattr(
+        driver,
+        "_gpu_pid_baseline_row",
+        lambda uuid, pid: {
+            "gpu_uuid": uuid,
+            "pid": pid,
+            "start_time_ticks": 12345,
+            "user": "guoxin",
+            "command": "python train_model.py",
+        },
+    )
+    admission = driver._full_admission_preflight(**common)
+    assert admission["unknown_compute_pid_count"] == 1
+    assert admission["external_compute_pid_baseline"] == [
+        {
+            "gpu_uuid": "GPU-3",
+            "pid": 4242,
+            "start_time_ticks": 12345,
+            "user": "guoxin",
+            "command": "python train_model.py",
+        }
+    ]
+    assert admission["external_compute_pid_policy"] == {
+        "schema_version": 1,
+        "mode": "user_authorized_preexisting_gpu_pid_baseline_v1",
+        "authorization_env": driver.FULL_ADMISSION_EXTERNAL_PID_BASELINE_ENV,
+        "new_unknown_gpu_pids": "forbidden_after_admission",
+        "resource_hard_stops": "unchanged",
+    }
+    assert driver._validate_admission_external_pid_policy(admission) is True
+
+
+def test_full_runtime_guard_tracks_external_pid_baseline_and_rejects_new_unknown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(driver, "REPO_ROOT", tmp_path)
+
+    class Probe:
+        @staticmethod
+        def ram_snapshot():
+            return SimpleNamespace(used_bytes=10, total_bytes=100)
+
+        @staticmethod
+        def gpu_snapshots():
+            return tuple(
+                SimpleNamespace(
+                    index=index,
+                    uuid=f"GPU-{index}",
+                    total_bytes=100,
+                    free_bytes=90,
+                )
+                for index in range(4)
+            )
+
+    policy = {
+        "policy_id": "frozen_conservative_e2e_v1",
+        "gpu_indices": [0, 1, 2, 3],
+        "hard_stop": {
+            "gpu_memory_percent_at_or_above": 90,
+            "ram_percent_at_or_above": 90,
+            "disk_percent_at_or_above": 90,
+            "cpu_percent_at_or_above": 90,
+            "temperature_c_above": 85,
+            "swap_io_positive": True,
+            "sustained_sample_count": 2,
+        },
+    }
+    cpu_values = iter(((100, 50), (200, 100), (300, 150)))
+    monkeypatch.setattr(
+        driver,
+        "_pid_start_time_ticks",
+        lambda pid: {4242: 12345, 5252: 23456}[pid],
+    )
+    baseline = [
+        {
+            "gpu_uuid": "GPU-3",
+            "pid": 4242,
+            "start_time_ticks": 12345,
+            "user": "guoxin",
+            "command": "python train_model.py",
+        }
+    ]
+    guard = driver.FullRuntimeGuard(
+        policy,
+        monitor_path=tmp_path / "guard.jsonl",
+        probe=Probe(),
+        temperatures=lambda: {f"GPU-{index}": 40 for index in range(4)},
+        swap_reader=lambda: (0, 0),
+        disk_usage=lambda _: SimpleNamespace(used=10, total=100),
+        gpu_process_memory=lambda: {},
+        gpu_compute_apps=lambda: (("GPU-3", 4242),),
+        cpu_reader=lambda: next(cpu_values),
+        allowed_external_gpu_pids=baseline,
+    )
+    sample = guard.enforce()
+    assert sample["external_compute_pid_baseline"] == baseline
+
+    rejecting_cpu_values = iter(((100, 50), (200, 100)))
+    rejecting = driver.FullRuntimeGuard(
+        policy,
+        monitor_path=tmp_path / "rejecting.jsonl",
+        probe=Probe(),
+        temperatures=lambda: {f"GPU-{index}": 40 for index in range(4)},
+        swap_reader=lambda: (0, 0),
+        disk_usage=lambda _: SimpleNamespace(used=10, total=100),
+        gpu_process_memory=lambda: {},
+        gpu_compute_apps=lambda: (("GPU-3", 5252),),
+        cpu_reader=lambda: next(rejecting_cpu_values),
+        allowed_external_gpu_pids=baseline,
+    )
+    with pytest.raises(driver.ResourceContractError, match="unknown GPU compute PIDs"):
+        rejecting.enforce()
+
+
 def test_full_runtime_guard_hard_stops_on_sustained_host_cpu(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -2879,6 +3025,7 @@ def test_full_runtime_guard_hard_stops_on_sustained_host_cpu(
         swap_reader=lambda: (0, 0),
         disk_usage=lambda _: SimpleNamespace(used=10, total=100),
         gpu_process_memory=lambda: {},
+        gpu_compute_apps=lambda: (),
         cpu_reader=lambda: next(cpu_values),
     )
     guard.enforce()
@@ -2907,6 +3054,7 @@ def test_full_runtime_guard_fails_when_bound_monitor_dies(
         policy,
         monitor_path=tmp_path / "guard.jsonl",
         swap_reader=lambda: (0, 0),
+        gpu_compute_apps=lambda: (),
         cpu_reader=lambda: (100, 50),
     )
     claim = {

@@ -1866,6 +1866,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             monitor_path=(
                 campaign_root / "formal_monitor/runtime_guard_samples.jsonl"
             ),
+            allowed_external_gpu_pids=admission.get(
+                "external_compute_pid_baseline"
+            ),
         )
         monitor_claim = _materialize_formal_full_monitor_claim(
             effective_runtime
@@ -1981,6 +1984,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         _wait_formal_full_monitor(effective_runtime)
     return exit_code
+
+
+def _validate_admission_external_pid_policy(
+    admission: Mapping[str, Any],
+) -> bool:
+    count = admission.get("unknown_compute_pid_count")
+    if count == 0:
+        return (
+            "external_compute_pid_baseline" not in admission
+            and "external_compute_pid_policy" not in admission
+        )
+    if type(count) is not int or count < 0:
+        return False
+    policy = admission.get("external_compute_pid_policy")
+    if policy != {
+        "schema_version": 1,
+        "mode": "user_authorized_preexisting_gpu_pid_baseline_v1",
+        "authorization_env": FULL_ADMISSION_EXTERNAL_PID_BASELINE_ENV,
+        "new_unknown_gpu_pids": "forbidden_after_admission",
+        "resource_hard_stops": "unchanged",
+    }:
+        return False
+    try:
+        baseline = _normalize_external_gpu_pid_baseline(
+            admission.get("external_compute_pid_baseline")
+        )
+    except ResourceContractError:
+        return False
+    return len(baseline) == count
 
 
 def _resume_formal_full_report_only(
@@ -2123,6 +2155,11 @@ def _validate_formal_full_execution_chain(
         "swap_out_delta_pages",
         "full_admission_sha256",
     }
+    if admission.get("unknown_compute_pid_count") != 0:
+        admission_fields = admission_fields | {
+            "external_compute_pid_baseline",
+            "external_compute_pid_policy",
+        }
     monitor_claim_fields = {
         "schema_version",
         "contract_type",
@@ -2191,7 +2228,7 @@ def _validate_formal_full_execution_chain(
         or admission.get("gpu_indices") != [0, 1, 2, 3]
         or not isinstance(admission.get("gpu_uuids"), list)
         or len(set(admission["gpu_uuids"])) != 4
-        or admission.get("unknown_compute_pid_count") != 0
+        or not _validate_admission_external_pid_policy(admission)
         or any(
             value < 2 * 1024**3
             for value in admission.get("free_vram_bytes", [])
@@ -3231,6 +3268,11 @@ def _validate_full_e2e_result_semantics(
         raise ValueError("Full E2E quality result coverage changed")
 
 
+FULL_ADMISSION_EXTERNAL_PID_BASELINE_ENV = (
+    "SAFA_R9_ALLOW_PREEXISTING_EXTERNAL_GPU_PIDS"
+)
+
+
 def _full_admission_preflight(
     *,
     resource_probe: Any | None = None,
@@ -3261,11 +3303,16 @@ def _full_admission_preflight(
     unknown = sorted(
         (uuid, pid) for uuid, pid in apps if uuid in selected_uuids
     )
+    external_pid_baseline: list[dict[str, Any]] = []
     if unknown:
-        raise ResourceContractError(
-            "Full admission found unknown GPU compute PIDs: "
-            + ",".join(f"{uuid}:{pid}" for uuid, pid in unknown)
-        )
+        if os.environ.get(FULL_ADMISSION_EXTERNAL_PID_BASELINE_ENV) != "1":
+            raise ResourceContractError(
+                "Full admission found unknown GPU compute PIDs: "
+                + ",".join(f"{uuid}:{pid}" for uuid, pid in unknown)
+            )
+        external_pid_baseline = [
+            _gpu_pid_baseline_row(uuid, pid) for uuid, pid in unknown
+        ]
     all_temperatures = (
         dict(temperatures)
         if temperatures is not None
@@ -3307,8 +3354,89 @@ def _full_admission_preflight(
         "swap_in_delta_pages": 0,
         "swap_out_delta_pages": 0,
     }
+    if external_pid_baseline:
+        evidence["unknown_compute_pid_count"] = len(external_pid_baseline)
+        evidence["external_compute_pid_baseline"] = external_pid_baseline
+        evidence["external_compute_pid_policy"] = {
+            "schema_version": 1,
+            "mode": "user_authorized_preexisting_gpu_pid_baseline_v1",
+            "authorization_env": FULL_ADMISSION_EXTERNAL_PID_BASELINE_ENV,
+            "new_unknown_gpu_pids": "forbidden_after_admission",
+            "resource_hard_stops": "unchanged",
+        }
     evidence["full_admission_sha256"] = _canonical_json_sha256(evidence)
     return evidence
+
+
+def _gpu_pid_baseline_row(gpu_uuid: str, pid: int) -> dict[str, Any]:
+    start_ticks = _pid_start_time_ticks(pid)
+    completed = subprocess.run(
+        ["ps", "-o", "user=", "-o", "args=", "-p", str(pid)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0 or not completed.stdout.strip():
+        raise ResourceContractError("Full admission GPU PID process disappeared")
+    fields = completed.stdout.strip().split(maxsplit=1)
+    user = fields[0]
+    command = fields[1] if len(fields) > 1 else ""
+    return {
+        "gpu_uuid": gpu_uuid,
+        "pid": int(pid),
+        "start_time_ticks": start_ticks,
+        "user": user,
+        "command": command,
+    }
+
+
+def _pid_start_time_ticks(pid: int) -> int:
+    stat_path = Path("/proc") / str(pid) / "stat"
+    try:
+        raw = stat_path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise ResourceContractError(
+            f"cannot read GPU PID start time: {pid}"
+        ) from error
+    try:
+        after_comm = raw.rsplit(")", 1)[1].split()
+        start_ticks = int(after_comm[19])
+    except (IndexError, ValueError) as error:
+        raise ResourceContractError(
+            f"GPU PID stat format changed: {pid}"
+        ) from error
+    if start_ticks <= 0:
+        raise ResourceContractError("GPU PID start time is not positive")
+    return start_ticks
+
+
+def _normalize_external_gpu_pid_baseline(
+    rows: Sequence[Mapping[str, Any]] | None,
+) -> tuple[dict[str, Any], ...]:
+    if rows is None:
+        return ()
+    normalized = []
+    seen: set[tuple[str, int]] = set()
+    for row in rows:
+        value = _mapping(row, "external GPU PID baseline row")
+        if set(value) != {"gpu_uuid", "pid", "start_time_ticks", "user", "command"}:
+            raise ResourceContractError("external GPU PID baseline fields changed")
+        key = (str(value["gpu_uuid"]), _positive_int(value["pid"], "external GPU PID"))
+        if key in seen:
+            raise ResourceContractError("external GPU PID baseline duplicated")
+        seen.add(key)
+        normalized.append(
+            {
+                "gpu_uuid": key[0],
+                "pid": key[1],
+                "start_time_ticks": _positive_int(
+                    value["start_time_ticks"], "external GPU PID start time"
+                ),
+                "user": str(value["user"]),
+                "command": str(value["command"]),
+            }
+        )
+    return tuple(sorted(normalized, key=lambda item: (item["gpu_uuid"], item["pid"])))
 
 
 def _query_gpu_compute_apps() -> tuple[tuple[str, int], ...]:
@@ -3405,7 +3533,9 @@ class FullRuntimeGuard:
         swap_reader: Any = _read_swap_io,
         disk_usage: Any = shutil.disk_usage,
         gpu_process_memory: Any | None = None,
+        gpu_compute_apps: Any = _query_gpu_compute_apps,
         cpu_reader: Any = _read_cpu_times,
+        allowed_external_gpu_pids: Sequence[Mapping[str, Any]] | None = None,
     ) -> None:
         self._policy = dict(_mapping(policy, "Full runtime guard policy"))
         if self._policy.get("policy_id") != "frozen_conservative_e2e_v1":
@@ -3421,6 +3551,10 @@ class FullRuntimeGuard:
             _query_gpu_process_memory_bytes
             if gpu_process_memory is None
             else gpu_process_memory
+        )
+        self._gpu_compute_apps = gpu_compute_apps
+        self._allowed_external_gpu_pids = _normalize_external_gpu_pid_baseline(
+            allowed_external_gpu_pids
         )
         self._monitor_path = Path(monitor_path)
         self._previous_swap = tuple(self._swap_reader())
@@ -3532,14 +3666,33 @@ class FullRuntimeGuard:
             else 0
         )
         process_rows = {}
+        live_worker_pids: set[int] = set()
         for worker_id, process in sorted((processes or {}).items()):
             if process.poll() is None:
+                pid = int(process.pid)
+                live_worker_pids.add(pid)
                 process_rows[worker_id] = {
-                    "pid": int(process.pid),
-                    "process_tree_rss_bytes": _process_tree_rss_bytes(
-                        int(process.pid)
-                    ),
+                    "pid": pid,
+                    "process_tree_rss_bytes": _process_tree_rss_bytes(pid),
                 }
+        selected_uuids = {row.uuid for row in snapshots}
+        current_compute_apps = tuple(self._gpu_compute_apps())
+        allowed_external = {
+            (row["gpu_uuid"], row["pid"], row["start_time_ticks"])
+            for row in self._allowed_external_gpu_pids
+        }
+        new_unknown = []
+        for gpu_uuid, pid in current_compute_apps:
+            if gpu_uuid not in selected_uuids or int(pid) in live_worker_pids:
+                continue
+            start_ticks = _pid_start_time_ticks(int(pid))
+            if (gpu_uuid, int(pid), start_ticks) not in allowed_external:
+                new_unknown.append((gpu_uuid, int(pid)))
+        if new_unknown:
+            raise ResourceContractError(
+                "Full runtime found unknown GPU compute PIDs: "
+                + ",".join(f"{uuid}:{pid}" for uuid, pid in sorted(new_unknown))
+            )
         gpu_memory = dict(self._gpu_process_memory())
         sample = {
             "schema_version": 1,
@@ -3564,6 +3717,9 @@ class FullRuntimeGuard:
                 for row in snapshots
             ],
             "processes": process_rows,
+            "external_compute_pid_baseline": list(
+                self._allowed_external_gpu_pids
+            ),
         }
         self._monitor_path.parent.mkdir(parents=True, exist_ok=True)
         with self._monitor_path.open("a", encoding="utf-8") as handle:
