@@ -171,6 +171,7 @@ class ActiveWorker:
     worker_id: str
     process: Any
     launch_ordinal: int
+    gpu_index: int
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -5595,6 +5596,14 @@ def execute_campaign(
         pending_index = 0
         while pending_index < len(pending):
             run, launch_ordinal, preferred_gpu_index = pending[pending_index]
+            if (
+                runtime_guard is not None
+                and run.phase == "full"
+                and preferred_gpu_index
+                in {worker.gpu_index for worker in active.values()}
+            ):
+                pending_index += 1
+                continue
             worker_id = f"{run.phase}:{run.logical_run_id}:shard-{run.shard_index}"
             lease = _admit_worker(
                 scheduler,
@@ -5646,6 +5655,9 @@ def execute_campaign(
                 worker_id=worker_id,
                 process=process,
                 launch_ordinal=launch_ordinal,
+                gpu_index={uuid: index for index, uuid in bindings.items()}[
+                    lease.gpu_uuid
+                ],
             )
             pending.pop(pending_index)
             launched = True

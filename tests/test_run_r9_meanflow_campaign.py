@@ -2868,6 +2868,38 @@ def _many_run_plan(tmp_path: Path, count: int) -> driver.PhasePlan:
     )
 
 
+def _full_shard_plan(tmp_path: Path, count: int) -> driver.PhasePlan:
+    runs = []
+    for index in range(count):
+        runtime_path = Path(f"full-runtime-{index}.yaml")
+        (tmp_path / runtime_path).write_text(
+            "mode: paper_algorithm_split\n", encoding="utf-8"
+        )
+        runs.append(
+            driver.RunSpec(
+                phase="full",
+                logical_run_id="winner",
+                arm_ref="paper_eta_0p125",
+                seed=7919,
+                repeat_index=None,
+                shard_index=index,
+                num_shards=count,
+                sample_count=128,
+                manifest_key="full_2048",
+                runtime_config=runtime_path,
+                output_dir=Path(f"full/winner/shards/shard_{index}"),
+                command=("python", f"full-worker-{index}.py"),
+            )
+        )
+    return driver.PhasePlan(
+        phase="full",
+        campaign_id="r9-test",
+        campaign_root=Path("campaign"),
+        logical_run_count=1,
+        runs=tuple(runs),
+    )
+
+
 def test_execute_refills_four_by_four_slots_without_exceeding_sixteen(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -2902,6 +2934,47 @@ def test_execute_refills_four_by_four_slots_without_exceeding_sixteen(
     assert set(scheduler.admitted_slots[:16]) == {
         (f"GPU-{gpu}", slot) for gpu in range(4) for slot in range(4)
     }
+    assert scheduler.active == {}
+
+
+def test_execute_full_with_runtime_guard_limits_one_worker_per_gpu(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(driver, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(driver, "validate_worker_completion", lambda run: {})
+    scheduler = _FourGpuSlotScheduler()
+    allow_complete = {"value": False}
+    processes = []
+
+    class GateProcess(_FakeProcess):
+        def poll(self):
+            return 0 if allow_complete["value"] else None
+
+    class Guard:
+        max_seen = 0
+
+        def enforce(self, processes_by_worker):
+            self.max_seen = max(self.max_seen, len(processes_by_worker))
+
+    guard = Guard()
+
+    def process_factory(*args, **kwargs):
+        process = GateProcess(0)
+        processes.append(process)
+        return process
+
+    driver.execute_campaign(
+        (_full_shard_plan(tmp_path, 8),),
+        scheduler=scheduler,
+        gpu_bindings={index: f"GPU-{index}" for index in range(4)},
+        peer_status_store=_StatusStore(),
+        process_factory=process_factory,
+        runtime_guard=guard,
+        sleep=lambda _: allow_complete.update(value=True),
+    )
+    assert len(processes) == 8
+    assert scheduler.max_active == 4
+    assert guard.max_seen == 4
     assert scheduler.active == {}
 
 
