@@ -660,6 +660,21 @@ def test_arcface_omits_cosines_for_any_non_exact_one_role(tmp_path: Path) -> Non
     assert rows[1]["native_face_count"] == 0
 
 
+def test_arcface_accepts_full_e2e_phase(tmp_path: Path) -> None:
+    config, samples, _ = _fixture(tmp_path)
+    request = replace(
+        _arcface_request(config, samples),
+        phase="full_e2e",
+        logical_run_id="formal_e2e_arcface_8",
+        arm_id="paper_eta_0p125",
+    )
+    rows = R9ProductionEvaluators(
+        config,
+        _dependencies(FakeQualityBackend(), FakeAnalyzer([1] * 6)),
+    ).arcface(request)
+    assert [row["sample_id"] for row in rows] == ["sample-a", "sample-b"]
+
+
 def test_arcface_rehashes_index_and_all_three_roles(tmp_path: Path) -> None:
     config, samples, _ = _fixture(tmp_path)
     samples[0].native.write_bytes(b"tampered")

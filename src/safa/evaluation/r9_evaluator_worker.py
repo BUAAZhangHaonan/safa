@@ -1590,7 +1590,7 @@ def _validate_quality_per_sample_metrics(
 def _validate_common_request(
     phase: Any, logical_run_id: Any, arm_id: Any, seed: Any
 ) -> None:
-    if phase not in {"diagnose", "calibrate", "confirm512", "full"}:
+    if phase not in {"diagnose", "calibrate", "confirm512", "full", "full_e2e"}:
         raise R9EvaluatorError("evaluator phase is not registered")
     for value, label in ((logical_run_id, "logical run ID"), (arm_id, "arm ID")):
         if not isinstance(value, str) or _SAFE_ID.fullmatch(value) is None:
