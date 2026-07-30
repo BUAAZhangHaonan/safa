@@ -2845,7 +2845,6 @@ def _rebuild_full_e2e_evidence(
         output_canonical = dict(output)
         output_canonical.pop("evaluator_output_sha256")
         evaluation = _mapping(campaign_runtime.get("evaluation"), "evaluation")
-        worker = _mapping(evaluation.get("worker"), "worker")
         expected_config = {
             "repo_root": str(REPO_ROOT.resolve()),
             "device": "cuda:0",
@@ -2853,27 +2852,14 @@ def _rebuild_full_e2e_evidence(
             "batch_size": int(
                 _mapping(evaluation.get("heldout"), "heldout")["batch_size"]
             ),
-            "arcface": dict(_mapping(evaluation.get("arcface"), "arcface")),
+            "arcface": _normalized_arcface_evaluation_contract(evaluation),
             "quality_script": dict(
                 _mapping(
                     _mapping(evaluation.get("quality"), "quality").get("script"),
                     "quality script",
                 )
             ),
-            "worker_contract": {
-                "path": str(
-                    _repo_path(REPO_ROOT, worker["path"], "worker").resolve()
-                ),
-                "sha256": worker["sha256"],
-                "implementation_path": str(
-                    _repo_path(
-                        REPO_ROOT,
-                        worker["implementation_path"],
-                        "worker implementation",
-                    ).resolve()
-                ),
-                "implementation_sha256": worker["implementation_sha256"],
-            },
+            "worker_contract": _normalized_worker_contract(evaluation),
         }
         if (
             request.get("contract_type") != "safa_r9_phase_evaluator_request_v1"
