@@ -125,6 +125,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PHASES = ("preflight", "diagnose", "calibrate", "confirm512", "full")
 CAMPAIGN_ID_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 RESOURCE_SMOKE_ROOT_EXIT_WAIT_SECONDS = 1.0
+FULL_GUARDED_MAX_ACTIVE_WORKERS = 2
 
 
 class _ProcessTreeRootExitObserved(RuntimeError):
@@ -5599,11 +5600,14 @@ def execute_campaign(
             if (
                 runtime_guard is not None
                 and run.phase == "full"
-                and preferred_gpu_index
-                in {worker.gpu_index for worker in active.values()}
             ):
-                pending_index += 1
-                continue
+                active_gpu_indices = {worker.gpu_index for worker in active.values()}
+                if (
+                    len(active) >= FULL_GUARDED_MAX_ACTIVE_WORKERS
+                    or preferred_gpu_index in active_gpu_indices
+                ):
+                    pending_index += 1
+                    continue
             worker_id = f"{run.phase}:{run.logical_run_id}:shard-{run.shard_index}"
             lease = _admit_worker(
                 scheduler,

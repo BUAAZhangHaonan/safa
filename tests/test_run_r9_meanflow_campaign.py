@@ -2937,7 +2937,7 @@ def test_execute_refills_four_by_four_slots_without_exceeding_sixteen(
     assert scheduler.active == {}
 
 
-def test_execute_full_with_runtime_guard_limits_one_worker_per_gpu(
+def test_execute_full_with_runtime_guard_limits_two_workers_total(
     monkeypatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(driver, "REPO_ROOT", tmp_path)
@@ -2973,8 +2973,8 @@ def test_execute_full_with_runtime_guard_limits_one_worker_per_gpu(
         sleep=lambda _: allow_complete.update(value=True),
     )
     assert len(processes) == 8
-    assert scheduler.max_active == 4
-    assert guard.max_seen == 4
+    assert scheduler.max_active == 2
+    assert guard.max_seen == 2
     assert scheduler.active == {}
 
 
