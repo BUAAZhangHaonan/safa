@@ -75,14 +75,14 @@ class ArmResult:
     delta_edev: float
     niqe: float
     native_niqe: float
-    fid: float
-    native_fid: float
-    kid: float
-    native_kid: float
+    fid: float | None
+    native_fid: float | None
+    kid: float | None
+    native_kid: float | None
     sharpness: float
     native_sharpness: float
     arcface_delta: float
-    arcface_delta_u95: float
+    arcface_delta_u95: float | None
     hard_gate_pass: bool
     failed_gates: tuple[str, ...]
     r_margin: float
@@ -694,11 +694,12 @@ def _evaluate_arm(
     arm_id: str,
     rows: Sequence[Mapping[str, Any]],
     *,
-    fid: float,
-    kid: float,
-    native_fid: float,
-    native_kid: float,
+    fid: float | None,
+    kid: float | None,
+    native_fid: float | None,
+    native_kid: float | None,
     bootstrap_indices: np.ndarray,
+    stage: int,
 ) -> ArmResult:
     if not isinstance(arm_id, str) or not arm_id:
         raise TriangleScreeningError("arm_id must be a non-empty string")
@@ -744,40 +745,61 @@ def _evaluate_arm(
         )
     ]
     arcface_delta = _mean(arcface_deltas)
-    arcface_delta_u95 = paired_bootstrap_upper(
-        arcface_deltas,
-        iterations=bootstrap_indices.shape[0],
-        indices=bootstrap_indices,
-    )
-    fid = _finite_number(fid, f"{arm_id}.fid")
-    kid = _finite_number(kid, f"{arm_id}.kid")
-    native_fid = _finite_number(native_fid, "native_fid")
-    native_kid = _finite_number(native_kid, "native_kid")
+    if stage == 32:
+        if any(value is not None for value in (fid, kid, native_fid, native_kid)):
+            raise TriangleScreeningError(
+                "stage32 provisional screening forbids FID/KID values"
+            )
+        fid = kid = native_fid = native_kid = None
+        arcface_delta_u95 = None
+        privacy_statistic = arcface_delta
+    else:
+        fid = _finite_number(fid, f"{arm_id}.fid")
+        kid = _finite_number(kid, f"{arm_id}.kid")
+        native_fid = _finite_number(native_fid, "native_fid")
+        native_kid = _finite_number(native_kid, "native_kid")
+        arcface_delta_u95 = paired_bootstrap_upper(
+            arcface_deltas,
+            iterations=bootstrap_indices.shape[0],
+            indices=bootstrap_indices,
+        )
+        privacy_statistic = arcface_delta_u95
     sharpness_floor = max(300.0, 0.95 * native_sharpness)
     checks = (
         ("candidate_exact_one", exact_one == n),
-        ("arcface_delta_u95", arcface_delta_u95 <= 0.02),
+        (
+            "arcface_delta" if stage == 32 else "arcface_delta_u95",
+            privacy_statistic <= 0.02,
+        ),
         ("e0", e0 >= 0.75),
         ("delta_e0", delta_e0 >= 0.30),
         ("delta_edev", delta_edev >= 0.05),
         ("niqe", niqe <= native_niqe + 0.10),
-        ("fid", fid <= native_fid + 3.0),
-        ("kid", kid <= native_kid + 0.005),
         ("sharpness", sharpness >= sharpness_floor),
     )
+    if stage != 32:
+        checks = checks[:-1] + (
+            ("fid", fid <= native_fid + 3.0),
+            ("kid", kid <= native_kid + 0.005),
+            checks[-1],
+        )
     failed = tuple(name for name, passed in checks if not passed)
     r_margin = min(
         (e0 - 0.75) / 0.75,
         (delta_e0 - 0.30) / 0.30,
         (delta_edev - 0.05) / 0.05,
     )
-    q_margin = min(
-        (native_fid + 3.0 - fid) / 3.0,
-        (native_kid + 0.005 - kid) / 0.005,
+    q_terms = [
         (native_niqe + 0.10 - niqe) / 0.10,
         sharpness / sharpness_floor - 1.0,
-    )
-    p_margin = (0.02 - arcface_delta_u95) / 0.02
+    ]
+    if stage != 32:
+        q_terms[:0] = [
+            (native_fid + 3.0 - fid) / 3.0,
+            (native_kid + 0.005 - kid) / 0.005,
+        ]
+    q_margin = min(q_terms)
+    p_margin = (0.02 - privacy_statistic) / 0.02
     return ArmResult(
         arm_id=arm_id,
         sample_count=n,
@@ -892,7 +914,12 @@ def _breakthrough_status(result: ArmResult, baseline: ArmResult) -> str:
         for value, baseline_value in zip(axes, baseline_axes, strict=True)
     )
     if strict_improvements >= 2 and no_worse:
-        if result.arcface_delta_u95 <= 0.0:
+        privacy_statistic = (
+            result.arcface_delta
+            if result.arcface_delta_u95 is None
+            else result.arcface_delta_u95
+        )
+        if privacy_statistic <= 0.0:
             return "privacy_positive_breakthrough"
         return "triangle_breakthrough"
     return "gate_survivor_no_breakthrough"
@@ -961,6 +988,7 @@ def evaluate_arms(
             native_fid=native_fid,
             native_kid=native_kid,
             bootstrap_indices=shared_indices,
+            stage=stage,
         )
         for arm_id, rows, fid, kid in normalized
     ]
@@ -1014,13 +1042,36 @@ def write_outputs(
         "schema_version": 1,
         "contract_type": "safa_triangle_screening_v1",
         "stage": stage,
-        "bootstrap": {
-            "bit_generator": "PCG64",
-            "seed": BOOTSTRAP_SEED,
-            "iterations": _bootstrap_iterations(stage),
-            "paired": True,
-            "shared_across_arms": True,
-        },
+        "bootstrap": (
+            None
+            if stage == 32
+            else {
+                "bit_generator": "PCG64",
+                "seed": BOOTSTRAP_SEED,
+                "iterations": _bootstrap_iterations(stage),
+                "paired": True,
+                "shared_across_arms": True,
+            }
+        ),
+        "privacy_inference": (
+            {
+                "statistic": "point_arcface_delta",
+                "provisional": True,
+                "bootstrap": None,
+            }
+            if stage == 32
+            else {
+                "statistic": "arcface_delta_u95",
+                "provisional": False,
+                "bootstrap": {
+                    "bit_generator": "PCG64",
+                    "seed": BOOTSTRAP_SEED,
+                    "iterations": _bootstrap_iterations(stage),
+                    "paired": True,
+                    "shared_across_arms": True,
+                },
+            }
+        ),
         "baseline_arm_id": baseline_arm_id,
         "arm_count": len(results),
         "gate_survivor_count": sum(result.hard_gate_pass for result in results),
@@ -1058,12 +1109,20 @@ def write_outputs(
                 "sample_count": result.sample_count,
                 "candidate_exact_one_count": result.candidate_exact_one_count,
                 "arcface_delta_u95": result.arcface_delta_u95,
+                "arcface_delta": result.arcface_delta,
                 "failed_gates": list(result.failed_gates),
             }
             for result in results
             if (
                 result.candidate_exact_one_count != result.sample_count
-                or result.arcface_delta_u95 > 0.02
+                or (
+                    result.arcface_delta_u95 is not None
+                    and result.arcface_delta_u95 > 0.02
+                )
+                or (
+                    result.arcface_delta_u95 is None
+                    and result.arcface_delta > 0.02
+                )
             )
         ],
     }

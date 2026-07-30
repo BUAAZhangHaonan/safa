@@ -63,13 +63,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     request = _read_json(args.request.resolve())
     if not isinstance(request, Mapping):
         raise TriangleScreeningError("request must be a JSON object")
-    required = (
-        "stage",
-        "native_fid",
-        "native_kid",
-        "baseline_arm_id",
-        "arms",
-    )
+    required = ("stage", "baseline_arm_id", "arms")
+    if request.get("stage") != 32:
+        required += ("native_fid", "native_kid")
     missing = [field for field in required if field not in request]
     if missing:
         raise TriangleScreeningError(
@@ -81,7 +77,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     materialized: list[dict[str, Any]] = []
     request_root = args.request.resolve().parent
     selection_manifest = None
-    if request["stage"] != 8:
+    if request["stage"] == 32 and "selection_manifest_path" in request:
+        selection_path = Path(request["selection_manifest_path"])
+        if not selection_path.is_absolute():
+            selection_path = request_root / selection_path
+        selection_manifest = _read_rows(selection_path.resolve())
+        if len(selection_manifest) != 32:
+            raise TriangleScreeningError(
+                "stage32 selection manifest must contain exactly 32 rows"
+            )
+    elif request["stage"] != 8:
         eligibility = request.get("eligibility")
         if not isinstance(eligibility, Mapping):
             raise TriangleScreeningError(
@@ -141,8 +146,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     results = evaluate_arms(
         materialized,
         stage=request["stage"],
-        native_fid=request["native_fid"],
-        native_kid=request["native_kid"],
+        native_fid=request.get("native_fid"),
+        native_kid=request.get("native_kid"),
         baseline_arm_id=request["baseline_arm_id"],
         expected_sample_ids=(
             None

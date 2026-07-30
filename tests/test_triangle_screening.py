@@ -211,24 +211,50 @@ def test_normalized_axes_are_monotonic() -> None:
             {
                 "arm_id": "paper_eta_0p125",
                 "rows": baseline_rows,
-                "fid": 12.0,
-                "kid": 0.012,
             },
             {
                 "arm_id": "better",
                 "rows": better_rows,
-                "fid": 11.0,
-                "kid": 0.011,
             },
         ],
         stage=32,
-        native_fid=10.0,
-        native_kid=0.01,
+        native_fid=None,
+        native_kid=None,
     )
     assert better.r_margin > baseline.r_margin
     assert better.q_margin > baseline.q_margin
     assert better.p_margin > baseline.p_margin
     assert better.status == "privacy_positive_breakthrough"
+
+
+def test_stage32_omits_fid_kid_and_uses_point_privacy() -> None:
+    results = evaluate_arms(
+        [
+            {
+                "arm_id": "paper_eta_0p125",
+                "rows": arm_rows(32, source_candidate_cosine=0.41),
+            }
+        ],
+        stage=32,
+        native_fid=None,
+        native_kid=None,
+    )
+    assert results[0].fid is None
+    assert results[0].kid is None
+    assert results[0].arcface_delta == pytest.approx(0.01)
+    assert results[0].arcface_delta_u95 is None
+    assert results[0].hard_gate_pass
+
+
+@pytest.mark.parametrize("stage", [128, 512])
+def test_final_stages_reject_missing_fid_kid(stage: int) -> None:
+    with pytest.raises(TriangleScreeningError, match="finite number"):
+        evaluate_arms(
+            [{"arm_id": "paper_eta_0p125", "rows": arm_rows(stage)}],
+            stage=stage,
+            native_fid=None,
+            native_kid=None,
+        )
 
 
 def test_pareto_keeps_ties_and_removes_strictly_dominated() -> None:
