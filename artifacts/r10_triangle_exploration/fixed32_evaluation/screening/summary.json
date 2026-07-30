@@ -1,0 +1,332 @@
+{
+  "arm_count": 4,
+  "arms": [
+    {
+      "P": 0.6260572286309347,
+      "Q": 0.051861818823612404,
+      "R": 0.09160719811916351,
+      "arcface_delta": 0.007478855427381308,
+      "arcface_delta_u95": null,
+      "arm_id": "eta0p125_baseline",
+      "candidate_exact_one_count": 32,
+      "delta_e0": 0.8016305248020217,
+      "delta_edev": 0.3825958592206007,
+      "e0": 0.8187053985893726,
+      "failed_gates": [],
+      "fid": null,
+      "hard_gate_pass": true,
+      "kid": null,
+      "native_fid": null,
+      "native_kid": null,
+      "native_niqe": 4.73994880501704,
+      "native_sharpness": 668.8278228822091,
+      "niqe": 4.6898436111046955,
+      "pareto": true,
+      "sample_count": 32,
+      "selected": true,
+      "sharpness": 668.3387277438815,
+      "status": "gate_survivor_no_breakthrough"
+    },
+    {
+      "P": 0.8685251073684563,
+      "Q": 0.0076126266563398826,
+      "R": -0.025647727772593498,
+      "arcface_delta": 0.0026294978526308728,
+      "arcface_delta_u95": null,
+      "arm_id": "eta0p125_disable_i1",
+      "candidate_exact_one_count": 32,
+      "delta_e0": 0.7136893303832039,
+      "delta_edev": 0.29396309655567165,
+      "e0": 0.7307642041705549,
+      "failed_gates": [
+        "e0"
+      ],
+      "fid": null,
+      "hard_gate_pass": false,
+      "kid": null,
+      "native_fid": null,
+      "native_kid": null,
+      "native_niqe": 4.73994880501704,
+      "native_sharpness": 668.8278228822091,
+      "niqe": 4.440067404523576,
+      "pareto": false,
+      "sample_count": 32,
+      "selected": false,
+      "sharpness": 640.2233914254248,
+      "status": "no_gate_survivor"
+    },
+    {
+      "P": 0.7697910401919118,
+      "Q": -0.004137908073040597,
+      "R": -0.007910663882891336,
+      "arcface_delta": 0.004604179196161764,
+      "arcface_delta_u95": null,
+      "arm_id": "eta0p125_disable_i2",
+      "candidate_exact_one_count": 32,
+      "delta_e0": 0.7269921283004805,
+      "delta_edev": 0.3300539473857498,
+      "e0": 0.7440670020878315,
+      "failed_gates": [
+        "e0",
+        "sharpness"
+      ],
+      "fid": null,
+      "hard_gate_pass": false,
+      "kid": null,
+      "native_fid": null,
+      "native_kid": null,
+      "native_niqe": 4.73994880501704,
+      "native_sharpness": 668.8278228822091,
+      "niqe": 4.757182681550751,
+      "pareto": false,
+      "sample_count": 32,
+      "selected": false,
+      "sharpness": 632.7572610927091,
+      "status": "no_gate_survivor"
+    },
+    {
+      "P": 0.6028070247675467,
+      "Q": 0.04128374442958194,
+      "R": -0.06827771143677334,
+      "arcface_delta": 0.007943859504649067,
+      "arcface_delta_u95": null,
+      "arm_id": "eta0p125_disable_i3",
+      "candidate_exact_one_count": 32,
+      "delta_e0": 0.681716842635069,
+      "delta_edev": 0.31840209673100617,
+      "e0": 0.69879171642242,
+      "failed_gates": [
+        "e0"
+      ],
+      "fid": null,
+      "hard_gate_pass": false,
+      "kid": null,
+      "native_fid": null,
+      "native_kid": null,
+      "native_niqe": 4.73994880501704,
+      "native_sharpness": 668.8278228822091,
+      "niqe": 4.768755667936547,
+      "pareto": false,
+      "sample_count": 32,
+      "selected": false,
+      "sharpness": 661.6175627999983,
+      "status": "no_gate_survivor"
+    }
+  ],
+  "baseline_arm_id": "eta0p125_baseline",
+  "bootstrap": null,
+  "contract_type": "safa_triangle_screening_v1",
+  "gate_survivor_count": 1,
+  "pareto_arm_ids": [
+    "eta0p125_baseline"
+  ],
+  "privacy_inference": {
+    "bootstrap": null,
+    "provisional": true,
+    "statistic": "point_arcface_delta"
+  },
+  "schema_version": 1,
+  "selected_arm_ids": [
+    "eta0p125_baseline"
+  ],
+  "selection": {
+    "eligible_count": 2045,
+    "prefix_count": 32,
+    "samples": [
+      {
+        "cell_rank": 0,
+        "label": 0,
+        "sample_id": "val:Manually_Annotated_Images/957/90282a4518444270514aea5a11b000c5f49764879b4814fd3bf591e5.jpg",
+        "sharpness_quartile": 0
+      },
+      {
+        "cell_rank": 0,
+        "label": 0,
+        "sample_id": "val:Manually_Annotated_Images/952/2c9f6a125b9e299507b42f3ff68a743637deaf0071b13b9182b01d03.jpg",
+        "sharpness_quartile": 1
+      },
+      {
+        "cell_rank": 0,
+        "label": 0,
+        "sample_id": "val:Manually_Annotated_Images/117/986d38d55654b351433d557bd5dfcce7e7378d2008ffd510fb16d800.jpg",
+        "sharpness_quartile": 2
+      },
+      {
+        "cell_rank": 0,
+        "label": 0,
+        "sample_id": "val:Manually_Annotated_Images/963/eca7d8795dac0e9e106ac98d556a382ee0accce2785eecff0f72aaf0.jpg",
+        "sharpness_quartile": 3
+      },
+      {
+        "cell_rank": 0,
+        "label": 1,
+        "sample_id": "val:Manually_Annotated_Images/495/91f3e5a312eb553cf2552fbefcddb2c7e62aa81cdef1c87389ad7f1f.JPG",
+        "sharpness_quartile": 0
+      },
+      {
+        "cell_rank": 0,
+        "label": 1,
+        "sample_id": "val:Manually_Annotated_Images/493/2d9782361c7c15f3c64fca50dda7904b165bdf5c6b03e430482b42be.jpg",
+        "sharpness_quartile": 1
+      },
+      {
+        "cell_rank": 0,
+        "label": 1,
+        "sample_id": "val:Manually_Annotated_Images/59/585ba63d00889ec44aa30bd32723290e440c305a4d3a6e8b9919c596.jpg",
+        "sharpness_quartile": 2
+      },
+      {
+        "cell_rank": 0,
+        "label": 1,
+        "sample_id": "val:Manually_Annotated_Images/462/f47a25cfd2e73e1fc1f5cae15f91b7875581ca0c82467e3dc43eb862.jpg",
+        "sharpness_quartile": 3
+      },
+      {
+        "cell_rank": 0,
+        "label": 2,
+        "sample_id": "val:Manually_Annotated_Images/970/975a7156dbc3efd8202a25b4f912de08a05d5b59e6db207f421bfec6.jpg",
+        "sharpness_quartile": 0
+      },
+      {
+        "cell_rank": 0,
+        "label": 2,
+        "sample_id": "val:Manually_Annotated_Images/659/fe0d94bfe4e15267e07af4667a79736f57abc2f7ea6f14a236b98560.jpg",
+        "sharpness_quartile": 1
+      },
+      {
+        "cell_rank": 0,
+        "label": 2,
+        "sample_id": "val:Manually_Annotated_Images/910/6b048ae4d7318a7d788203240bb088fd6fdd83382827d0707441c97e.jpg",
+        "sharpness_quartile": 2
+      },
+      {
+        "cell_rank": 0,
+        "label": 2,
+        "sample_id": "val:Manually_Annotated_Images/840/2277bf4f991d8349f45a31afc662f15a280ab174e4b2c428ad9b7b5b.jpg",
+        "sharpness_quartile": 3
+      },
+      {
+        "cell_rank": 0,
+        "label": 3,
+        "sample_id": "val:Manually_Annotated_Images/658/0e129e33342847f002e7831ab2e8378c4c3a642607516ba41acf942a.jpg",
+        "sharpness_quartile": 0
+      },
+      {
+        "cell_rank": 0,
+        "label": 3,
+        "sample_id": "val:Manually_Annotated_Images/1051/99eb7f04c34277bfa425c1df6dcb863afde2b696e20c3255aa7f59ad.png",
+        "sharpness_quartile": 1
+      },
+      {
+        "cell_rank": 0,
+        "label": 3,
+        "sample_id": "val:Manually_Annotated_Images/1043/8e11682faf7c35401eb6f12e72fab39197c42681853b76766c67e640.jpg",
+        "sharpness_quartile": 2
+      },
+      {
+        "cell_rank": 0,
+        "label": 3,
+        "sample_id": "val:Manually_Annotated_Images/164/ada5800c80190560c9e1ef14f7071287d3db7ae44d9cd5e5871dbed6.jpg",
+        "sharpness_quartile": 3
+      },
+      {
+        "cell_rank": 0,
+        "label": 4,
+        "sample_id": "val:Manually_Annotated_Images/644/d7646c7d93b6b572129272dda8579eba52002cf140cfbdb84e197a27.jpg",
+        "sharpness_quartile": 0
+      },
+      {
+        "cell_rank": 0,
+        "label": 4,
+        "sample_id": "val:Manually_Annotated_Images/985/84967b42ad57c442fe62fac4a5fb72ce2b83c07e23fc447f8450468c.jpg",
+        "sharpness_quartile": 1
+      },
+      {
+        "cell_rank": 0,
+        "label": 4,
+        "sample_id": "val:Manually_Annotated_Images/901/b2c7cf5fe3428b27069a16a1d9228d30a47b42d2d19e4697cdadce56.jpg",
+        "sharpness_quartile": 2
+      },
+      {
+        "cell_rank": 0,
+        "label": 4,
+        "sample_id": "val:Manually_Annotated_Images/1049/64e00802544020505ea22b8a027a0f4a2ec02446b2b0cdb513b45937.jpg",
+        "sharpness_quartile": 3
+      },
+      {
+        "cell_rank": 0,
+        "label": 5,
+        "sample_id": "val:Manually_Annotated_Images/848/c6e8db65950ea6412f33803e0b0fb4f37016f7e15df8db431844af12.jpg",
+        "sharpness_quartile": 0
+      },
+      {
+        "cell_rank": 0,
+        "label": 5,
+        "sample_id": "val:Manually_Annotated_Images/683/4088c8523b4d891adbe29a808ecb840351135095700ba7488a91c366.png",
+        "sharpness_quartile": 1
+      },
+      {
+        "cell_rank": 0,
+        "label": 5,
+        "sample_id": "val:Manually_Annotated_Images/981/1a7ce16d877f85e71a99a2f5771c2ebcaece23993af22d3368d38bac.jpg",
+        "sharpness_quartile": 2
+      },
+      {
+        "cell_rank": 0,
+        "label": 5,
+        "sample_id": "val:Manually_Annotated_Images/986/6afda6dd23d754a7e8b1fb6a3f9192ac069d0e8d149e0198af87a7ae.jpg",
+        "sharpness_quartile": 3
+      },
+      {
+        "cell_rank": 0,
+        "label": 6,
+        "sample_id": "val:Manually_Annotated_Images/921/eee126016abdd00e87371094b98783cf7a87377800d319b7e3ba2f24.jpg",
+        "sharpness_quartile": 0
+      },
+      {
+        "cell_rank": 0,
+        "label": 6,
+        "sample_id": "val:Manually_Annotated_Images/743/c80189f4862f1b364a2a5a3dcfe1aad7d53974d00f19067cc7c6ebc7.jpg",
+        "sharpness_quartile": 1
+      },
+      {
+        "cell_rank": 0,
+        "label": 6,
+        "sample_id": "val:Manually_Annotated_Images/968/606de9c3409e875c847a14837cfa46fc42153bb7080cef7f099e0e30.jpg",
+        "sharpness_quartile": 2
+      },
+      {
+        "cell_rank": 0,
+        "label": 6,
+        "sample_id": "val:Manually_Annotated_Images/714/4f4c200a12caafba195d425e946c7aa3c857bd757e0ca1897c5476b3.jpg",
+        "sharpness_quartile": 3
+      },
+      {
+        "cell_rank": 0,
+        "label": 7,
+        "sample_id": "val:Manually_Annotated_Images/706/3b99315ac29b78e3c08f2d665142958160ef4fb23b24878ac06e6760.jpg",
+        "sharpness_quartile": 0
+      },
+      {
+        "cell_rank": 0,
+        "label": 7,
+        "sample_id": "val:Manually_Annotated_Images/804/87c37a268a173e5c92d4be9c783936f9af5cfb450a6348f38c9c25a1.jpg",
+        "sharpness_quartile": 1
+      },
+      {
+        "cell_rank": 0,
+        "label": 7,
+        "sample_id": "val:Manually_Annotated_Images/895/7965f207a0b0f8fa82773f40644c4b31aaeab63403e012068a2942d6.jpg",
+        "sharpness_quartile": 2
+      },
+      {
+        "cell_rank": 0,
+        "label": 7,
+        "sample_id": "val:Manually_Annotated_Images/801/f54ba5349959622f4474f54549a85647abdff11d823d0f5737617346.jpg",
+        "sharpness_quartile": 3
+      }
+    ],
+    "selector": "safa-triangle-512-v1"
+  },
+  "stage": 32
+}

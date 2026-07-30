@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "contract_type": "safa_r10_triangle_fixed32_metric_manifest_v1",
+  "evidence_level": "provisional_stage32_point_estimates",
+  "stage": 32,
+  "sample_count": 32,
+  "arm_count": 4,
+  "privacy_inference": {
+    "statistic": "point_arcface_delta",
+    "bootstrap": null,
+    "provisional": true
+  },
+  "selection_manifest": {
+    "path": "artifacts/r10_triangle_exploration/preparation_v1/prefix32.jsonl",
+    "sha256": "fc47ae9372f23667e6b59ab2f33b22bc6cc8405be0095aaee1565d1158be1b05"
+  },
+  "screening_request": {
+    "path": "artifacts/r10_triangle_exploration/fixed32_evaluation/rows/screening_request.json",
+    "sha256": "ac54028c43d0b530a017cf6b89229661e17d4c69ba38889fd05f57ede1643028"
+  },
+  "arm_evidence_path_layout": {
+    "rows": "artifacts/r10_triangle_exploration/fixed32_evaluation/rows/{arm_id}.jsonl",
+    "quality": "artifacts/r10_triangle_exploration/fixed32_evaluation/quality/{arm_id}/quality.json",
+    "arcface_request": "artifacts/r10_triangle_exploration/fixed32_evaluation/arcface/{arm_id}/request.json",
+    "arcface_result": "artifacts/r10_triangle_exploration/fixed32_evaluation/arcface/{arm_id}/result.json"
+  },
+  "arms": [
+    {
+      "arm_id": "eta0p125_baseline",
+      "rows_sha256": "27a8dd5ceaabab37f98d437712bb37705aeac90bf26af7f2d0e8e043b6a54494",
+      "quality_sha256": "ac3944c532afea9a178915ae14c9fefbd623a6e333fca502283f3897cd1f7327",
+      "arcface_request_sha256": "d3c09fbe9b28518d7e6fc208449a5fa2fef67b4c565cdeea94b29f127df4b744",
+      "arcface_result_sha256": "1585c703db5ca2aafe1f7768319e96366d2b2caa74d2a60dc20640a16797cc0f"
+    },
+    {
+      "arm_id": "eta0p125_disable_i1",
+      "rows_sha256": "80d05058728a8fb8e0de8280347d8b52815b94a6d4c0ba8ea2f28a283a8457b3",
+      "quality_sha256": "efa0ac67a9b057dd165e9f0d2b423f55421fca11fd144155765ce3590cfd891d",
+      "arcface_request_sha256": "d0519d0ba2eee9d7773a4eaf814aa0e38df24a1ffa825b4436a5c5b4d018c205",
+      "arcface_result_sha256": "7edde95457952cce92476bf5d83d030d7ced93c14c625249b377387b40f98b78"
+    },
+    {
+      "arm_id": "eta0p125_disable_i2",
+      "rows_sha256": "a98ea48d3fddf80b400b446725ead1f7fa39c2a7837a4c3032caee9a9ba8dd45",
+      "quality_sha256": "e6e86fe1912d35985f1fa40f802c91e148250781680b1776fbacfb24960b22bc",
+      "arcface_request_sha256": "22d8e3063379bcf360f061b97dfa78405977e2e6ca0aa60bdf23568adc22fbe2",
+      "arcface_result_sha256": "57d750c472f183c44538f6d7410c18790f1c17b6e1e00033600ecc1f3360a8be"
+    },
+    {
+      "arm_id": "eta0p125_disable_i3",
+      "rows_sha256": "397a397d213fb6e8ee35855aeab6990698586c260175719a36fa344726ffa1af",
+      "quality_sha256": "01027f8882b6496df0a3dc5f3e2950b9d852463d602e760fcc6b5e344aa2b74a",
+      "arcface_request_sha256": "5d76afa1e5a434ac02e4dbbae27d3b82b4f79316a4f1fe38b9465219b837b2ff",
+      "arcface_result_sha256": "bf05e6bf9bf87b89756ee5ab49d76d03ebc817362a3b84263981103e74114e2b"
+    }
+  ],
+  "native_quality": {
+    "path": "artifacts/r10_triangle_exploration/fixed32_evaluation/quality/native/quality.json",
+    "sha256": "f1e3894124c50c32e089190395a5be39793ba901f6fd3b6d717b930dab2f71e4"
+  },
+  "outputs": {
+    "summary.json": "849d788643276795c321b081d6aec531d93835d823271457560b861895f44a91",
+    "arms.csv": "bbcb0e400174abe8c6f1113b4b60f17f805433ad1b2afc1bec99482107c4dbf7",
+    "arcface_failures.json": "ec8775bba264d292a59f32a33ce6f81966028721251847035c52d6a59ee6f267",
+    "conclusion.md": "32b14375b79c230e4863cefa93170e432bee5f0dc489585d7ee1f7e9c77bc322"
+  },
+  "result": {
+    "gate_survivor_count": 1,
+    "pareto_arm_ids": [
+      "eta0p125_baseline"
+    ],
+    "selected_arm_ids": [
+      "eta0p125_baseline"
+    ]
+  }
+}
