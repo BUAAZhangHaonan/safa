@@ -2139,7 +2139,7 @@ def _validate_runtime_resources(
         slots = _strict_int(
             value.get("generation_slots_per_gpu"), "generation slots per GPU"
         )
-        if (batch_size, slots) not in {(4, 2), (2, 4)}:
+        if (batch_size, slots) not in {(4, 2), (2, 4), (2, 2)}:
             raise CampaignContractError("generation batch/slot policy is invalid")
         normalized.update(
             {
