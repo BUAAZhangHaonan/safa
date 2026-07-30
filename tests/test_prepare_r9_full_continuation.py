@@ -100,6 +100,148 @@ def test_e2e_run_uses_bound_runtime_resource_policy(
     assert captured["policy"] == policy
 
 
+def test_e2e_evaluators_allow_pre_e2e_resource_profile_bootstrap(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    source_path = tmp_path / "source.png"
+    native_path = tmp_path / "native.png"
+    generated_path = tmp_path / "generated.png"
+    for path, content in (
+        (source_path, b"source"),
+        (native_path, b"native"),
+        (generated_path, b"generated"),
+    ):
+        path.write_bytes(content)
+    root = (
+        tmp_path
+        / "artifacts/r9_meanflow_flow_map_guidance/campaigns"
+        / "r9-report-only-formal-v9/full_e2e"
+    )
+    for arm in ("native", "paper_eta_0p125"):
+        arm_root = root / "generation" / arm
+        arm_root.mkdir(parents=True)
+        generated = native_path if arm == "native" else generated_path
+        row = {
+            "sample_id": "sample-000",
+            "source": str(source_path),
+            "native": str(native_path),
+            "generated": str(generated),
+        }
+        (arm_root / "per_sample.jsonl").write_text(
+            json.dumps(row, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        (arm_root / "generation_result.json").write_text(
+            json.dumps({"arm_id": arm}), encoding="utf-8"
+        )
+    native_config = tmp_path / "native.yaml"
+    native_config.write_text("arm_config_sha256: " + "1" * 64 + "\n", encoding="utf-8")
+
+    class Request:
+        def __init__(self, **kwargs) -> None:
+            self.__dict__.update(kwargs)
+
+    class FakeSampleEvidence(Request):
+        pass
+
+    class Callbacks:
+        def __init__(self, **kwargs) -> None:
+            events.append("callbacks")
+            assert kwargs["runtime"] == {"python": sys.executable}
+
+        def arcface(self, request) -> list[dict]:
+            events.append(f"arcface:{request.phase}:{request.arm_id}")
+            return []
+
+        def quality(self, request) -> dict:
+            events.append(f"quality:{request.image_role}")
+            return {}
+
+    class Driver:
+        REPO_ROOT = tmp_path
+        FULL_CONTINUATION_CHILD_CAMPAIGN_ID = "r9-report-only-formal-v9"
+        ArcFaceEvaluationRequest = Request
+        QualityEvaluationRequest = Request
+        R9ProductionEvaluatorCallbacks = Callbacks
+        SampleEvidence = FakeSampleEvidence
+
+        @staticmethod
+        def load_full_continuation_request(*, allow_pre_e2e_profiles: bool = False):
+            assert allow_pre_e2e_profiles is True
+            events.append("load_pre_e2e")
+            return {"python": sys.executable}, Path("request.yaml"), "source"
+
+        @staticmethod
+        def _canonical_json_sha256(value) -> str:
+            return _digest(value)
+
+        @staticmethod
+        def _continuation_for_runtime(runtime):
+            return {"runtime": runtime}
+
+        @staticmethod
+        def _require_full_selection_binding(continuation, runtime):
+            del continuation, runtime
+            return {"winner": {"config_sha256": "2" * 64}}
+
+        @staticmethod
+        def materialize_full_e2e_resource_profiles(runtime) -> dict:
+            del runtime
+            events.append("materialize_profiles")
+            return {}
+
+        @staticmethod
+        def _rebuild_full_e2e_evidence(runtime, *, require_materialized_result=False):
+            del runtime, require_materialized_result
+            return {"plan": plan, "result": {"full_e2e_result_sha256": "3" * 64}}
+
+        @staticmethod
+        def _write_exclusive_bytes(path: Path, content: bytes) -> None:
+            events.append(f"write:{path.name}")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+
+    plan = {
+        "manifest": {"sample_ids": ["sample-000"], "path": "manifest.json"},
+        "runs": [
+            {
+                "arm_id": "native",
+                "runtime_config": str(native_config.relative_to(tmp_path)),
+            }
+        ],
+    }
+    runtime = {
+        "campaign_root": (
+            "artifacts/r9_meanflow_flow_map_guidance/campaigns/"
+            "r9-report-only-formal-v9"
+        ),
+        "evaluation": {
+            "quality": {"real_index": {"path": "real.json", "sha256": "4" * 64}}
+        },
+    }
+
+    result = cli._run_e2e_evaluators(
+        Driver,
+        runtime,
+        plan,
+        scheduler=object(),
+        gpu_bindings={},
+        peer_status_store=object(),
+        runtime_guard=object(),
+    )
+
+    assert result["full_e2e_result_sha256"] == "3" * 64
+    assert events == [
+        "load_pre_e2e",
+        "callbacks",
+        "arcface:full_e2e:paper_eta_0p125",
+        "quality:native",
+        "quality:candidate",
+        "materialize_profiles",
+        "write:run_result.json",
+    ]
+
+
 def test_e2e_prepare_dry_run_has_zero_writes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

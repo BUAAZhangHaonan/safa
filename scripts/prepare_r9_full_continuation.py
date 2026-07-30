@@ -1060,7 +1060,9 @@ def _run_e2e_evaluators(
     peer_status_store,
     runtime_guard,
 ) -> dict:
-    runtime, _, _ = driver.load_full_continuation_request()
+    runtime, _, _ = driver.load_full_continuation_request(
+        allow_pre_e2e_profiles=True
+    )
     root = _e2e_root(driver)
     rows = {
         arm: _per_sample_rows(root / "generation" / arm / "per_sample.jsonl")
