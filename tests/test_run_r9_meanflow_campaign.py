@@ -3682,6 +3682,7 @@ def test_evaluator_runtime_guard_receives_all_active_evaluator_processes(
     class Guard:
         @staticmethod
         def enforce(processes):
+            assert callbacks._scheduler_lock._is_owned()
             observed_worker_sets.append(set(processes))
 
     class Process:
