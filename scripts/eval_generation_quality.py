@@ -401,12 +401,14 @@ def create_fid_metric():
     return FrechetInceptionDistance(feature=2048, normalize=False)
 
 
-def create_kid_metric():
+def create_kid_metric(*, subset_size: int):
+    if isinstance(subset_size, bool) or not isinstance(subset_size, int) or subset_size < 1:
+        raise ValueError("KID subset_size must be a positive integer")
     try:
         from torchmetrics.image.kid import KernelInceptionDistance
     except ImportError as exc:
         raise RuntimeError("torchmetrics[image] is required for KID evaluation") from exc
-    return KernelInceptionDistance(subset_size=50, normalize=False)
+    return KernelInceptionDistance(subset_size=subset_size, normalize=False)
 
 
 def create_iqa_metric(method: str):
@@ -481,6 +483,7 @@ def evaluate_generation_quality(
     max_generated: int | None = None,
     max_real: int | None = None,
     subset_seed: int | None = 1337,
+    kid_subset_size: int = 50,
     device: str = "auto",
     sample_id_manifest: Path | None = None,
     per_sample_jsonl: Path | None = None,
@@ -518,6 +521,13 @@ def evaluate_generation_quality(
             real_paths = []
         contract_real_paths = real_paths
 
+    if "kid" in metric_names:
+        if isinstance(kid_subset_size, bool) or not isinstance(kid_subset_size, int) or kid_subset_size < 1:
+            raise ValueError("KID subset_size must be a positive integer")
+        smallest_kid_population = min(len(generated_paths), len(real_paths))
+        if kid_subset_size >= smallest_kid_population:
+            raise ValueError("KID subset_size must be smaller than both real and generated sample counts")
+
     labels = manifest_ids if manifest_mode else [path.name for path in generated_paths]
     real_labels = manifest_ids if manifest_mode else [path.name for path in contract_real_paths]
     quality_contract: dict[str, Any] = {
@@ -532,6 +542,8 @@ def evaluate_generation_quality(
         "real_asset_manifest_sha256": asset_manifest_digest(contract_real_paths, real_labels),
         "generated_asset_manifest_sha256": asset_manifest_digest(generated_paths, labels),
     }
+    if "kid" in metric_names:
+        quality_contract["kid_subset_size"] = kid_subset_size
     if generation_result is not None:
         try:
             generation_payload = json.loads(generation_result.read_text(encoding="utf-8"))
@@ -568,7 +580,7 @@ def evaluate_generation_quality(
 
     selected_device = quality_eval_device(device)
     fid = create_fid_metric() if "fid" in metric_names else None
-    kid = create_kid_metric() if "kid" in metric_names else None
+    kid = create_kid_metric(subset_size=kid_subset_size) if "kid" in metric_names else None
     iqa = create_iqa_metric(iqa_method) if "niqe" in metric_names else None
     fid, fid_device = prepare_metric_for_device(fid, selected_device)
     kid, kid_device = prepare_metric_for_device(kid, selected_device)

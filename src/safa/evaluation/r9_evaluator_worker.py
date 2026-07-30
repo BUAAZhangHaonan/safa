@@ -851,22 +851,27 @@ def evaluate_quality_request(
             real_rows.append({"sample_id": sample_id, "image_path": str(source)})
         _write_exclusive_jsonl(real_index, real_rows)
         _write_exclusive_jsonl(per_sample, generated_rows)
-        raw = backend(
-            quality_script=config.quality_script,
-            real_index=real_index,
-            generated_dir=generated_dir,
-            output=output,
-            iqa_method="niqe",
-            metrics=QUALITY_METRICS,
-            max_generated=None,
-            max_real=None,
-            subset_seed=request.seed,
-            device=config.device,
-            sample_id_manifest=request.manifest_path,
-            per_sample_jsonl=per_sample,
-            generation_result=None,
-            reuse_valid_output=False,
-        )
+        quality_kwargs = {
+            "quality_script": config.quality_script,
+            "real_index": real_index,
+            "generated_dir": generated_dir,
+            "output": output,
+            "iqa_method": "niqe",
+            "metrics": QUALITY_METRICS,
+            "max_generated": None,
+            "max_real": None,
+            "subset_seed": request.seed,
+            "device": config.device,
+            "sample_id_manifest": request.manifest_path,
+            "per_sample_jsonl": per_sample,
+            "generation_result": None,
+            "reuse_valid_output": False,
+        }
+        if request.phase == "full_e2e":
+            if len(samples) < 2:
+                raise R9EvaluatorError("full_e2e quality requires at least two samples for KID")
+            quality_kwargs["kid_subset_size"] = len(samples) - 1
+        raw = backend(**quality_kwargs)
         if not output.is_file():
             raise R9EvaluatorError(
                 "quality backend did not write its registered output"

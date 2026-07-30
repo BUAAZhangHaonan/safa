@@ -422,9 +422,11 @@ def _fixture(
 class FakeQualityBackend:
     def __init__(self, mutation: str | None = None) -> None:
         self.generated_dir: Path | None = None
+        self.last_kwargs: dict[str, Any] | None = None
         self.mutation = mutation
 
     def __call__(self, **kwargs: Any) -> dict[str, Any]:
+        self.last_kwargs = dict(kwargs)
         generated_dir = Path(kwargs["generated_dir"])
         self.generated_dir = generated_dir
         manifest_rows = [
@@ -581,6 +583,8 @@ def test_quality_uses_exact_hardlink_view_and_cleans_it(tmp_path: Path) -> None:
         _dependencies(backend, FakeAnalyzer([1] * 6)),
     )
     result = evaluator.quality(_quality_request(samples, manifest))
+    assert backend.last_kwargs is not None
+    assert "kid_subset_size" not in backend.last_kwargs
     binding = result["r9_evidence_binding"]
     assert binding == {
         "schema_version": 1,
@@ -634,6 +638,25 @@ def test_quality_rejects_manifest_order_mismatch(tmp_path: Path) -> None:
             config,
             _dependencies(FakeQualityBackend(), FakeAnalyzer([1] * 6)),
         ).quality(_quality_request(tuple(reversed(samples)), manifest))
+
+
+def test_quality_full_e2e_sets_kid_subset_size_below_sample_count(
+    tmp_path: Path,
+) -> None:
+    config, samples, manifest = _fixture(tmp_path)
+    backend = FakeQualityBackend()
+    request = replace(
+        _quality_request(samples, manifest),
+        phase="full_e2e",
+        logical_run_id="formal_e2e_quality_8",
+        arm_id="native",
+    )
+    R9ProductionEvaluators(
+        config,
+        _dependencies(backend, FakeAnalyzer([1] * 6)),
+    ).quality(request)
+    assert backend.last_kwargs is not None
+    assert backend.last_kwargs["kid_subset_size"] == len(samples) - 1
 
 
 def test_arcface_omits_cosines_for_any_non_exact_one_role(tmp_path: Path) -> None:
