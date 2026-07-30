@@ -2951,6 +2951,22 @@ def _rebuild_full_e2e_evidence(
     return {"plan": plan, "result": result, "gate": gate}
 
 
+def _normalized_worker_contract(evaluation: Mapping[str, Any]) -> dict[str, str]:
+    worker = _mapping(evaluation.get("worker"), "evaluation worker")
+    worker_script = _repo_path(REPO_ROOT, worker.get("path"), "evaluation worker")
+    worker_implementation = _repo_path(
+        REPO_ROOT,
+        worker.get("implementation_path"),
+        "evaluation worker implementation",
+    )
+    return {
+        "path": str(worker_script.resolve()),
+        "sha256": str(worker.get("sha256")),
+        "implementation_path": str(worker_implementation.resolve()),
+        "implementation_sha256": str(worker.get("implementation_sha256")),
+    }
+
+
 def _normalized_arcface_evaluation_contract(
     evaluation: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -2979,7 +2995,7 @@ def build_full_e2e_resource_profiles(
         / "full_e2e"
     )
     evaluation = _mapping(campaign_runtime.get("evaluation"), "evaluation")
-    expected_worker = _mapping(evaluation.get("worker"), "evaluation worker")
+    expected_worker = _normalized_worker_contract(evaluation)
     expected_arcface = _arcface_evaluation_contract_sha256(evaluation)
     expected_quality = _mapping(
         _mapping(evaluation.get("quality"), "quality evaluation").get("script"),
@@ -4144,21 +4160,9 @@ class R9ProductionEvaluatorCallbacks:
     ) -> None:
         self._python = str(runtime["python"])
         evaluation = _mapping(campaign_runtime.get("evaluation"), "evaluation")
-        worker = _mapping(evaluation.get("worker"), "evaluation worker")
-        self._worker_script = _repo_path(
-            REPO_ROOT, worker.get("path"), "evaluation worker"
-        )
-        self._worker_implementation = _repo_path(
-            REPO_ROOT,
-            worker.get("implementation_path"),
-            "evaluation worker implementation",
-        )
-        self._worker_contract = {
-            "path": str(self._worker_script.resolve()),
-            "sha256": str(worker.get("sha256")),
-            "implementation_path": str(self._worker_implementation.resolve()),
-            "implementation_sha256": str(worker.get("implementation_sha256")),
-        }
+        self._worker_contract = _normalized_worker_contract(evaluation)
+        self._worker_script = Path(self._worker_contract["path"])
+        self._worker_implementation = Path(self._worker_contract["implementation_path"])
         self._validate_current_worker_contract()
         self._evaluation = dict(evaluation)
         normalized_arcface = _normalized_arcface_evaluation_contract(evaluation)

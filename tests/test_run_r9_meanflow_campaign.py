@@ -3378,6 +3378,12 @@ def test_full_e2e_measured_resource_profile_rebuild_and_tamper_fail_closed(
         "implementation_path": "src/worker.py",
         "implementation_sha256": "2" * 64,
     }
+    (tmp_path / worker_contract["path"]).parent.mkdir(parents=True)
+    (tmp_path / worker_contract["path"]).write_text("worker wrapper", encoding="utf-8")
+    (tmp_path / worker_contract["implementation_path"]).parent.mkdir(parents=True)
+    (tmp_path / worker_contract["implementation_path"]).write_text(
+        "worker implementation", encoding="utf-8"
+    )
     arcface = {"weights_sha256": "3" * 64}
     quality_sha256 = "4" * 64
     campaign_runtime = {
@@ -3387,6 +3393,14 @@ def test_full_e2e_measured_resource_profile_rebuild_and_tamper_fail_closed(
             "arcface": arcface,
             "quality": {"script": {"sha256": quality_sha256}},
         },
+    }
+    expected_worker_contract = {
+        "path": str((tmp_path / worker_contract["path"]).resolve()),
+        "sha256": worker_contract["sha256"],
+        "implementation_path": str(
+            (tmp_path / worker_contract["implementation_path"]).resolve()
+        ),
+        "implementation_sha256": worker_contract["implementation_sha256"],
     }
     expected_arcface_sha256 = driver._canonical_json_sha256(arcface)
     monkeypatch.setattr(
@@ -3427,7 +3441,7 @@ def test_full_e2e_measured_resource_profile_rebuild_and_tamper_fail_closed(
             "unit_id": unit,
             "evaluator_request_sha256": request["evaluator_request_sha256"],
             "evaluator_output_sha256": result["evaluator_output_sha256"],
-            "worker_contract": worker_contract,
+            "worker_contract": expected_worker_contract,
             "arcface_contract_sha256": expected_arcface_sha256,
             "quality_script_sha256": quality_sha256,
             "resource_policy_id": "frozen_conservative_e2e_v1",
@@ -3469,7 +3483,7 @@ def test_full_e2e_measured_resource_profile_rebuild_and_tamper_fail_closed(
         driver._validate_full_e2e_runtime_resource_profiles(
             runtime_profiles,
             repo_root=tmp_path,
-            worker_contract=worker_contract,
+            worker_contract=expected_worker_contract,
             arcface_contract_sha256=expected_arcface_sha256,
             quality_script_sha256=quality_sha256,
         )
@@ -3481,7 +3495,7 @@ def test_full_e2e_measured_resource_profile_rebuild_and_tamper_fail_closed(
         driver._validate_full_e2e_runtime_resource_profiles(
             runtime_profiles,
             repo_root=tmp_path,
-            worker_contract=worker_contract,
+            worker_contract=expected_worker_contract,
             arcface_contract_sha256=expected_arcface_sha256,
             quality_script_sha256=quality_sha256,
         )
