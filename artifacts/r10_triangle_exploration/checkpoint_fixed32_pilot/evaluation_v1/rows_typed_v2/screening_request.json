@@ -1,0 +1,103 @@
+{
+  "arms": [
+    {
+      "arm_id": "g_a398b1ab6b504799_ema",
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/evaluation_v1/rows_typed_v2/g_a398b1ab6b504799_ema.jsonl"
+    },
+    {
+      "arm_id": "g_d75236bccc581e59_ema",
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/evaluation_v1/rows_typed_v2/g_d75236bccc581e59_ema.jsonl"
+    },
+    {
+      "arm_id": "g_33a4c9bfb46080e8_ema",
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/evaluation_v1/rows_typed_v2/g_33a4c9bfb46080e8_ema.jsonl"
+    },
+    {
+      "arm_id": "g_1058090b828d8e02_ema",
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/evaluation_v1/rows_typed_v2/g_1058090b828d8e02_ema.jsonl"
+    },
+    {
+      "arm_id": "g_10b333a6c4b88e46_raw",
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/evaluation_v1/rows_typed_v2/g_10b333a6c4b88e46_raw.jsonl"
+    },
+    {
+      "arm_id": "g_07acf4a70561a8bb_raw",
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/evaluation_v1/rows_typed_v2/g_07acf4a70561a8bb_raw.jsonl"
+    },
+    {
+      "arm_id": "g_7954f6dade2eabdc_raw",
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/evaluation_v1/rows_typed_v2/g_7954f6dade2eabdc_raw.jsonl"
+    },
+    {
+      "arm_id": "g_2bee11a6d19fd926_raw",
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/evaluation_v1/rows_typed_v2/g_2bee11a6d19fd926_raw.jsonl"
+    },
+    {
+      "arm_id": "g_7dedf30358bf197f_raw",
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/evaluation_v1/rows_typed_v2/g_7dedf30358bf197f_raw.jsonl"
+    },
+    {
+      "arm_id": "g_0de4aaf3d8c52e7a_raw",
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/evaluation_v1/rows_typed_v2/g_0de4aaf3d8c52e7a_raw.jsonl"
+    },
+    {
+      "arm_id": "g_40513b501c5dfe51_raw",
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/evaluation_v1/rows_typed_v2/g_40513b501c5dfe51_raw.jsonl"
+    },
+    {
+      "arm_id": "g_07ca3753b56cfa8c_raw",
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/evaluation_v1/rows_typed_v2/g_07ca3753b56cfa8c_raw.jsonl"
+    },
+    {
+      "arm_id": "g_f5313b0f8891c9b7_ema",
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/evaluation_v1/rows_typed_v2/g_f5313b0f8891c9b7_ema.jsonl"
+    },
+    {
+      "arm_id": "g_3d843659d72b0eed_ema",
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/evaluation_v1/rows_typed_v2/g_3d843659d72b0eed_ema.jsonl"
+    },
+    {
+      "arm_id": "g_a3c9985ead28003f_ema",
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/evaluation_v1/rows_typed_v2/g_a3c9985ead28003f_ema.jsonl"
+    },
+    {
+      "arm_id": "g_c79a2764919a700b_ema",
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/evaluation_v1/rows_typed_v2/g_c79a2764919a700b_ema.jsonl"
+    },
+    {
+      "arm_id": "g_64e9b8fec063a837_raw",
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/evaluation_v1/rows_typed_v2/g_64e9b8fec063a837_raw.jsonl"
+    },
+    {
+      "arm_id": "g_f9202e53566c32ec_raw",
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/evaluation_v1/rows_typed_v2/g_f9202e53566c32ec_raw.jsonl"
+    },
+    {
+      "arm_id": "g_f9b67cc2c0e71ef3_raw",
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/evaluation_v1/rows_typed_v2/g_f9b67cc2c0e71ef3_raw.jsonl"
+    },
+    {
+      "arm_id": "g_632d1080add2de4c_raw",
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/evaluation_v1/rows_typed_v2/g_632d1080add2de4c_raw.jsonl"
+    },
+    {
+      "arm_id": "g_45ea2d8d9c6e79ff_ema",
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/evaluation_v1/rows_typed_v2/g_45ea2d8d9c6e79ff_ema.jsonl"
+    },
+    {
+      "arm_id": "g_484754f660406479_ema",
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/evaluation_v1/rows_typed_v2/g_484754f660406479_ema.jsonl"
+    },
+    {
+      "arm_id": "g_5d56efdb05715c0f_ema",
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/evaluation_v1/rows_typed_v2/g_5d56efdb05715c0f_ema.jsonl"
+    },
+    {
+      "arm_id": "g_a15fcad1225e3c0d_ema",
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/evaluation_v1/rows_typed_v2/g_a15fcad1225e3c0d_ema.jsonl"
+    }
+  ],
+  "baseline_arm_id": "g_a398b1ab6b504799_ema",
+  "selection_manifest_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/prefix32.jsonl",
+  "stage": 32
+}

@@ -1,0 +1,115 @@
+{
+  "failures": [
+    {
+      "arcface_delta": 0.024804015946673426,
+      "arcface_delta_u95": null,
+      "arm_id": "g_33a4c9bfb46080e8_ema",
+      "candidate_exact_one_count": 32,
+      "failed_gates": [
+        "arcface_delta",
+        "niqe",
+        "sharpness"
+      ],
+      "sample_count": 32
+    },
+    {
+      "arcface_delta": 0.022862328565635377,
+      "arcface_delta_u95": null,
+      "arm_id": "g_1058090b828d8e02_ema",
+      "candidate_exact_one_count": 32,
+      "failed_gates": [
+        "arcface_delta",
+        "niqe",
+        "sharpness"
+      ],
+      "sample_count": 32
+    },
+    {
+      "arcface_delta": 0.03286870379045538,
+      "arcface_delta_u95": null,
+      "arm_id": "g_10b333a6c4b88e46_raw",
+      "candidate_exact_one_count": 32,
+      "failed_gates": [
+        "arcface_delta",
+        "niqe",
+        "sharpness"
+      ],
+      "sample_count": 32
+    },
+    {
+      "arcface_delta": 0.021201102921446086,
+      "arcface_delta_u95": null,
+      "arm_id": "g_0de4aaf3d8c52e7a_raw",
+      "candidate_exact_one_count": 32,
+      "failed_gates": [
+        "arcface_delta",
+        "e0",
+        "niqe",
+        "sharpness"
+      ],
+      "sample_count": 32
+    },
+    {
+      "arcface_delta": 0.02074478863875669,
+      "arcface_delta_u95": null,
+      "arm_id": "g_f5313b0f8891c9b7_ema",
+      "candidate_exact_one_count": 32,
+      "failed_gates": [
+        "arcface_delta",
+        "niqe",
+        "sharpness"
+      ],
+      "sample_count": 32
+    },
+    {
+      "arcface_delta": 0.0413038532781954,
+      "arcface_delta_u95": null,
+      "arm_id": "g_3d843659d72b0eed_ema",
+      "candidate_exact_one_count": 32,
+      "failed_gates": [
+        "arcface_delta",
+        "niqe",
+        "sharpness"
+      ],
+      "sample_count": 32
+    },
+    {
+      "arcface_delta": 0.0413038532781954,
+      "arcface_delta_u95": null,
+      "arm_id": "g_a3c9985ead28003f_ema",
+      "candidate_exact_one_count": 32,
+      "failed_gates": [
+        "arcface_delta",
+        "niqe",
+        "sharpness"
+      ],
+      "sample_count": 32
+    },
+    {
+      "arcface_delta": 0.0413038532781954,
+      "arcface_delta_u95": null,
+      "arm_id": "g_c79a2764919a700b_ema",
+      "candidate_exact_one_count": 32,
+      "failed_gates": [
+        "arcface_delta",
+        "niqe",
+        "sharpness"
+      ],
+      "sample_count": 32
+    },
+    {
+      "arcface_delta": 0.021201102921446086,
+      "arcface_delta_u95": null,
+      "arm_id": "g_632d1080add2de4c_raw",
+      "candidate_exact_one_count": 32,
+      "failed_gates": [
+        "arcface_delta",
+        "e0",
+        "niqe",
+        "sharpness"
+      ],
+      "sample_count": 32
+    }
+  ],
+  "schema_version": 1
+}
