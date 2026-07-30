@@ -1,0 +1,41 @@
+{
+  "arcface": {
+    "all_repeated_face_counts_equal": true,
+    "det_size": [
+      224,
+      224
+    ],
+    "device": "cuda:0",
+    "failure_count": 4,
+    "failure_sample_ids": [
+      "val:Manually_Annotated_Images/680/a307c74778e9d37808732047d80fa7b3f2db2b17f289e42002d7cbc6.jpg",
+      "val:Manually_Annotated_Images/365/321800005c95997baeb50709fcb9450e44196a76950674c10b57d16b.jpg",
+      "val:Manually_Annotated_Images/804/9c405664818542b6d5340e71b5c5d84565d6ca1665f643a89fe30cc1.JPG",
+      "val:Manually_Annotated_Images/627/a4c5c6830c879c675a70f3129ba2be3232df5f574aed73a2ef9689a4.jpg"
+    ],
+    "model_name": "buffalo_l",
+    "repeats_per_image": 2
+  },
+  "contract_type": "safa_r9_full_failure_diagnostic_v1",
+  "fid_kid_rerun": false,
+  "formal_evaluator_modified": false,
+  "inputs": {
+    "arcface_formal_evidence": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/full/evaluator_evidence/arcface/winner.json",
+    "arcface_raw_evidence": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/full/evaluator_runs/arcface/winner/result.json",
+    "arcface_request": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/full/evaluator_runs/arcface/winner/request.json",
+    "automatic_evidence": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/full/automatic_evidence.json"
+  },
+  "schema_version": 1,
+  "sharpness": {
+    "candidate_gt_native_count": 852,
+    "candidate_gt_native_fraction": 0.416015625,
+    "candidate_mean": 591.7002634128564,
+    "candidate_to_native_mean_ratio": 0.8610117972673653,
+    "count": 2048,
+    "decile_basis": "ranked_native_sharpness",
+    "delta_mean": -95.51478438412391,
+    "delta_median": -25.586059093941003,
+    "native_mean": 687.2150477969803,
+    "native_sharpness_definition": "grayscale_laplacian_variance"
+  }
+}
