@@ -1,0 +1,37 @@
+{
+  "artifacts": [
+    {
+      "path": "artifacts/closeout/r9-formal-v9-closeout-20260730T202118CST/closeout_report.md",
+      "sha256": "878c98c35879f0c756a7fa0d1fa721db2816cc9e8070cb17c2f35220c242e234",
+      "size": 9247
+    },
+    {
+      "path": "artifacts/closeout/r9-formal-v9-closeout-20260730T202118CST/invalid_experiments_appendix.md",
+      "sha256": "2ef2e18842c23a357407d7d8f0dc47b5f7e83949fb00584e66a52fb32f3a1555",
+      "size": 5609
+    },
+    {
+      "path": "artifacts/closeout/r9-formal-v9-closeout-20260730T202118CST/machine_summary.json",
+      "sha256": "8f6c4bfc1f7be93a7ecc006fd06e1bee69231b28b432ad4ffa0b0d0913179ae8",
+      "size": 24110
+    },
+    {
+      "path": "artifacts/closeout/r9-formal-v9-closeout-20260730T202118CST/pareto_table.csv",
+      "sha256": "fa64d7a7ecb734d85b9b420ceab743730694265fef3a39a7cf16537064551837",
+      "size": 700
+    },
+    {
+      "path": "artifacts/closeout/r9-formal-v9-closeout-20260730T202118CST/resource_cost_table.csv",
+      "sha256": "0a26967e4a36f2416e7f9c752d9573eea97e04fa9296ac4649355d5125ea1793",
+      "size": 1150
+    },
+    {
+      "path": "artifacts/closeout/r9-formal-v9-closeout-20260730T202118CST/visual_checklist.csv",
+      "sha256": "cf1be72151ddd1f8d897108ae6d86058a51bd1a53be6dc23355c6f1b1bb8d314",
+      "size": 461
+    }
+  ],
+  "contract_type": "safa_r9_closeout_artifact_manifest_v1",
+  "created_at_cst": "2026-07-30T20:21:18.664430+08:00",
+  "schema_version": 1
+}

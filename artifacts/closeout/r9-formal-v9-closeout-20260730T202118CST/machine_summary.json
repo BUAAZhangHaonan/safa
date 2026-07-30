@@ -1,0 +1,456 @@
+{
+  "blocked_successors": {
+    "checkpoint_512_screening": "not_started_because_r9_full_gate_verdict_failed_locked_winner",
+    "next_exploration": "not_started_in_this_formal_closeout_turn",
+    "pareto_formal_evaluation": "not_started_because_checkpoint_512_screening_not_started"
+  },
+  "contract_type": "safa_r9_formal_v9_closeout_machine_summary_v1",
+  "created_at_cst": "2026-07-30T20:21:18.664430+08:00",
+  "deep_experiment_conclusions": [
+    {
+      "aspect": "formal gate discipline",
+      "conclusion": "R9 should be recorded as a failed formal winner, not a near-pass. The affect and distribution gains are real, but the formal contract is conjunctive: one hard identity/quality failure invalidates the arm.",
+      "guidance": "Next-stage selection should optimize the exact formal gate from the start instead of treating Confirm512 or affect metrics as enough evidence to lock a winner."
+    },
+    {
+      "aspect": "identity robustness",
+      "conclusion": "The privacy story is recognizer-dependent. AdaFace and FaceNet had complete coverage and acceptable privacy upper bounds, but ArcFace coverage dropped to 2044/2048 and made the identity report unusable.",
+      "guidance": "The next model should treat exact-one-face preservation under ArcFace as a primary objective. A candidate that improves two recognizers but breaks the third is not robust enough for formal anonymization."
+    },
+    {
+      "aspect": "face geometry and detector compatibility",
+      "conclusion": "The failed ArcFace coverage is likely a geometry/landmark compatibility problem, not simply a semantic anonymization problem. Four samples were enough to collapse the hard gate.",
+      "guidance": "Before another large sweep, inspect the four ArcFace-missing samples and add a detector-compatible face-preservation diagnostic to every screening stage."
+    },
+    {
+      "aspect": "sharpness and local quality",
+      "conclusion": "R9 improved FID, KID, NIQE, e0, and edev, but still failed sharpness relative to native. Aggregate distribution metrics hid a local face quality loss that the formal gate caught.",
+      "guidance": "The next stage can spend some of the large affect margin to recover high-frequency facial detail. Decoder schedule, guidance strength, or a direct sharpness/landmark regularizer should be tested before wider checkpoint ranking."
+    },
+    {
+      "aspect": "visual review role",
+      "conclusion": "The visual review found zero severe failures, yet the candidate still failed. Human severe-only inspection is useful for catching obvious collapses, but it is too coarse to certify identity coverage or sharpness preservation.",
+      "guidance": "Keep visual review as a safety gate, but do not use it as evidence that a candidate is formally safe or high quality."
+    },
+    {
+      "aspect": "screening strategy",
+      "conclusion": "The 193-checkpoint Pareto branch is not invalid as data, but it is not a valid R9 successor until the formal Full gate failure is acknowledged. Starting it under the old R9 success assumption would mix exploratory screening with formal closure.",
+      "guidance": "If the 193 checkpoint set is used next, label it as a new exploratory phase and include ArcFace coverage and sharpness gates in the 512 screening itself."
+    },
+    {
+      "aspect": "metric tradeoff",
+      "conclusion": "R9 has more affect displacement than it needs for the gate, while it lacks enough detector-compatible detail. The bottleneck is no longer whether the model can move expression-space metrics; it is whether it can do so without damaging formal face evidence.",
+      "guidance": "The next search should prioritize preserving face structure first and then tune anonymization strength, rather than increasing guidance until affect metrics look strong."
+    },
+    {
+      "aspect": "execution engineering",
+      "conclusion": "The run failures before the final gate were mostly operational: stale heldout markers, monitor-chain strictness, CPU oversubscription, and authorized external GPU PID drift. None of these changed the final scientific verdict.",
+      "guidance": "Do not build a larger controller for the next phase. Keep simple tmux sessions, strict artifacts, and small direct fixes; spend engineering time on model/evaluator alignment instead."
+    },
+    {
+      "aspect": "next-stage starting point",
+      "conclusion": "The useful R9 result is a negative boundary: `paper_eta_0p125` is good enough to show promising affect movement but not good enough to serve as the formal locked winner.",
+      "guidance": "Start the next conversation from this failed gate, not from Confirm512. The first task should be a small diagnostic of ArcFace-missing samples and sharpness loss, followed by a redesigned 512-screening gate."
+    }
+  ],
+  "failed_full_archives": [
+    {
+      "archive_id": "full-official-20260730T1453CST-cpu-guard",
+      "archive_manifest_sha256": "f9fa94770eac8ede59b2bac15d03bdb135cfec85b4a745f223add8fd8a5d11b2",
+      "contract_type": "safa_r9_formal_full_failed_attempt_archive_manifest_v1",
+      "mtime": "2026-07-30 15:15:14",
+      "path": "artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/formal_failed_attempts/full-official-20260730T1453CST-cpu-guard/archive_manifest.json",
+      "reason": "ResourceContractError: Full runtime sustained host CPU at or above 90%",
+      "sha256": "0ee4c5eb8854dda466452495989b2e534e0d49a4a74d0f79fe17c6f7ae158250",
+      "size": 15874
+    },
+    {
+      "archive_id": "full-official-restart-20260730T151603CST-peer-status-collision",
+      "archive_manifest_sha256": "86a80df3ae77af03708cf6b6a3b3a6948a36383c1b0e581067e54eb9ca75a48e",
+      "contract_type": "safa_r9_formal_full_failed_attempt_archive_manifest_v1",
+      "mtime": "2026-07-30 15:24:47",
+      "path": "artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/formal_failed_attempts/full-official-restart-20260730T151603CST-peer-status-collision/archive_manifest.json",
+      "reason": "ResourceContractError: worker admission status already exists for full:native:shard-0",
+      "sha256": "9a916d6601a8dbea013e0506db96b5279cd62afffdfc21a5c141540b85b0eaac",
+      "size": 7272
+    },
+    {
+      "archive_id": "20260730T074002Z",
+      "archive_manifest_sha256": "f977a0ed7aaf557b5845bb809c6df005136fab8931abd11554ab36733cf1782d",
+      "contract_type": "safa_r9_failed_formal_full_archive_v1",
+      "mtime": "2026-07-30 15:40:03",
+      "path": "artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/failed_full_execution_archives/20260730T074002Z/archive_manifest.json",
+      "sha256": "1d2016fe0b751dba9b1e73139010359fac39b4340a06e940926ec132109023b0",
+      "size": 704448
+    },
+    {
+      "archive_id": "20260730T075538Z",
+      "archive_manifest_sha256": "8a25ee671fcc5d04eb8de66cf95da46f29361d1f8fcf7cd663bc0707a0041e00",
+      "contract_type": "safa_r9_failed_formal_full_archive_v1",
+      "mtime": "2026-07-30 15:55:38",
+      "path": "artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/failed_full_execution_archives/20260730T075538Z/archive_manifest.json",
+      "sha256": "3f67be38af5a51208dc9c45af5cc0f18915310543fdb46d0e03d6e3ea9ef20c4",
+      "size": 3393
+    },
+    {
+      "archive_id": "20260730T082223Z-formal-only",
+      "archive_manifest_sha256": "e6686fc32ec3aff3f5bc165c19329b97c8d7496dab21d611ef7bc27e493c1857",
+      "contract_type": "safa_r9_failed_formal_full_archive_v1",
+      "mtime": "2026-07-30 16:22:23",
+      "path": "artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/failed_full_execution_archives/20260730T082223Z-formal-only/archive_manifest.json",
+      "sha256": "be2e5cce1948970ac94d280b4688c35916f19ed2aa62d5dc3ced8a1c75540f63",
+      "size": 7550
+    },
+    {
+      "archive_id": "20260730T083420Z-formal-only",
+      "archive_manifest_sha256": "ac7cce0437ea8a6723224b15eba4addfe38f2d37acfb16e7f943ea5e08147095",
+      "contract_type": "safa_r9_failed_formal_full_archive_v1",
+      "mtime": "2026-07-30 16:34:20",
+      "path": "artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/failed_full_execution_archives/20260730T083420Z-formal-only/archive_manifest.json",
+      "sha256": "462f6ac239a00d1513a1051ff2f8c15a2e2844cb94ab095aaf294efd5b601219",
+      "size": 2606
+    },
+    {
+      "archive_id": "20260730T090941Z-formal-evaluator-guard-pid-accounting",
+      "archive_manifest_sha256": "22641db3e6c0bbbc482e3e11b86fae42eefe1db403b433a28950afae4f20f910",
+      "contract_type": "safa_r9_failed_formal_full_archive_v1",
+      "mtime": "2026-07-30 17:09:41",
+      "path": "artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/failed_full_execution_archives/20260730T090941Z-formal-evaluator-guard-pid-accounting/archive_manifest.json",
+      "reason": "formal_full_evaluator_runtime_guard_pid_accounting_failure",
+      "sha256": "5207390c03f1ce3e95e6b8af5c5e32339a4e719f2313d1f21490488ebfc9c653",
+      "size": 5375
+    },
+    {
+      "archive_id": "20260730T092619Z-formal-evaluator-guard-sampling-race",
+      "archive_manifest_sha256": "4de184d9bb6d18f9a6a62f5d4d28323433d62f139a1cb4d9e51c2b1b5f3a02d4",
+      "contract_type": "safa_r9_failed_formal_full_archive_v1",
+      "mtime": "2026-07-30 17:26:19",
+      "path": "artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/failed_full_execution_archives/20260730T092619Z-formal-evaluator-guard-sampling-race/archive_manifest.json",
+      "reason": "formal_full_evaluator_guard_sampling_race",
+      "sha256": "5a15c8868c5f5494807b5032d619faf2eef1142788fbebcad4783e89e711da63",
+      "size": 3861
+    },
+    {
+      "archive_id": "20260730T094138Z-formal-external-gpu3-pid-drift",
+      "archive_manifest_sha256": "0e32b2161798c1c3768d2238d9adfc25bde57aacd65523ce81dd0e764dd2cb44",
+      "contract_type": "safa_r9_failed_formal_full_archive_v1",
+      "mtime": "2026-07-30 17:41:38",
+      "path": "artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/failed_full_execution_archives/20260730T094138Z-formal-external-gpu3-pid-drift/archive_manifest.json",
+      "reason": "formal_full_external_gpu3_pid_started_after_admission",
+      "sha256": "b88e8f01ecaaa1136b6d78069f07c4de5db6766c1ef2ca5597ef21e1ffccafda",
+      "size": 4358
+    },
+    {
+      "archive_id": "20260730T100749Z-formal-host-cpu-hardstop-arcface",
+      "archive_manifest_sha256": "64e2bbddc52a820f57fa3b6b63c4c06fac434baa47ba1231bc3a75b02d0916d8",
+      "contract_type": "safa_r9_failed_formal_full_archive_v1",
+      "mtime": "2026-07-30 18:07:49",
+      "path": "artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/failed_full_execution_archives/20260730T100749Z-formal-host-cpu-hardstop-arcface/archive_manifest.json",
+      "reason": "formal_full_host_cpu_hardstop_during_arcface",
+      "sha256": "0e90f146dd4a2383c41679468652fb4fe3e6db2fcaf5bf250894f46600c29177",
+      "size": 3795
+    },
+    {
+      "archive_id": "20260730T102039Z-formal-monitor-first-cpu-delta",
+      "archive_manifest_sha256": "dd4c860692c619aeabed6ce5176e126f3117d03697151a366903cdffa9465f2c",
+      "contract_type": "safa_r9_failed_formal_full_archive_v1",
+      "mtime": "2026-07-30 18:20:39",
+      "path": "artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/failed_full_execution_archives/20260730T102039Z-formal-monitor-first-cpu-delta/archive_manifest.json",
+      "reason": "formal_full_monitor_first_cpu_delta_zero",
+      "sha256": "b4c3f24eab9363195c69b5656460bc75a2ee7297b377630065dd4a25397e99f5",
+      "size": 2501
+    },
+    {
+      "archive_id": "20260730T103500Z-formal-external-gpu2-pid-drift",
+      "archive_manifest_sha256": "143bae0969b50b0c8b2bb9471134fa63cd2533756df8d98e533e53be32dcb4e4",
+      "contract_type": "safa_r9_failed_formal_full_archive_v1",
+      "mtime": "2026-07-30 18:35:00",
+      "path": "artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/failed_full_execution_archives/20260730T103500Z-formal-external-gpu2-pid-drift/archive_manifest.json",
+      "reason": "formal_full_external_gpu2_pid_started_after_admission",
+      "sha256": "1a689480fbe92dd7aaeccd212101f04c9de7d317360deba2c2e15ff7be47cd70",
+      "size": 3618
+    },
+    {
+      "archive_id": "20260730T111918Z-formal-heldout-host-cpu-hardstop",
+      "archive_manifest_sha256": "713e294e37e1d51c8834a816fb7dbdd95d738d15bae77009a943a228ffab9591",
+      "mtime": "2026-07-30 19:19:18",
+      "path": "artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/failed_full_execution_archives/20260730T111918Z-formal-heldout-host-cpu-hardstop/archive_manifest.json",
+      "reason": "recover6 heldout evaluator hard-stopped because Full runtime host CPU reached or exceeded 90%",
+      "sha256": "8d2b6399ba8d4378bd4600c8bbbe56c40db91b6de0dd916f90390e787027a9cd",
+      "size": 1689
+    },
+    {
+      "archive_id": "20260730T112138Z-heldout-started-aborted-before-formal",
+      "archive_manifest_sha256": "89b001a849910f451d8818384267fe9f2a34a9e103c1716012d671e209539331",
+      "contract_type": "safa_r9_partial_heldout_attempt_archive_v1",
+      "mtime": "2026-07-30 19:21:38",
+      "path": "artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/failed_full_execution_archives/20260730T112138Z-heldout-started-aborted-before-formal/archive_manifest.json",
+      "reason": "recover7 stopped before formal claim; heldout_execution_started existed without heldout_raw_evidence and would forbid rerun",
+      "sha256": "697ab45e6c5c755b3e945d3dacc0d933f7030dd70b2db727c23c3e281953f9f2",
+      "size": 1119
+    }
+  ],
+  "git": {
+    "head": "28df579715480d5c75c1b1e13cb117aaa69217e7",
+    "origin_master": "28df579715480d5c75c1b1e13cb117aaa69217e7",
+    "status_short": ""
+  },
+  "historical_closeout_inputs": {
+    "candidate_count": 193,
+    "candidate_manifest_sha256": "6f9fcde6ff98225374470d553d6c0ca67787dde1a32337fccb1bc8ef399d9b87",
+    "checkpoint_plan_counts": {
+      "checkpoint_bound_rows": 50,
+      "checkpoint_references": 223,
+      "checkpointless_rows": 39,
+      "distinct_checkpoint_sha256": 193,
+      "distinct_ema_checkpoint_sha256": 31,
+      "distinct_raw_checkpoint_sha256": 162,
+      "duplicate_checkpoint_references": 30,
+      "eligible_candidates": 193,
+      "ema_checkpoint_references": 55,
+      "excluded_records": 39,
+      "ledger_rows": 89,
+      "pending_preflight": 0,
+      "preflight_requests": 193,
+      "raw_checkpoint_references": 168,
+      "selector_conflicts": 0
+    },
+    "checkpoint_plan_sha256": "cefac86b2e3dd28f251d7318c844c1b3b0c841ecb855ee56f1c01db72152a486",
+    "latest_candidate_manifest": "artifacts/closeout/historical-canonical-512-v1/candidate_manifest__5dbb82fdb1c89d8f.json",
+    "latest_checkpoint_plan": "artifacts/closeout/historical-canonical-512-v1/checkpoint_plan_final__b10a45cb36872258.json",
+    "ledger_path": "artifacts/closeout/historical-ledger-v1-precommit-5e5ec305-20260726/experiment_ledger.jsonl",
+    "ledger_rows": 89,
+    "ledger_sha256": "5d8f50fd9eead11f2094905718fbcb9f55fefebd1c979fe49242f772a159c1e3"
+  },
+  "legacy_archive_v2": {
+    "cli": "scripts/run_canonical_preflight_launcher.py archive-legacy-untracked-failure-v2 --help",
+    "reason": "existing archive-legacy-untracked-failure-v2 CLI requires prepare_completion path, file sha256, canonical sha256, mtime ns, controller owner nonce, observer session, policy sha256, and old policy tree sha256; no unambiguous binding was present in the R9 formal v9 artifact namespace during this closeout pass",
+    "status": "not_executed"
+  },
+  "machine_summary_sha256": "d2c47ad0bf546c04327738938f77ea2828b1eb1555ace0b8e1f1707ad1285631",
+  "next_stage_starting_prompt_role": "Start from the failed R9 Full gate. Do not treat Confirm512 or paper_eta_0p125 as a formal pass.",
+  "r9_full": {
+    "artifact_counts": {
+      "evaluator_evidence_json": 3,
+      "evaluator_result_json": 4,
+      "full_png_all": 6152,
+      "generation_result_json": 32,
+      "heldout_raw_evidence_json": 1,
+      "native_generated_png": 2048,
+      "visual_contact_sheets": 8,
+      "winner_generated_png": 2048,
+      "winner_matched_native_png": 2048
+    },
+    "campaign_root": "artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9",
+    "execution_counts_report_only_finalize": {
+      "evaluator_execution_count": 0,
+      "generation_execution_count": 0,
+      "heldout_execution_count": 0
+    },
+    "failures": [
+      "arcface_coverage_not_2048",
+      "quality:arcface_not_exactly_one_face_per_image",
+      "quality:sharpness_below_gate",
+      "arcface_identity_report_unavailable"
+    ],
+    "formal_terminal_exit_code": 20,
+    "formal_terminal_status": "awaiting_visual_review",
+    "gate_contract_sha256": "d5d08ba06e22f8f9b3f638fbb8de42afd1629cd28ce6b515ae0d70109c275afd",
+    "gate_path": "artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/full/gate_contract.json",
+    "identity_report": {
+      "adaface": {
+        "coverage": 2048,
+        "reason": null,
+        "roles": {
+          "native": {
+            "auc": 0.4871354103088379,
+            "eer": 0.509765625,
+            "status": "available",
+            "tar_at_far": {
+              "0.0001": 0.00048828125,
+              "0.001": 0.00048828125
+            }
+          },
+          "winner": {
+            "auc": 0.5128679275512695,
+            "eer": 0.494140625,
+            "status": "available",
+            "tar_at_far": {
+              "0.0001": 0.001953125,
+              "0.001": 0.0048828125
+            }
+          }
+        },
+        "status": "available"
+      },
+      "arcface": {
+        "coverage": 2044,
+        "reason": "incomplete_exact_one_face_coverage",
+        "roles": {
+          "native": {
+            "reason": "incomplete_exact_one_face_coverage",
+            "status": "unavailable"
+          },
+          "winner": {
+            "reason": "incomplete_exact_one_face_coverage",
+            "status": "unavailable"
+          }
+        },
+        "status": "unavailable"
+      },
+      "facenet": {
+        "coverage": 2048,
+        "reason": null,
+        "roles": {
+          "native": {
+            "auc": 0.4943356513977051,
+            "eer": 0.49560546875,
+            "status": "available",
+            "tar_at_far": {
+              "0.0001": 0.00048828125,
+              "0.001": 0.001953125
+            }
+          },
+          "winner": {
+            "auc": 0.5128538608551025,
+            "eer": 0.49365234375,
+            "status": "available",
+            "tar_at_far": {
+              "0.0001": 0.00146484375,
+              "0.001": 0.00390625
+            }
+          }
+        },
+        "status": "available"
+      }
+    },
+    "paired_metrics": {
+      "e0": {
+        "candidate_mean": 0.7533507201085285,
+        "lower_95_one_sided": 0.6884717989528554,
+        "mean_delta": 0.7041324312765482,
+        "native_mean": 0.04921828883198032,
+        "upper_95_one_sided": 0.7197785037979428
+      },
+      "edev": {
+        "candidate_mean": 0.5432848038581142,
+        "lower_95_one_sided": 0.26838984005967176,
+        "mean_delta": 0.28046317318398906,
+        "native_mean": 0.2628216306741251,
+        "upper_95_one_sided": 0.29221970387199003
+      },
+      "niqe": {
+        "candidate_mean": 4.724278868354088,
+        "lower_95_one_sided": -0.04006974066520166,
+        "mean_delta": -0.01178234593375492,
+        "native_mean": 4.736061214287843,
+        "upper_95_one_sided": 0.01715403860156869
+      },
+      "sharpness": {
+        "candidate_mean": 591.7002634128564,
+        "lower_95_one_sided": -110.28155540622059,
+        "mean_delta": -95.51478438412391,
+        "native_mean": 687.2150477969803,
+        "upper_95_one_sided": -80.70555113297583
+      }
+    },
+    "phase": "full",
+    "report_only_finalize_path": "artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/full/report_only_finalize.json",
+    "report_only_finalize_sha256": "92ba23baf1f9cfd11ec3fc4b0e6d11507d2e3f617bbd64b33a2117b9d1b23667",
+    "selected_arm_ids": [
+      "paper_eta_0p125"
+    ],
+    "verdict": "failed_locked_winner",
+    "visual_review": {
+      "contact_sheet_count": 8,
+      "evidence_contract_sha256": "073f461e74fa20b2b4ba8e250992057f984df2938b96359e1104559b479b3051",
+      "evidence_path": "artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/full/visual_evidence/winner/visual_evidence.json",
+      "path": "artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/full/visual_reviews/winner.json",
+      "review_sha256": "378bd65652378a59ed73f6e6bee3940810eec61bf788ba0c3a260e82952f3351",
+      "sample_count": 64,
+      "severe_count": 0
+    },
+    "winner_arm_id": "paper_eta_0p125"
+  },
+  "repo": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization",
+  "resources": {
+    "formal_monitor_session": {
+      "duration_seconds_from_monotonic": 1521.248325748,
+      "gpu": {
+        "0": {
+          "max_used_bytes": 5835325440,
+          "max_used_percent": 22.64404296875,
+          "uuid": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+        },
+        "1": {
+          "max_used_bytes": 473956352,
+          "max_used_percent": 1.8391927083333333,
+          "uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+        },
+        "2": {
+          "max_used_bytes": 473956352,
+          "max_used_percent": 1.8391927083333333,
+          "uuid": "GPU-e27fe71d-eaf7-3eb5-d0ff-c1c63b4f6b02"
+        },
+        "3": {
+          "max_used_bytes": 3376414720,
+          "max_used_percent": 13.102213541666666,
+          "uuid": "GPU-61ea2925-9905-7f56-cd64-7a792a32efef"
+        }
+      },
+      "max_cpu_busy_percent": 84.54258675078864,
+      "max_disk_used_percent": 59.17166871405322,
+      "max_ram_used_percent": 23.44371864029653,
+      "sample_count": 292
+    },
+    "formal_monitor_summary": {
+      "contract_type": "safa_r9_formal_full_monitor_summary_v1",
+      "formal_execution_terminal_sha256": "206977b137c75b41ecf9311bee3f037bbd27423b4a0e332124f9edc2bc27ff30",
+      "log_progress_count": 2,
+      "monitor_claim_sha256": "5d32f1778048a3815e289755c0a2276f550ceec6e0da01640c17aa5b4befc99c",
+      "monitor_summary_sha256": "a1e5d34ebd0e4af828a019489bfdcbe711e860252df3f2ec50f429a57b54b7a6",
+      "sample_count": 292,
+      "samples": {
+        "file_sha256": "99d3baaa44569afe674fd3c149c5c5dcbf3e8f4c82014fb52a1351630acb6ced",
+        "path": "artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/formal_monitor/session_samples.jsonl"
+      },
+      "schema_version": 1,
+      "tmux_session": "/tmp/tmux-1020/default,2811576,182"
+    },
+    "report_only_finalize2": {
+      "duration_seconds_estimated_from_start_to_report_mtime": 397.35192370414734,
+      "log_path": "artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/operator_logs/full-reportonly-finalize2-20260730T200805CST.log",
+      "session": "safa-r9-full-reportonly-finalize2-20260730T200805CST"
+    },
+    "runtime_guard": {
+      "duration_seconds_from_monotonic": 1235.919096999,
+      "gpu": {
+        "0": {
+          "max_used_bytes": 5933891584,
+          "max_used_percent": 23.026529947916668,
+          "uuid": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+        },
+        "1": {
+          "max_used_bytes": 473956352,
+          "max_used_percent": 1.8391927083333333,
+          "uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+        },
+        "2": {
+          "max_used_bytes": 473956352,
+          "max_used_percent": 1.8391927083333333,
+          "uuid": "GPU-e27fe71d-eaf7-3eb5-d0ff-c1c63b4f6b02"
+        },
+        "3": {
+          "max_used_bytes": 3376414720,
+          "max_used_percent": 13.102213541666666,
+          "uuid": "GPU-61ea2925-9905-7f56-cd64-7a792a32efef"
+        }
+      },
+      "max_cpu_busy_percent": 78.34943301133977,
+      "max_disk_used_percent": 59.17162409928397,
+      "max_ram_used_percent": 23.37337557526516,
+      "sample_count": 803
+    }
+  },
+  "schema_version": 1
+}

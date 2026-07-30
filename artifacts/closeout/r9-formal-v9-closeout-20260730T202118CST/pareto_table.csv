@@ -1,0 +1,4 @@
+stage,candidate_count,evaluated_count,selected_count,status,reason,evidence_path
+historical_candidate_manifest,193,0,0,available_not_screened_in_this_gate_failed_closeout,R9 Full formal gate verdict failed_locked_winner,artifacts/closeout/historical-canonical-512-v1/candidate_manifest__5dbb82fdb1c89d8f.json
+canonical_512_screening,193,0,0,not_started,blocked by R9 Full formal gate failure,artifacts/closeout/historical-canonical-512-v1/checkpoint_plan_final__b10a45cb36872258.json
+formal_pareto_evaluation,0,0,0,not_started,no screened candidates because prerequisite screening was not started,artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/full/gate_contract.json

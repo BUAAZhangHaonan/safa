@@ -1,0 +1,2 @@
+unit_id,evidence_path,contact_sheet_count,review_path,review_sample_count,severe_count,review_sha256,status
+winner,artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/full/visual_evidence/winner/visual_evidence.json,8,artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/full/visual_reviews/winner.json,64,0,378bd65652378a59ed73f6e6bee3940810eec61bf788ba0c3a260e82952f3351,review_present_no_severe_visual_failures
