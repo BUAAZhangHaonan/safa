@@ -1,0 +1,49 @@
+{
+  "batch_size": 2,
+  "candidate_count": 24,
+  "candidate_manifest": {
+    "canonical_sha256": "c9ee09a9deced912b491e474fc6eff088dfb696b96ce9cbbd8b719f616fabf3c",
+    "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/closeout/historical-canonical-512-v1/candidate_manifest__5dbb82fdb1c89d8f.json",
+    "sha256": "6f9fcde6ff98225374470d553d6c0ca67787dde1a32337fccb1bc8ef399d9b87"
+  },
+  "contract_type": "safa_r10_triangle32_pilot_preparation_v1",
+  "generation_only": true,
+  "jobs_per_queue": 6,
+  "native_per_sample": {
+    "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/fixed32_evaluation/inputs/native_per_sample.jsonl",
+    "sha256": "3ccca65d7e400e6973ef54cc7a37f19ada07f0978865c7500b6d23634a3e9250"
+  },
+  "post_generation_evaluation": "official NIQE/sharpness plus three-role R9 ArcFace; source-candidate-only evidence is forbidden",
+  "queue_count": 4,
+  "queue_paths": [
+    "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/preparation_v1/queue_gpu0.json",
+    "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/preparation_v1/queue_gpu1.json",
+    "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/preparation_v1/queue_gpu2.json",
+    "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/preparation_v1/queue_gpu3.json"
+  ],
+  "retry_count": 0,
+  "runner": {
+    "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/scripts/run_triangle32_screening_worker.py",
+    "sha256": "b7388deab79f29d847b9f9018755d021d95514cd69666c6a7bd263ef0fd5d162"
+  },
+  "sample_manifest": {
+    "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/prefix32.jsonl",
+    "sample_count": 32,
+    "sha256": "fc47ae9372f23667e6b59ab2f33b22bc6cc8405be0095aaee1565d1158be1b05"
+  },
+  "schema_version": 1,
+  "seed": 4549,
+  "selected24": {
+    "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/selected24/selected24.json",
+    "sha256": "548a9b544de6486c535de821ebaee5ee7c375fc377b91facf3a2dcb47dc20dd4"
+  },
+  "selection_source": {
+    "completed_primary_result_count": 193,
+    "historical_primary_root": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/closeout/historical-canonical-512-v1/by_policy/5dbb82fdb1c89d8f7afd463a2f0b40743f42abd7b0f07dcefab144a32787c7af/runs/smoke8_primary"
+  },
+  "status": "prepared_not_launched",
+  "worker": {
+    "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/src/safa/closeout/canonical_screening_worker.py",
+    "sha256": "a2e64b118fb2479a622a3b1024624ef564e34d29f15e2caaa3ef2d95f521174c"
+  }
+}

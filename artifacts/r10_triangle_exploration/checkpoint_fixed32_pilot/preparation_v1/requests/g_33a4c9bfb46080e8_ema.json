@@ -1,0 +1,515 @@
+{
+  "authorized_gpu": {
+    "physical_gpu_index": 2,
+    "physical_gpu_uuid": "GPU-e27fe71d-eaf7-3eb5-d0ff-c1c63b4f6b02"
+  },
+  "authorized_gpu_registry": [
+    {
+      "physical_gpu_index": 0,
+      "physical_gpu_uuid": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+    },
+    {
+      "physical_gpu_index": 1,
+      "physical_gpu_uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+    },
+    {
+      "physical_gpu_index": 2,
+      "physical_gpu_uuid": "GPU-e27fe71d-eaf7-3eb5-d0ff-c1c63b4f6b02"
+    },
+    {
+      "physical_gpu_index": 3,
+      "physical_gpu_uuid": "GPU-61ea2925-9905-7f56-cd64-7a792a32efef"
+    }
+  ],
+  "batch_size": 2,
+  "candidate": {
+    "candidate_id": "g_33a4c9bfb46080e8_ema",
+    "checkpoint_model": "ema",
+    "checkpoint_path": "artifacts/checkpoints/e13_pu_adamw_meanflow_sit_stage2_e14resume_gpu23_200ep/best.pt",
+    "checkpoint_sha256": "33a4c9bfb46080e8a75c503c269e21e2c6d436913d2a42db7ed0ea74ea31ce9d",
+    "comparability_groups": [
+      "medium_v2_training_historical:ccc0183100bb"
+    ],
+    "evidence_levels": [
+      "historical_observation"
+    ],
+    "ledger_statuses": [
+      "started_incomplete"
+    ],
+    "output_contract": {
+      "capability": {
+        "capability_sha256": "e134121109db378ef0f78bc58292c8ba9ec366a8788fc46a3c313f2f7b14007d",
+        "checkpoint_sha256": "33a4c9bfb46080e8a75c503c269e21e2c6d436913d2a42db7ed0ea74ea31ce9d",
+        "checkpoint_training_config_observation": {
+          "decoder_fields": {
+            "vae_model": {
+              "present": false,
+              "value": null
+            },
+            "vae_path": {
+              "present": false,
+              "value": null
+            },
+            "vae_scaling_factor": {
+              "present": false,
+              "value": null
+            }
+          },
+          "latent_training": {
+            "present": false,
+            "value": null
+          }
+        },
+        "contract_type": "safa_generator_output_capability_v1",
+        "generator_output_tensor": {
+          "channels": 4,
+          "dtype_family": "floating",
+          "height": 32,
+          "postprocess": "identity",
+          "rank": 4,
+          "semantic_space": "scaled_vae_latent",
+          "value_contract": "finite_unbounded",
+          "width": 32
+        },
+        "model_config_sha256": "b6140ffcebc75f94546168708d7e3b334540709ae2426bb8aa28681d7ebb1577",
+        "model_image_size": 32,
+        "model_type": "meanflow_sit",
+        "native_output_size": [
+          32,
+          32
+        ],
+        "nfe": 1,
+        "output_space": "latent",
+        "resolution_source": "checkpoint_model_config_explicit_latent_space",
+        "runtime_model_config_sha256": "72bdd2caaf64fb41b8f6e1eb3efc361127897e3fd6fe9bae6e9cba0ab3b48dae",
+        "sample_steps": 1,
+        "sampler": "meanflow",
+        "schema_version": 1
+      },
+      "contract_type": "safa_generator_output_contract_v1",
+      "decoder": {
+        "asset_digest_cache": {
+          "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/closeout/historical-canonical-512-v1/shared/vae_asset_digests_v1.json"
+        },
+        "asset_digest_cache_algorithm": {
+          "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/src/safa/evaluation/meanflow_guidance_runner.py",
+          "sha256": "c5c619af8df3edb8c92491350e078064821a8a7e12b9c317aa7e91bca12645ce"
+        },
+        "config": {
+          "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/checkpoints/external/sd-vae-ft-ema/config.json",
+          "sha256": "92d3dfb746fca211a2c9e019e285f8597412211728dce3c5bcf4eda0f2d62e7e"
+        },
+        "decoded_rgb_shape": [
+          "B",
+          3,
+          256,
+          256
+        ],
+        "decoder_type": "r9_frozen_sd_vae_ft_ema",
+        "directory": {
+          "digest": "ac188e7f6ff31ff1a3bbde37fea3c345ec72f9e10589cf8aa8a3ec7e86afb188",
+          "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/checkpoints/external/sd-vae-ft-ema"
+        },
+        "directory_digest_algorithm": "sha256_relative_posix_nul_content_nul_v1",
+        "environment": {
+          "diffusers_version": "0.38.0",
+          "packages_sha256": "35196c0c7f5a8a2db3dcb31a67c0102fbd713db6d67af72eacfffe8f8b82be7b",
+          "provenance_snapshot": {
+            "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/closeout/historical-ledger-v1-precommit-5e5ec305-20260726/provenance_snapshot.json",
+            "sha256": "94507bbd5b2361b29cc3f4a68ade43b9cf3597fecdd20a93835548360c717b68"
+          },
+          "python_version": "3.12.13",
+          "torch_version": "2.11.0+cu128"
+        },
+        "implementation": {
+          "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/src/safa/training/latent_codec.py",
+          "sha256": "b57aded8d27da9ec209c1ec0f04e5d08f9ac53fd92a67f069f32d2259b6c39cb"
+        },
+        "latent_shape": [
+          "B",
+          4,
+          32,
+          32
+        ],
+        "output_range": [
+          0.0,
+          1.0
+        ],
+        "scaling_factor": 0.18215,
+        "trusted_generation_result": {
+          "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v8/confirm512/paper_eta_0p125/shards/shard_0/generation_result.json",
+          "sha256": "f96e3afcf618abd93ae1e4fc2196f19ff55cbbf63f8ea6119b939e68d995f149"
+        },
+        "trusted_reference_checkpoint": {
+          "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/checkpoints/e15_meanflow_sit_b_face_mixed_h100_resume_2400ep/last_nopretrained.pt",
+          "sha256": "4690717781db58a6021d57d124300a9b212f0a5043cf3028fb5de4d9c835cc4d"
+        },
+        "trusted_resolved_config": {
+          "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v8/runtime_configs/confirm512/paper_eta_0p125.yaml",
+          "sha256": "5adb05787baa1130ead3f20c8483603d3696fd65ac04d1c75623f42678fa7819"
+        },
+        "trusted_runner": {
+          "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/src/safa/evaluation/meanflow_guidance_runner.py",
+          "sha256": "c5c619af8df3edb8c92491350e078064821a8a7e12b9c317aa7e91bca12645ce"
+        },
+        "trusted_runtime_config": {
+          "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/configs/medium_v2/experiments/r9_meanflow_semigroup_preflight.yaml",
+          "sha256": "0a9536583af4d3b6234e425bca8ad01d6e52110b81827ad97b71dfa08a40b24d"
+        },
+        "vae_source_path": "artifacts/checkpoints/external/sd-vae-ft-ema",
+        "weights": {
+          "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/checkpoints/external/sd-vae-ft-ema/diffusion_pytorch_model.safetensors",
+          "sha256": "32db726da04f06c1b6b14c0043ce115cc87a501482945c5add89a40d838fcb46"
+        }
+      },
+      "decoder_mode": "required",
+      "output_contract_sha256": "7d15fc256c58f089718d46814b9f5e0b4b9a8390f6ff7f51b0c2854376bbe495",
+      "quality_protocol_family": "native_rgb_256_r9_frozen_vae",
+      "rgb_contract": {
+        "channels": 3,
+        "dtype_family": "floating",
+        "finite": true,
+        "height": 256,
+        "output_range": [
+          0.0,
+          1.0
+        ],
+        "postprocess": "frozen_vae_decode_then_affine_then_clamp_unit_interval",
+        "rank": 4,
+        "semantic_space": "rgb_unit_interval",
+        "value_contract": "finite_closed_unit_interval",
+        "width": 256
+      },
+      "schema_version": 1
+    },
+    "path_aliases": [
+      "artifacts/checkpoints/e13_pu_adamw_meanflow_sit_stage2_e14resume_gpu23_200ep/best.pt"
+    ],
+    "preflight_request_sha256": "d15202cd3a023e2f7f93308e4dad814c52f324eec4fa81e7e85963cb04e0f522",
+    "preflight_result_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/closeout/historical-canonical-512-v1/by_policy/5dbb82fdb1c89d8f7afd463a2f0b40743f42abd7b0f07dcefab144a32787c7af/checkpoint_preflight/results/33a4c9bfb46080e8a75c503c269e21e2c6d436913d2a42db7ed0ea74ea31ce9d__ema.json",
+    "preflight_result_sha256": "0dcc4ce1a5ea14fe92002a08ae52d80b6d5c80e6ddaa7825beaea239e6eb16d7",
+    "protocol_families": [
+      "medium_v2_training_historical"
+    ],
+    "source_logical_experiment_ids": [
+      "E13"
+    ],
+    "source_run_ids": [
+      "e13_pu_adamw_meanflow_sit_stage2_e14resume_gpu23_200ep"
+    ]
+  },
+  "candidate_manifest": {
+    "canonical_sha256": "c9ee09a9deced912b491e474fc6eff088dfb696b96ce9cbbd8b719f616fabf3c",
+    "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/closeout/historical-canonical-512-v1/candidate_manifest__5dbb82fdb1c89d8f.json",
+    "sha256": "6f9fcde6ff98225374470d553d6c0ca67787dde1a32337fccb1bc8ef399d9b87"
+  },
+  "contract_type": "safa_r10_triangle32_worker_request_v1",
+  "e0": {
+    "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/checkpoints/e0_medium_v1/best.pt",
+    "sha256": "d7d2c57a552155776b8c15a4e52e43ec5082fc046aa0aabb4e9709685f7e3d1a"
+  },
+  "edev": {
+    "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/checkpoints/e0_resnet18/best.pt",
+    "sha256": "373b331c917834467e854ddf3fe20f39000532f189ec73f76a1abc55d82e560e"
+  },
+  "features": {
+    "directory": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/e0_features/val_face_mixed_e14_e0_medium_v1",
+    "manifest": {
+      "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/e0_features/val_face_mixed_e14_e0_medium_v1/manifest.json",
+      "sha256": "386fbb59f409882c431e0949ca201c901831fdcf19cfb22743cc671fad7b9c37"
+    },
+    "shard": {
+      "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/e0_features/val_face_mixed_e14_e0_medium_v1/features.pt",
+      "sha256": "7b734059e48f9b1f9129cfc7bd6cbbd271c9f3afb63095837fd3f8fed009615d"
+    }
+  },
+  "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/logs_v1/g_33a4c9bfb46080e8_ema.log",
+  "mode": "triangle32",
+  "native_per_sample": {
+    "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/fixed32_evaluation/inputs/native_per_sample.jsonl",
+    "sha256": "3ccca65d7e400e6973ef54cc7a37f19ada07f0978865c7500b6d23634a3e9250"
+  },
+  "native_rgb_size": [
+    256,
+    256
+  ],
+  "nfe": 1,
+  "output_contract": {
+    "capability": {
+      "capability_sha256": "e134121109db378ef0f78bc58292c8ba9ec366a8788fc46a3c313f2f7b14007d",
+      "checkpoint_sha256": "33a4c9bfb46080e8a75c503c269e21e2c6d436913d2a42db7ed0ea74ea31ce9d",
+      "checkpoint_training_config_observation": {
+        "decoder_fields": {
+          "vae_model": {
+            "present": false,
+            "value": null
+          },
+          "vae_path": {
+            "present": false,
+            "value": null
+          },
+          "vae_scaling_factor": {
+            "present": false,
+            "value": null
+          }
+        },
+        "latent_training": {
+          "present": false,
+          "value": null
+        }
+      },
+      "contract_type": "safa_generator_output_capability_v1",
+      "generator_output_tensor": {
+        "channels": 4,
+        "dtype_family": "floating",
+        "height": 32,
+        "postprocess": "identity",
+        "rank": 4,
+        "semantic_space": "scaled_vae_latent",
+        "value_contract": "finite_unbounded",
+        "width": 32
+      },
+      "model_config_sha256": "b6140ffcebc75f94546168708d7e3b334540709ae2426bb8aa28681d7ebb1577",
+      "model_image_size": 32,
+      "model_type": "meanflow_sit",
+      "native_output_size": [
+        32,
+        32
+      ],
+      "nfe": 1,
+      "output_space": "latent",
+      "resolution_source": "checkpoint_model_config_explicit_latent_space",
+      "runtime_model_config_sha256": "72bdd2caaf64fb41b8f6e1eb3efc361127897e3fd6fe9bae6e9cba0ab3b48dae",
+      "sample_steps": 1,
+      "sampler": "meanflow",
+      "schema_version": 1
+    },
+    "contract_type": "safa_generator_output_contract_v1",
+    "decoder": {
+      "asset_digest_cache": {
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/closeout/historical-canonical-512-v1/shared/vae_asset_digests_v1.json"
+      },
+      "asset_digest_cache_algorithm": {
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/src/safa/evaluation/meanflow_guidance_runner.py",
+        "sha256": "c5c619af8df3edb8c92491350e078064821a8a7e12b9c317aa7e91bca12645ce"
+      },
+      "config": {
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/checkpoints/external/sd-vae-ft-ema/config.json",
+        "sha256": "92d3dfb746fca211a2c9e019e285f8597412211728dce3c5bcf4eda0f2d62e7e"
+      },
+      "decoded_rgb_shape": [
+        "B",
+        3,
+        256,
+        256
+      ],
+      "decoder_type": "r9_frozen_sd_vae_ft_ema",
+      "directory": {
+        "digest": "ac188e7f6ff31ff1a3bbde37fea3c345ec72f9e10589cf8aa8a3ec7e86afb188",
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/checkpoints/external/sd-vae-ft-ema"
+      },
+      "directory_digest_algorithm": "sha256_relative_posix_nul_content_nul_v1",
+      "environment": {
+        "diffusers_version": "0.38.0",
+        "packages_sha256": "35196c0c7f5a8a2db3dcb31a67c0102fbd713db6d67af72eacfffe8f8b82be7b",
+        "provenance_snapshot": {
+          "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/closeout/historical-ledger-v1-precommit-5e5ec305-20260726/provenance_snapshot.json",
+          "sha256": "94507bbd5b2361b29cc3f4a68ade43b9cf3597fecdd20a93835548360c717b68"
+        },
+        "python_version": "3.12.13",
+        "torch_version": "2.11.0+cu128"
+      },
+      "implementation": {
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/src/safa/training/latent_codec.py",
+        "sha256": "b57aded8d27da9ec209c1ec0f04e5d08f9ac53fd92a67f069f32d2259b6c39cb"
+      },
+      "latent_shape": [
+        "B",
+        4,
+        32,
+        32
+      ],
+      "output_range": [
+        0.0,
+        1.0
+      ],
+      "scaling_factor": 0.18215,
+      "trusted_generation_result": {
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v8/confirm512/paper_eta_0p125/shards/shard_0/generation_result.json",
+        "sha256": "f96e3afcf618abd93ae1e4fc2196f19ff55cbbf63f8ea6119b939e68d995f149"
+      },
+      "trusted_reference_checkpoint": {
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/checkpoints/e15_meanflow_sit_b_face_mixed_h100_resume_2400ep/last_nopretrained.pt",
+        "sha256": "4690717781db58a6021d57d124300a9b212f0a5043cf3028fb5de4d9c835cc4d"
+      },
+      "trusted_resolved_config": {
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v8/runtime_configs/confirm512/paper_eta_0p125.yaml",
+        "sha256": "5adb05787baa1130ead3f20c8483603d3696fd65ac04d1c75623f42678fa7819"
+      },
+      "trusted_runner": {
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/src/safa/evaluation/meanflow_guidance_runner.py",
+        "sha256": "c5c619af8df3edb8c92491350e078064821a8a7e12b9c317aa7e91bca12645ce"
+      },
+      "trusted_runtime_config": {
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/configs/medium_v2/experiments/r9_meanflow_semigroup_preflight.yaml",
+        "sha256": "0a9536583af4d3b6234e425bca8ad01d6e52110b81827ad97b71dfa08a40b24d"
+      },
+      "vae_source_path": "artifacts/checkpoints/external/sd-vae-ft-ema",
+      "weights": {
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/checkpoints/external/sd-vae-ft-ema/diffusion_pytorch_model.safetensors",
+        "sha256": "32db726da04f06c1b6b14c0043ce115cc87a501482945c5add89a40d838fcb46"
+      }
+    },
+    "decoder_mode": "required",
+    "output_contract_sha256": "7d15fc256c58f089718d46814b9f5e0b4b9a8390f6ff7f51b0c2854376bbe495",
+    "quality_protocol_family": "native_rgb_256_r9_frozen_vae",
+    "rgb_contract": {
+      "channels": 3,
+      "dtype_family": "floating",
+      "finite": true,
+      "height": 256,
+      "output_range": [
+        0.0,
+        1.0
+      ],
+      "postprocess": "frozen_vae_decode_then_affine_then_clamp_unit_interval",
+      "rank": 4,
+      "semantic_space": "rgb_unit_interval",
+      "value_contract": "finite_closed_unit_interval",
+      "width": 256
+    },
+    "schema_version": 1
+  },
+  "output_decoder_registry": {
+    "contract_type": "safa_canonical_output_decoder_registry_v1",
+    "decoder_registry_sha256": "20c491e8f58dc02427132b27492e2f71d17d43c6628e7af9b42df267f2eaebd2",
+    "latent": {
+      "asset_digest_cache": {
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/closeout/historical-canonical-512-v1/shared/vae_asset_digests_v1.json"
+      },
+      "asset_digest_cache_algorithm": {
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/src/safa/evaluation/meanflow_guidance_runner.py",
+        "sha256": "c5c619af8df3edb8c92491350e078064821a8a7e12b9c317aa7e91bca12645ce"
+      },
+      "config": {
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/checkpoints/external/sd-vae-ft-ema/config.json",
+        "sha256": "92d3dfb746fca211a2c9e019e285f8597412211728dce3c5bcf4eda0f2d62e7e"
+      },
+      "decoded_rgb_shape": [
+        "B",
+        3,
+        256,
+        256
+      ],
+      "decoder_type": "r9_frozen_sd_vae_ft_ema",
+      "directory": {
+        "digest": "ac188e7f6ff31ff1a3bbde37fea3c345ec72f9e10589cf8aa8a3ec7e86afb188",
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/checkpoints/external/sd-vae-ft-ema"
+      },
+      "directory_digest_algorithm": "sha256_relative_posix_nul_content_nul_v1",
+      "environment": {
+        "diffusers_version": "0.38.0",
+        "packages_sha256": "35196c0c7f5a8a2db3dcb31a67c0102fbd713db6d67af72eacfffe8f8b82be7b",
+        "provenance_snapshot": {
+          "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/closeout/historical-ledger-v1-precommit-5e5ec305-20260726/provenance_snapshot.json",
+          "sha256": "94507bbd5b2361b29cc3f4a68ade43b9cf3597fecdd20a93835548360c717b68"
+        },
+        "python_version": "3.12.13",
+        "torch_version": "2.11.0+cu128"
+      },
+      "implementation": {
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/src/safa/training/latent_codec.py",
+        "sha256": "b57aded8d27da9ec209c1ec0f04e5d08f9ac53fd92a67f069f32d2259b6c39cb"
+      },
+      "latent_shape": [
+        "B",
+        4,
+        32,
+        32
+      ],
+      "output_range": [
+        0.0,
+        1.0
+      ],
+      "scaling_factor": 0.18215,
+      "trusted_generation_result": {
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v8/confirm512/paper_eta_0p125/shards/shard_0/generation_result.json",
+        "sha256": "f96e3afcf618abd93ae1e4fc2196f19ff55cbbf63f8ea6119b939e68d995f149"
+      },
+      "trusted_reference_checkpoint": {
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/checkpoints/e15_meanflow_sit_b_face_mixed_h100_resume_2400ep/last_nopretrained.pt",
+        "sha256": "4690717781db58a6021d57d124300a9b212f0a5043cf3028fb5de4d9c835cc4d"
+      },
+      "trusted_resolved_config": {
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v8/runtime_configs/confirm512/paper_eta_0p125.yaml",
+        "sha256": "5adb05787baa1130ead3f20c8483603d3696fd65ac04d1c75623f42678fa7819"
+      },
+      "trusted_runner": {
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/src/safa/evaluation/meanflow_guidance_runner.py",
+        "sha256": "c5c619af8df3edb8c92491350e078064821a8a7e12b9c317aa7e91bca12645ce"
+      },
+      "trusted_runtime_config": {
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/configs/medium_v2/experiments/r9_meanflow_semigroup_preflight.yaml",
+        "sha256": "0a9536583af4d3b6234e425bca8ad01d6e52110b81827ad97b71dfa08a40b24d"
+      },
+      "vae_source_path": "artifacts/checkpoints/external/sd-vae-ft-ema",
+      "weights": {
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/checkpoints/external/sd-vae-ft-ema/diffusion_pytorch_model.safetensors",
+        "sha256": "32db726da04f06c1b6b14c0043ce115cc87a501482945c5add89a40d838fcb46"
+      }
+    },
+    "pixel": {
+      "channels": 3,
+      "clamp_output": true,
+      "decoder_forbidden": true,
+      "decoder_type": "native_rgb_unit_interval",
+      "height": 224,
+      "model_space": "rgb_neg1_pos1",
+      "model_type": "conditional_flow_matching",
+      "output_range": [
+        0.0,
+        1.0
+      ],
+      "postprocess": "in_generator_clamp_minus1_1_then_affine_then_clamp_unit_interval",
+      "sample_api": "clamp_output=true",
+      "sample_steps": 32,
+      "sampler": "heun",
+      "sampling_implementation": {
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/src/safa/models/generator.py",
+        "sha256": "b3d8a699aa4a236c3998681510f7bc1e01ada5415a04342182c91f2f7ae74219"
+      },
+      "width": 224
+    },
+    "schema_version": 1
+  },
+  "output_dir": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/runs_v1/g_33a4c9bfb46080e8_ema",
+  "pixel_image_size": 256,
+  "quality_protocol_family": "native_rgb_256_r9_frozen_vae",
+  "retry_count": 0,
+  "run_request_sha256": "6cd6767cd7efd38f41383a1c6df924ca2fe5c8bf25c5ab1637b6b4b6bc42b055",
+  "runner": {
+    "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/scripts/run_triangle32_screening_worker.py",
+    "sha256": "b7388deab79f29d847b9f9018755d021d95514cd69666c6a7bd263ef0fd5d162"
+  },
+  "sample_count": 32,
+  "sample_manifest": {
+    "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/prefix32.jsonl",
+    "sample_count": 32,
+    "sha256": "fc47ae9372f23667e6b59ab2f33b22bc6cc8405be0095aaee1565d1158be1b05"
+  },
+  "schema_version": 1,
+  "screening_worker": {
+    "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/src/safa/closeout/canonical_screening_worker.py",
+    "sha256": "a2e64b118fb2479a622a3b1024624ef564e34d29f15e2caaa3ef2d95f521174c"
+  },
+  "seed": 4549,
+  "selected24": {
+    "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/selected24/selected24.json",
+    "sha256": "548a9b544de6486c535de821ebaee5ee7c375fc377b91facf3a2dcb47dc20dd4"
+  },
+  "selection_rank": 3,
+  "source_index": {
+    "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/data/index/val_face_mixed_e14.jsonl",
+    "sha256": "da14e23eacefecbc2948d1374fb93961a13d017a9183aa1fe2a2f62b33a4b4ea"
+  }
+}

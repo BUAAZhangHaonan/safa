@@ -1,0 +1,169 @@
+{
+  "contract_type": "safa_r10_triangle32_gpu_queue_v1",
+  "generation_only": true,
+  "gpu_index": 1,
+  "job_count": 6,
+  "jobs": [
+    {
+      "candidate_id": "g_d75236bccc581e59_ema",
+      "command": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/scripts/run_triangle32_screening_worker.py",
+        "--request",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/preparation_v1/requests/g_d75236bccc581e59_ema.json",
+        "--gpu-index",
+        "1",
+        "--gpu-uuid",
+        "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      ],
+      "environment": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "CUDA_VISIBLE_DEVICES": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "gpu_index": 1,
+      "gpu_uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/logs_v1/g_d75236bccc581e59_ema.log",
+      "output_dir": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/runs_v1/g_d75236bccc581e59_ema",
+      "queue_position": 1,
+      "request_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/preparation_v1/requests/g_d75236bccc581e59_ema.json",
+      "retry_count": 0,
+      "run_request_sha256": "744efcbd3d349b99ca811501c20fecd8f14f8d56f3370897ad01cd2f8c4dc194",
+      "selection_rank": 2
+    },
+    {
+      "candidate_id": "g_07acf4a70561a8bb_raw",
+      "command": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/scripts/run_triangle32_screening_worker.py",
+        "--request",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/preparation_v1/requests/g_07acf4a70561a8bb_raw.json",
+        "--gpu-index",
+        "1",
+        "--gpu-uuid",
+        "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      ],
+      "environment": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "CUDA_VISIBLE_DEVICES": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "gpu_index": 1,
+      "gpu_uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/logs_v1/g_07acf4a70561a8bb_raw.log",
+      "output_dir": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/runs_v1/g_07acf4a70561a8bb_raw",
+      "queue_position": 2,
+      "request_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/preparation_v1/requests/g_07acf4a70561a8bb_raw.json",
+      "retry_count": 0,
+      "run_request_sha256": "a0403ae0fd1e9ea46b581d6c35eabc329a1a7edf71dc11780dabf367fd759cb7",
+      "selection_rank": 6
+    },
+    {
+      "candidate_id": "g_0de4aaf3d8c52e7a_raw",
+      "command": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/scripts/run_triangle32_screening_worker.py",
+        "--request",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/preparation_v1/requests/g_0de4aaf3d8c52e7a_raw.json",
+        "--gpu-index",
+        "1",
+        "--gpu-uuid",
+        "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      ],
+      "environment": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "CUDA_VISIBLE_DEVICES": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "gpu_index": 1,
+      "gpu_uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/logs_v1/g_0de4aaf3d8c52e7a_raw.log",
+      "output_dir": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/runs_v1/g_0de4aaf3d8c52e7a_raw",
+      "queue_position": 3,
+      "request_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/preparation_v1/requests/g_0de4aaf3d8c52e7a_raw.json",
+      "retry_count": 0,
+      "run_request_sha256": "86e903492dad31534706f614b8adddb6f433da0574b68314c9a745692100285f",
+      "selection_rank": 10
+    },
+    {
+      "candidate_id": "g_3d843659d72b0eed_ema",
+      "command": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/scripts/run_triangle32_screening_worker.py",
+        "--request",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/preparation_v1/requests/g_3d843659d72b0eed_ema.json",
+        "--gpu-index",
+        "1",
+        "--gpu-uuid",
+        "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      ],
+      "environment": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "CUDA_VISIBLE_DEVICES": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "gpu_index": 1,
+      "gpu_uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/logs_v1/g_3d843659d72b0eed_ema.log",
+      "output_dir": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/runs_v1/g_3d843659d72b0eed_ema",
+      "queue_position": 4,
+      "request_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/preparation_v1/requests/g_3d843659d72b0eed_ema.json",
+      "retry_count": 0,
+      "run_request_sha256": "bb5e0c21f5f2df6bfc5447402e4193351f323d94f750e2b91590b3b03d4103ca",
+      "selection_rank": 14
+    },
+    {
+      "candidate_id": "g_f9202e53566c32ec_raw",
+      "command": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/scripts/run_triangle32_screening_worker.py",
+        "--request",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/preparation_v1/requests/g_f9202e53566c32ec_raw.json",
+        "--gpu-index",
+        "1",
+        "--gpu-uuid",
+        "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      ],
+      "environment": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "CUDA_VISIBLE_DEVICES": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "gpu_index": 1,
+      "gpu_uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/logs_v1/g_f9202e53566c32ec_raw.log",
+      "output_dir": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/runs_v1/g_f9202e53566c32ec_raw",
+      "queue_position": 5,
+      "request_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/preparation_v1/requests/g_f9202e53566c32ec_raw.json",
+      "retry_count": 0,
+      "run_request_sha256": "1e1422d532ab1fdddd12248dde4bd0537686928e85e0480e2f6f98f48d02e30d",
+      "selection_rank": 18
+    },
+    {
+      "candidate_id": "g_484754f660406479_ema",
+      "command": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/scripts/run_triangle32_screening_worker.py",
+        "--request",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/preparation_v1/requests/g_484754f660406479_ema.json",
+        "--gpu-index",
+        "1",
+        "--gpu-uuid",
+        "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      ],
+      "environment": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "CUDA_VISIBLE_DEVICES": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "gpu_index": 1,
+      "gpu_uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/logs_v1/g_484754f660406479_ema.log",
+      "output_dir": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/runs_v1/g_484754f660406479_ema",
+      "queue_position": 6,
+      "request_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/preparation_v1/requests/g_484754f660406479_ema.json",
+      "retry_count": 0,
+      "run_request_sha256": "fdbfcf9ec59e87180ea346299d668b2e4158b70d16c56850c38e7d4c43f75711",
+      "selection_rank": 22
+    }
+  ],
+  "launchable": true,
+  "requires_tmux": true,
+  "retry_count": 0,
+  "schema_version": 1,
+  "sequential": true
+}
