@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "contract_type": "safa_r10_triangle_day_one_closeout_v1",
+  "date": "2026-07-31",
+  "timezone": "Asia/Shanghai",
+  "status": "closed_exploratory_no_checkpoint_survivor",
+  "boundary": {
+    "exploratory_stage32": true,
+    "formal_result": false,
+    "privacy_proof": false,
+    "arcface_u95_available": false,
+    "fid_kid_interpreted": false,
+    "full193_started": false,
+    "stage128_started": false,
+    "stage512_started": false
+  },
+  "commit_shas": [
+    "11a2c8f53eec7956e69971e25821115fe64e4801",
+    "27b6bd9e4692048c251cb73b351edb9f75789ccf",
+    "9a50eb794ab9ffaa66b11618d15f014323d60efd",
+    "7368bd24f678413dcdcaaa6d3b1f483f30f53538",
+    "67c4cc093b5a7b608761775abdf0f57ab8e4d040",
+    "4c5fe40e4cf7165c2b62cd5b570e2384ff905efd",
+    "19e0352d5761621a632f16c4d901ecb99290d7b0",
+    "bf50e32a97512b8c295e9aca3e0eed952287fcf2",
+    "fe8819b2b770bc9b82874371b26c4c4a14ea281b",
+    "e425528cd9d8d3a54669cbafbb09265242c20c27",
+    "6052249d5e53f4c53529fcd7f647af2656af69d1",
+    "e176c6930295ca8fb0feecce078214617e91f928"
+  ],
+  "r9_full_diagnostic": {
+    "arcface_failure_count": 4,
+    "repeats_per_image": 2,
+    "repeated_face_counts_equal": true,
+    "detector": "buffalo_l",
+    "det_size": [224, 224],
+    "formal_evaluator_modified": false,
+    "fid_kid_rerun": false,
+    "sharpness_pairs": 2048,
+    "native_sharpness_mean": 687.2150477969803,
+    "candidate_sharpness_mean": 591.7002634128564,
+    "candidate_gt_native_count": 852
+  },
+  "fixed32": {
+    "sample_count": 32,
+    "arm_count": 4,
+    "exact_one_count_per_arm": 32,
+    "survivor_count": 1,
+    "pareto_arm_ids": ["eta0p125_baseline"],
+    "selected_arm_ids": ["eta0p125_baseline"],
+    "privacy_statistic": "point_arcface_delta",
+    "arms": [
+      {"arm_id": "eta0p125_baseline", "e0": 0.8187053985893726, "delta_e0": 0.8016305248020217, "delta_edev": 0.3825958592206007, "niqe": 4.6898436111046955, "sharpness": 668.3387277438815, "arcface_delta": 0.007478855427381308, "failed_gates": [], "R": 0.09160719811916351, "Q": 0.051861818823612404, "P": 0.6260572286309347},
+      {"arm_id": "eta0p125_disable_i1", "e0": 0.7307642041705549, "delta_e0": 0.7136893303832039, "delta_edev": 0.29396309655567165, "niqe": 4.440067404523576, "sharpness": 640.2233914254248, "arcface_delta": 0.0026294978526308728, "failed_gates": ["e0"], "R": -0.025647727772593498, "Q": 0.0076126266563398826, "P": 0.8685251073684563},
+      {"arm_id": "eta0p125_disable_i2", "e0": 0.7440670020878315, "delta_e0": 0.7269921283004805, "delta_edev": 0.3300539473857498, "niqe": 4.757182681550751, "sharpness": 632.7572610927091, "arcface_delta": 0.004604179196161764, "failed_gates": ["e0", "sharpness"], "R": -0.007910663882891336, "Q": -0.004137908073040597, "P": 0.7697910401919118},
+      {"arm_id": "eta0p125_disable_i3", "e0": 0.69879171642242, "delta_e0": 0.681716842635069, "delta_edev": 0.31840209673100617, "niqe": 4.768755667936547, "sharpness": 661.6175627999983, "arcface_delta": 0.007943859504649067, "failed_gates": ["e0"], "R": -0.06827771143677334, "Q": 0.04128374442958194, "P": 0.6028070247675467}
+    ]
+  },
+  "checkpoint_pilot": {
+    "candidate_count": 24,
+    "checkpoint_models": {"raw": 12, "ema": 12},
+    "output_spaces": {"latent": 23, "pixel": 1},
+    "sample_count_per_candidate": 32,
+    "materialized_row_count": 768,
+    "exact_one_candidates": 24,
+    "exact_one_count_per_candidate": 32,
+    "shared_native_per_sample": {
+      "niqe": {"min": 2.724729505143257, "median": 4.667019606993368, "max": 7.3609381682273165, "mean": 4.739948805017041},
+      "sharpness": {"min": 196.89566956460476, "median": 574.9847128379624, "max": 1590.6612005233765, "mean": 668.8278228822091}
+    },
+    "candidate_arm_mean_distribution": {
+      "niqe": {"min": 5.022925088140231, "median": 6.116071886938139, "max": 6.988251647170825, "mean": 6.094865718196384},
+      "sharpness": {"min": 76.71241541011841, "median": 201.45667262341885, "max": 327.10665559920017, "mean": 219.43317316809262}
+    },
+    "representation_semantics": {
+      "e0": "mean candidate cosine",
+      "delta_e0": "mean(candidate_e0)-mean(native_e0)",
+      "delta_edev": "mean(candidate_edev)-mean(native_edev)",
+      "arcface_delta": "mean(source_candidate_cosine)-mean(source_native_cosine)",
+      "units": "raw cosine and cosine-point differences, not percentages"
+    },
+    "hard_gate_survivor_count": 0,
+    "pareto_count": 0,
+    "selected_count": 0,
+    "at_least_6": false,
+    "gate_failure_counts": {"arcface_delta": 9, "delta_e0": 15, "e0": 17, "niqe": 24, "sharpness": 24}
+  },
+  "decision": {
+    "fixed32_interval_branch": "stop after baseline-only survivor",
+    "checkpoint_pilot": "stop after zero of 24 survivors",
+    "full193": "not authorized and not started",
+    "stage128": "not started",
+    "stage512": "not started"
+  },
+  "push": {
+    "status": "blocked",
+    "attempt_count": 1,
+    "retried": false,
+    "error": "Connection timed out during banner exchange; UNKNOWN port 65535"
+  },
+  "evidence": [
+    {"path": "artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/full/diagnostics/r9_full_failures_v1/diagnostic_summary.json", "sha256": "f1acd6117b488eb86e7532f9ff0119cdbed05856359ce7fb529f3f7a4ab5c4e5"},
+    {"path": "artifacts/r10_triangle_exploration/preparation_v1/prefix32.jsonl", "sha256": "fc47ae9372f23667e6b59ab2f33b22bc6cc8405be0095aaee1565d1158be1b05"},
+    {"path": "artifacts/r10_triangle_exploration/fixed32_evaluation/fixed32_metric_manifest.json", "sha256": "8a15d8707995956e2f9ec02668777432dc1eb80c3e3c91531961db8ac6e8a963"},
+    {"path": "artifacts/r10_triangle_exploration/fixed32_evaluation/screening/summary.json", "sha256": "849d788643276795c321b081d6aec531d93835d823271457560b861895f44a91"},
+    {"path": "artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/selected24/selected24.json", "sha256": "548a9b544de6486c535de821ebaee5ee7c375fc377b91facf3a2dcb47dc20dd4"},
+    {"path": "artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/preparation_v1/preparation_manifest.json", "sha256": "6ef3d2beb324fe4ec447d5a4d7a6ffae01de97c6208372cbdccc63589f066dcf"},
+    {"path": "artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/evaluation_v1/rows_typed_v2/materialization_summary.json", "sha256": "4dc4a4950f3d8a82bd9dfc01d165d70548d1fe411e530009ecbc509c933387fd"},
+    {"path": "artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/evaluation_v1/screening_typed_v2/summary.json", "sha256": "35f2468314a7a6e1853f28a24d4ed474246c3c75050f282bb519165d0b123c31"},
+    {"path": "artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/evaluation_v1/screening_typed_v2/arms.csv", "sha256": "9fb4c8404a013823b883c43d64bd65eac38006f4161626576a665cb8032d997d"}
+  ]
+}
