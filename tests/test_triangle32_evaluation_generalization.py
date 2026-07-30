@@ -22,10 +22,35 @@ PREPARATION = (
     "preparation_v1/preparation_manifest.json"
 )
 MATERIALIZER = ROOT / "scripts/materialize_fixed32_triangle_rows.py"
+QUALITY_PREPARER = ROOT / "scripts/prepare_fixed32_quality_inputs.py"
+REAL_INDEX = ROOT / "data/index/val_face_mixed_e14.jsonl"
+RUNS_ROOT = (
+    ROOT
+    / "artifacts/r10_triangle_exploration/checkpoint_fixed32_pilot/runs_v1"
+)
+SELECTION = (
+    ROOT
+    / "artifacts/r10_triangle_exploration/preparation_v1/prefix32.jsonl"
+)
+NATIVE_PER_SAMPLE = (
+    ROOT
+    / "artifacts/r10_triangle_exploration/fixed32_evaluation/"
+    "inputs/native_per_sample.jsonl"
+)
 
 
 def _materializer():
     spec = importlib.util.spec_from_file_location("triangle_materializer", MATERIALIZER)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _quality_preparer():
+    spec = importlib.util.spec_from_file_location(
+        "triangle_quality_preparer", QUALITY_PREPARER
+    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -67,6 +92,67 @@ def test_triangle32_preparation_rejects_duplicate_arm_ids(tmp_path: Path) -> Non
     changed_preparation.write_text(json.dumps(preparation) + "\n", encoding="utf-8")
     with pytest.raises(TriangleScreeningError, match="duplicate arm ID"):
         load_arm_set(changed_preparation)
+
+
+def test_quality_preparer_requires_explicit_real_index() -> None:
+    module = _quality_preparer()
+    with pytest.raises(SystemExit):
+        module.parse_args([
+            "--runs-root",
+            str(RUNS_ROOT),
+            "--selection-manifest",
+            str(SELECTION),
+            "--output-dir",
+            "/unused",
+        ])
+
+
+def test_quality_preparer_binds_registered_real_index(tmp_path: Path) -> None:
+    module = _quality_preparer()
+    output_dir = tmp_path / "quality-inputs"
+    assert module.main([
+        "--runs-root",
+        str(RUNS_ROOT),
+        "--selection-manifest",
+        str(SELECTION),
+        "--real-index",
+        str(REAL_INDEX),
+        "--output-dir",
+        str(output_dir),
+        "--arm-set-manifest",
+        str(PREPARATION),
+        "--native-per-sample",
+        str(NATIVE_PER_SAMPLE),
+    ]) == 0
+    manifest = json.loads(
+        (output_dir / "quality_input_manifest.json").read_text(encoding="utf-8")
+    )
+    binding = {"path": str(REAL_INDEX), "sha256": sha256_file(REAL_INDEX)}
+    assert manifest["schema_version"] == 2
+    assert manifest["contract_type"] == "safa_triangle_fixed32_quality_inputs_v2"
+    assert manifest["real_index"] == binding
+    assert manifest["native"]["real_index"] == binding
+    assert len(manifest["candidates"]) == 24
+    assert all(row["real_index"] == binding for row in manifest["candidates"])
+
+
+def test_quality_preparer_rejects_substitute_real_index(tmp_path: Path) -> None:
+    module = _quality_preparer()
+    with pytest.raises(TriangleScreeningError, match="registered E14 index"):
+        module.main([
+            "--runs-root",
+            str(RUNS_ROOT),
+            "--selection-manifest",
+            str(SELECTION),
+            "--real-index",
+            str(SELECTION),
+            "--output-dir",
+            str(tmp_path / "quality-inputs"),
+            "--arm-set-manifest",
+            str(PREPARATION),
+            "--native-per-sample",
+            str(NATIVE_PER_SAMPLE),
+        ])
 
 
 def test_official_arcface_requires_three_roles_and_bound_output() -> None:

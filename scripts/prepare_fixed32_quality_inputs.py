@@ -17,6 +17,10 @@ from safa.evaluation.triangle_screening import TriangleScreeningError
 
 
 ARM_IDS = LEGACY_ARM_IDS
+REGISTERED_REAL_INDEX = (
+    Path(__file__).resolve().parents[1]
+    / "data/index/val_face_mixed_e14.jsonl"
+).resolve()
 
 
 def _rows(path: Path) -> list[Mapping[str, Any]]:
@@ -44,6 +48,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--runs-root", type=Path, required=True)
     parser.add_argument("--selection-manifest", type=Path, required=True)
+    parser.add_argument("--real-index", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--arm-set-manifest", type=Path)
     parser.add_argument("--native-per-sample", type=Path)
@@ -54,6 +59,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     runs_root = args.runs_root.resolve()
     selection_path = args.selection_manifest.resolve()
+    real_index_path = args.real_index.resolve()
+    if real_index_path != REGISTERED_REAL_INDEX:
+        raise TriangleScreeningError(
+            f"real index must be the registered E14 index: {REGISTERED_REAL_INDEX}"
+        )
+    if not real_index_path.is_file():
+        raise TriangleScreeningError(
+            f"registered E14 real index is missing: {real_index_path}"
+        )
+    real_index_binding = {
+        "path": str(real_index_path),
+        "sha256": _sha256(real_index_path),
+    }
     arm_set = load_arm_set(args.arm_set_manifest)
     if (
         arm_set.selection_manifest is not None
@@ -112,14 +130,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         handle.write(
             json.dumps(
                 {
-                    "schema_version": 1,
-                    "contract_type": "safa_triangle_fixed32_quality_inputs_v1",
+                    "schema_version": 2,
+                    "contract_type": "safa_triangle_fixed32_quality_inputs_v2",
                     "metrics": ["niqe", "sharpness"],
+                    "real_index": real_index_binding,
                     "selection_manifest": str(selection_path),
                     "selection_manifest_sha256": _sha256(selection_path),
                     "native": {
                         "per_sample": str(native_path),
                         "per_sample_sha256": _sha256(native_path),
+                        "real_index": real_index_binding,
                         "role_binding": "generated_equals_existing_native",
                     },
                     "candidates": [
@@ -127,6 +147,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             "arm_id": arm_id,
                             "per_sample": str(run_paths[arm_id]),
                             "per_sample_sha256": _sha256(run_paths[arm_id]),
+                            "real_index": real_index_binding,
                             "role_binding": "existing_generated_candidate",
                         }
                         for arm_id in arm_set.arm_ids
