@@ -1335,7 +1335,10 @@ def _build_effective_evaluation(
         resource_smokes = _validate_full_e2e_runtime_resource_profiles(
             raw_resources,
             repo_root=repo_root,
-            worker_contract=normalized_worker,
+            worker_contract=_normalized_worker_contract(
+                {"worker": normalized_worker},
+                repo_root=repo_root,
+            ),
             arcface_contract_sha256=_canonical_json_sha256(normalized_arcface),
             quality_script_sha256=normalized_quality["script"]["sha256"],
         )
@@ -2937,11 +2940,16 @@ def _rebuild_full_e2e_evidence(
     return {"plan": plan, "result": result, "gate": gate}
 
 
-def _normalized_worker_contract(evaluation: Mapping[str, Any]) -> dict[str, str]:
+def _normalized_worker_contract(
+    evaluation: Mapping[str, Any],
+    *,
+    repo_root: Path | None = None,
+) -> dict[str, str]:
+    root = REPO_ROOT if repo_root is None else repo_root
     worker = _mapping(evaluation.get("worker"), "evaluation worker")
-    worker_script = _repo_path(REPO_ROOT, worker.get("path"), "evaluation worker")
+    worker_script = _repo_path(root, worker.get("path"), "evaluation worker")
     worker_implementation = _repo_path(
-        REPO_ROOT,
+        root,
         worker.get("implementation_path"),
         "evaluation worker implementation",
     )
