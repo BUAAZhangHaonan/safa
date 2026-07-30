@@ -249,10 +249,13 @@ def _validate_arcface_contract(
         "insightface_version",
         "onnxruntime_version",
         "assets",
-        "execution",
         "execution_probe",
     }
-    if not isinstance(value, Mapping) or set(value) != expected_fields:
+    if not isinstance(value, Mapping):
+        raise R9EvaluatorError("ArcFace runtime contract fields are not canonical")
+    field_set = set(value)
+    has_inline_execution = "execution" in field_set
+    if field_set != expected_fields | ({"execution"} if has_inline_execution else set()):
         raise R9EvaluatorError("ArcFace runtime contract fields are not canonical")
     if value.get("model_name") != ARCFACE_MODEL_NAME:
         raise R9EvaluatorError("R9 ArcFace model must be buffalo_l")
@@ -283,7 +286,13 @@ def _validate_arcface_contract(
         if _sha256_file(path) != expected_sha256:
             raise R9EvaluatorError(f"ArcFace asset digest mismatch: {filename}")
         normalized_assets[filename] = expected_sha256
-    execution = _validate_arcface_execution_contract(value.get("execution"))
+    if has_inline_execution:
+        raw_execution = value.get("execution")
+    else:
+        raw_execution = _read_arcface_execution_from_probe_binding(
+            value.get("execution_probe"), repo_root=repo_root
+        )
+    execution = _validate_arcface_execution_contract(raw_execution)
     execution_probe = _validate_arcface_execution_provenance(
         value.get("execution_probe"),
         execution=execution,
@@ -300,6 +309,52 @@ def _validate_arcface_contract(
         "execution": execution,
         "execution_probe": execution_probe,
     }
+
+
+def _read_arcface_execution_from_probe_binding(
+    value: Any, *, repo_root: Path | None
+) -> Any:
+    if not isinstance(value, Mapping):
+        raise R9EvaluatorError(
+            "ArcFace execution probe provenance fields are not canonical"
+        )
+    raw_path = Path(str(value.get("path", "")))
+    if repo_root is None:
+        if not raw_path.is_absolute():
+            raise R9EvaluatorError(
+                f"normalized ArcFace execution probe path must be absolute: {raw_path}"
+            )
+        probe_path = raw_path.resolve()
+        if not probe_path.is_file():
+            raise FileNotFoundError(
+                f"ArcFace execution probe does not exist: {probe_path}"
+            )
+    else:
+        candidate = raw_path if raw_path.is_absolute() else repo_root / raw_path
+        probe_path = _require_contained(
+            repo_root,
+            candidate,
+            "ArcFace execution probe",
+            must_exist=True,
+        )
+    probe_sha256 = _require_sha256(
+        value.get("sha256"), "ArcFace execution probe SHA256"
+    )
+    if _sha256_file(probe_path) != probe_sha256:
+        raise R9EvaluatorError("ArcFace execution probe digest mismatch")
+    probe = _read_json_mapping(probe_path, "ArcFace execution probe")
+    if set(probe) != {
+        "schema_version",
+        "contract_type",
+        "cuda_visible_devices",
+        "runtime_device_id",
+        "execution",
+    } or (
+        probe.get("schema_version") != 1
+        or probe.get("contract_type") != "safa_r9_arcface_execution_probe_v1"
+    ):
+        raise R9EvaluatorError("ArcFace execution probe identity mismatch")
+    return probe.get("execution")
 
 
 def _validate_arcface_execution_provenance(

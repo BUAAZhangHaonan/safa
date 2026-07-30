@@ -2951,6 +2951,25 @@ def _rebuild_full_e2e_evidence(
     return {"plan": plan, "result": result, "gate": gate}
 
 
+def _normalized_arcface_evaluation_contract(
+    evaluation: Mapping[str, Any],
+) -> dict[str, Any]:
+    from safa.evaluation.r9_evaluator_worker import _validate_arcface_contract
+
+    return _validate_arcface_contract(
+        _mapping(evaluation.get("arcface"), "ArcFace evaluation"),
+        repo_root=REPO_ROOT,
+    )
+
+
+def _arcface_evaluation_contract_sha256(
+    evaluation: Mapping[str, Any],
+) -> str:
+    return _canonical_json_sha256(
+        _normalized_arcface_evaluation_contract(evaluation)
+    )
+
+
 def build_full_e2e_resource_profiles(
     campaign_runtime: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -2961,9 +2980,7 @@ def build_full_e2e_resource_profiles(
     )
     evaluation = _mapping(campaign_runtime.get("evaluation"), "evaluation")
     expected_worker = _mapping(evaluation.get("worker"), "evaluation worker")
-    expected_arcface = _canonical_json_sha256(
-        _mapping(evaluation.get("arcface"), "ArcFace evaluation")
-    )
+    expected_arcface = _arcface_evaluation_contract_sha256(evaluation)
     expected_quality = _mapping(
         _mapping(evaluation.get("quality"), "quality evaluation").get("script"),
         "quality script",
@@ -4144,13 +4161,15 @@ class R9ProductionEvaluatorCallbacks:
         }
         self._validate_current_worker_contract()
         self._evaluation = dict(evaluation)
+        normalized_arcface = _normalized_arcface_evaluation_contract(evaluation)
+        self._evaluation["arcface"] = normalized_arcface
         quality = _mapping(evaluation.get("quality"), "quality evaluation")
         quality_script = _mapping(quality.get("script"), "quality script")
         self._quality_script_sha256 = _require_sha256(
             quality_script.get("sha256"), "quality script SHA256"
         )
         self._arcface_contract_sha256 = _canonical_json_sha256(
-            _mapping(evaluation.get("arcface"), "ArcFace evaluation")
+            normalized_arcface
         )
         resource_smokes = _mapping(
             evaluation.get("resource_smokes"), "evaluator resource smokes"

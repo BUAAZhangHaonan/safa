@@ -18,6 +18,7 @@ from safa.evaluation.r9_evaluator_worker import (
     R9EvaluatorError,
     R9ProductionEvaluators,
     _production_face_analyzer_factory,
+    _validate_arcface_contract,
     _production_quality_backend,
     build_worker_request,
     execute_worker_request,
@@ -348,6 +349,23 @@ def _arcface_contract(root: Path) -> dict[str, Any]:
     }
     _add_arcface_execution_provenance(root, contract)
     return contract
+
+
+def test_arcface_contract_accepts_probe_only_runtime_declaration(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    contract = _arcface_contract(repo_root)
+    probe_only = dict(contract)
+    execution = probe_only.pop("execution")
+
+    validated = _validate_arcface_contract(probe_only, repo_root=repo_root)
+
+    assert validated["execution"] == execution
+    assert Path(validated["execution_probe"]["path"]).is_absolute()
+    assert Path(validated["execution_probe"]["path"]).is_file()
+    assert validated["execution_probe"]["sha256"] == contract["execution_probe"]["sha256"]
 
 
 def _fixture(

@@ -3389,6 +3389,11 @@ def test_full_e2e_measured_resource_profile_rebuild_and_tamper_fail_closed(
         },
     }
     expected_arcface_sha256 = driver._canonical_json_sha256(arcface)
+    monkeypatch.setattr(
+        driver,
+        "_arcface_evaluation_contract_sha256",
+        lambda evaluation: expected_arcface_sha256,
+    )
     units = {
         "arcface": ("arcface", "formal_e2e_arcface_8", 100, 10),
         "quality_native": (
