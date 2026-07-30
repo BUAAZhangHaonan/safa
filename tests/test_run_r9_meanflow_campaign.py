@@ -3805,6 +3805,52 @@ def test_evaluator_runtime_guard_receives_all_active_evaluator_processes(
     ]
 
 
+def test_heldout_evaluator_sets_cpu_thread_caps(tmp_path: Path) -> None:
+    callbacks = _minimal_evaluator_callbacks(tmp_path)
+    captured_env = {}
+
+    class Process:
+        pid = 1234
+        returncode = 0
+
+        @staticmethod
+        def poll():
+            return 0
+
+    def process_factory(command, **kwargs):
+        captured_env.update(kwargs["env"])
+        request_path = Path(command[command.index("--request") + 1])
+        output_path = Path(command[command.index("--output") + 1])
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        output = {
+            "schema_version": 1,
+            "contract_type": "safa_r9_phase_evaluator_output_v1",
+            "task": request["task"],
+            "evaluator_request_sha256": request["evaluator_request_sha256"],
+            "worker_contract": callbacks._worker_contract,
+            "arcface_contract_sha256": callbacks._arcface_contract_sha256,
+            "quality_script_sha256": callbacks._quality_script_sha256,
+            "result": {"strict": True},
+        }
+        output["evaluator_output_sha256"] = driver._canonical_json_sha256(output)
+        output_path.write_text(json.dumps(output), encoding="utf-8")
+        return Process()
+
+    callbacks._process_factory = process_factory
+
+    assert callbacks._run("heldout", "full", "winner_cpu_cap", {}) == {
+        "strict": True
+    }
+    for key in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    ):
+        assert captured_env[key] == "1"
+
+
 def test_heldout_uses_one_lease_and_attempt_is_single_use(
     tmp_path: Path, monkeypatch
 ) -> None:

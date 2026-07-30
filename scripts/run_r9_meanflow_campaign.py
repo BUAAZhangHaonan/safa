@@ -4472,6 +4472,15 @@ class R9ProductionEvaluatorCallbacks:
         environment["SAFA_R9_WORKER_ID"] = worker_id
         environment["SAFA_R9_GPU_UUID"] = lease.gpu_uuid
         environment["SAFA_R9_GPU_SLOT"] = str(lease.slot_index)
+        if evaluator == "heldout":
+            for thread_env in (
+                "OMP_NUM_THREADS",
+                "OPENBLAS_NUM_THREADS",
+                "MKL_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS",
+                "VECLIB_MAXIMUM_THREADS",
+            ):
+                environment[thread_env] = "1"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         process = None
         worker_terminal = False
