@@ -81,13 +81,13 @@ class ArmResult:
     native_kid: float | None
     sharpness: float
     native_sharpness: float
-    arcface_delta: float
+    arcface_delta: float | None
     arcface_delta_u95: float | None
     hard_gate_pass: bool
     failed_gates: tuple[str, ...]
     r_margin: float
     q_margin: float
-    p_margin: float
+    p_margin: float | None
     pareto: bool = False
     selected: bool = False
     status: str = "gate_survivor_no_breakthrough"
@@ -706,7 +706,7 @@ def _evaluate_arm(
     indexed = _unique_rows(rows, required_fields=ROW_FIELDS)
     ordered = [indexed[sample_id] for sample_id in sorted(indexed)]
     numeric: dict[str, list[float]] = {}
-    for field in ROW_FIELDS[1:9] + ROW_FIELDS[12:]:
+    for field in ROW_FIELDS[1:9]:
         numeric[field] = [
             _finite_number(row[field], f"{arm_id}.{row['sample_id']}.{field}")
             for row in ordered
@@ -718,6 +718,8 @@ def _evaluate_arm(
             for row in ordered
         ]
     n = len(ordered)
+    source_exact_one = sum(count == 1 for count in counts["source_face_count"])
+    native_exact_one = sum(count == 1 for count in counts["native_face_count"])
     exact_one = sum(count == 1 for count in counts["candidate_face_count"])
     e0 = _mean(numeric["candidate_e0"])
     delta_e0 = _mean(
@@ -736,15 +738,36 @@ def _evaluate_arm(
     native_niqe = _mean(numeric["native_niqe"])
     sharpness = _mean(numeric["candidate_sharpness"])
     native_sharpness = _mean(numeric["native_sharpness"])
-    arcface_deltas = [
-        candidate - native
-        for candidate, native in zip(
-            numeric["source_candidate_cosine"],
-            numeric["source_native_cosine"],
-            strict=True,
-        )
-    ]
-    arcface_delta = _mean(arcface_deltas)
+    privacy_available = source_exact_one == native_exact_one == exact_one == n
+    arcface_deltas: list[float] = []
+    if privacy_available:
+        for row in ordered:
+            arcface_deltas.append(
+                _finite_number(
+                    row["source_candidate_cosine"],
+                    f"{arm_id}.{row['sample_id']}.source_candidate_cosine",
+                )
+                - _finite_number(
+                    row["source_native_cosine"],
+                    f"{arm_id}.{row['sample_id']}.source_native_cosine",
+                )
+            )
+    else:
+        for row in ordered:
+            if not (
+                row["source_face_count"]
+                == row["native_face_count"]
+                == row["candidate_face_count"]
+                == 1
+            ) and (
+                row["source_native_cosine"] is not None
+                or row["source_candidate_cosine"] is not None
+            ):
+                raise TriangleScreeningError(
+                    f"{arm_id}.{row['sample_id']} must use null ArcFace cosines "
+                    "when any required role is not exact-one"
+                )
+    arcface_delta = _mean(arcface_deltas) if privacy_available else None
     if stage == 32:
         if any(value is not None for value in (fid, kid, native_fid, native_kid)):
             raise TriangleScreeningError(
@@ -758,25 +781,35 @@ def _evaluate_arm(
         kid = _finite_number(kid, f"{arm_id}.kid")
         native_fid = _finite_number(native_fid, "native_fid")
         native_kid = _finite_number(native_kid, "native_kid")
-        arcface_delta_u95 = paired_bootstrap_upper(
-            arcface_deltas,
-            iterations=bootstrap_indices.shape[0],
-            indices=bootstrap_indices,
+        arcface_delta_u95 = (
+            paired_bootstrap_upper(
+                arcface_deltas,
+                iterations=bootstrap_indices.shape[0],
+                indices=bootstrap_indices,
+            )
+            if privacy_available
+            else None
         )
         privacy_statistic = arcface_delta_u95
     sharpness_floor = max(300.0, 0.95 * native_sharpness)
     checks = (
+        ("source_exact_one", source_exact_one == n),
+        ("native_exact_one", native_exact_one == n),
         ("candidate_exact_one", exact_one == n),
-        (
-            "arcface_delta" if stage == 32 else "arcface_delta_u95",
-            privacy_statistic <= 0.02,
-        ),
+        ("arcface_privacy_available", privacy_statistic is not None),
         ("e0", e0 >= 0.75),
         ("delta_e0", delta_e0 >= 0.30),
         ("delta_edev", delta_edev >= 0.05),
         ("niqe", niqe <= native_niqe + 0.10),
         ("sharpness", sharpness >= sharpness_floor),
     )
+    if privacy_statistic is not None:
+        checks = checks[:4] + (
+            (
+                "arcface_delta" if stage == 32 else "arcface_delta_u95",
+                privacy_statistic <= 0.02,
+            ),
+        ) + checks[4:]
     if stage != 32:
         checks = checks[:-1] + (
             ("fid", fid <= native_fid + 3.0),
@@ -799,7 +832,11 @@ def _evaluate_arm(
             (native_kid + 0.005 - kid) / 0.005,
         ]
     q_margin = min(q_terms)
-    p_margin = (0.02 - privacy_statistic) / 0.02
+    p_margin = (
+        (0.02 - privacy_statistic) / 0.02
+        if privacy_statistic is not None
+        else None
+    )
     return ArmResult(
         arm_id=arm_id,
         sample_count=n,
@@ -903,6 +940,8 @@ def apply_stage_cap(frontier: Sequence[ArmResult], stage: int) -> list[ArmResult
 def _breakthrough_status(result: ArmResult, baseline: ArmResult) -> str:
     if not result.hard_gate_pass:
         return "no_gate_survivor"
+    if result.p_margin is None or baseline.p_margin is None:
+        return "gate_survivor_no_breakthrough"
     axes = (result.r_margin, result.q_margin, result.p_margin)
     baseline_axes = (baseline.r_margin, baseline.q_margin, baseline.p_margin)
     strict_improvements = sum(
@@ -1115,12 +1154,14 @@ def write_outputs(
             for result in results
             if (
                 result.candidate_exact_one_count != result.sample_count
+                or result.p_margin is None
                 or (
                     result.arcface_delta_u95 is not None
                     and result.arcface_delta_u95 > 0.02
                 )
                 or (
                     result.arcface_delta_u95 is None
+                    and result.arcface_delta is not None
                     and result.arcface_delta > 0.02
                 )
             )

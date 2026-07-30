@@ -169,6 +169,8 @@ def test_eligibility_join_is_exact_and_preserves_three_sources() -> None:
 def test_candidate_exact_one_equality_passes_and_511_fails() -> None:
     pass_rows = arm_rows(512)
     fail_rows = arm_rows(512, candidate_count=0)
+    fail_rows[-1]["source_native_cosine"] = None
+    fail_rows[-1]["source_candidate_cosine"] = None
     results = evaluate_arms(
         [
             {
@@ -244,6 +246,35 @@ def test_stage32_omits_fid_kid_and_uses_point_privacy() -> None:
     assert results[0].arcface_delta == pytest.approx(0.01)
     assert results[0].arcface_delta_u95 is None
     assert results[0].hard_gate_pass
+
+
+@pytest.mark.parametrize(
+    ("field", "count", "gate"),
+    [
+        ("candidate_face_count", 2, "candidate_exact_one"),
+        ("native_face_count", 0, "native_exact_one"),
+        ("source_face_count", 0, "source_exact_one"),
+    ],
+)
+def test_non_exact_one_preserves_null_privacy_and_hard_fails(
+    field: str, count: int, gate: str
+) -> None:
+    rows = arm_rows(32)
+    rows[0][field] = count
+    rows[0]["source_native_cosine"] = None
+    rows[0]["source_candidate_cosine"] = None
+    result = evaluate_arms(
+        [{"arm_id": "paper_eta_0p125", "rows": rows}],
+        stage=32,
+        native_fid=None,
+        native_kid=None,
+    )[0]
+    assert not result.hard_gate_pass
+    assert gate in result.failed_gates
+    assert "arcface_privacy_available" in result.failed_gates
+    assert result.arcface_delta is None
+    assert result.arcface_delta_u95 is None
+    assert result.p_margin is None
 
 
 @pytest.mark.parametrize("stage", [128, 512])

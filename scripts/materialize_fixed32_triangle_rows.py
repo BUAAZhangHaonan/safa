@@ -96,6 +96,32 @@ def _integer(row: Mapping[str, Any], field: str, label: str) -> int:
     return value
 
 
+def _identity_cosines(
+    row: Mapping[str, Any], *, label: str
+) -> tuple[float | None, float | None]:
+    counts = tuple(
+        _integer(row, field, label)
+        for field in (
+            "source_face_count",
+            "native_face_count",
+            "candidate_face_count",
+        )
+    )
+    if counts == (1, 1, 1):
+        return (
+            _finite(row, "source_native_cosine", label),
+            _finite(row, "source_candidate_cosine", label),
+        )
+    if (
+        row.get("source_native_cosine") is not None
+        or row.get("source_candidate_cosine") is not None
+    ):
+        raise TriangleScreeningError(
+            f"{label} must omit ArcFace cosines when any required role is not exact-one"
+        )
+    return None, None
+
+
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -195,6 +221,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             native_q = native_quality[sample_id]
             candidate_q = candidate_quality[sample_id]
             identity = arcface[sample_id]
+            source_native_cosine, source_candidate_cosine = _identity_cosines(
+                identity, label=f"{arm_id} ArcFace"
+            )
             rows.append(
                 {
                     "arm_id": arm_id,
@@ -225,12 +254,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "candidate_face_count": _integer(
                         identity, "candidate_face_count", f"{arm_id} ArcFace"
                     ),
-                    "source_native_cosine": _finite(
-                        identity, "source_native_cosine", f"{arm_id} ArcFace"
-                    ),
-                    "source_candidate_cosine": _finite(
-                        identity, "source_candidate_cosine", f"{arm_id} ArcFace"
-                    ),
+                    "source_native_cosine": source_native_cosine,
+                    "source_candidate_cosine": source_candidate_cosine,
                 }
             )
         row_path = output_dir / f"{arm_id}.jsonl"
