@@ -3668,6 +3668,67 @@ def _minimal_evaluator_callbacks(tmp_path: Path):
     return callbacks
 
 
+def test_evaluator_runtime_guard_receives_all_active_evaluator_processes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(driver, "REPO_ROOT", tmp_path)
+    callbacks = _minimal_evaluator_callbacks(tmp_path)
+    peer = SimpleNamespace(pid=1111, poll=lambda: None)
+    callbacks._active_evaluator_processes[
+        "evaluator:arcface:full:winner"
+    ] = peer
+    observed_worker_sets = []
+
+    class Guard:
+        @staticmethod
+        def enforce(processes):
+            observed_worker_sets.append(set(processes))
+
+    class Process:
+        pid = 2222
+        returncode = 0
+
+        def __init__(self):
+            self._poll_count = 0
+            self.terminated = False
+
+        def poll(self):
+            self._poll_count += 1
+            return None if self._poll_count == 1 else 0
+
+    def process_factory(command, **kwargs):
+        del kwargs
+        request_path = Path(command[command.index("--request") + 1])
+        output_path = Path(command[command.index("--output") + 1])
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        output = {
+            "schema_version": 1,
+            "contract_type": "safa_r9_phase_evaluator_output_v1",
+            "task": request["task"],
+            "evaluator_request_sha256": request["evaluator_request_sha256"],
+            "worker_contract": callbacks._worker_contract,
+            "arcface_contract_sha256": callbacks._arcface_contract_sha256,
+            "quality_script_sha256": callbacks._quality_script_sha256,
+            "result": {"strict": True},
+        }
+        output["evaluator_output_sha256"] = driver._canonical_json_sha256(output)
+        output_path.write_text(json.dumps(output), encoding="utf-8")
+        return Process()
+
+    callbacks._runtime_guard = Guard()
+    callbacks._process_factory = process_factory
+
+    assert callbacks._run("quality", "full", "winner__candidate", {}) == {
+        "strict": True
+    }
+    assert observed_worker_sets == [
+        {
+            "evaluator:arcface:full:winner",
+            "evaluator:quality:full:winner__candidate",
+        }
+    ]
+
+
 def test_heldout_uses_one_lease_and_attempt_is_single_use(
     tmp_path: Path, monkeypatch
 ) -> None:

@@ -4502,6 +4502,8 @@ class R9ProductionEvaluatorCallbacks:
                     try:
                         with self._scheduler_lock:
                             self._scheduler.enforce_actual_ram_limit()
+                            guarded_processes = dict(self._active_evaluator_processes)
+                        guarded_processes[worker_id] = process
                         peak_rss_bytes = max(
                             peak_rss_bytes,
                             int(self._rss_sampler(int(process.pid))),
@@ -4515,9 +4517,7 @@ class R9ProductionEvaluatorCallbacks:
                             ),
                         )
                         if self._runtime_guard is not None:
-                            self._runtime_guard.enforce(
-                                {worker_id: process}
-                            )
+                            self._runtime_guard.enforce(guarded_processes)
                     except (CampaignFailedError, ResourceContractError):
                         _terminate_process(process)
                         self._peer_status_store.record_terminal(
