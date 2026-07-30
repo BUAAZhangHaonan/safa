@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -2361,14 +2362,28 @@ def _start_formal_full_monitor(
     claim: Mapping[str, Any],
 ) -> None:
     session = str(claim["session_name"])
+    campaign_root = REPO_ROOT / str(campaign_runtime["campaign_root"])
+    samples_path = campaign_root / "formal_monitor/session_samples.jsonl"
+    log_path = campaign_root / "formal_monitor/operator.log"
     if subprocess.run(
         ["tmux", "has-session", "-t", session],
         check=False,
         capture_output=True,
     ).returncode == 0:
         raise RuntimeError("formal Full monitor tmux session already exists")
+    monitor_command = " ".join(shlex.quote(str(value)) for value in claim["command"])
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     started = subprocess.run(
-        ["tmux", "new-session", "-d", "-s", session, *claim["command"]],
+        [
+            "tmux",
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "bash",
+            "-lc",
+            f"exec >> {shlex.quote(str(log_path))} 2>&1\nexec {monitor_command}",
+        ],
         cwd=REPO_ROOT,
         check=False,
         capture_output=True,
@@ -2378,12 +2393,36 @@ def _start_formal_full_monitor(
         raise RuntimeError(
             f"formal Full monitor tmux start failed: {started.stderr.strip()}"
         )
+    def monitor_log_tail() -> str:
+        if not log_path.is_file():
+            return ""
+        return log_path.read_text(encoding="utf-8", errors="replace")[-4000:]
+
     if subprocess.run(
         ["tmux", "has-session", "-t", session],
         check=False,
         capture_output=True,
     ).returncode != 0:
-        raise RuntimeError("formal Full monitor tmux did not stay alive")
+        log_tail = monitor_log_tail()
+        raise RuntimeError(
+            "formal Full monitor exited before first sample"
+            + (f": {log_tail}" if log_tail else "")
+        )
+    deadline = time.monotonic() + 15
+    while not samples_path.is_file():
+        if subprocess.run(
+            ["tmux", "has-session", "-t", session],
+            check=False,
+            capture_output=True,
+        ).returncode != 0:
+            log_tail = monitor_log_tail()
+            raise RuntimeError(
+                "formal Full monitor exited before first sample"
+                + (f": {log_tail}" if log_tail else "")
+            )
+        if time.monotonic() >= deadline:
+            raise RuntimeError("formal Full monitor did not publish its first sample")
+        time.sleep(0.2)
 
 
 def _materialize_formal_full_terminal(

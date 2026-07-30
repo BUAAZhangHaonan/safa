@@ -3388,8 +3388,9 @@ def test_full_runtime_guard_fails_when_bound_monitor_dies(
 
 
 def test_formal_monitor_start_requires_live_tmux_session(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setattr(driver, "REPO_ROOT", tmp_path)
     outcomes = iter((1, 0, 1))
     monkeypatch.setattr(
         driver.subprocess,
@@ -3398,7 +3399,7 @@ def test_formal_monitor_start_requires_live_tmux_session(
             returncode=next(outcomes), stderr=""
         ),
     )
-    with pytest.raises(RuntimeError, match="did not stay alive"):
+    with pytest.raises(RuntimeError, match="exited before first sample"):
         driver._start_formal_full_monitor(
             {"campaign_root": "campaign"},
             {
