@@ -3339,6 +3339,7 @@ def _validate_full_e2e_result_semantics(
 FULL_ADMISSION_EXTERNAL_PID_BASELINE_ENV = (
     "SAFA_R9_ALLOW_PREEXISTING_EXTERNAL_GPU_PIDS"
 )
+FULL_RUNTIME_EXTERNAL_PID_DRIFT_ENV = "SAFA_R9_ALLOW_EXTERNAL_GPU_PID_DRIFT"
 
 
 def _full_admission_preflight(
@@ -3430,6 +3431,14 @@ def _full_admission_preflight(
             "mode": "user_authorized_preexisting_gpu_pid_baseline_v1",
             "authorization_env": FULL_ADMISSION_EXTERNAL_PID_BASELINE_ENV,
             "new_unknown_gpu_pids": "forbidden_after_admission",
+            "resource_hard_stops": "unchanged",
+        }
+    if os.environ.get(FULL_RUNTIME_EXTERNAL_PID_DRIFT_ENV) == "1":
+        evidence["external_compute_pid_drift_policy"] = {
+            "schema_version": 1,
+            "mode": "user_authorized_runtime_external_gpu_pid_drift_v1",
+            "authorization_env": FULL_RUNTIME_EXTERNAL_PID_DRIFT_ENV,
+            "new_external_gpu_pids": "record_and_continue",
             "resource_hard_stops": "unchanged",
         }
     evidence["full_admission_sha256"] = _canonical_json_sha256(evidence)
@@ -3750,12 +3759,19 @@ class FullRuntimeGuard:
             for row in self._allowed_external_gpu_pids
         }
         new_unknown = []
+        external_drift = []
+        allow_external_drift = (
+            os.environ.get(FULL_RUNTIME_EXTERNAL_PID_DRIFT_ENV) == "1"
+        )
         for gpu_uuid, pid in current_compute_apps:
             if gpu_uuid not in selected_uuids or int(pid) in live_worker_pids:
                 continue
             start_ticks = _pid_start_time_ticks(int(pid))
             if (gpu_uuid, int(pid), start_ticks) not in allowed_external:
-                new_unknown.append((gpu_uuid, int(pid)))
+                if allow_external_drift:
+                    external_drift.append(_gpu_pid_baseline_row(gpu_uuid, int(pid)))
+                else:
+                    new_unknown.append((gpu_uuid, int(pid)))
         if new_unknown:
             raise ResourceContractError(
                 "Full runtime found unknown GPU compute PIDs: "
@@ -3788,6 +3804,7 @@ class FullRuntimeGuard:
             "external_compute_pid_baseline": list(
                 self._allowed_external_gpu_pids
             ),
+            "external_compute_pid_drift": external_drift,
         }
         self._monitor_path.parent.mkdir(parents=True, exist_ok=True)
         with self._monitor_path.open("a", encoding="utf-8") as handle:
