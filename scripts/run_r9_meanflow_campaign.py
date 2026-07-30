@@ -1992,14 +1992,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     return exit_code
 
 
+def _validate_admission_external_pid_drift_policy(
+    admission: Mapping[str, Any],
+) -> bool:
+    if "external_compute_pid_drift_policy" not in admission:
+        return True
+    return admission.get("external_compute_pid_drift_policy") == {
+        "schema_version": 1,
+        "mode": "user_authorized_runtime_external_gpu_pid_drift_v1",
+        "authorization_env": FULL_RUNTIME_EXTERNAL_PID_DRIFT_ENV,
+        "new_external_gpu_pids": "record_and_continue",
+        "resource_hard_stops": "unchanged",
+    }
+
+
 def _validate_admission_external_pid_policy(
     admission: Mapping[str, Any],
 ) -> bool:
     count = admission.get("unknown_compute_pid_count")
+    drift_policy_ok = _validate_admission_external_pid_drift_policy(admission)
     if count == 0:
         return (
             "external_compute_pid_baseline" not in admission
             and "external_compute_pid_policy" not in admission
+            and drift_policy_ok
         )
     if type(count) is not int or count < 0:
         return False
@@ -2018,7 +2034,7 @@ def _validate_admission_external_pid_policy(
         )
     except ResourceContractError:
         return False
-    return len(baseline) == count
+    return len(baseline) == count and drift_policy_ok
 
 
 def _resume_formal_full_report_only(
@@ -2166,6 +2182,8 @@ def _validate_formal_full_execution_chain(
             "external_compute_pid_baseline",
             "external_compute_pid_policy",
         }
+    if "external_compute_pid_drift_policy" in admission:
+        admission_fields = admission_fields | {"external_compute_pid_drift_policy"}
     monitor_claim_fields = {
         "schema_version",
         "contract_type",

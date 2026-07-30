@@ -3281,6 +3281,52 @@ def test_full_admission_external_pid_baseline_requires_explicit_env(
     assert driver._validate_admission_external_pid_policy(admission) is True
 
 
+def test_admission_policy_validator_accepts_authorized_external_pid_drift() -> None:
+    admission = {
+        "unknown_compute_pid_count": 1,
+        "external_compute_pid_baseline": [
+            {
+                "gpu_uuid": "GPU-3",
+                "pid": 4242,
+                "start_time_ticks": 12345,
+                "user": "guoxin",
+                "command": "python train_model.py",
+            }
+        ],
+        "external_compute_pid_policy": {
+            "schema_version": 1,
+            "mode": "user_authorized_preexisting_gpu_pid_baseline_v1",
+            "authorization_env": driver.FULL_ADMISSION_EXTERNAL_PID_BASELINE_ENV,
+            "new_unknown_gpu_pids": "forbidden_after_admission",
+            "resource_hard_stops": "unchanged",
+        },
+        "external_compute_pid_drift_policy": {
+            "schema_version": 1,
+            "mode": "user_authorized_runtime_external_gpu_pid_drift_v1",
+            "authorization_env": driver.FULL_RUNTIME_EXTERNAL_PID_DRIFT_ENV,
+            "new_external_gpu_pids": "record_and_continue",
+            "resource_hard_stops": "unchanged",
+        },
+    }
+
+    assert driver._validate_admission_external_pid_policy(admission) is True
+
+
+def test_admission_policy_validator_rejects_unknown_external_pid_drift_policy() -> None:
+    admission = {
+        "unknown_compute_pid_count": 0,
+        "external_compute_pid_drift_policy": {
+            "schema_version": 1,
+            "mode": "user_authorized_runtime_external_gpu_pid_drift_v1",
+            "authorization_env": driver.FULL_RUNTIME_EXTERNAL_PID_DRIFT_ENV,
+            "new_external_gpu_pids": "silently_ignore",
+            "resource_hard_stops": "unchanged",
+        },
+    }
+
+    assert driver._validate_admission_external_pid_policy(admission) is False
+
+
 def test_full_runtime_guard_tracks_external_pid_baseline_and_rejects_new_unknown(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
