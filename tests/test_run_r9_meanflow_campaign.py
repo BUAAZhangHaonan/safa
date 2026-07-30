@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import yaml
@@ -30,6 +31,233 @@ def runtime() -> dict:
     return driver.load_runtime_config(
         ROOT / "configs/medium_v2/experiments/r9_meanflow_campaign.yaml"
     )
+
+
+def _sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _contract_digest(value: dict[str, Any], digest_field: str) -> str:
+    payload = dict(value)
+    payload.pop(digest_field, None)
+    return driver._canonical_json_sha256(payload)
+
+
+def _fake_arcface_profile_inputs() -> dict[str, tuple[str, list[Any]]]:
+    return {
+        "1k3d68.onnx": ("data", ["None", 3, 192, 192]),
+        "2d106det.onnx": ("input.1", ["None", 3, 192, 192]),
+        "det_10g.onnx": ("input.1", [1, 3, "?", "?"]),
+        "genderage.onnx": ("data", ["None", 3, 96, 96]),
+        "w600k_r50.onnx": ("input.1", ["None", 3, 112, 112]),
+    }
+
+
+def _fake_arcface_resolved_shape(filename: str) -> list[int]:
+    _, metadata_shape = _fake_arcface_profile_inputs()[filename]
+    if filename == "det_10g.onnx":
+        return [1, 3, 224, 224]
+    return [1, 3, int(metadata_shape[2]), int(metadata_shape[3])]
+
+
+def _fake_arcface_profile_events(filename: str) -> list[list[str]]:
+    if filename == "det_10g.onnx":
+        return [
+            ["cuda_conv_kernel_time", "Conv", "CUDAExecutionProvider"],
+            ["cpu_shape_kernel_time", "Shape", "CPUExecutionProvider"],
+        ]
+    return [
+        ["cuda_kernel_time", "Conv", "CUDAExecutionProvider"],
+        ["cuda_kernel_time", "Conv", "CUDAExecutionProvider"],
+    ]
+
+
+def _value_digest(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _fake_provider_options() -> dict[str, dict[str, str]]:
+    return {
+        "CUDAExecutionProvider": {
+            "cudnn_conv_algo_search": "DEFAULT",
+            "device_id": "runtime",
+            "use_tf32": "0",
+        },
+        "CPUExecutionProvider": {},
+    }
+
+
+def _fake_session_options_projection() -> dict[str, str]:
+    return {
+        "enable_cpu_mem_arena": "True",
+        "enable_mem_pattern": "True",
+        "enable_mem_reuse": "True",
+        "execution_mode": "ExecutionMode.ORT_SEQUENTIAL",
+        "execution_order": "ExecutionOrder.DEFAULT",
+        "graph_optimization_level": "GraphOptimizationLevel.ORT_ENABLE_ALL",
+        "inter_op_num_threads": "0",
+        "intra_op_num_threads": "0",
+        "log_severity_level": "-1",
+        "log_verbosity_level": "0",
+        "logid": "",
+        "optimized_model_filepath": "",
+        "use_deterministic_compute": "False",
+        "use_per_session_threads": "True",
+    }
+
+
+def _profile_event_digest(events: list[list[str]]) -> str:
+    return hashlib.sha256(
+        json.dumps(sorted(events), sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _arcface_contract(root: Path) -> dict[str, Any]:
+    model_root = root / "insightface"
+    asset_root = model_root / "models" / "buffalo_l"
+    asset_root.mkdir(parents=True)
+    assets = {}
+    for filename in sorted(_fake_arcface_profile_inputs()):
+        path = asset_root / filename
+        path.write_bytes(filename.encode())
+        assets[filename] = _sha(path)
+    provider_options = _fake_provider_options()
+    session_projection = _fake_session_options_projection()
+    execution = {
+        "providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        "cuda_provider_options": {
+            "device_id": "runtime",
+            "use_tf32": "0",
+            "cudnn_conv_algo_search": "DEFAULT",
+        },
+        "probe": {
+            "definition": "zeros_float32_nchw_from_session_input_metadata",
+            "session_construction": "matched_direct_session_probe",
+            "production_session_match": {
+                "asset_path_and_sha256": "exact",
+                "providers": "exact",
+                "provider_options": "complete_normalized_exact",
+                "session_options_projection": "exact",
+                "excluded_session_option_fields": [
+                    "enable_profiling",
+                    "profile_file_prefix",
+                ],
+                "session_options_projection_fields": list(session_projection),
+                "locked_cuda_provider_options": [
+                    "device_id",
+                    "use_tf32",
+                    "cudnn_conv_algo_search",
+                ],
+            },
+            "dynamic_dimension_resolution": {
+                "batch_axis": "null_or_symbol_to_1",
+                "channel_axis": "fixed_integer_3",
+                "detector_spatial_axes": "question_mark_to_locked_det_size",
+                "other_spatial_axes": "fixed_positive_integers",
+            },
+            "event_projection": ["name", "op_name", "provider"],
+            "node_provider_policy": "fail_nonempty_unregistered",
+            "ordering": "lexicographic_keep_duplicates",
+            "assets": {
+                filename: {
+                    "input_name": input_name,
+                    "input_metadata_shape": input_metadata_shape,
+                    "input_shape": _fake_arcface_resolved_shape(filename),
+                    "input_dtype": "float32",
+                    "node_assignment_counts": {
+                        "CUDAExecutionProvider": len(
+                            [
+                                event
+                                for event in _fake_arcface_profile_events(filename)
+                                if event[2] == "CUDAExecutionProvider"
+                            ]
+                        ),
+                        "CPUExecutionProvider": len(
+                            [
+                                event
+                                for event in _fake_arcface_profile_events(filename)
+                                if event[2] == "CPUExecutionProvider"
+                            ]
+                        ),
+                    },
+                    "provider_options": provider_options,
+                    "provider_options_sha256": _value_digest(provider_options),
+                    "session_options_projection": session_projection,
+                    "session_options_projection_sha256": _value_digest(
+                        session_projection
+                    ),
+                    "ordered_node_events_sha256": _profile_event_digest(
+                        _fake_arcface_profile_events(filename)
+                    ),
+                }
+                for filename, (input_name, input_metadata_shape) in (
+                    _fake_arcface_profile_inputs().items()
+                )
+            },
+        },
+    }
+    contract = {
+        "model_name": "buffalo_l",
+        "model_root": str(model_root),
+        "det_size": [224, 224],
+        "provider": "CUDAExecutionProvider",
+        "insightface_version": "0.7.3",
+        "onnxruntime_version": "1.26.0",
+        "assets": assets,
+        "execution": execution,
+    }
+    artifact_root = root / "artifacts" / "arcface-execution-probe"
+    artifact_root.mkdir(parents=True)
+    probe_path = artifact_root / "probe.json"
+    claim_path = artifact_root / "claim.json"
+    result_path = artifact_root / "result.json"
+    probe = {
+        "schema_version": 1,
+        "contract_type": "safa_r9_arcface_execution_probe_v1",
+        "cuda_visible_devices": "GPU-test",
+        "runtime_device_id": 0,
+        "execution": execution,
+    }
+    probe_path.write_text(json.dumps(probe, sort_keys=True) + "\n", encoding="utf-8")
+    probe_sha256 = _sha(probe_path)
+    claim = {
+        "schema_version": 1,
+        "contract_type": "safa_r9_bootstrap_resource_smoke_claim_v1",
+        "kind": "arcface_profile",
+        "probe_output": str(probe_path.resolve()),
+        "retry_allowed": False,
+    }
+    claim["bootstrap_claim_sha256"] = _contract_digest(
+        claim, "bootstrap_claim_sha256"
+    )
+    claim_path.write_text(json.dumps(claim, sort_keys=True) + "\n", encoding="utf-8")
+    result = {
+        "schema_version": 1,
+        "contract_type": "safa_r9_bootstrap_resource_smoke_result_v1",
+        "bootstrap_claim_sha256": claim["bootstrap_claim_sha256"],
+        "status": "succeeded",
+        "failure_reason": None,
+        "returncode": 0,
+        "retry_allowed": False,
+        "probe_output_sha256": probe_sha256,
+    }
+    result["bootstrap_result_sha256"] = _contract_digest(
+        result, "bootstrap_result_sha256"
+    )
+    result_path.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
+    contract["execution_probe"] = {
+        "path": str(probe_path.relative_to(root)),
+        "sha256": probe_sha256,
+        "bootstrap_claim_path": str(claim_path.relative_to(root)),
+        "bootstrap_claim_sha256": claim["bootstrap_claim_sha256"],
+        "bootstrap_claim_file_sha256": _sha(claim_path),
+        "bootstrap_result_path": str(result_path.relative_to(root)),
+        "bootstrap_result_sha256": result["bootstrap_result_sha256"],
+        "bootstrap_result_file_sha256": _sha(result_path),
+    }
+    return contract
 
 
 def test_exact_cli_rejects_algorithm_override() -> None:
@@ -667,6 +895,29 @@ def test_confirm_launch_schedule_is_latin_rotated_and_gpu_balanced() -> None:
         assert counts == {0: 4, 1: 4, 2: 4, 3: 4}
 
 
+def test_full_launch_schedule_runs_one_arm_before_the_next() -> None:
+    plan = driver.build_phase_plan(
+        runtime(),
+        phase="full",
+        campaign_id="r9-test",
+        winner_arm_id="paper_eta_0p125",
+    )
+    schedule = driver._generation_launch_schedule(plan)
+    assert len(schedule) == 32
+    assert [row["launch_index"] for row in schedule] == list(range(32))
+    assert [row["logical_run_id"] for row in schedule[:16]] == ["native"] * 16
+    assert [row["logical_run_id"] for row in schedule[16:]] == ["winner"] * 16
+    for arm_id in ["native", "paper_eta_0p125"]:
+        counts = {
+            gpu: sum(
+                row["arm_ref"] == arm_id and row["preferred_gpu_index"] == gpu
+                for row in schedule
+            )
+            for gpu in range(4)
+        }
+        assert counts == {0: 4, 1: 4, 2: 4, 3: 4}
+
+
 def test_dry_run_performs_no_write(tmp_path: Path) -> None:
     payload = runtime()
     payload["campaign_root"] = str(tmp_path / "campaigns")
@@ -1184,6 +1435,62 @@ def test_confirm_runtime_config_binds_measured_batch_resource_policy(
     assert config["r9_generation_gpu_slot_claim_bytes"] == 6_000_000_000
     assert config["r9_generation_ram_slot_budget_bytes"] == 3_000_000_000
     assert config["r9_generation_slots_per_gpu"] == 2
+
+
+def test_resource_scheduler_caps_generation_slots_to_measured_declaration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(driver, "REPO_ROOT", tmp_path)
+    smoke_path = tmp_path / "shared" / "resource_smoke.json"
+    smoke_path.parent.mkdir(parents=True)
+    smoke_path.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        driver,
+        "validate_resource_smoke_contract",
+        lambda payload: {"peak_rss_bytes": 1_000_000},
+    )
+
+    class Probe:
+        @staticmethod
+        def gpu_snapshots():
+            return tuple(
+                SimpleNamespace(
+                    index=index,
+                    uuid=f"GPU-{index}",
+                    free_bytes=24 * 1024**3,
+                    total_bytes=24 * 1024**3,
+                )
+                for index in range(4)
+            )
+
+        @staticmethod
+        def ram_snapshot():
+            return SimpleNamespace(
+                used_bytes=1_000_000,
+                total_bytes=128 * 1024**3,
+            )
+
+    scheduler, _, _ = driver.build_resource_scheduler(
+        {
+            "campaign_id": "r9-test",
+            "campaign_root": "campaigns/r9-test",
+            "resources": {
+                "physical_gpus": [0, 1, 2, 3],
+                "global_slot_lock_root": str(tmp_path / "slots"),
+                "max_slots_per_gpu": 4,
+                "generation_slots_per_gpu": 2,
+                "gpu_slot_claim_bytes": 4_987_027_456,
+                "gpu_headroom_bytes": 2 * 1024**3,
+                "ram_slot_budget_bytes": 2_000_000,
+                "resource_smoke": {
+                    "result": {"path": "shared/resource_smoke.json"},
+                },
+            },
+        },
+        probe=Probe(),
+    )
+
+    assert scheduler.max_gpu_slots == 2
 
 
 def test_formal_preflight_binds_closure_seal_and_its_schedule(
@@ -2321,6 +2628,8 @@ def test_production_evaluator_callback_runs_bound_worker_once(
         encoding="utf-8",
     )
     campaign_root = tmp_path / "campaign"
+    arcface_contract = _arcface_contract(tmp_path)
+    arcface_contract.pop("execution")
     evaluation = {
         "worker": {
             "path": "scripts/run_r9_phase_evaluator.py",
@@ -2334,7 +2643,7 @@ def test_production_evaluator_callback_runs_bound_worker_once(
                 "sha256": driver._sha256_path(quality_script),
             }
         },
-        "arcface": {},
+        "arcface": arcface_contract,
         "heldout": {"batch_size": 16},
         "resource_smokes": {
             "arcface": {"ram_slot_budget_bytes": 1_758_923_162},

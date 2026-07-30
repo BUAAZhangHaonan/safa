@@ -5689,7 +5689,7 @@ def _stable_launch_ordinal(phase: str, run_index: int) -> int:
 
 
 def _generation_launch_schedule(plan: PhasePlan) -> tuple[dict[str, Any], ...]:
-    """Pre-register a deterministic shard-major Latin rotation over four GPUs."""
+    """Pre-register deterministic GPU launch preferences for one phase."""
     by_logical: dict[str, dict[int, RunSpec]] = {}
     logical_order: list[str] = []
     for run in plan.runs:
@@ -5702,7 +5702,6 @@ def _generation_launch_schedule(plan: PhasePlan) -> tuple[dict[str, Any], ...]:
         shards[run.shard_index] = run
     if len(logical_order) != plan.logical_run_count:
         raise ValueError("launch schedule logical-run count mismatch")
-    schedule = []
     logical_count = len(logical_order)
     shard_counts = {run.num_shards for run in plan.runs}
     if len(shard_counts) != 1:
@@ -5711,23 +5710,40 @@ def _generation_launch_schedule(plan: PhasePlan) -> tuple[dict[str, Any], ...]:
     for logical_index, logical_run_id in enumerate(logical_order):
         if set(by_logical[logical_run_id]) != set(range(shard_count)):
             raise ValueError("launch schedule logical run has incomplete shards")
+    schedule = []
     launch_index = 0
-    for shard_index in range(shard_count):
-        for offset in range(logical_count):
-            logical_index = (shard_index + offset) % logical_count
-            logical_run_id = logical_order[logical_index]
-            run = by_logical[logical_run_id][shard_index]
-            schedule.append(
-                {
-                    "launch_index": launch_index,
-                    "logical_run_id": logical_run_id,
-                    "arm_ref": run.arm_ref,
-                    "shard_index": shard_index,
-                    "preferred_gpu_index": (shard_index + logical_index) % 4,
-                    "run": run,
-                }
-            )
-            launch_index += 1
+    if plan.phase == "full":
+        for logical_index, logical_run_id in enumerate(logical_order):
+            for shard_index in range(shard_count):
+                run = by_logical[logical_run_id][shard_index]
+                schedule.append(
+                    {
+                        "launch_index": launch_index,
+                        "logical_run_id": logical_run_id,
+                        "arm_ref": run.arm_ref,
+                        "shard_index": shard_index,
+                        "preferred_gpu_index": shard_index % 4,
+                        "run": run,
+                    }
+                )
+                launch_index += 1
+    else:
+        for shard_index in range(shard_count):
+            for offset in range(logical_count):
+                logical_index = (shard_index + offset) % logical_count
+                logical_run_id = logical_order[logical_index]
+                run = by_logical[logical_run_id][shard_index]
+                schedule.append(
+                    {
+                        "launch_index": launch_index,
+                        "logical_run_id": logical_run_id,
+                        "arm_ref": run.arm_ref,
+                        "shard_index": shard_index,
+                        "preferred_gpu_index": (shard_index + logical_index) % 4,
+                        "run": run,
+                    }
+                )
+                launch_index += 1
     if len(schedule) != len(plan.runs):
         raise ValueError("launch schedule does not cover every shard")
     return tuple(schedule)
@@ -5936,6 +5952,17 @@ def build_resource_scheduler(
         if lock_backend is None
         else lock_backend
     )
+    max_gpu_slots = _positive_int(
+        resources.get("max_slots_per_gpu"), "max GPU slots"
+    )
+    generation_slots_per_gpu = resources.get("generation_slots_per_gpu")
+    if generation_slots_per_gpu is not None:
+        max_gpu_slots = min(
+            max_gpu_slots,
+            _positive_int(
+                generation_slots_per_gpu, "generation slots per GPU"
+            ),
+        )
     scheduler = R9ResourceScheduler(
         campaign_id=str(campaign_runtime["campaign_id"]),
         resource_contract_sha256=resource_contract_sha256,
@@ -5949,9 +5976,7 @@ def build_resource_scheduler(
         gpu_headroom_bytes=_positive_int(
             resources.get("gpu_headroom_bytes"), "GPU headroom bytes"
         ),
-        max_gpu_slots=_positive_int(
-            resources.get("max_slots_per_gpu"), "max GPU slots"
-        ),
+        max_gpu_slots=max_gpu_slots,
         ram_slot_budget_bytes_override=_positive_int(
             resources.get("ram_slot_budget_bytes"), "RAM slot budget bytes"
         ),
