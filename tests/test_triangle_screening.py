@@ -476,3 +476,111 @@ def test_incomplete_arm_row_is_rejected() -> None:
             native_fid=10.0,
             native_kid=0.01,
         )
+
+
+def test_real_artifact_adapter_script_builds_nested_prefixes(
+    tmp_path: Path,
+) -> None:
+    full_root = tmp_path / "full"
+    (full_root / "evaluator_evidence" / "arcface").mkdir(parents=True)
+    request_dir = full_root / "evaluator_runs" / "arcface" / "winner"
+    request_dir.mkdir(parents=True)
+    source_index_path = tmp_path / "source_index.jsonl"
+    manifest_path = tmp_path / "full_2048.jsonl"
+    manifest_rows = []
+    source_rows = []
+    face_rows = []
+    paired_rows = []
+    for index in range(2048):
+        sample_id = f"sample-{index:04d}"
+        manifest_rows.append({"sample_id": sample_id})
+        source_rows.append({"sample_id": sample_id, "label": index % 8})
+        face_rows.append(
+            {
+                "sample_id": sample_id,
+                "source_face_count": 1,
+                "native_face_count": 0 if index < 3 else 1,
+                "candidate_face_count": 1,
+                "source_native_cosine": 0.0,
+                "source_candidate_cosine": 0.0,
+            }
+        )
+        paired_rows.append(
+            {"sample_id": sample_id, "native_sharpness": 100.0 + index}
+        )
+    manifest_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in manifest_rows),
+        encoding="utf-8",
+    )
+    source_index_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in source_rows),
+        encoding="utf-8",
+    )
+    import hashlib
+
+    def digest(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    (full_root / "automatic_evidence.json").write_text(
+        json.dumps(
+            {
+                "manifest": {
+                    "path": str(manifest_path),
+                    "sha256": digest(manifest_path),
+                },
+                "source_index": {
+                    "path": str(source_index_path),
+                    "sha256": digest(source_index_path),
+                },
+                "arms": [
+                    {
+                        "arm_id": "paper_eta_0p125",
+                        "paired_metric_rows": {"rows": paired_rows},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (full_root / "evaluator_evidence" / "arcface" / "winner.json").write_text(
+        json.dumps({"arcface": {"rows": face_rows}}), encoding="utf-8"
+    )
+    (request_dir / "request.json").write_text(
+        json.dumps({"config": {"arcface": {"model_name": "buffalo_l"}}}),
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "prepared"
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "prepare_triangle_eligible512.py"
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--full-root",
+            str(full_root),
+            "--output-dir",
+            str(output_dir),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    rows512 = [
+        json.loads(line)
+        for line in (output_dir / "eligible512.jsonl").read_text().splitlines()
+    ]
+    rows32 = [
+        json.loads(line)
+        for line in (output_dir / "prefix32.jsonl").read_text().splitlines()
+    ]
+    rows128 = [
+        json.loads(line)
+        for line in (output_dir / "prefix128.jsonl").read_text().splitlines()
+    ]
+    assert len(rows512) == 512
+    assert rows32 == rows512[:32]
+    assert rows128 == rows512[:128]

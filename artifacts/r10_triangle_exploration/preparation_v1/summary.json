@@ -1,0 +1,52 @@
+{
+  "contract_type": "safa_triangle_eligible512_preparation_v1",
+  "counts": {
+    "eligible": 2045,
+    "full": 2048,
+    "prefix128": 128,
+    "prefix32": 32,
+    "selected": 512
+  },
+  "inputs": {
+    "arcface_evidence": {
+      "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/full/evaluator_evidence/arcface/winner.json",
+      "sha256": "3026a4147f267e6cf7a0eba5aaf0e3ccab37b4e9715c9c90d84a348ddf38d692"
+    },
+    "arcface_request": {
+      "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/full/evaluator_runs/arcface/winner/request.json",
+      "sha256": "6f49e48cd5c25fccc365f4c025f64c326de96c204e41a66f248404cc0fd70236"
+    },
+    "automatic_evidence": {
+      "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/full/automatic_evidence.json",
+      "sha256": "f84331655ea2412fdef26b580a19b0e86f0d1859f1048e8bc95b47baa9f8f13d"
+    },
+    "full_manifest": {
+      "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/configs/medium_v2/experiments/r9_manifests/full_2048.jsonl",
+      "sha256": "ba760481941505b2d519951b8077026cdc0cdf97bcd44b5eac7e0e9329b36b68"
+    },
+    "source_index": {
+      "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/data/index/val_face_mixed_e14.jsonl",
+      "sha256": "da14e23eacefecbc2948d1374fb93961a13d017a9183aa1fe2a2f62b33a4b4ea"
+    }
+  },
+  "outputs": {
+    "eligible512": {
+      "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/eligible512.jsonl",
+      "sha256": "4ac3174db7298074dbf4a3081dd33be28737d30f5fd8e003d3d2e56f541450ce"
+    },
+    "eligible_pool": {
+      "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/eligible_pool_2045.jsonl",
+      "sha256": "56c2baf99779d8b9cf7460b34bc1e388ba1f8687e8073ca1d636f137dd2c00e8"
+    },
+    "prefix128": {
+      "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/prefix128.jsonl",
+      "sha256": "9e1bfa90057c9b72f02a29340d91f0d87d4d4f35119733824b9659bd7ee8db89"
+    },
+    "prefix32": {
+      "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/prefix32.jsonl",
+      "sha256": "fc47ae9372f23667e6b59ab2f33b22bc6cc8405be0095aaee1565d1158be1b05"
+    }
+  },
+  "schema_version": 1,
+  "selector": "safa-triangle-512-v1"
+}

@@ -1,0 +1,78 @@
+{
+  "arms": [
+    {
+      "active_guidance_intervals": [
+        "I1",
+        "I2",
+        "I3"
+      ],
+      "arm_id": "eta0p125_baseline",
+      "config_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/fixed32_configs/eta0p125_baseline.yaml",
+      "config_sha256": "283eab5272f12b9e10cdf609c05e91b4cf0a508537c26cc375c743cd49908262",
+      "disabled_interval": null,
+      "effective_arm_config_sha256": "d4d9102deab5a94cd14f1db15cfb42dd9a53375cf2a6dea9e90d6607fbbf1a28",
+      "expected_algorithm_nfe": 8,
+      "expected_diagnostic_nfe": 0,
+      "role": "baseline"
+    },
+    {
+      "active_guidance_intervals": [
+        "I2",
+        "I3"
+      ],
+      "arm_id": "eta0p125_disable_i1",
+      "config_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/fixed32_configs/eta0p125_disable_i1.yaml",
+      "config_sha256": "71a25f50ad4bac29770574e0a2ea934ff71593d0ee8ffc8b754f8ea880b5cbc6",
+      "disabled_interval": "I1",
+      "effective_arm_config_sha256": "2a64cd0dd61d225ab95ac0bfe84916ea7bce55c7809225d3c519af4a67ef40af",
+      "expected_algorithm_nfe": 7,
+      "expected_diagnostic_nfe": 0,
+      "role": "leave_one_interval_out"
+    },
+    {
+      "active_guidance_intervals": [
+        "I1",
+        "I3"
+      ],
+      "arm_id": "eta0p125_disable_i2",
+      "config_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/fixed32_configs/eta0p125_disable_i2.yaml",
+      "config_sha256": "4d1042aa9db1ea7c856a3cb61e1e236b004cdd6bdd8489d675e8f982cd6c85a0",
+      "disabled_interval": "I2",
+      "effective_arm_config_sha256": "1c07b233eaab1240994bb115d6273efb359d88999af0d66097ef4a3b26185927",
+      "expected_algorithm_nfe": 7,
+      "expected_diagnostic_nfe": 0,
+      "role": "leave_one_interval_out"
+    },
+    {
+      "active_guidance_intervals": [
+        "I1",
+        "I2"
+      ],
+      "arm_id": "eta0p125_disable_i3",
+      "config_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/fixed32_configs/eta0p125_disable_i3.yaml",
+      "config_sha256": "8428ecad1917bf557cba2fcc80b58b6af69d6346e24dc1c25b970d6918470ce4",
+      "disabled_interval": "I3",
+      "effective_arm_config_sha256": "2a5bb9e98a53ac4ed56a7d2240d013728165bcc2e61ffd58bbebaafefee16ac4",
+      "expected_algorithm_nfe": 7,
+      "expected_diagnostic_nfe": 0,
+      "role": "leave_one_interval_out"
+    }
+  ],
+  "contract_type": "safa_r10_triangle_fixed32_diagnostic_preparation_v1",
+  "diagnostic_id": "r10-triangle-fixed32-interval-leave-one-v1",
+  "execution_status": "prepared_not_started",
+  "nfe_disclosure": "baseline NFE8; each leave-one-interval ablation NFE7",
+  "registration": "new_diagnostic_not_r9_continuation",
+  "schema_version": 1,
+  "shared": {
+    "batch_size": 2,
+    "checkpoint": "artifacts/checkpoints/e15_meanflow_sit_b_face_mixed_h100_resume_2400ep/last_nopretrained.pt",
+    "checkpoint_sha256": "4690717781db58a6021d57d124300a9b212f0a5043cf3028fb5de4d9c835cc4d",
+    "max_samples": 32,
+    "mode": "paper_algorithm_split",
+    "sample_id_manifest": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/prefix32.jsonl",
+    "sample_id_manifest_sha256": "fc47ae9372f23667e6b59ab2f33b22bc6cc8405be0095aaee1565d1158be1b05",
+    "sampling_seed": 7919,
+    "step_size": 0.125
+  }
+}
