@@ -892,6 +892,7 @@ def _monitor_formal_full(driver) -> int:
     last_log_bytes = -1
     log_progress_count = 0
     previous_cpu = driver._read_cpu_times()
+    time.sleep(0.05)
     while not terminal_path.is_file():
         probe = driver.SystemResourceProbe()
         ram = probe.ram_snapshot()

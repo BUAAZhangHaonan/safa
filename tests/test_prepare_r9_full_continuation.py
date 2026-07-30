@@ -46,6 +46,97 @@ def test_e2e_run_requires_tmux_before_any_gpu_work(
         cli._run_e2e(object())
 
 
+def test_formal_monitor_waits_before_first_cpu_delta(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = (
+        tmp_path
+        / "artifacts/r9_meanflow_flow_map_guidance/campaigns"
+        / "r9-report-only-formal-v9"
+    )
+    monitor_root = root / "formal_monitor"
+    monitor_root.mkdir(parents=True)
+    claim = {
+        "session_name": "safa-r9-v9-formal-full-monitor",
+        "monitor_claim_sha256": "1" * 64,
+    }
+    (monitor_root / "claim.json").write_text(json.dumps(claim), encoding="utf-8")
+    terminal_path = root / "formal_execution_terminal.json"
+    slept = {"initial": False}
+    sleep_calls = []
+
+    def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        if seconds == 0.05:
+            slept["initial"] = True
+        if seconds == 5:
+            terminal = {"formal_execution_terminal_sha256": "2" * 64}
+            terminal_path.write_text(json.dumps(terminal), encoding="utf-8")
+
+    class Probe:
+        @staticmethod
+        def ram_snapshot():
+            return type("Ram", (), {"used_bytes": 1, "total_bytes": 10})()
+
+        @staticmethod
+        def gpu_snapshots():
+            return tuple(
+                type(
+                    "Gpu",
+                    (),
+                    {
+                        "index": index,
+                        "uuid": f"GPU-{index}",
+                        "total_bytes": 10,
+                        "free_bytes": 9,
+                    },
+                )()
+                for index in range(4)
+            )
+
+    class Driver:
+        REPO_ROOT = tmp_path
+        FULL_CONTINUATION_CHILD_CAMPAIGN_ID = "r9-report-only-formal-v9"
+        SystemResourceProbe = Probe
+
+        @staticmethod
+        def _read_json_mapping(path: Path, label: str) -> dict:
+            del label
+            return json.loads(path.read_text(encoding="utf-8"))
+
+        @staticmethod
+        def _read_cpu_times():
+            return (101, 50) if slept["initial"] else (100, 50)
+
+        @staticmethod
+        def _canonical_json_sha256(value: dict) -> str:
+            return _digest(value)
+
+        @staticmethod
+        def _write_exclusive_bytes(path: Path, content: bytes) -> None:
+            path.write_bytes(content)
+
+    monkeypatch.setenv("TMUX", "/tmp/tmux-test")
+    monkeypatch.setattr(cli.time, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=args, returncode=0, stdout="safa-r9-v9-formal-full-monitor\n"
+        ),
+    )
+    monkeypatch.setattr(
+        cli.shutil,
+        "disk_usage",
+        lambda _: type("Disk", (), {"used": 1, "total": 10})(),
+    )
+
+    assert cli._monitor_formal_full(Driver) == 0
+    assert sleep_calls[0] == 0.05
+    assert (monitor_root / "session_samples.jsonl").is_file()
+    assert (monitor_root / "summary.json").is_file()
+
+
 def test_e2e_run_uses_bound_runtime_resource_policy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
