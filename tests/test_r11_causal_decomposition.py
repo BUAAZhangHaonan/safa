@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from scripts import run_meanflow_flow_map_guidance as generation_cli
+from scripts import run_r11_quality_evaluation as quality_cli
 from safa.evaluation.causal_decomposition import (
     CausalDecompositionError,
     classify_causal_decomposition,
@@ -15,6 +17,7 @@ from safa.evaluation import meanflow_guidance_runner as runner
 
 REPO = Path(__file__).resolve().parents[1]
 PREPARATION = REPO / "artifacts/r11_causal_decomposition/preparation_v1"
+PYTHON = "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python"
 
 
 def _evidence(*, transport_pass: bool, paper_fail: bool) -> dict:
@@ -152,10 +155,59 @@ def test_preparation_artifacts_bind_nfe5_reuse_and_exact_retry0_ledger() -> None
     assert sum(job["job_type"] == "generation" for job in jobs) == 2
     assert sum(job["job_type"] == "quality" for job in jobs) == 6
     assert all(job["retry_limit"] == 0 for job in jobs)
-    assert max(
-        sum(job["wave"] == wave for job in jobs)
-        for wave in {job["wave"] for job in jobs}
-    ) <= 4
+    assert {wave: sum(job["wave"] == wave for job in jobs) for wave in (0, 1, 2)} == {
+        0: 2,
+        1: 4,
+        2: 2,
+    }
+    assert all(job["argv"][0] == PYTHON for job in jobs)
+    assert all(Path(job["argv"][0]).is_file() for job in jobs)
+    assert all(job["log_path"].endswith(".log") for job in jobs)
+    assert all(
+        job["fresh_output_paths"] == [job["output_path"], job["log_path"]]
+        for job in jobs
+        if job["job_type"] == "quality"
+    )
+    fresh_paths = [
+        path for job in jobs for path in job["fresh_output_paths"]
+    ]
+    assert len(fresh_paths) == len(set(fresh_paths)) == 18
+    assert all(not Path(path).exists() for path in fresh_paths)
+    assert all(job["env"]["CUDA_VISIBLE_DEVICES"] == job["gpu"]["uuid"] for job in jobs)
+    for wave in (0, 1, 2):
+        wave_gpus = [job["gpu"]["index"] for job in jobs if job["wave"] == wave]
+        assert len(wave_gpus) == len(set(wave_gpus))
+    assert not any(
+        forbidden in token.lower()
+        for job in jobs
+        for token in job["argv"]
+        for forbidden in ("arcface", "controller")
+    )
+
+    for job in jobs:
+        if job["job_type"] == "generation":
+            assert job["argv"][1] == "scripts/run_meanflow_flow_map_guidance.py"
+            parsed = generation_cli.parse_args(job["argv"][2:])
+            assert parsed.output_dir == Path(job["output_path"])
+            assert job["fresh_output"] == job["output_path"]
+            assert job["fresh_output_paths"] == [
+                job["output_path"],
+                job["asset_digest_path"],
+                job["log_path"],
+            ]
+        else:
+            assert job["argv"][1] == "scripts/run_r11_quality_evaluation.py"
+            parsed = quality_cli.parse_args(job["argv"][2:])
+            assert parsed.output == Path(job["output_path"])
+            if job["role"] == "transport_only_nfe5":
+                expected = (
+                    Path("artifacts/r11_causal_decomposition/preparation_v1")
+                    / f"runs/{job['dataset_id']}/transport_only_nfe5"
+                    / "generation_result.json"
+                )
+                assert parsed.generation_result == expected
+            else:
+                assert parsed.generation_result is None
 
     for dataset_id, count in (("prefix128", 128), ("sharpness_tail32", 32)):
         config = yaml.safe_load(

@@ -42,7 +42,7 @@
   },
   "launch_ledger": {
     "path": "artifacts/r11_causal_decomposition/preparation_v1/launch_ledger.json",
-    "sha256": "1cee02e0255836527952adb2cfac86ad17a4b334b8503e9c2f2974ce784392af"
+    "sha256": "e152117e7bd078b6bee992f87def723aa56aa84895a74bcbaeb4127d8e18849b"
   },
   "schema_version": 1,
   "status": "go_not_launched"

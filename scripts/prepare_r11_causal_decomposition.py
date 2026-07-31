@@ -44,6 +44,7 @@ DATASETS = (
         1,
     ),
 )
+PYTHON = "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python"
 GPU_UUIDS = (
     "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6",
     "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1",
@@ -251,6 +252,8 @@ def _quality_job(
     generated_dir: Path,
     per_sample: Path,
     output: Path,
+    log_path: Path,
+    generation_result: Path | None = None,
 ) -> dict[str, Any]:
     metrics = (
         ["fid", "kid", "niqe", "sharpness"]
@@ -258,6 +261,7 @@ def _quality_job(
         else ["niqe", "sharpness"]
     )
     argv = [
+        PYTHON,
         "scripts/run_r11_quality_evaluation.py",
         "--real-index",
         "data/index/val_face_mixed_e14.jsonl",
@@ -276,6 +280,8 @@ def _quality_job(
     ]
     if dataset_id == "prefix128":
         argv.extend(["--kid-subset-size", "127"])
+    if generation_result is not None:
+        argv.extend(["--generation-result", str(generation_result)])
     return {
         "job_id": job_id,
         "job_type": "quality",
@@ -286,6 +292,9 @@ def _quality_job(
         "argv": argv,
         "dataset_id": dataset_id,
         "role": role,
+        "output_path": str(output),
+        "log_path": str(log_path),
+        "fresh_output_paths": [str(output), str(log_path)],
         "classifier_metrics": ["niqe", "sharpness"],
         "fid_kid_role": "descriptive_only"
         if dataset_id == "prefix128"
@@ -377,6 +386,8 @@ def prepare(output_root: Path, config_dir: Path) -> dict[str, Any]:
         _write_yaml(_absolute(config_path), effective)
         run_dir = output_root / "runs" / dataset_id / "transport_only_nfe5"
         quality_dir = output_root / "quality" / dataset_id
+        generation_log = output_root / "logs" / f"generate__{dataset_id}.log"
+        asset_digest_path = Path(str(effective["asset_digest_cache"]))
         jobs.append(
             {
                 "job_id": f"generate__{dataset_id}",
@@ -386,11 +397,22 @@ def prepare(output_root: Path, config_dir: Path) -> dict[str, Any]:
                 "gpu": {"index": gpu_index, "uuid": GPU_UUIDS[gpu_index]},
                 "env": {"CUDA_VISIBLE_DEVICES": GPU_UUIDS[gpu_index]},
                 "argv": [
+                    PYTHON,
                     "scripts/run_meanflow_flow_map_guidance.py",
                     "--config",
                     str(config_path),
+                    "--output-dir",
+                    str(run_dir),
                 ],
                 "fresh_output": str(run_dir),
+                "output_path": str(run_dir),
+                "asset_digest_path": str(asset_digest_path),
+                "log_path": str(generation_log),
+                "fresh_output_paths": [
+                    str(run_dir),
+                    str(asset_digest_path),
+                    str(generation_log),
+                ],
             }
         )
         role_sources = {
@@ -408,11 +430,12 @@ def prepare(output_root: Path, config_dir: Path) -> dict[str, Any]:
         for role_index, role in enumerate(
             ("native", "paper_eta_0p125", "transport_only_nfe5")
         ):
+            job_id = f"quality__{dataset_id}__{role}"
             generated_dir, per_sample = role_sources[role]
             quality_output = quality_dir / role / "quality.json"
             jobs.append(
                 _quality_job(
-                    job_id=f"quality__{dataset_id}__{role}",
+                    job_id=job_id,
                     wave=1 + quality_job_index // 4,
                     gpu_index=quality_job_index % 4,
                     dataset_id=dataset_id,
@@ -421,6 +444,12 @@ def prepare(output_root: Path, config_dir: Path) -> dict[str, Any]:
                     generated_dir=generated_dir,
                     per_sample=per_sample,
                     output=quality_output,
+                    log_path=output_root / "logs" / f"{job_id}.log",
+                    generation_result=(
+                        run_dir / "generation_result.json"
+                        if role == "transport_only_nfe5"
+                        else None
+                    ),
                 )
             )
             quality_job_index += 1
