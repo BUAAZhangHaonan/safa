@@ -1,0 +1,398 @@
+{
+  "regular_privacy": {
+    "u12": [
+      {
+        "delta_e0": 0.9090427160263062,
+        "delta_edev": 0.658422589302063,
+        "full_lpips": 0.29945969581604004,
+        "privacy_delta": 0.1262541122445912,
+        "rank": 1,
+        "roi_fft_high_retention": 4.1162371504560715,
+        "roi_lpips": 0.2414456605911255,
+        "sample_id": "val:Manually_Annotated_Images/1049/64e00802544020505ea22b8a027a0f4a2ec02446b2b0cdb513b45937.jpg",
+        "sharpness_loss": -0.4358418352179989,
+        "sharpness_ratio": 1.435841835217999
+      },
+      {
+        "delta_e0": 1.4647734761238098,
+        "delta_edev": 1.1911036968231201,
+        "full_lpips": 0.28737732768058777,
+        "privacy_delta": 0.1123312382909997,
+        "rank": 2,
+        "roi_fft_high_retention": 1.1177958436054984,
+        "roi_lpips": 0.16145330667495728,
+        "sample_id": "val:Manually_Annotated_Images/921/eee126016abdd00e87371094b98783cf7a87377800d319b7e3ba2f24.jpg",
+        "sharpness_loss": -0.31214613243893674,
+        "sharpness_ratio": 1.3121461324389367
+      },
+      {
+        "delta_e0": 1.078480452299118,
+        "delta_edev": 0.4557238738052547,
+        "full_lpips": 0.2178928256034851,
+        "privacy_delta": 0.11031189349481822,
+        "rank": 3,
+        "roi_fft_high_retention": 1.4675853749088843,
+        "roi_lpips": 0.1703425794839859,
+        "sample_id": "val:Manually_Annotated_Images/164/ada5800c80190560c9e1ef14f7071287d3db7ae44d9cd5e5871dbed6.jpg",
+        "sharpness_loss": -0.5242954343861517,
+        "sharpness_ratio": 1.5242954343861517
+      },
+      {
+        "delta_e0": 0.7267479747533798,
+        "delta_edev": -0.08226794004440308,
+        "full_lpips": 0.07399076968431473,
+        "privacy_delta": 0.10869667495597063,
+        "rank": 4,
+        "roi_fft_high_retention": 0.8031742129302395,
+        "roi_lpips": 0.05773298814892769,
+        "sample_id": "val:Manually_Annotated_Images/706/3b99315ac29b78e3c08f2d665142958160ef4fb23b24878ac06e6760.jpg",
+        "sharpness_loss": -0.012639668191278819,
+        "sharpness_ratio": 1.0126396681912788
+      },
+      {
+        "delta_e0": 0.7030376046895981,
+        "delta_edev": 0.09294718503952026,
+        "full_lpips": 0.19951385259628296,
+        "privacy_delta": 0.08962595571835247,
+        "rank": 5,
+        "roi_fft_high_retention": 1.1143206139207429,
+        "roi_lpips": 0.17178359627723694,
+        "sample_id": "val:Manually_Annotated_Images/895/7965f207a0b0f8fa82773f40644c4b31aaeab63403e012068a2942d6.jpg",
+        "sharpness_loss": 0.3313876403732975,
+        "sharpness_ratio": 0.6686123596267025
+      },
+      {
+        "delta_e0": 0.6813186705112457,
+        "delta_edev": 0.26852288842201233,
+        "full_lpips": 0.4256456196308136,
+        "privacy_delta": 0.088149983603418,
+        "rank": 6,
+        "roi_fft_high_retention": 1.2155116639414327,
+        "roi_lpips": 0.2760593295097351,
+        "sample_id": "val:Manually_Annotated_Images/1043/8e11682faf7c35401eb6f12e72fab39197c42681853b76766c67e640.jpg",
+        "sharpness_loss": -0.10145023849540635,
+        "sharpness_ratio": 1.1014502384954064
+      },
+      {
+        "delta_e0": 1.3666354417800903,
+        "delta_edev": 1.030069962143898,
+        "full_lpips": 0.23601798713207245,
+        "privacy_delta": 0.08314712844741456,
+        "rank": 7,
+        "roi_fft_high_retention": 1.0641156605335682,
+        "roi_lpips": 0.16814926266670227,
+        "sample_id": "val:Manually_Annotated_Images/495/91f3e5a312eb553cf2552fbefcddb2c7e62aa81cdef1c87389ad7f1f.JPG",
+        "sharpness_loss": -0.22065282954911036,
+        "sharpness_ratio": 1.2206528295491104
+      },
+      {
+        "delta_e0": 1.3061518967151642,
+        "delta_edev": 1.3308660387992859,
+        "full_lpips": 0.14448654651641846,
+        "privacy_delta": 0.08183891158259687,
+        "rank": 8,
+        "roi_fft_high_retention": 0.5771496615610101,
+        "roi_lpips": 0.1691880226135254,
+        "sample_id": "val:Manually_Annotated_Images/714/4f4c200a12caafba195d425e946c7aa3c857bd757e0ca1897c5476b3.jpg",
+        "sharpness_loss": 0.6406191909457761,
+        "sharpness_ratio": 0.3593808090542238
+      }
+    ],
+    "u16": [
+      {
+        "delta_e0": 0.6240508854389191,
+        "delta_edev": 0.4116937816143036,
+        "full_lpips": 0.4357265532016754,
+        "privacy_delta": 0.14772839032044327,
+        "rank": 1,
+        "roi_fft_high_retention": 1.1020480431027435,
+        "roi_lpips": 0.2801585793495178,
+        "sample_id": "val:Manually_Annotated_Images/1043/8e11682faf7c35401eb6f12e72fab39197c42681853b76766c67e640.jpg",
+        "sharpness_loss": -0.14682014594460613,
+        "sharpness_ratio": 1.1468201459446061
+      },
+      {
+        "delta_e0": 0.5495378971099854,
+        "delta_edev": 0.5860909223556519,
+        "full_lpips": 0.1092202216386795,
+        "privacy_delta": 0.13163595041627119,
+        "rank": 2,
+        "roi_fft_high_retention": 1.0310133295129615,
+        "roi_lpips": 0.08261215686798096,
+        "sample_id": "val:Manually_Annotated_Images/462/f47a25cfd2e73e1fc1f5cae15f91b7875581ca0c82467e3dc43eb862.jpg",
+        "sharpness_loss": -0.2147902645593236,
+        "sharpness_ratio": 1.2147902645593236
+      },
+      {
+        "delta_e0": 1.4912551641464233,
+        "delta_edev": 1.1931299567222595,
+        "full_lpips": 0.28770866990089417,
+        "privacy_delta": 0.10803823093566418,
+        "rank": 3,
+        "roi_fft_high_retention": 1.2213637043092822,
+        "roi_lpips": 0.15983591973781586,
+        "sample_id": "val:Manually_Annotated_Images/921/eee126016abdd00e87371094b98783cf7a87377800d319b7e3ba2f24.jpg",
+        "sharpness_loss": -0.8111902992129605,
+        "sharpness_ratio": 1.8111902992129605
+      },
+      {
+        "delta_e0": 1.2920279204845428,
+        "delta_edev": 1.3500539064407349,
+        "full_lpips": 0.17551690340042114,
+        "privacy_delta": 0.07960668986914561,
+        "rank": 4,
+        "roi_fft_high_retention": 0.5329465460564918,
+        "roi_lpips": 0.1845472753047943,
+        "sample_id": "val:Manually_Annotated_Images/714/4f4c200a12caafba195d425e946c7aa3c857bd757e0ca1897c5476b3.jpg",
+        "sharpness_loss": 0.7356371319316262,
+        "sharpness_ratio": 0.2643628680683738
+      },
+      {
+        "delta_e0": 1.1537005603313446,
+        "delta_edev": 0.48102622432634234,
+        "full_lpips": 0.2422792911529541,
+        "privacy_delta": 0.07819712899775616,
+        "rank": 5,
+        "roi_fft_high_retention": 1.89981534045548,
+        "roi_lpips": 0.18693634867668152,
+        "sample_id": "val:Manually_Annotated_Images/164/ada5800c80190560c9e1ef14f7071287d3db7ae44d9cd5e5871dbed6.jpg",
+        "sharpness_loss": -1.226411075052353,
+        "sharpness_ratio": 2.226411075052353
+      },
+      {
+        "delta_e0": 0.8606451004743576,
+        "delta_edev": 0.28034430742263794,
+        "full_lpips": 0.0987868383526802,
+        "privacy_delta": 0.07663739103153464,
+        "rank": 6,
+        "roi_fft_high_retention": 1.1745922086038236,
+        "roi_lpips": 0.08842232078313828,
+        "sample_id": "val:Manually_Annotated_Images/895/7965f207a0b0f8fa82773f40644c4b31aaeab63403e012068a2942d6.jpg",
+        "sharpness_loss": 0.40134917658799574,
+        "sharpness_ratio": 0.5986508234120043
+      },
+      {
+        "delta_e0": 1.4327532052993774,
+        "delta_edev": 0.8282955586910248,
+        "full_lpips": 0.14516091346740723,
+        "privacy_delta": 0.061414397438386406,
+        "rank": 7,
+        "roi_fft_high_retention": 0.8262568324079171,
+        "roi_lpips": 0.07228384912014008,
+        "sample_id": "val:Manually_Annotated_Images/804/87c37a268a173e5c92d4be9c783936f9af5cfb450a6348f38c9c25a1.jpg",
+        "sharpness_loss": 0.008002089491094821,
+        "sharpness_ratio": 0.9919979105089052
+      },
+      {
+        "delta_e0": 0.7237114757299423,
+        "delta_edev": 0.021928012371063232,
+        "full_lpips": 0.08854815363883972,
+        "privacy_delta": 0.05149618512076439,
+        "rank": 8,
+        "roi_fft_high_retention": 0.7216926361560915,
+        "roi_lpips": 0.05974457412958145,
+        "sample_id": "val:Manually_Annotated_Images/706/3b99315ac29b78e3c08f2d665142958160ef4fb23b24878ac06e6760.jpg",
+        "sharpness_loss": -0.0011063142566580808,
+        "sharpness_ratio": 1.001106314256658
+      }
+    ]
+  },
+  "tail_sharpness": {
+    "u12": [
+      {
+        "delta_e0": 0.8825957998633385,
+        "delta_edev": 0.8218708410859108,
+        "full_lpips": 0.2856661379337311,
+        "privacy_delta": -0.07236332602039638,
+        "rank": 1,
+        "roi_fft_high_retention": 0.8552567087535253,
+        "roi_lpips": 0.17730087041854858,
+        "sample_id": "val:Manually_Annotated_Images/224/bdc7eaef76c1e5ee142bcc51b761d5bab5beb4e9e561ea73df8f53fa.jpg",
+        "sharpness_loss": 0.830121794166187,
+        "sharpness_ratio": 0.169878205833813
+      },
+      {
+        "delta_e0": 0.19734883308410645,
+        "delta_edev": 0.04224461317062378,
+        "full_lpips": 0.5505884885787964,
+        "privacy_delta": 0.03203632811077402,
+        "rank": 2,
+        "roi_fft_high_retention": 0.23889922319979315,
+        "roi_lpips": 0.441427081823349,
+        "sample_id": "val:Manually_Annotated_Images/402/286d6bb5a94023a3af0bfa0dda0a20aa37e5a1fc57a81cfe4034ae44.jpg",
+        "sharpness_loss": 0.8229073580712718,
+        "sharpness_ratio": 0.17709264192872817
+      },
+      {
+        "delta_e0": 0.46621495485305786,
+        "delta_edev": 0.19701844453811646,
+        "full_lpips": 0.22718322277069092,
+        "privacy_delta": 8.207112368054104e-05,
+        "rank": 3,
+        "roi_fft_high_retention": 0.40402904558781705,
+        "roi_lpips": 0.1116786003112793,
+        "sample_id": "val:Manually_Annotated_Images/221/c31512157111047e5f13fb96ee6ecc777ea618b84eb8950a54b45ad2.jpg",
+        "sharpness_loss": 0.7949577835055546,
+        "sharpness_ratio": 0.20504221649444537
+      },
+      {
+        "delta_e0": 0.6567457914352417,
+        "delta_edev": 0.025036126375198364,
+        "full_lpips": 0.2389073669910431,
+        "privacy_delta": 0.031015456788019286,
+        "rank": 4,
+        "roi_fft_high_retention": 0.9149976117171994,
+        "roi_lpips": 0.19166511297225952,
+        "sample_id": "val:Manually_Annotated_Images/614/54a981169e9a44241d0665da64ac8ceeac475dbeac30ffe4795f1f80.jpg",
+        "sharpness_loss": 0.7666556214186846,
+        "sharpness_ratio": 0.23334437858131538
+      },
+      {
+        "delta_e0": 1.1952137649059296,
+        "delta_edev": 0.5167177021503448,
+        "full_lpips": 0.22997428476810455,
+        "privacy_delta": -0.07881527767606485,
+        "rank": 5,
+        "roi_fft_high_retention": 0.6594826633924545,
+        "roi_lpips": 0.11181480437517166,
+        "sample_id": "val:Manually_Annotated_Images/685/a5591f517485d01fc68fcd5ab7111b35aae7517caa1b3d1174b1413c.jpg",
+        "sharpness_loss": 0.7584150121965783,
+        "sharpness_ratio": 0.24158498780342172
+      },
+      {
+        "delta_e0": 1.2179496884346008,
+        "delta_edev": 0.9448534548282623,
+        "full_lpips": 0.4587612748146057,
+        "privacy_delta": 0.1144592984881135,
+        "rank": 6,
+        "roi_fft_high_retention": 2.7991943647707522,
+        "roi_lpips": 0.37513720989227295,
+        "sample_id": "val:Manually_Annotated_Images/506/2b4f84de47a39905a2d05b94a530b07429508954dabd853fd5682525.jpg",
+        "sharpness_loss": 0.7513589147836103,
+        "sharpness_ratio": 0.24864108521638975
+      },
+      {
+        "delta_e0": 0.7598847299814224,
+        "delta_edev": 0.159373939037323,
+        "full_lpips": 0.10107206553220749,
+        "privacy_delta": -0.02570022743139893,
+        "rank": 7,
+        "roi_fft_high_retention": 0.5054069355022749,
+        "roi_lpips": 0.06341054290533066,
+        "sample_id": "val:Manually_Annotated_Images/640/dfb056319186e05d62d1b341bc812c55ba7bf8599a46fc98d8315e5b.jpg",
+        "sharpness_loss": 0.7411874880640328,
+        "sharpness_ratio": 0.25881251193596727
+      },
+      {
+        "delta_e0": 0.651814341545105,
+        "delta_edev": 0.030427873134613037,
+        "full_lpips": 0.17038467526435852,
+        "privacy_delta": 0.039253579085068574,
+        "rank": 8,
+        "roi_fft_high_retention": 0.16388878113669014,
+        "roi_lpips": 0.1285260170698166,
+        "sample_id": "val:Manually_Annotated_Images/824/9fb5d0d4fc3006585fee96350d654fa93b68dd4e55ca770a62cb14de.JPG",
+        "sharpness_loss": 0.7073690090149949,
+        "sharpness_ratio": 0.29263099098500517
+      }
+    ],
+    "u16": [
+      {
+        "delta_e0": 0.21758759021759033,
+        "delta_edev": -0.10542768239974976,
+        "full_lpips": 0.6488513350486755,
+        "privacy_delta": 0.06947490381085956,
+        "rank": 1,
+        "roi_fft_high_retention": 0.26215800151442714,
+        "roi_lpips": 0.4739859700202942,
+        "sample_id": "val:Manually_Annotated_Images/402/286d6bb5a94023a3af0bfa0dda0a20aa37e5a1fc57a81cfe4034ae44.jpg",
+        "sharpness_loss": 0.8546574518986253,
+        "sharpness_ratio": 0.1453425481013747
+      },
+      {
+        "delta_e0": 0.5067499279975891,
+        "delta_edev": 0.1977320909500122,
+        "full_lpips": 0.23590746521949768,
+        "privacy_delta": 0.01608748326917294,
+        "rank": 2,
+        "roi_fft_high_retention": 0.383680998379531,
+        "roi_lpips": 0.12048961967229843,
+        "sample_id": "val:Manually_Annotated_Images/221/c31512157111047e5f13fb96ee6ecc777ea618b84eb8950a54b45ad2.jpg",
+        "sharpness_loss": 0.8168491545696251,
+        "sharpness_ratio": 0.18315084543037483
+      },
+      {
+        "delta_e0": 1.2663906812667847,
+        "delta_edev": 0.9622167646884918,
+        "full_lpips": 0.4632997214794159,
+        "privacy_delta": 0.11324175237763695,
+        "rank": 3,
+        "roi_fft_high_retention": 2.5594619622418953,
+        "roi_lpips": 0.3608877658843994,
+        "sample_id": "val:Manually_Annotated_Images/506/2b4f84de47a39905a2d05b94a530b07429508954dabd853fd5682525.jpg",
+        "sharpness_loss": 0.8126690332121045,
+        "sharpness_ratio": 0.18733096678789554
+      },
+      {
+        "delta_e0": -0.10427245497703552,
+        "delta_edev": 0.12249204516410828,
+        "full_lpips": 0.5384294986724854,
+        "privacy_delta": -0.0314369235791591,
+        "rank": 4,
+        "roi_fft_high_retention": 2.3296722676471404,
+        "roi_lpips": 0.4111759066581726,
+        "sample_id": "val:Manually_Annotated_Images/685/a5591f517485d01fc68fcd5ab7111b35aae7517caa1b3d1174b1413c.jpg",
+        "sharpness_loss": 0.776452116211,
+        "sharpness_ratio": 0.223547883789
+      },
+      {
+        "delta_e0": 0.8093689233064651,
+        "delta_edev": 0.21122217178344727,
+        "full_lpips": 0.10652400553226471,
+        "privacy_delta": -0.029274524617263997,
+        "rank": 5,
+        "roi_fft_high_retention": 0.5180792392826793,
+        "roi_lpips": 0.0649065226316452,
+        "sample_id": "val:Manually_Annotated_Images/640/dfb056319186e05d62d1b341bc812c55ba7bf8599a46fc98d8315e5b.jpg",
+        "sharpness_loss": 0.7482620195164578,
+        "sharpness_ratio": 0.2517379804835423
+      },
+      {
+        "delta_e0": 0.764564536511898,
+        "delta_edev": 0.8513925448060036,
+        "full_lpips": 0.4623597264289856,
+        "privacy_delta": 0.03592796694000618,
+        "rank": 6,
+        "roi_fft_high_retention": 0.8550543150525303,
+        "roi_lpips": 0.35110077261924744,
+        "sample_id": "val:Manually_Annotated_Images/224/bdc7eaef76c1e5ee142bcc51b761d5bab5beb4e9e561ea73df8f53fa.jpg",
+        "sharpness_loss": 0.7334284584943995,
+        "sharpness_ratio": 0.2665715415056005
+      },
+      {
+        "delta_e0": 0.6762808561325073,
+        "delta_edev": 0.006420135498046875,
+        "full_lpips": 0.1835756003856659,
+        "privacy_delta": 0.03166378285497633,
+        "rank": 7,
+        "roi_fft_high_retention": 0.2082671466261641,
+        "roi_lpips": 0.13320432603359222,
+        "sample_id": "val:Manually_Annotated_Images/824/9fb5d0d4fc3006585fee96350d654fa93b68dd4e55ca770a62cb14de.JPG",
+        "sharpness_loss": 0.7319293628220365,
+        "sharpness_ratio": 0.2680706371779635
+      },
+      {
+        "delta_e0": 1.0846573114395142,
+        "delta_edev": 0.17312836647033691,
+        "full_lpips": 0.15526553988456726,
+        "privacy_delta": -0.1674544369288426,
+        "rank": 8,
+        "roi_fft_high_retention": 0.7224483297408186,
+        "roi_lpips": 0.10565260052680969,
+        "sample_id": "val:Manually_Annotated_Images/461/4fcb8fee0175233066f8dd5f83c34bc9a261017a728751b67317f11d.jpg",
+        "sharpness_loss": 0.6827623052335123,
+        "sharpness_ratio": 0.31723769476648767
+      }
+    ]
+  }
+}
