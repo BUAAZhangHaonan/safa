@@ -73,14 +73,16 @@ def _ordered_index(
     return result
 
 
-def _quality_rows(path: Path, label: str) -> list[Mapping[str, Any]]:
+def _quality_payload(
+    path: Path, label: str, *, expected_metrics: Sequence[str]
+) -> Mapping[str, Any]:
     payload = _json(path)
     if not isinstance(payload, Mapping):
         raise TriangleScreeningError(f"{label} quality output must be an object")
     metrics = payload.get("metrics")
-    if metrics != ["niqe", "sharpness"]:
+    if metrics != list(expected_metrics):
         raise TriangleScreeningError(
-            f"{label} quality output must contain only NIQE and sharpness"
+            f"{label} quality output metrics disagree with the locked dataset"
         )
     per_sample = payload.get("per_sample_metrics")
     if (
@@ -92,7 +94,13 @@ def _quality_rows(path: Path, label: str) -> list[Mapping[str, Any]]:
         raise TriangleScreeningError(
             f"{label} official per-sample quality metrics are missing"
         )
-    return per_sample["rows"]
+    if "fid" not in expected_metrics and any(
+        field in payload for field in ("fid", "kid_mean", "kid_std")
+    ):
+        raise TriangleScreeningError(
+            f"{label} tail quality output contains forbidden FID/KID"
+        )
+    return payload
 
 
 def _finite(row: Mapping[str, Any], field: str, label: str) -> float:
@@ -135,16 +143,20 @@ def _identity_cosines(
             "candidate_face_count",
         )
     )
+    all_roles_exact_one = counts == (1, 1, 1)
     values: list[float | None] = []
     for field, pair_exact_one in (
         ("source_native_cosine", counts[0] == counts[1] == 1),
         ("source_candidate_cosine", counts[0] == counts[2] == 1),
     ):
         if pair_exact_one:
-            value = _finite(row, field, label)
-            if value < -1.0 or value > 1.0:
-                raise TriangleScreeningError(f"{label}.{field} must be in [-1,1]")
-            values.append(value)
+            if row.get(field) is None and not all_roles_exact_one:
+                values.append(None)
+            else:
+                value = _finite(row, field, label)
+                if value < -1.0 or value > 1.0:
+                    raise TriangleScreeningError(f"{label}.{field} must be in [-1,1]")
+                values.append(value)
         else:
             if row.get(field) is not None:
                 raise TriangleScreeningError(
@@ -168,6 +180,33 @@ def _representation_cosines(
         ),
         _finite(candidate_row, "edev_cosine", candidate_label),
     )
+
+
+def _direct_meanflow_representation_cosines(
+    row: Mapping[str, Any], *, candidate_label: str
+) -> tuple[float, float, float, float]:
+    forbidden = sorted(
+        field for field in ("e0_cosine", "candidate_edev_cosine") if field in row
+    )
+    if forbidden:
+        raise TriangleScreeningError(
+            f"{candidate_label} uses forbidden representation aliases: {forbidden}"
+        )
+    values = (
+        _finite(row, "native_cosine", candidate_label),
+        _finite(row, "candidate_cosine", candidate_label),
+        _finite(row, "native_edev_cosine", candidate_label),
+        _finite(row, "edev_cosine", candidate_label),
+    )
+    if any(value < -1.0 or value > 1.0 for value in values):
+        raise TriangleScreeningError(
+            f"{candidate_label} representation cosines must be in [-1,1]"
+        )
+    if _finite(row, "cosine", candidate_label) != values[1]:
+        raise TriangleScreeningError(
+            f"{candidate_label}.cosine must equal candidate_cosine exactly"
+        )
+    return values
 
 
 def _sha256(path: Path) -> str:
@@ -239,7 +278,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--runs-root", type=Path, required=True)
     parser.add_argument("--evaluation-root", type=Path, required=True)
     parser.add_argument("--selection-manifest", type=Path, required=True)
-    parser.add_argument("--native-representation-rows", type=Path, required=True)
+    parser.add_argument("--native-representation-rows", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--baseline-arm-id")
     return parser.parse_args(argv)
@@ -265,26 +304,59 @@ def main(argv: Sequence[str] | None = None) -> int:
     selection_rows = _jsonl(selection_path)
     selection_ids = [row.get("sample_id") for row in selection_rows]
     if (
-        len(selection_ids) != 32
-        or len(set(selection_ids)) != 32
+        len(selection_ids) != arm_set.sample_count
+        or len(set(selection_ids)) != arm_set.sample_count
         or any(not isinstance(value, str) for value in selection_ids)
     ):
-        raise TriangleScreeningError("selection manifest must contain 32 unique IDs")
+        raise TriangleScreeningError(
+            f"selection manifest must contain {arm_set.sample_count} unique IDs"
+        )
 
-    native_representation_path = args.native_representation_rows.resolve()
-    native_representation = _ordered_index(
-        _jsonl(native_representation_path),
-        expected_sample_ids=selection_ids,
-        label="shared native representation",
+    is_r11 = (
+        arm_set.contract_type == "safa_r11_initial_noise_evaluation_dataset_v1"
     )
+    if is_r11:
+        if args.native_representation_rows is not None:
+            raise TriangleScreeningError(
+                "R11 materialization reads native representations directly "
+                "from each generation row"
+            )
+        native_representation_path = None
+        native_representation = None
+    else:
+        if args.native_representation_rows is None:
+            raise TriangleScreeningError(
+                "legacy materialization requires native representation rows"
+            )
+        native_representation_path = args.native_representation_rows.resolve()
+        native_representation = _ordered_index(
+            _jsonl(native_representation_path),
+            expected_sample_ids=selection_ids,
+            label="shared native representation",
+        )
     runs_root = args.runs_root.resolve()
     evaluation_root = args.evaluation_root.resolve()
     native_quality_path = evaluation_root / "quality" / "native" / "quality.json"
-    native_quality = _indexed(
-        _quality_rows(native_quality_path, "native"), "native quality"
+    native_quality_payload = _quality_payload(
+        native_quality_path,
+        "native",
+        expected_metrics=arm_set.quality_metrics,
     )
-    if set(native_quality) != set(selection_ids):
-        raise TriangleScreeningError("native quality rows do not match fixed32")
+    native_quality = _ordered_index(
+        native_quality_payload["per_sample_metrics"]["rows"],
+        expected_sample_ids=selection_ids,
+        label="native quality",
+    )
+    native_fid = (
+        _finite(native_quality_payload, "fid", "native quality")
+        if arm_set.stage != 32
+        else None
+    )
+    native_kid = (
+        _finite(native_quality_payload, "kid_mean", "native quality")
+        if arm_set.stage != 32
+        else None
+    )
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=False)
@@ -297,9 +369,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         arcface_request_path = evaluation_root / "arcface" / arm_id / "request.json"
         arcface_result_path = evaluation_root / "arcface" / arm_id / "result.json"
-        run_rows = _indexed(_jsonl(run_path), f"{arm_id} generation")
-        candidate_quality = _indexed(
-            _quality_rows(candidate_quality_path, arm_id), f"{arm_id} quality"
+        run_rows = _ordered_index(
+            _jsonl(run_path),
+            expected_sample_ids=selection_ids,
+            label=f"{arm_id} generation",
+        )
+        candidate_quality_payload = _quality_payload(
+            candidate_quality_path,
+            arm_id,
+            expected_metrics=arm_set.quality_metrics,
+        )
+        candidate_quality = _ordered_index(
+            candidate_quality_payload["per_sample_metrics"]["rows"],
+            expected_sample_ids=selection_ids,
+            label=f"{arm_id} quality",
         )
         request = _json(arcface_request_path)
         result = _json(arcface_result_path)
@@ -314,31 +397,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         arcface_rows = _official_arcface(
             request, result, arm_id=arm_id, sample_ids=selection_ids
         )
-        arcface = _indexed(arcface_rows, f"{arm_id} ArcFace")
-        expected = set(selection_ids)
-        if any(set(rows) != expected for rows in (run_rows, candidate_quality, arcface)):
-            raise TriangleScreeningError(
-                f"{arm_id} evidence does not match the fixed32 manifest"
-            )
+        arcface = _ordered_index(
+            arcface_rows,
+            expected_sample_ids=selection_ids,
+            label=f"{arm_id} ArcFace",
+        )
         rows: list[dict[str, Any]] = []
         for sample_id in selection_ids:
             generated = run_rows[sample_id]
             native_q = native_quality[sample_id]
             candidate_q = candidate_quality[sample_id]
             identity = arcface[sample_id]
-            native_rep = native_representation[sample_id]
-            native_e0, candidate_e0, native_edev, candidate_edev = (
-                _representation_cosines(
-                    native_rep, generated, candidate_label=arm_id
+            if is_r11:
+                native_e0, candidate_e0, native_edev, candidate_edev = (
+                    _direct_meanflow_representation_cosines(
+                        generated, candidate_label=arm_id
+                    )
                 )
-            )
+            else:
+                assert native_representation is not None
+                native_e0, candidate_e0, native_edev, candidate_edev = (
+                    _representation_cosines(
+                        native_representation[sample_id],
+                        generated,
+                        candidate_label=arm_id,
+                    )
+                )
             source_native_cosine, source_candidate_cosine = _identity_cosines(
                 identity, label=f"{arm_id} ArcFace"
             )
             rows.append(
                 {
                     "arm_id": arm_id,
-                    "stage": 32,
+                    "stage": arm_set.stage,
                     "sample_id": sample_id,
                     "native_e0": native_e0,
                     "candidate_e0": candidate_e0,
@@ -373,7 +464,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 handle.write(
                     json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
                 )
-        materialized_arms.append({"arm_id": arm_id, "rows_path": str(row_path)})
+        arm_binding: dict[str, Any] = {
+            "arm_id": arm_id,
+            "rows_path": str(row_path),
+        }
+        if arm_set.stage != 32:
+            arm_binding.update(
+                {
+                    "fid": _finite(candidate_quality_payload, "fid", arm_id),
+                    "kid": _finite(candidate_quality_payload, "kid_mean", arm_id),
+                }
+            )
+        materialized_arms.append(arm_binding)
         provenance.append(
             {
                 "arm_id": arm_id,
@@ -389,10 +491,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         handle.write(
             json.dumps(
                 {
-                    "stage": 32,
+                    "stage": arm_set.stage,
                     "baseline_arm_id": baseline_arm_id,
                     "selection_manifest_path": str(selection_path),
+                    "selection_manifest_sha256": _sha256(selection_path),
+                    "selection_role": arm_set.selection_role,
                     "arms": materialized_arms,
+                    **(
+                        {}
+                        if arm_set.stage == 32
+                        else {"native_fid": native_fid, "native_kid": native_kid}
+                    ),
                 },
                 indent=2,
                 sort_keys=True,
@@ -405,19 +514,46 @@ def main(argv: Sequence[str] | None = None) -> int:
             json.dumps(
                 {
                     "schema_version": 1,
-                    "contract_type": "safa_triangle_fixed32_rows_v1",
+                    "contract_type": (
+                        "safa_r11_typed_triangle_rows_v1"
+                        if is_r11
+                        else "safa_triangle_fixed32_rows_v1"
+                    ),
+                    "selection_role": arm_set.selection_role,
+                    "sample_count": arm_set.sample_count,
+                    "stage": arm_set.stage,
                     "metric_contract": {
-                        "fid_kid": "absent_not_interpreted",
-                        "quality": ["niqe", "sharpness"],
-                        "privacy": "point_arcface_delta",
+                        "fid_kid": (
+                            "required"
+                            if arm_set.stage != 32
+                            else "forbidden_absent"
+                        ),
+                        "quality": list(arm_set.quality_metrics),
+                        "privacy": (
+                            "arcface_delta_u95_shared_pcg64_2000"
+                            if arm_set.stage != 32
+                            else "point_arcface_delta"
+                        ),
                         "arcface_detector": "buffalo_l",
                     },
                     "diagnostic_manifest_sha256": _sha256(diagnostic_path),
                     "selection_manifest_sha256": _sha256(selection_path),
-                    "native_representation_rows": {
-                        "path": str(native_representation_path),
-                        "sha256": _sha256(native_representation_path),
-                    },
+                    "native_representation_rows": (
+                        {
+                            "binding": "direct_per_arm_generation_rows",
+                            "fields": [
+                                "native_cosine",
+                                "candidate_cosine",
+                                "native_edev_cosine",
+                                "edev_cosine",
+                            ],
+                        }
+                        if is_r11
+                        else {
+                            "path": str(native_representation_path),
+                            "sha256": _sha256(native_representation_path),
+                        }
+                    ),
                     "native_quality_output_sha256": _sha256(native_quality_path),
                     "arms": provenance,
                 },

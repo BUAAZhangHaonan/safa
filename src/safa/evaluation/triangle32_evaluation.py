@@ -29,6 +29,11 @@ class Triangle32ArmSet:
     seed: int | None
     result_filename: str
     baseline_arm_id: str | None
+    selection_role: str
+    sample_count: int
+    stage: int
+    quality_metrics: tuple[str, ...]
+    selection_sample_id_sha256: str | None
 
 
 def sha256_file(path: Path) -> str:
@@ -112,6 +117,11 @@ def load_arm_set(path: Path | None) -> Triangle32ArmSet:
             seed=None,
             result_filename="generation_result.json",
             baseline_arm_id=LEGACY_ARM_IDS[0],
+            selection_role="prefix32",
+            sample_count=32,
+            stage=32,
+            quality_metrics=("niqe", "sharpness"),
+            selection_sample_id_sha256=None,
         )
     manifest_path = path.resolve()
     value = read_json(manifest_path, "triangle32 arm-set manifest")
@@ -150,6 +160,94 @@ def load_arm_set(path: Path | None) -> Triangle32ArmSet:
             seed=seed,
             result_filename="generation_result.json",
             baseline_arm_id=LEGACY_ARM_IDS[0],
+            selection_role="prefix32",
+            sample_count=32,
+            stage=32,
+            quality_metrics=("niqe", "sharpness"),
+            selection_sample_id_sha256=None,
+        )
+    if contract_type == "safa_r11_initial_noise_evaluation_dataset_v1":
+        if (
+            value.get("schema_version") != 1
+            or value.get("registration") != "official_r11_typed_evaluation"
+        ):
+            raise TriangleScreeningError("R11 evaluation registration differs")
+        role = value.get("selection_role")
+        expected = {
+            "prefix128": {
+                "sample_count": 128,
+                "stage": 128,
+                "quality_metrics": ["fid", "kid", "niqe", "sharpness"],
+            },
+            "sharpness_tail32": {
+                "sample_count": 32,
+                "stage": 32,
+                "quality_metrics": ["niqe", "sharpness"],
+            },
+        }.get(role)
+        if expected is None or any(value.get(key) != item for key, item in expected.items()):
+            raise TriangleScreeningError("R11 selection role/count/stage/metrics differ")
+        sample_binding = value.get("selection_manifest")
+        selection = _bound_file(sample_binding, "R11 selection manifest")
+        if (
+            not isinstance(sample_binding, Mapping)
+            or sample_binding.get("sample_count") != expected["sample_count"]
+        ):
+            raise TriangleScreeningError("R11 selection manifest count differs")
+        sample_id_sha256 = sample_binding.get("ordered_sample_id_sha256")
+        if (
+            not isinstance(sample_id_sha256, str)
+            or len(sample_id_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in sample_id_sha256)
+        ):
+            raise TriangleScreeningError("R11 ordered sample-ID digest is invalid")
+        ordered_ids = []
+        for line_number, line in enumerate(
+            selection.read_text(encoding="utf-8").splitlines(), 1
+        ):
+            row = json.loads(line)
+            sample_id = row.get("sample_id") if isinstance(row, Mapping) else None
+            if not isinstance(sample_id, str) or not sample_id:
+                raise TriangleScreeningError(
+                    f"R11 selection row {line_number} has invalid sample_id"
+                )
+            ordered_ids.append(sample_id)
+        actual_sample_id_sha256 = hashlib.sha256(
+            "".join(f"{sample_id}\n" for sample_id in ordered_ids).encode("utf-8")
+        ).hexdigest()
+        if (
+            len(ordered_ids) != expected["sample_count"]
+            or len(set(ordered_ids)) != expected["sample_count"]
+            or actual_sample_id_sha256 != sample_id_sha256
+        ):
+            raise TriangleScreeningError("R11 ordered selection binding differs")
+        arms = value.get("arms")
+        if not isinstance(arms, list):
+            raise TriangleScreeningError("R11 evaluation arms are missing")
+        arm_ids = _arm_ids(
+            [arm.get("arm_id") if isinstance(arm, Mapping) else None for arm in arms],
+            "R11 evaluation",
+        )
+        baseline_arm_id = value.get("baseline_arm_id")
+        if baseline_arm_id not in arm_ids:
+            raise TriangleScreeningError("R11 baseline arm is not registered")
+        seed = value.get("sampling_seed")
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TriangleScreeningError("R11 evaluation seed is invalid")
+        return Triangle32ArmSet(
+            contract_type=str(contract_type),
+            manifest_path=manifest_path,
+            arm_ids=arm_ids,
+            selection_manifest=selection,
+            selection_manifest_sha256=str(sample_binding["sha256"]),
+            seed=seed,
+            result_filename="generation_result.json",
+            baseline_arm_id=str(baseline_arm_id),
+            selection_role=str(role),
+            sample_count=int(expected["sample_count"]),
+            stage=int(expected["stage"]),
+            quality_metrics=tuple(expected["quality_metrics"]),
+            selection_sample_id_sha256=sample_id_sha256,
         )
     if contract_type != "safa_r10_triangle32_pilot_preparation_v1":
         raise TriangleScreeningError("unknown triangle32 arm-set contract")
@@ -191,6 +289,11 @@ def load_arm_set(path: Path | None) -> Triangle32ArmSet:
         seed=seed,
         result_filename="result.json",
         baseline_arm_id=None,
+        selection_role="prefix32",
+        sample_count=32,
+        stage=32,
+        quality_metrics=("niqe", "sharpness"),
+        selection_sample_id_sha256=None,
     )
 
 
@@ -202,8 +305,27 @@ def validate_generation_result(
     result_path = run_root / arm_set.result_filename
     result = read_json(result_path, f"{arm_id} generation result")
     if arm_set.result_filename == "generation_result.json":
-        if result.get("status") != "complete" or result.get("sample_count") != 32:
+        if (
+            result.get("status") != "complete"
+            or result.get("sample_count") != arm_set.sample_count
+        ):
             raise TriangleScreeningError(f"{arm_id} generation is not complete")
+        if (
+            arm_set.contract_type
+            == "safa_r11_initial_noise_evaluation_dataset_v1"
+        ):
+            completion_path = run_root / "completion.json"
+            completion = read_json(completion_path, f"{arm_id} completion")
+            if (
+                completion.get("schema_version") != 1
+                or completion.get("status") != "complete"
+                or completion.get("sample_count") != arm_set.sample_count
+                or completion.get("sample_id_sha256")
+                != arm_set.selection_sample_id_sha256
+            ):
+                raise TriangleScreeningError(
+                    f"{arm_id} completion binding differs"
+                )
     else:
         binding = result.get("per_sample")
         if (
@@ -213,7 +335,7 @@ def validate_generation_result(
             or result.get("failure") is not None
             or result.get("generation_only") is not True
             or result.get("evaluation_status") != "not_started"
-            or result.get("sample_count") != 32
+            or result.get("sample_count") != arm_set.sample_count
             or result.get("worker_result_sha256")
             != canonical_line_digest(result, "worker_result_sha256")
             or not isinstance(binding, Mapping)

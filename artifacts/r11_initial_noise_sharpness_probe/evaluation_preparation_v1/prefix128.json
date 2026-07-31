@@ -1,0 +1,43 @@
+{
+  "arms": [
+    {
+      "arm_id": "eta025_prefix128",
+      "config": {
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/configs/medium_v2/experiments/r11_initial_noise_fixed_eta025_prefix128.yaml",
+        "sha256": "983b9caef6a322325ff6722afe9088307b7ae015f305df561c3815be37bfafdc"
+      },
+      "eta": 0.25,
+      "run_root": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/runs_v1/eta025_prefix128"
+    },
+    {
+      "arm_id": "eta05_prefix128",
+      "config": {
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/configs/medium_v2/experiments/r11_initial_noise_fixed_eta05_prefix128.yaml",
+        "sha256": "ba69366c4e57d07bcd481ad5a24baf8bc366a9547bd1b31442c66414cdde37ab"
+      },
+      "eta": 0.5,
+      "run_root": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/runs_v1/eta05_prefix128"
+    }
+  ],
+  "baseline_arm_id": "eta025_prefix128",
+  "contract_type": "safa_r11_initial_noise_evaluation_dataset_v1",
+  "dataset_id": "prefix128",
+  "quality_metrics": [
+    "fid",
+    "kid",
+    "niqe",
+    "sharpness"
+  ],
+  "registration": "official_r11_typed_evaluation",
+  "sample_count": 128,
+  "sampling_seed": 1337,
+  "schema_version": 1,
+  "selection_manifest": {
+    "ordered_sample_id_sha256": "3af3ecd3f844f61b7e7e5a25519ed97fa30dc56663e52fc2ee84cdd9cabac2d5",
+    "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/prefix128.jsonl",
+    "sample_count": 128,
+    "sha256": "9e1bfa90057c9b72f02a29340d91f0d87d4d4f35119733824b9659bd7ee8db89"
+  },
+  "selection_role": "prefix128",
+  "stage": 128
+}

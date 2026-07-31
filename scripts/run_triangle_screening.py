@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -74,18 +75,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     arms = request["arms"]
     if not isinstance(arms, list):
         raise TriangleScreeningError("request.arms must be a list")
+    if request["stage"] == 32 and any(
+        field in request for field in ("native_fid", "native_kid")
+    ):
+        raise TriangleScreeningError(
+            "stage32 requests forbid native FID/KID fields"
+        )
     materialized: list[dict[str, Any]] = []
     request_root = args.request.resolve().parent
     selection_manifest = None
-    if request["stage"] == 32 and "selection_manifest_path" in request:
+    if "selection_manifest_path" in request:
         selection_path = Path(request["selection_manifest_path"])
         if not selection_path.is_absolute():
             selection_path = request_root / selection_path
-        selection_manifest = _read_rows(selection_path.resolve())
-        if len(selection_manifest) != 32:
+        selection_path = selection_path.resolve()
+        selection_manifest = _read_rows(selection_path)
+        if len(selection_manifest) != request["stage"]:
             raise TriangleScreeningError(
-                "stage32 selection manifest must contain exactly 32 rows"
+                "locked selection manifest count must equal the screening stage"
             )
+        declared_sha256 = request.get("selection_manifest_sha256")
+        if (
+            not isinstance(declared_sha256, str)
+            or hashlib.sha256(selection_path.read_bytes()).hexdigest()
+            != declared_sha256
+        ):
+            raise TriangleScreeningError("locked selection manifest SHA256 differs")
     elif request["stage"] != 8:
         eligibility = request.get("eligibility")
         if not isinstance(eligibility, Mapping):
@@ -127,6 +142,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     for index, arm in enumerate(arms):
         if not isinstance(arm, Mapping):
             raise TriangleScreeningError(f"request.arms[{index}] must be an object")
+        if request["stage"] == 32 and any(
+            field in arm for field in ("fid", "kid")
+        ):
+            raise TriangleScreeningError(
+                "stage32 arm requests forbid FID/KID fields"
+            )
+        if request["stage"] != 32 and any(
+            field not in arm for field in ("fid", "kid")
+        ):
+            raise TriangleScreeningError(
+                "non-stage32 arm requests require FID/KID fields"
+            )
         row_path_value = arm.get("rows_path")
         if not isinstance(row_path_value, str) or not row_path_value:
             raise TriangleScreeningError(
@@ -161,6 +188,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         stage=request["stage"],
         baseline_arm_id=request["baseline_arm_id"],
         selection_manifest=selection_manifest,
+        selection_metadata=(
+            None
+            if "selection_role" not in request
+            else {
+                "selection_role": request["selection_role"],
+                "manifest_sha256": request["selection_manifest_sha256"],
+            }
+        ),
     )
     return 0
 

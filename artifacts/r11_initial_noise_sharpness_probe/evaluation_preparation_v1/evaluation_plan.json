@@ -1,0 +1,149 @@
+{
+  "contract_type": "safa_r11_official_evaluation_preparation_v1",
+  "datasets": [
+    {
+      "commands": {
+        "arcface_request_build": [
+          "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+          "scripts/build_fixed32_arcface_requests.py",
+          "--diagnostic-manifest",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_preparation_v1/prefix128.json",
+          "--selection-manifest",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/prefix128.jsonl",
+          "--runs-root",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/runs_v1",
+          "--template-request",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/full/evaluator_runs/arcface/winner/request.json",
+          "--output-root",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/arcface",
+          "--device",
+          "cuda:0"
+        ],
+        "materialize": [
+          "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+          "scripts/materialize_fixed32_triangle_rows.py",
+          "--diagnostic-manifest",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_preparation_v1/prefix128.json",
+          "--runs-root",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/runs_v1",
+          "--evaluation-root",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128",
+          "--selection-manifest",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/prefix128.jsonl",
+          "--output-dir",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/rows",
+          "--baseline-arm-id",
+          "eta025_prefix128"
+        ],
+        "quality_prepare": [
+          "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+          "scripts/prepare_fixed32_quality_inputs.py",
+          "--runs-root",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/runs_v1",
+          "--selection-manifest",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/prefix128.jsonl",
+          "--real-index",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/data/index/val_face_mixed_e14.jsonl",
+          "--output-dir",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/inputs",
+          "--arm-set-manifest",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_preparation_v1/prefix128.json",
+          "--device",
+          "cuda:0"
+        ],
+        "screen": [
+          "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+          "scripts/run_triangle_screening.py",
+          "--request",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/rows/screening_request.json",
+          "--output-dir",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/screening"
+        ]
+      },
+      "dataset_contract": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_preparation_v1/prefix128.json",
+      "dataset_contract_sha256": "bf0a80aff1503290ce37c62fa67ee0b5c6a1d59bebf73c0c455009158150fce8",
+      "dataset_id": "prefix128",
+      "expected_arcface_request_count": 2,
+      "output_root": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128"
+    },
+    {
+      "commands": {
+        "arcface_request_build": [
+          "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+          "scripts/build_fixed32_arcface_requests.py",
+          "--diagnostic-manifest",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_preparation_v1/sharpness_tail32.json",
+          "--selection-manifest",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/preparation_v1/tail32.jsonl",
+          "--runs-root",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/runs_v1",
+          "--template-request",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/full/evaluator_runs/arcface/winner/request.json",
+          "--output-root",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/arcface",
+          "--device",
+          "cuda:0"
+        ],
+        "materialize": [
+          "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+          "scripts/materialize_fixed32_triangle_rows.py",
+          "--diagnostic-manifest",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_preparation_v1/sharpness_tail32.json",
+          "--runs-root",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/runs_v1",
+          "--evaluation-root",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32",
+          "--selection-manifest",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/preparation_v1/tail32.jsonl",
+          "--output-dir",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/rows",
+          "--baseline-arm-id",
+          "eta025_tail32"
+        ],
+        "quality_prepare": [
+          "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+          "scripts/prepare_fixed32_quality_inputs.py",
+          "--runs-root",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/runs_v1",
+          "--selection-manifest",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/preparation_v1/tail32.jsonl",
+          "--real-index",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/data/index/val_face_mixed_e14.jsonl",
+          "--output-dir",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/inputs",
+          "--arm-set-manifest",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_preparation_v1/sharpness_tail32.json",
+          "--device",
+          "cuda:0"
+        ],
+        "screen": [
+          "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+          "scripts/run_triangle_screening.py",
+          "--request",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/rows/screening_request.json",
+          "--output-dir",
+          "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/screening"
+        ]
+      },
+      "dataset_contract": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_preparation_v1/sharpness_tail32.json",
+      "dataset_contract_sha256": "640a1b64a7ec1bca70ca4e5491c16b785a53956a52d44edbef9fd40e394b56f4",
+      "dataset_id": "sharpness_tail32",
+      "expected_arcface_request_count": 2,
+      "output_root": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32"
+    }
+  ],
+  "expected_arcface_request_count": 4,
+  "formal_arcface_template": {
+    "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/full/evaluator_runs/arcface/winner/request.json",
+    "sha256": "6f49e48cd5c25fccc365f4c025f64c326de96c204e41a66f248404cc0fd70236"
+  },
+  "real_index": {
+    "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/data/index/val_face_mixed_e14.jsonl",
+    "sha256": "da14e23eacefecbc2948d1374fb93961a13d017a9183aa1fe2a2f62b33a4b4ea"
+  },
+  "run_contracts": {
+    "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/preparation_v1/run_contracts.json",
+    "sha256": "b8fa49398ddf5ebf05bdec9cdc5a27eed9b61054a5522692988219f517bf39f4"
+  },
+  "schema_version": 1
+}

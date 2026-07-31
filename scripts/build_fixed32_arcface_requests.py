@@ -80,15 +80,17 @@ def _resolve_file(value: Any, label: str) -> Path:
     return path
 
 
-def _ordered_ids(rows: Sequence[Mapping[str, Any]], label: str) -> list[str]:
+def _ordered_ids(
+    rows: Sequence[Mapping[str, Any]], label: str, *, expected_count: int
+) -> list[str]:
     values = [row.get("sample_id") for row in rows]
     if (
-        len(values) != 32
+        len(values) != expected_count
         or any(not isinstance(value, str) or not value for value in values)
-        or len(set(values)) != 32
+        or len(set(values)) != expected_count
     ):
         raise Fixed32ArcFaceRequestError(
-            f"{label} must contain exactly 32 unique ordered sample IDs"
+            f"{label} must contain exactly {expected_count} unique ordered sample IDs"
         )
     return [str(value) for value in values]
 
@@ -138,6 +140,18 @@ def _canonical_digest(value: Mapping[str, Any], field: str) -> str:
     ).hexdigest()
 
 
+def _asset_manifest_digest(
+    samples: Sequence[Mapping[str, Any]], *, role: str
+) -> str:
+    digest_field = f"{role}_sha256"
+    return hashlib.sha256(
+        "".join(
+            f"{sample['sample_id']}\t{sample[digest_field]}\n"
+            for sample in samples
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _template(path: Path) -> Mapping[str, Any]:
     template = _json(path, "authoritative ArcFace template request")
     if (
@@ -170,7 +184,7 @@ def _samples(
     path: Path, *, expected_ids: Sequence[str], label: str
 ) -> tuple[SampleEvidence, ...]:
     rows = _jsonl(path, label)
-    if _ordered_ids(rows, label) != list(expected_ids):
+    if _ordered_ids(rows, label, expected_count=len(expected_ids)) != list(expected_ids):
         raise Fixed32ArcFaceRequestError(
             f"{label} does not match the fixed32 selection order"
         )
@@ -223,6 +237,7 @@ def build_requests(
     selection_ids = _ordered_ids(
         _jsonl(selection_path, "fixed32 selection manifest"),
         "fixed32 selection manifest",
+        expected_count=arm_set.sample_count,
     )
     seed = arm_set.seed
 
@@ -252,9 +267,14 @@ def build_requests(
         request = ArcFaceEvaluationRequest(
             phase="diagnose",
             logical_run_id=(
-                f"r10_triangle_fixed32__{arm_id}"
-                if arm_set.arm_ids == ARM_IDS
-                else f"r10_triangle32__{arm_id}"
+                f"r11_initial_noise__{arm_set.selection_role}__{arm_id}"
+                if arm_set.contract_type
+                == "safa_r11_initial_noise_evaluation_dataset_v1"
+                else (
+                    f"r10_triangle_fixed32__{arm_id}"
+                    if arm_set.arm_ids == ARM_IDS
+                    else f"r10_triangle32__{arm_id}"
+                )
             ),
             arm_id=arm_id,
             seed=seed,
@@ -273,13 +293,33 @@ def build_requests(
             json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
             handle.write("\n")
         output_paths.append(request_path)
+    source_asset_digests = {
+        _asset_manifest_digest(payload["payload"]["samples"], role="source")
+        for _, payload in requests
+    }
+    native_asset_digests = {
+        _asset_manifest_digest(payload["payload"]["samples"], role="native")
+        for _, payload in requests
+    }
+    if len(source_asset_digests) != 1 or len(native_asset_digests) != 1:
+        raise Fixed32ArcFaceRequestError(
+            "source/native asset manifests must be shared exactly across arms"
+        )
     build_manifest = {
         "schema_version": 1,
         "contract_type": (
-            "safa_r10_triangle_fixed32_arcface_request_build_v1"
-            if arm_set.arm_ids == ARM_IDS
-            else "safa_r10_triangle32_arcface_request_build_v1"
+            "safa_r11_typed_arcface_request_build_v1"
+            if arm_set.contract_type
+            == "safa_r11_initial_noise_evaluation_dataset_v1"
+            else (
+                "safa_r10_triangle_fixed32_arcface_request_build_v1"
+                if arm_set.arm_ids == ARM_IDS
+                else "safa_r10_triangle32_arcface_request_build_v1"
+            )
         ),
+        "selection_role": arm_set.selection_role,
+        "sample_count": arm_set.sample_count,
+        "stage": arm_set.stage,
         "diagnostic_manifest": {
             "path": str(diagnostic_path),
             "sha256": _sha256(diagnostic_path),
@@ -294,12 +334,32 @@ def build_requests(
             "evaluator_request_sha256": template["evaluator_request_sha256"],
         },
         "device": device,
+        "source_asset_manifest_sha256": next(iter(source_asset_digests)),
+        "native_asset_manifest_sha256": next(iter(native_asset_digests)),
         "requests": [
             {
                 "arm_id": arm_id,
                 "path": str(request_path),
                 "sha256": _sha256(request_path),
                 "evaluator_request_sha256": payload["evaluator_request_sha256"],
+                **(
+                    {
+                        "completion_sha256": _sha256(
+                            resolved_runs_root / arm_id / "completion.json"
+                        ),
+                        "generation_result_sha256": _sha256(
+                            resolved_runs_root
+                            / arm_id
+                            / arm_set.result_filename
+                        ),
+                        "per_sample_sha256": _sha256(
+                            resolved_runs_root / arm_id / "per_sample.jsonl"
+                        ),
+                    }
+                    if arm_set.contract_type
+                    == "safa_r11_initial_noise_evaluation_dataset_v1"
+                    else {}
+                ),
             }
             for (arm_id, payload), request_path in zip(
                 requests, output_paths, strict=True

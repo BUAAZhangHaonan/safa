@@ -52,6 +52,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--arm-set-manifest", type=Path)
     parser.add_argument("--native-per-sample", type=Path)
+    parser.add_argument("--device", default="cuda:0")
     return parser.parse_args(argv)
 
 
@@ -84,11 +85,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     selection = _rows(selection_path)
     sample_ids = [row.get("sample_id") for row in selection]
     if (
-        len(sample_ids) != 32
-        or len(set(sample_ids)) != 32
+        len(sample_ids) != arm_set.sample_count
+        or len(set(sample_ids)) != arm_set.sample_count
         or any(not isinstance(value, str) for value in sample_ids)
     ):
-        raise TriangleScreeningError("selection manifest must contain 32 unique IDs")
+        raise TriangleScreeningError(
+            f"selection manifest must contain {arm_set.sample_count} unique IDs"
+        )
 
     run_paths = {
         arm_id: validate_generation_result(arm_set, runs_root, arm_id)
@@ -103,7 +106,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     native_source_path = (
         args.native_per_sample.resolve()
         if args.native_per_sample is not None
-        else run_paths[ARM_IDS[0]]
+        else run_paths[arm_set.arm_ids[0]]
     )
     baseline = _rows(native_source_path)
     if [row.get("sample_id") for row in baseline] != sample_ids:
@@ -125,14 +128,101 @@ def main(argv: Sequence[str] | None = None) -> int:
     with native_path.open("x", encoding="utf-8") as handle:
         for row in native_view:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
+    metrics = list(arm_set.quality_metrics)
+    native_generated_dir = Path(str(native_view[0]["generated"])).resolve().parent
+    if any(
+        Path(str(row["generated"])).resolve().parent != native_generated_dir
+        for row in native_view
+    ):
+        raise TriangleScreeningError(
+            "shared native images must occupy one exact generated directory"
+        )
+    quality_root = output_dir.parent / "quality"
+
+    def quality_job(
+        role: str,
+        per_sample: Path,
+        generated_dir: Path,
+        output: Path,
+        generation_result: Path | None,
+    ) -> dict[str, Any]:
+        argv = [
+            sys.executable,
+            "scripts/run_r11_quality_evaluation.py",
+            "--real-index",
+            str(real_index_path),
+            "--generated-dir",
+            str(generated_dir),
+            "--output",
+            str(output),
+            "--sample-id-manifest",
+            str(selection_path),
+            "--per-sample-jsonl",
+            str(per_sample),
+        ]
+        if generation_result is not None:
+            argv.extend(["--generation-result", str(generation_result)])
+        if "kid" in metrics:
+            argv.extend(["--kid-subset-size", str(arm_set.sample_count - 1)])
+        argv.extend(
+            [
+                "--reuse-valid-output",
+                "--seed",
+                str(arm_set.seed),
+                "--device",
+                args.device,
+                "--metrics",
+                *metrics,
+            ]
+        )
+        return {
+            "role": role,
+            "argv": argv,
+            "metrics": metrics,
+            "real_index_required": True,
+            "output": str(output),
+        }
+
+    quality_jobs = [
+        quality_job(
+            "native",
+            native_path,
+            native_generated_dir,
+            quality_root / "native" / "quality.json",
+            None,
+        )
+    ]
+    quality_jobs.extend(
+        quality_job(
+            arm_id,
+            run_paths[arm_id],
+            runs_root / arm_id / "generated_images",
+            quality_root / arm_id / "quality.json",
+            runs_root / arm_id / arm_set.result_filename,
+        )
+        for arm_id in arm_set.arm_ids
+    )
     manifest_path = output_dir / "quality_input_manifest.json"
     with manifest_path.open("x", encoding="utf-8") as handle:
         handle.write(
             json.dumps(
                 {
-                    "schema_version": 2,
-                    "contract_type": "safa_triangle_fixed32_quality_inputs_v2",
-                    "metrics": ["niqe", "sharpness"],
+                    "schema_version": (
+                        3
+                        if arm_set.contract_type
+                        == "safa_r11_initial_noise_evaluation_dataset_v1"
+                        else 2
+                    ),
+                    "contract_type": (
+                        "safa_r11_typed_quality_inputs_v1"
+                        if arm_set.contract_type
+                        == "safa_r11_initial_noise_evaluation_dataset_v1"
+                        else "safa_triangle_fixed32_quality_inputs_v2"
+                    ),
+                    "selection_role": arm_set.selection_role,
+                    "sample_count": arm_set.sample_count,
+                    "stage": arm_set.stage,
+                    "metrics": metrics,
                     "real_index": real_index_binding,
                     "selection_manifest": str(selection_path),
                     "selection_manifest_sha256": _sha256(selection_path),
@@ -147,6 +237,33 @@ def main(argv: Sequence[str] | None = None) -> int:
                             "arm_id": arm_id,
                             "per_sample": str(run_paths[arm_id]),
                             "per_sample_sha256": _sha256(run_paths[arm_id]),
+                            **(
+                                {
+                                    "completion": {
+                                        "path": str(
+                                            runs_root / arm_id / "completion.json"
+                                        ),
+                                        "sha256": _sha256(
+                                            runs_root / arm_id / "completion.json"
+                                        ),
+                                    },
+                                    "generation_result": {
+                                        "path": str(
+                                            runs_root
+                                            / arm_id
+                                            / arm_set.result_filename
+                                        ),
+                                        "sha256": _sha256(
+                                            runs_root
+                                            / arm_id
+                                            / arm_set.result_filename
+                                        ),
+                                    },
+                                }
+                                if arm_set.contract_type
+                                == "safa_r11_initial_noise_evaluation_dataset_v1"
+                                else {}
+                            ),
                             "real_index": real_index_binding,
                             "role_binding": "existing_generated_candidate",
                         }
@@ -160,6 +277,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             "sha256": _sha256(arm_set.manifest_path),
                         }
                     ),
+                    "quality_jobs": quality_jobs,
                 },
                 indent=2,
                 sort_keys=True,

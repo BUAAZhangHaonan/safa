@@ -753,11 +753,14 @@ def _evaluate_arm(
             ),
         ):
             if pair_exact_one:
-                pair_values.append(
-                    _finite_number(
-                        row[field], f"{arm_id}.{row['sample_id']}.{field}"
+                if row[field] is None and not privacy_available:
+                    pair_values.append(None)
+                else:
+                    pair_values.append(
+                        _finite_number(
+                            row[field], f"{arm_id}.{row['sample_id']}.{field}"
+                        )
                     )
-                )
             else:
                 if row[field] is not None:
                     raise TriangleScreeningError(
@@ -1066,6 +1069,7 @@ def write_outputs(
     stage: int,
     baseline_arm_id: str,
     selection_manifest: Sequence[Mapping[str, Any]] | None = None,
+    selection_metadata: Mapping[str, Any] | None = None,
 ) -> None:
     output_dir = output_dir.resolve()
     targets = (
@@ -1125,12 +1129,19 @@ def write_outputs(
         "arms": rows,
     }
     if selection_manifest is not None:
-        summary["selection"] = {
-            "selector": "safa-triangle-512-v1",
-            "eligible_count": 2045,
-            "prefix_count": len(selection_manifest),
-            "samples": list(selection_manifest),
-        }
+        if selection_metadata is None:
+            summary["selection"] = {
+                "selector": "safa-triangle-512-v1",
+                "eligible_count": 2045,
+                "prefix_count": len(selection_manifest),
+                "samples": list(selection_manifest),
+            }
+        else:
+            summary["selection"] = {
+                **dict(selection_metadata),
+                "sample_count": len(selection_manifest),
+                "samples": list(selection_manifest),
+            }
     with targets[0].open("x", encoding="utf-8") as handle:
         handle.write(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     with targets[1].open("x", encoding="utf-8", newline="") as handle:
