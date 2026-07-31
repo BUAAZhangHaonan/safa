@@ -22,6 +22,12 @@ FORMAL_ARCFACE_TEMPLATE = (
     / "artifacts/r9_meanflow_flow_map_guidance/campaigns/"
     "r9-report-only-formal-v9/full/evaluator_runs/arcface/winner/request.json"
 ).resolve()
+ARCFACE_WORKER_WRAPPER = (
+    REPO_ROOT / "scripts/run_r9_phase_evaluator.py"
+).resolve()
+ARCFACE_WORKER_IMPLEMENTATION = (
+    REPO_ROOT / "src/safa/evaluation/r9_evaluator_worker.py"
+).resolve()
 EXPECTED_DATASETS = {
     "prefix128": {
         "stage": 128,
@@ -38,6 +44,12 @@ EXPECTED_DATASETS = {
         "baseline": "eta025_tail32",
     },
 }
+GPU_BINDINGS = (
+    {"physical_index": 0, "uuid": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"},
+    {"physical_index": 1, "uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"},
+    {"physical_index": 2, "uuid": "GPU-e27fe71d-eaf7-3eb5-d0ff-c1c63b4f6b02"},
+    {"physical_index": 3, "uuid": "GPU-61ea2925-9905-7f56-cd64-7a792a32efef"},
+)
 
 
 class R11EvaluationPreparationError(RuntimeError):
@@ -198,6 +210,176 @@ def _dataset_contracts(run_contracts_path: Path) -> dict[str, dict[str, Any]]:
     return datasets
 
 
+def _launch_job(
+    *,
+    job_id: str,
+    kind: str,
+    dataset_id: str,
+    role: str,
+    wave: str,
+    gpu_slot: int,
+    argv: list[str],
+    inputs: list[Path],
+    outputs: list[Path],
+    log_path: Path,
+) -> dict[str, Any]:
+    gpu = GPU_BINDINGS[gpu_slot]
+    return {
+        "job_id": job_id,
+        "kind": kind,
+        "dataset_id": dataset_id,
+        "role": role,
+        "wave": wave,
+        "retry_count": 0,
+        "physical_gpu": gpu,
+        "environment": {"CUDA_VISIBLE_DEVICES": gpu["uuid"]},
+        "logical_device": "cuda:0",
+        "argv": argv,
+        "input_paths": [str(path) for path in inputs],
+        "output_path": str(outputs[0]),
+        "log_path": str(log_path),
+        "fresh_output_paths": [str(path) for path in (*outputs, log_path)],
+    }
+
+
+def _evaluation_launch_jobs(
+    contracts: Mapping[str, Mapping[str, Any]],
+    *,
+    evaluation_root: Path,
+    runs_root: Path,
+) -> list[dict[str, Any]]:
+    assignments = {
+        ("prefix128", "native", "quality"): ("A", 0),
+        ("prefix128", "eta025_prefix128", "quality"): ("A", 1),
+        ("prefix128", "eta05_prefix128", "quality"): ("A", 2),
+        ("sharpness_tail32", "native", "quality"): ("A", 3),
+        ("sharpness_tail32", "eta025_tail32", "quality"): ("B", 0),
+        ("sharpness_tail32", "eta05_tail32", "quality"): ("B", 1),
+        ("prefix128", "eta025_prefix128", "arcface"): ("B", 2),
+        ("prefix128", "eta05_prefix128", "arcface"): ("B", 3),
+        ("sharpness_tail32", "eta025_tail32", "arcface"): ("C", 0),
+        ("sharpness_tail32", "eta05_tail32", "arcface"): ("C", 1),
+    }
+    jobs: list[dict[str, Any]] = []
+    for dataset_id, contract in contracts.items():
+        dataset_root = evaluation_root / dataset_id
+        selection = Path(str(contract["selection_manifest"]["path"]))
+        metrics = list(contract["quality_metrics"])
+        baseline = str(contract["baseline_arm_id"])
+        quality_roles = ["native", *[str(arm["arm_id"]) for arm in contract["arms"]]]
+        for role in quality_roles:
+            is_native = role == "native"
+            per_sample = (
+                dataset_root / "inputs/native_per_sample.jsonl"
+                if is_native
+                else runs_root / role / "per_sample.jsonl"
+            )
+            generated_dir = (
+                runs_root / baseline / "native_images"
+                if is_native
+                else runs_root / role / "generated_images"
+            )
+            output_path = dataset_root / "quality" / role / "quality.json"
+            argv = [
+                sys.executable,
+                "scripts/run_r11_quality_evaluation.py",
+                "--real-index",
+                str(REAL_INDEX),
+                "--generated-dir",
+                str(generated_dir),
+                "--output",
+                str(output_path),
+                "--sample-id-manifest",
+                str(selection),
+                "--per-sample-jsonl",
+                str(per_sample),
+            ]
+            if not is_native:
+                argv.extend(
+                    [
+                        "--generation-result",
+                        str(runs_root / role / "generation_result.json"),
+                    ]
+                )
+            if "kid" in metrics:
+                argv.extend(
+                    ["--kid-subset-size", str(int(contract["sample_count"]) - 1)]
+                )
+            argv.extend(
+                [
+                    "--seed",
+                    str(contract["sampling_seed"]),
+                    "--device",
+                    "cuda:0",
+                    "--metrics",
+                    *metrics,
+                ]
+            )
+            wave, gpu_slot = assignments[(dataset_id, role, "quality")]
+            quality_job = _launch_job(
+                    job_id=f"quality__{dataset_id}__{role}",
+                    kind="quality",
+                    dataset_id=dataset_id,
+                    role=role,
+                    wave=wave,
+                    gpu_slot=gpu_slot,
+                    argv=argv,
+                    inputs=[selection, per_sample],
+                    outputs=[output_path],
+                    log_path=dataset_root / "logs" / f"quality__{role}.log",
+                )
+            quality_job["quality_output_path"] = str(output_path)
+            jobs.append(quality_job)
+        for arm in contract["arms"]:
+            arm_id = str(arm["arm_id"])
+            request_path = dataset_root / "arcface" / arm_id / "request.json"
+            result_path = dataset_root / "arcface" / arm_id / "result.json"
+            wave, gpu_slot = assignments[(dataset_id, arm_id, "arcface")]
+            arcface_job = _launch_job(
+                    job_id=f"arcface__{dataset_id}__{arm_id}",
+                    kind="arcface",
+                    dataset_id=dataset_id,
+                    role=arm_id,
+                    wave=wave,
+                    gpu_slot=gpu_slot,
+                    argv=[
+                        sys.executable,
+                        "scripts/run_r9_phase_evaluator.py",
+                        "--request",
+                        str(request_path),
+                        "--output",
+                        str(result_path),
+                    ],
+                    inputs=[request_path],
+                    outputs=[result_path],
+                    log_path=dataset_root / "logs" / f"arcface__{arm_id}.log",
+                )
+            arcface_job["request_path"] = str(request_path)
+            arcface_job["result_path"] = str(result_path)
+            jobs.append(arcface_job)
+    expected_mapping = set(assignments)
+    if (
+        len(jobs) != 10
+        or sum(job["kind"] == "quality" for job in jobs) != 6
+        or sum(job["kind"] == "arcface" for job in jobs) != 4
+        or len({job["job_id"] for job in jobs}) != 10
+        or {
+            (job["dataset_id"], job["role"], job["kind"]) for job in jobs
+        }
+        != expected_mapping
+    ):
+        raise R11EvaluationPreparationError("evaluation launch job matrix differs")
+    fresh = [path for job in jobs for path in job["fresh_output_paths"]]
+    if len(fresh) != len(set(fresh)):
+        raise R11EvaluationPreparationError("evaluation launch outputs are not unique")
+    existing = [path for path in fresh if Path(path).exists()]
+    if existing:
+        raise R11EvaluationPreparationError(
+            f"evaluation launch outputs are not fresh: {existing[:4]!r}"
+        )
+    return jobs
+
+
 def prepare(
     *,
     run_contracts_path: Path,
@@ -209,13 +391,13 @@ def prepare(
     evaluation_root = (
         REPO_ROOT / "artifacts/r11_initial_noise_sharpness_probe/evaluation_v1"
     ).resolve()
+    runs_root = (
+        REPO_ROOT / "artifacts/r11_initial_noise_sharpness_probe/runs_v1"
+    ).resolve()
     datasets = []
     for dataset_id, contract in contracts.items():
         contract_path = output / f"{dataset_id}.json"
         dataset_root = evaluation_root / dataset_id
-        runs_root = (
-            REPO_ROOT / "artifacts/r11_initial_noise_sharpness_probe/runs_v1"
-        ).resolve()
         commands = {
             "quality_prepare": [
                 sys.executable,
@@ -283,9 +465,13 @@ def prepare(
                 "output_root": str(dataset_root),
             }
         )
+    launch_jobs = _evaluation_launch_jobs(
+        contracts, evaluation_root=evaluation_root, runs_root=runs_root
+    )
     plan = {
         "schema_version": 1,
-        "contract_type": "safa_r11_official_evaluation_preparation_v1",
+        "contract_type": "safa_r11_official_evaluation_preparation_v2",
+        "retry_count": 0,
         "run_contracts": {
             "path": str(run_contracts_path.resolve()),
             "sha256": sha256_file(run_contracts_path.resolve()),
@@ -298,7 +484,32 @@ def prepare(
             "path": str(FORMAL_ARCFACE_TEMPLATE),
             "sha256": sha256_file(FORMAL_ARCFACE_TEMPLATE),
         },
+        "r11_arcface_worker": {
+            "request_contract": "safa_r11_arcface_evaluator_request_v1",
+            "output_contract": "safa_r11_arcface_evaluator_output_v1",
+            "pair_policy": "pairwise_exact_one_v1",
+            "wrapper": {
+                "path": str(ARCFACE_WORKER_WRAPPER),
+                "sha256": sha256_file(ARCFACE_WORKER_WRAPPER),
+            },
+            "implementation": {
+                "path": str(ARCFACE_WORKER_IMPLEMENTATION),
+                "sha256": sha256_file(ARCFACE_WORKER_IMPLEMENTATION),
+            },
+        },
         "expected_arcface_request_count": 4,
+        "expected_quality_job_count": 6,
+        "gpu_bindings": list(GPU_BINDINGS),
+        "launch_jobs": launch_jobs,
+        "launch_waves": [
+            {
+                "wave": wave,
+                "job_ids": [
+                    job["job_id"] for job in launch_jobs if job["wave"] == wave
+                ],
+            }
+            for wave in ("A", "B", "C")
+        ],
         "datasets": datasets,
     }
     if write:

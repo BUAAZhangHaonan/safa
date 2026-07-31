@@ -143,20 +143,16 @@ def _identity_cosines(
             "candidate_face_count",
         )
     )
-    all_roles_exact_one = counts == (1, 1, 1)
     values: list[float | None] = []
     for field, pair_exact_one in (
         ("source_native_cosine", counts[0] == counts[1] == 1),
         ("source_candidate_cosine", counts[0] == counts[2] == 1),
     ):
         if pair_exact_one:
-            if row.get(field) is None and not all_roles_exact_one:
-                values.append(None)
-            else:
-                value = _finite(row, field, label)
-                if value < -1.0 or value > 1.0:
-                    raise TriangleScreeningError(f"{label}.{field} must be in [-1,1]")
-                values.append(value)
+            value = _finite(row, field, label)
+            if value < -1.0 or value > 1.0:
+                raise TriangleScreeningError(f"{label}.{field} must be in [-1,1]")
+            values.append(value)
         else:
             if row.get(field) is not None:
                 raise TriangleScreeningError(
@@ -219,10 +215,21 @@ def _official_arcface(
     *,
     arm_id: str,
     sample_ids: Sequence[str],
+    is_r11: bool = False,
 ) -> list[Mapping[str, Any]]:
+    request_contract = (
+        "safa_r11_arcface_evaluator_request_v1"
+        if is_r11
+        else "safa_r9_phase_evaluator_request_v1"
+    )
+    output_contract = (
+        "safa_r11_arcface_evaluator_output_v1"
+        if is_r11
+        else "safa_r9_phase_evaluator_output_v1"
+    )
     if (
         request.get("schema_version") != 1
-        or request.get("contract_type") != "safa_r9_phase_evaluator_request_v1"
+        or request.get("contract_type") != request_contract
         or request.get("task") != "arcface"
         or request.get("evaluator_request_sha256")
         != canonical_digest(request, "evaluator_request_sha256")
@@ -233,6 +240,10 @@ def _official_arcface(
     if (
         not isinstance(payload, Mapping)
         or payload.get("arm_id") != arm_id
+        or (
+            is_r11
+            and payload.get("pair_policy") != "pairwise_exact_one_v1"
+        )
         or not isinstance(samples, list)
         or [row.get("sample_id") for row in samples if isinstance(row, Mapping)]
         != list(sample_ids)
@@ -256,7 +267,7 @@ def _official_arcface(
         )
     if (
         result.get("schema_version") != 1
-        or result.get("contract_type") != "safa_r9_phase_evaluator_output_v1"
+        or result.get("contract_type") != output_contract
         or result.get("task") != "arcface"
         or result.get("evaluator_request_sha256")
         != request["evaluator_request_sha256"]
@@ -267,7 +278,24 @@ def _official_arcface(
         raise TriangleScreeningError(
             f"{arm_id} ArcFace result is not the bound official evaluator output"
         )
-    return result["result"]
+    rows = result["result"]
+    if is_r11:
+        expected_fields = {
+            "sample_id",
+            "source_face_count",
+            "native_face_count",
+            "candidate_face_count",
+            "source_native_cosine",
+            "source_candidate_cosine",
+        }
+        if any(
+            not isinstance(row, Mapping) or set(row) != expected_fields
+            for row in rows
+        ):
+            raise TriangleScreeningError(
+                f"{arm_id} R11 ArcFace result rows are not canonical"
+            )
+    return rows
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -362,6 +390,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_dir.mkdir(parents=True, exist_ok=False)
     materialized_arms: list[dict[str, Any]] = []
     provenance: list[dict[str, Any]] = []
+    shared_native_representations: dict[str, tuple[float, float]] | None = None
     for arm_id in arm_ids:
         run_path = validate_generation_result(arm_set, runs_root, arm_id)
         candidate_quality_path = (
@@ -395,7 +424,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{arm_id} ArcFace request must bind buffalo_l"
             )
         arcface_rows = _official_arcface(
-            request, result, arm_id=arm_id, sample_ids=selection_ids
+            request,
+            result,
+            arm_id=arm_id,
+            sample_ids=selection_ids,
+            is_r11=is_r11,
         )
         arcface = _ordered_index(
             arcface_rows,
@@ -414,6 +447,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                         generated, candidate_label=arm_id
                     )
                 )
+                native_values = (native_e0, native_edev)
+                if shared_native_representations is None:
+                    shared_native_representations = {}
+                expected_native = shared_native_representations.setdefault(
+                    sample_id, native_values
+                )
+                if expected_native != native_values:
+                    raise TriangleScreeningError(
+                        f"{arm_id} native representation values differ across eta "
+                        f"for {sample_id}"
+                    )
             else:
                 assert native_representation is not None
                 native_e0, candidate_e0, native_edev, candidate_edev = (

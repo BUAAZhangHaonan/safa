@@ -753,14 +753,11 @@ def _evaluate_arm(
             ),
         ):
             if pair_exact_one:
-                if row[field] is None and not privacy_available:
-                    pair_values.append(None)
-                else:
-                    pair_values.append(
-                        _finite_number(
-                            row[field], f"{arm_id}.{row['sample_id']}.{field}"
-                        )
+                pair_values.append(
+                    _finite_number(
+                        row[field], f"{arm_id}.{row['sample_id']}.{field}"
                     )
+                )
             else:
                 if row[field] is not None:
                     raise TriangleScreeningError(

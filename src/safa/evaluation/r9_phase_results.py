@@ -254,6 +254,9 @@ class ArcFaceEvaluationRequest:
     source_index_path: Path
     source_index_sha256: str
     samples: tuple[SampleEvidence, ...]
+    pair_policy: Literal[
+        "all_roles_exact_one_v1", "pairwise_exact_one_v1"
+    ] = "all_roles_exact_one_v1"
 
 
 @dataclass(frozen=True)

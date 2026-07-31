@@ -930,18 +930,44 @@ def evaluate_arcface_request(
             "native_face_count": native_count,
             "candidate_face_count": candidate_count,
         }
-        if source_count == native_count == candidate_count == 1:
+        if request.pair_policy == "all_roles_exact_one_v1":
+            if source_count == native_count == candidate_count == 1:
+                row.update(
+                    {
+                        "source_native_cosine": _embedding_cosine(
+                            source_embedding, native_embedding, "ArcFace source-native"
+                        ),
+                        "source_candidate_cosine": _embedding_cosine(
+                            source_embedding,
+                            candidate_embedding,
+                            "ArcFace source-candidate",
+                        ),
+                    }
+                )
+        elif request.pair_policy == "pairwise_exact_one_v1":
             row.update(
                 {
-                    "source_native_cosine": _embedding_cosine(
-                        source_embedding, native_embedding, "ArcFace source-native"
+                    "source_native_cosine": (
+                        _embedding_cosine(
+                            source_embedding, native_embedding, "ArcFace source-native"
+                        )
+                        if source_count == native_count == 1
+                        else None
                     ),
-                    "source_candidate_cosine": _embedding_cosine(
-                        source_embedding,
-                        candidate_embedding,
-                        "ArcFace source-candidate",
+                    "source_candidate_cosine": (
+                        _embedding_cosine(
+                            source_embedding,
+                            candidate_embedding,
+                            "ArcFace source-candidate",
+                        )
+                        if source_count == candidate_count == 1
+                        else None
                     ),
                 }
+            )
+        else:
+            raise R9EvaluatorError(
+                f"unknown ArcFace pair policy: {request.pair_policy!r}"
             )
         rows.append(row)
     _assert_finite_json(rows, "ArcFace rows")
@@ -955,6 +981,7 @@ def build_worker_request(
     | HeldoutEvaluationRequest,
     *,
     config: ProductionEvaluatorConfig,
+    contract_type: str = "safa_r9_phase_evaluator_request_v1",
 ) -> dict[str, Any]:
     if task not in WORKER_TASKS:
         raise R9EvaluatorError(f"unknown evaluator task: {task!r}")
@@ -971,9 +998,21 @@ def build_worker_request(
     }[task]
     if not isinstance(request, expected_type):
         raise R9EvaluatorError(f"{task} worker request type mismatch")
+    if contract_type == "safa_r9_phase_evaluator_request_v1":
+        if task == "arcface" and request.pair_policy != "all_roles_exact_one_v1":
+            raise R9EvaluatorError(
+                "historical R9 ArcFace requests require all_roles_exact_one_v1"
+            )
+    elif contract_type == "safa_r11_arcface_evaluator_request_v1":
+        if task != "arcface" or request.pair_policy != "pairwise_exact_one_v1":
+            raise R9EvaluatorError(
+                "R11 ArcFace requests require pairwise_exact_one_v1"
+            )
+    else:
+        raise R9EvaluatorError(f"unknown evaluator request contract: {contract_type!r}")
     payload = {
         "schema_version": 1,
-        "contract_type": "safa_r9_phase_evaluator_request_v1",
+        "contract_type": contract_type,
         "task": task,
         "config": {
             "repo_root": str(config.repo_root.resolve()),
@@ -988,7 +1027,13 @@ def build_worker_request(
             ),
             "batch_size": config.batch_size,
         },
-        "payload": _serialize_evaluator_request(task, request),
+        "payload": _serialize_evaluator_request(
+            task,
+            request,
+            include_arcface_pair_policy=(
+                contract_type == "safa_r11_arcface_evaluator_request_v1"
+            ),
+        ),
     }
     payload["evaluator_request_sha256"] = _canonical_digest(
         payload, "evaluator_request_sha256"
@@ -1003,10 +1048,16 @@ def execute_worker_request(
     dependencies: EvaluatorDependencies,
 ) -> dict[str, Any]:
     envelope = _read_json_mapping(request_path, "evaluator worker request")
+    contract_type = envelope.get("contract_type")
+    if contract_type not in {
+        "safa_r9_phase_evaluator_request_v1",
+        "safa_r11_arcface_evaluator_request_v1",
+    }:
+        raise R9EvaluatorError("evaluator worker request contract is not registered")
     _validate_digest_contract(
         envelope,
         digest_field="evaluator_request_sha256",
-        contract_type="safa_r9_phase_evaluator_request_v1",
+        contract_type=str(contract_type),
     )
     if set(envelope) != {
         "schema_version",
@@ -1020,14 +1071,27 @@ def execute_worker_request(
     task = envelope.get("task")
     if task not in WORKER_TASKS:
         raise R9EvaluatorError("evaluator worker task is not registered")
+    if (
+        contract_type == "safa_r11_arcface_evaluator_request_v1"
+        and task != "arcface"
+    ):
+        raise R9EvaluatorError("R11 evaluator request contract is ArcFace-only")
     config = _decode_config(envelope.get("config"))
-    request = _decode_evaluator_request(str(task), envelope.get("payload"))
+    request = _decode_evaluator_request(
+        str(task),
+        envelope.get("payload"),
+        contract_type=str(contract_type),
+    )
     evaluators = R9ProductionEvaluators(config, dependencies)
     result = getattr(evaluators, str(task))(request)
     _assert_finite_json(result, "evaluator worker result")
     output = {
         "schema_version": 1,
-        "contract_type": "safa_r9_phase_evaluator_output_v1",
+        "contract_type": (
+            "safa_r11_arcface_evaluator_output_v1"
+            if contract_type == "safa_r11_arcface_evaluator_request_v1"
+            else "safa_r9_phase_evaluator_output_v1"
+        ),
         "task": task,
         "evaluator_request_sha256": envelope["evaluator_request_sha256"],
         "worker_contract": _json_roundtrip(
@@ -1756,7 +1820,12 @@ def _serialize_samples(samples: Sequence[SampleEvidence]) -> list[dict[str, str]
     ]
 
 
-def _serialize_evaluator_request(task: str, request: Any) -> dict[str, Any]:
+def _serialize_evaluator_request(
+    task: str,
+    request: Any,
+    *,
+    include_arcface_pair_policy: bool = False,
+) -> dict[str, Any]:
     if task == "quality":
         return {
             "phase": request.phase,
@@ -1776,7 +1845,7 @@ def _serialize_evaluator_request(task: str, request: Any) -> dict[str, Any]:
             "per_sample_set_sha256": request.per_sample_set_sha256,
         }
     if task == "arcface":
-        return {
+        payload = {
             "phase": request.phase,
             "logical_run_id": request.logical_run_id,
             "arm_id": request.arm_id,
@@ -1785,6 +1854,9 @@ def _serialize_evaluator_request(task: str, request: Any) -> dict[str, Any]:
             "source_index_sha256": request.source_index_sha256,
             "samples": _serialize_samples(request.samples),
         }
+        if include_arcface_pair_policy:
+            payload["pair_policy"] = request.pair_policy
+        return payload
     return {
         "phase": request.phase,
         "arm_id": request.arm_id,
@@ -1819,7 +1891,12 @@ def _decode_config(value: Any) -> ProductionEvaluatorConfig:
     )
 
 
-def _decode_evaluator_request(task: str, value: Any) -> Any:
+def _decode_evaluator_request(
+    task: str,
+    value: Any,
+    *,
+    contract_type: str = "safa_r9_phase_evaluator_request_v1",
+) -> Any:
     if not isinstance(value, Mapping):
         raise R9EvaluatorError("evaluator payload must be a mapping")
     (
@@ -1876,6 +1953,16 @@ def _decode_evaluator_request(task: str, value: Any) -> Any:
             "source_index_sha256",
             "samples",
         }
+        pair_policy = "all_roles_exact_one_v1"
+        if contract_type == "safa_r11_arcface_evaluator_request_v1":
+            expected.add("pair_policy")
+            pair_policy = value.get("pair_policy")
+            if pair_policy != "pairwise_exact_one_v1":
+                raise R9EvaluatorError(
+                    "R11 ArcFace evaluator pair policy is not registered"
+                )
+        elif contract_type != "safa_r9_phase_evaluator_request_v1":
+            raise R9EvaluatorError("ArcFace evaluator request contract is not registered")
         if set(value) != expected:
             raise R9EvaluatorError("ArcFace evaluator payload fields are not canonical")
         return arcface_request_type(
@@ -1886,6 +1973,7 @@ def _decode_evaluator_request(task: str, value: Any) -> Any:
             source_index_path=Path(str(value["source_index_path"])),
             source_index_sha256=value["source_index_sha256"],
             samples=samples,
+            pair_policy=pair_policy,
         )
     expected = {
         "phase",

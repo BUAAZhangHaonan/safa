@@ -115,13 +115,22 @@ def _production_config(
         raise Fixed32ArcFaceRequestError(
             "authoritative template repository root disagrees with this checkout"
         )
+    worker_contract = dict(config["worker_contract"])
+    worker_implementation = (
+        REPO_ROOT / "src/safa/evaluation/r9_evaluator_worker.py"
+    ).resolve()
+    if Path(str(worker_contract.get("implementation_path"))).resolve() != worker_implementation:
+        raise Fixed32ArcFaceRequestError(
+            "authoritative template worker implementation path differs"
+        )
+    worker_contract["implementation_sha256"] = _sha256(worker_implementation)
     return ProductionEvaluatorConfig(
         repo_root=REPO_ROOT,
         device=device,
         work_root=work_root,
         quality_script=config["quality_script"],
         arcface=config["arcface"],
-        worker_contract=config["worker_contract"],
+        worker_contract=worker_contract,
         batch_size=config["batch_size"],
     )
 
@@ -264,6 +273,9 @@ def build_requests(
             device=device,
             work_root=resolved_output_root / arm_id / "work",
         )
+        is_r11 = (
+            arm_set.contract_type == "safa_r11_initial_noise_evaluation_dataset_v1"
+        )
         request = ArcFaceEvaluationRequest(
             phase="diagnose",
             logical_run_id=(
@@ -281,8 +293,27 @@ def build_requests(
             source_index_path=source_index_path,
             source_index_sha256=source_index_sha256,
             samples=samples,
+            pair_policy=(
+                "pairwise_exact_one_v1"
+                if is_r11
+                else "all_roles_exact_one_v1"
+            ),
         )
-        requests.append((arm_id, build_worker_request("arcface", request, config=config)))
+        requests.append(
+            (
+                arm_id,
+                build_worker_request(
+                    "arcface",
+                    request,
+                    config=config,
+                    contract_type=(
+                        "safa_r11_arcface_evaluator_request_v1"
+                        if is_r11
+                        else "safa_r9_phase_evaluator_request_v1"
+                    ),
+                ),
+            )
+        )
 
     output_paths = []
     for arm_id, payload in requests:
@@ -308,7 +339,7 @@ def build_requests(
     build_manifest = {
         "schema_version": 1,
         "contract_type": (
-            "safa_r11_typed_arcface_request_build_v1"
+            "safa_r11_typed_arcface_request_build_v2"
             if arm_set.contract_type
             == "safa_r11_initial_noise_evaluation_dataset_v1"
             else (

@@ -683,6 +683,68 @@ def test_arcface_omits_cosines_for_any_non_exact_one_role(tmp_path: Path) -> Non
     assert rows[1]["native_face_count"] == 0
 
 
+@pytest.mark.parametrize(
+    ("counts", "source_native_available", "source_candidate_available"),
+    [
+        ((1, 1, 2), True, False),
+        ((1, 2, 1), False, True),
+        ((2, 1, 1), False, False),
+        ((1, 1, 1), True, True),
+    ],
+)
+def test_r11_arcface_transport_emits_pairwise_independent_explicit_values(
+    tmp_path: Path,
+    counts: tuple[int, int, int],
+    source_native_available: bool,
+    source_candidate_available: bool,
+) -> None:
+    config, samples, _ = _fixture(tmp_path)
+    request = replace(
+        _arcface_request(config, samples),
+        pair_policy="pairwise_exact_one_v1",
+    )
+    envelope = build_worker_request(
+        "arcface",
+        request,
+        config=config,
+        contract_type="safa_r11_arcface_evaluator_request_v1",
+    )
+    assert envelope["payload"]["pair_policy"] == "pairwise_exact_one_v1"
+    request_path = tmp_path / "r11-request.json"
+    request_path.write_text(json.dumps(envelope), encoding="utf-8")
+    output = execute_worker_request(
+        request_path,
+        tmp_path / "r11-result.json",
+        dependencies=_dependencies(
+            FakeQualityBackend(),
+            FakeAnalyzer([*counts, 1, 1, 1]),
+        ),
+    )
+    assert output["contract_type"] == "safa_r11_arcface_evaluator_output_v1"
+    row = output["result"][0]
+    assert set(row) == {
+        "sample_id",
+        "source_face_count",
+        "native_face_count",
+        "candidate_face_count",
+        "source_native_cosine",
+        "source_candidate_cosine",
+    }
+    assert (row["source_native_cosine"] is not None) is source_native_available
+    assert (
+        row["source_candidate_cosine"] is not None
+    ) is source_candidate_available
+
+
+def test_historical_arcface_request_contract_omits_pair_policy(tmp_path: Path) -> None:
+    config, samples, _ = _fixture(tmp_path)
+    envelope = build_worker_request(
+        "arcface", _arcface_request(config, samples), config=config
+    )
+    assert envelope["contract_type"] == "safa_r9_phase_evaluator_request_v1"
+    assert "pair_policy" not in envelope["payload"]
+
+
 def test_arcface_accepts_full_e2e_phase(tmp_path: Path) -> None:
     config, samples, _ = _fixture(tmp_path)
     request = replace(

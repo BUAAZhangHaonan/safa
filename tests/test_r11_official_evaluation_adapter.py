@@ -36,10 +36,10 @@ def _module(path: Path, name: str) -> ModuleType:
 def _rows(
     count: int,
     *,
+    source_face_count: int = 1,
     native_face_count: int = 1,
     candidate_face_count: int = 1,
 ) -> list[dict[str, object]]:
-    privacy_available = native_face_count == candidate_face_count == 1
     return [
         {
             "sample_id": f"s{index:03d}",
@@ -51,11 +51,15 @@ def _rows(
             "candidate_niqe": 5.01,
             "native_sharpness": 400.0,
             "candidate_sharpness": 400.0,
-            "source_face_count": 1,
+            "source_face_count": source_face_count,
             "native_face_count": native_face_count,
             "candidate_face_count": candidate_face_count,
-            "source_native_cosine": 0.40 if privacy_available else None,
-            "source_candidate_cosine": 0.39 if privacy_available else None,
+            "source_native_cosine": (
+                0.40 if source_face_count == native_face_count == 1 else None
+            ),
+            "source_candidate_cosine": (
+                0.39 if source_face_count == candidate_face_count == 1 else None
+            ),
         }
         for index in range(count)
     ]
@@ -72,6 +76,48 @@ def test_real_r11_dry_preparation_binds_both_locked_datasets(
         write=True,
     )
     assert plan["expected_arcface_request_count"] == 4
+    assert plan["expected_quality_job_count"] == 6
+    assert plan["retry_count"] == 0
+    assert [row["physical_index"] for row in plan["gpu_bindings"]] == [0, 1, 2, 3]
+    assert all(row["uuid"].startswith("GPU-") for row in plan["gpu_bindings"])
+    jobs = plan["launch_jobs"]
+    assert len(jobs) == 10
+    assert len({job["job_id"] for job in jobs}) == 10
+    assert len(
+        {
+            path
+            for job in jobs
+            for path in job["fresh_output_paths"]
+        }
+    ) == 20
+    assert [wave["wave"] for wave in plan["launch_waves"]] == ["A", "B", "C"]
+    assert all(job["retry_count"] == 0 for job in jobs)
+    assert all(
+        job["environment"]["CUDA_VISIBLE_DEVICES"]
+        == job["physical_gpu"]["uuid"]
+        and job["logical_device"] == "cuda:0"
+        for job in jobs
+    )
+    assert all(
+        "--reuse-valid-output" not in job["argv"]
+        for job in jobs
+        if job["kind"] == "quality"
+    )
+    assert {
+        (job["kind"], job["dataset_id"], job["role"])
+        for job in jobs
+    } == {
+        ("quality", "prefix128", "native"),
+        ("quality", "prefix128", "eta025_prefix128"),
+        ("quality", "prefix128", "eta05_prefix128"),
+        ("quality", "sharpness_tail32", "native"),
+        ("quality", "sharpness_tail32", "eta025_tail32"),
+        ("quality", "sharpness_tail32", "eta05_tail32"),
+        ("arcface", "prefix128", "eta025_prefix128"),
+        ("arcface", "prefix128", "eta05_prefix128"),
+        ("arcface", "sharpness_tail32", "eta025_tail32"),
+        ("arcface", "sharpness_tail32", "eta05_tail32"),
+    }
     datasets = {row["dataset_id"]: row for row in plan["datasets"]}
     assert set(datasets) == {"prefix128", "sharpness_tail32"}
     prefix = load_arm_set(Path(datasets["prefix128"]["dataset_contract"]))
@@ -205,28 +251,42 @@ def test_prefix128_uses_shared_pcg64_2000_and_tail32_forbids_inference_metrics(
 
 
 @pytest.mark.parametrize(
-    ("native_count", "candidate_count"),
-    [(1, 2), (2, 1)],
+    ("source_count", "native_count", "candidate_count", "expected"),
+    [
+        (1, 1, 2, (0.40, None)),
+        (1, 2, 1, (None, 0.39)),
+        (2, 1, 1, (None, None)),
+        (1, 1, 1, (0.40, 0.39)),
+    ],
 )
-def test_official_arcface_role_failure_is_explicit_null_and_hard_fails(
+def test_official_arcface_pairs_are_independent_and_role_failure_hard_fails(
+    source_count: int,
     native_count: int,
     candidate_count: int,
+    expected: tuple[float | None, float | None],
 ) -> None:
     materializer = _module(MATERIALIZER, "r11_materializer")
     official_row = {
-        "source_face_count": 1,
+        "source_face_count": source_count,
         "native_face_count": native_count,
         "candidate_face_count": candidate_count,
+        "source_native_cosine": (
+            0.40 if source_count == native_count == 1 else None
+        ),
+        "source_candidate_cosine": (
+            0.39 if source_count == candidate_count == 1 else None
+        ),
     }
     assert materializer._identity_cosines(
         official_row, label="ArcFace"
-    ) == (None, None)
+    ) == expected
     result = evaluate_arms(
         [
             {
                 "arm_id": "eta025_tail32",
                 "rows": _rows(
                     32,
+                    source_face_count=source_count,
                     native_face_count=native_count,
                     candidate_face_count=candidate_count,
                 ),
@@ -237,12 +297,19 @@ def test_official_arcface_role_failure_is_explicit_null_and_hard_fails(
         native_kid=None,
         baseline_arm_id="eta025_tail32",
     )[0]
-    assert not result.hard_gate_pass
-    assert result.arcface_delta is None
-    expected_gate = (
-        "native_exact_one" if native_count != 1 else "candidate_exact_one"
-    )
-    assert expected_gate in result.failed_gates
+    if (source_count, native_count, candidate_count) == (1, 1, 1):
+        assert result.arcface_delta == pytest.approx(-0.01)
+    else:
+        assert not result.hard_gate_pass
+        assert result.arcface_delta is None
+        expected_gate = (
+            "source_exact_one"
+            if source_count != 1
+            else "native_exact_one"
+            if native_count != 1
+            else "candidate_exact_one"
+        )
+        assert expected_gate in result.failed_gates
 
 
 def test_direct_meanflow_representation_has_no_aliases_and_kid_cli_is_exact() -> None:

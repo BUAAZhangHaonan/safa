@@ -1,5 +1,5 @@
 {
-  "contract_type": "safa_r11_official_evaluation_preparation_v1",
+  "contract_type": "safa_r11_official_evaluation_preparation_v2",
   "datasets": [
     {
       "commands": {
@@ -133,14 +133,524 @@
     }
   ],
   "expected_arcface_request_count": 4,
+  "expected_quality_job_count": 6,
   "formal_arcface_template": {
     "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/full/evaluator_runs/arcface/winner/request.json",
     "sha256": "6f49e48cd5c25fccc365f4c025f64c326de96c204e41a66f248404cc0fd70236"
+  },
+  "gpu_bindings": [
+    {
+      "physical_index": 0,
+      "uuid": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+    },
+    {
+      "physical_index": 1,
+      "uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+    },
+    {
+      "physical_index": 2,
+      "uuid": "GPU-e27fe71d-eaf7-3eb5-d0ff-c1c63b4f6b02"
+    },
+    {
+      "physical_index": 3,
+      "uuid": "GPU-61ea2925-9905-7f56-cd64-7a792a32efef"
+    }
+  ],
+  "launch_jobs": [
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_r11_quality_evaluation.py",
+        "--real-index",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/data/index/val_face_mixed_e14.jsonl",
+        "--generated-dir",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/runs_v1/eta025_prefix128/native_images",
+        "--output",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/quality/native/quality.json",
+        "--sample-id-manifest",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/prefix128.jsonl",
+        "--per-sample-jsonl",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/inputs/native_per_sample.jsonl",
+        "--kid-subset-size",
+        "127",
+        "--seed",
+        "1337",
+        "--device",
+        "cuda:0",
+        "--metrics",
+        "fid",
+        "kid",
+        "niqe",
+        "sharpness"
+      ],
+      "dataset_id": "prefix128",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+      },
+      "fresh_output_paths": [
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/quality/native/quality.json",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/logs/quality__native.log"
+      ],
+      "input_paths": [
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/prefix128.jsonl",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/inputs/native_per_sample.jsonl"
+      ],
+      "job_id": "quality__prefix128__native",
+      "kind": "quality",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/logs/quality__native.log",
+      "logical_device": "cuda:0",
+      "output_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/quality/native/quality.json",
+      "physical_gpu": {
+        "physical_index": 0,
+        "uuid": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+      },
+      "quality_output_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/quality/native/quality.json",
+      "retry_count": 0,
+      "role": "native",
+      "wave": "A"
+    },
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_r11_quality_evaluation.py",
+        "--real-index",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/data/index/val_face_mixed_e14.jsonl",
+        "--generated-dir",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/runs_v1/eta025_prefix128/generated_images",
+        "--output",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/quality/eta025_prefix128/quality.json",
+        "--sample-id-manifest",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/prefix128.jsonl",
+        "--per-sample-jsonl",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/runs_v1/eta025_prefix128/per_sample.jsonl",
+        "--generation-result",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/runs_v1/eta025_prefix128/generation_result.json",
+        "--kid-subset-size",
+        "127",
+        "--seed",
+        "1337",
+        "--device",
+        "cuda:0",
+        "--metrics",
+        "fid",
+        "kid",
+        "niqe",
+        "sharpness"
+      ],
+      "dataset_id": "prefix128",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "fresh_output_paths": [
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/quality/eta025_prefix128/quality.json",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/logs/quality__eta025_prefix128.log"
+      ],
+      "input_paths": [
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/prefix128.jsonl",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/runs_v1/eta025_prefix128/per_sample.jsonl"
+      ],
+      "job_id": "quality__prefix128__eta025_prefix128",
+      "kind": "quality",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/logs/quality__eta025_prefix128.log",
+      "logical_device": "cuda:0",
+      "output_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/quality/eta025_prefix128/quality.json",
+      "physical_gpu": {
+        "physical_index": 1,
+        "uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "quality_output_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/quality/eta025_prefix128/quality.json",
+      "retry_count": 0,
+      "role": "eta025_prefix128",
+      "wave": "A"
+    },
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_r11_quality_evaluation.py",
+        "--real-index",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/data/index/val_face_mixed_e14.jsonl",
+        "--generated-dir",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/runs_v1/eta05_prefix128/generated_images",
+        "--output",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/quality/eta05_prefix128/quality.json",
+        "--sample-id-manifest",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/prefix128.jsonl",
+        "--per-sample-jsonl",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/runs_v1/eta05_prefix128/per_sample.jsonl",
+        "--generation-result",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/runs_v1/eta05_prefix128/generation_result.json",
+        "--kid-subset-size",
+        "127",
+        "--seed",
+        "1337",
+        "--device",
+        "cuda:0",
+        "--metrics",
+        "fid",
+        "kid",
+        "niqe",
+        "sharpness"
+      ],
+      "dataset_id": "prefix128",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-e27fe71d-eaf7-3eb5-d0ff-c1c63b4f6b02"
+      },
+      "fresh_output_paths": [
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/quality/eta05_prefix128/quality.json",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/logs/quality__eta05_prefix128.log"
+      ],
+      "input_paths": [
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/prefix128.jsonl",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/runs_v1/eta05_prefix128/per_sample.jsonl"
+      ],
+      "job_id": "quality__prefix128__eta05_prefix128",
+      "kind": "quality",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/logs/quality__eta05_prefix128.log",
+      "logical_device": "cuda:0",
+      "output_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/quality/eta05_prefix128/quality.json",
+      "physical_gpu": {
+        "physical_index": 2,
+        "uuid": "GPU-e27fe71d-eaf7-3eb5-d0ff-c1c63b4f6b02"
+      },
+      "quality_output_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/quality/eta05_prefix128/quality.json",
+      "retry_count": 0,
+      "role": "eta05_prefix128",
+      "wave": "A"
+    },
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_r9_phase_evaluator.py",
+        "--request",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/arcface/eta025_prefix128/request.json",
+        "--output",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/arcface/eta025_prefix128/result.json"
+      ],
+      "dataset_id": "prefix128",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-e27fe71d-eaf7-3eb5-d0ff-c1c63b4f6b02"
+      },
+      "fresh_output_paths": [
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/arcface/eta025_prefix128/result.json",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/logs/arcface__eta025_prefix128.log"
+      ],
+      "input_paths": [
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/arcface/eta025_prefix128/request.json"
+      ],
+      "job_id": "arcface__prefix128__eta025_prefix128",
+      "kind": "arcface",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/logs/arcface__eta025_prefix128.log",
+      "logical_device": "cuda:0",
+      "output_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/arcface/eta025_prefix128/result.json",
+      "physical_gpu": {
+        "physical_index": 2,
+        "uuid": "GPU-e27fe71d-eaf7-3eb5-d0ff-c1c63b4f6b02"
+      },
+      "request_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/arcface/eta025_prefix128/request.json",
+      "result_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/arcface/eta025_prefix128/result.json",
+      "retry_count": 0,
+      "role": "eta025_prefix128",
+      "wave": "B"
+    },
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_r9_phase_evaluator.py",
+        "--request",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/arcface/eta05_prefix128/request.json",
+        "--output",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/arcface/eta05_prefix128/result.json"
+      ],
+      "dataset_id": "prefix128",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-61ea2925-9905-7f56-cd64-7a792a32efef"
+      },
+      "fresh_output_paths": [
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/arcface/eta05_prefix128/result.json",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/logs/arcface__eta05_prefix128.log"
+      ],
+      "input_paths": [
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/arcface/eta05_prefix128/request.json"
+      ],
+      "job_id": "arcface__prefix128__eta05_prefix128",
+      "kind": "arcface",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/logs/arcface__eta05_prefix128.log",
+      "logical_device": "cuda:0",
+      "output_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/arcface/eta05_prefix128/result.json",
+      "physical_gpu": {
+        "physical_index": 3,
+        "uuid": "GPU-61ea2925-9905-7f56-cd64-7a792a32efef"
+      },
+      "request_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/arcface/eta05_prefix128/request.json",
+      "result_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/arcface/eta05_prefix128/result.json",
+      "retry_count": 0,
+      "role": "eta05_prefix128",
+      "wave": "B"
+    },
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_r11_quality_evaluation.py",
+        "--real-index",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/data/index/val_face_mixed_e14.jsonl",
+        "--generated-dir",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/runs_v1/eta025_tail32/native_images",
+        "--output",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/quality/native/quality.json",
+        "--sample-id-manifest",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/preparation_v1/tail32.jsonl",
+        "--per-sample-jsonl",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/inputs/native_per_sample.jsonl",
+        "--seed",
+        "1337",
+        "--device",
+        "cuda:0",
+        "--metrics",
+        "niqe",
+        "sharpness"
+      ],
+      "dataset_id": "sharpness_tail32",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-61ea2925-9905-7f56-cd64-7a792a32efef"
+      },
+      "fresh_output_paths": [
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/quality/native/quality.json",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/logs/quality__native.log"
+      ],
+      "input_paths": [
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/preparation_v1/tail32.jsonl",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/inputs/native_per_sample.jsonl"
+      ],
+      "job_id": "quality__sharpness_tail32__native",
+      "kind": "quality",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/logs/quality__native.log",
+      "logical_device": "cuda:0",
+      "output_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/quality/native/quality.json",
+      "physical_gpu": {
+        "physical_index": 3,
+        "uuid": "GPU-61ea2925-9905-7f56-cd64-7a792a32efef"
+      },
+      "quality_output_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/quality/native/quality.json",
+      "retry_count": 0,
+      "role": "native",
+      "wave": "A"
+    },
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_r11_quality_evaluation.py",
+        "--real-index",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/data/index/val_face_mixed_e14.jsonl",
+        "--generated-dir",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/runs_v1/eta025_tail32/generated_images",
+        "--output",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/quality/eta025_tail32/quality.json",
+        "--sample-id-manifest",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/preparation_v1/tail32.jsonl",
+        "--per-sample-jsonl",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/runs_v1/eta025_tail32/per_sample.jsonl",
+        "--generation-result",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/runs_v1/eta025_tail32/generation_result.json",
+        "--seed",
+        "1337",
+        "--device",
+        "cuda:0",
+        "--metrics",
+        "niqe",
+        "sharpness"
+      ],
+      "dataset_id": "sharpness_tail32",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+      },
+      "fresh_output_paths": [
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/quality/eta025_tail32/quality.json",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/logs/quality__eta025_tail32.log"
+      ],
+      "input_paths": [
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/preparation_v1/tail32.jsonl",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/runs_v1/eta025_tail32/per_sample.jsonl"
+      ],
+      "job_id": "quality__sharpness_tail32__eta025_tail32",
+      "kind": "quality",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/logs/quality__eta025_tail32.log",
+      "logical_device": "cuda:0",
+      "output_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/quality/eta025_tail32/quality.json",
+      "physical_gpu": {
+        "physical_index": 0,
+        "uuid": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+      },
+      "quality_output_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/quality/eta025_tail32/quality.json",
+      "retry_count": 0,
+      "role": "eta025_tail32",
+      "wave": "B"
+    },
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_r11_quality_evaluation.py",
+        "--real-index",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/data/index/val_face_mixed_e14.jsonl",
+        "--generated-dir",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/runs_v1/eta05_tail32/generated_images",
+        "--output",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/quality/eta05_tail32/quality.json",
+        "--sample-id-manifest",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/preparation_v1/tail32.jsonl",
+        "--per-sample-jsonl",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/runs_v1/eta05_tail32/per_sample.jsonl",
+        "--generation-result",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/runs_v1/eta05_tail32/generation_result.json",
+        "--seed",
+        "1337",
+        "--device",
+        "cuda:0",
+        "--metrics",
+        "niqe",
+        "sharpness"
+      ],
+      "dataset_id": "sharpness_tail32",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "fresh_output_paths": [
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/quality/eta05_tail32/quality.json",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/logs/quality__eta05_tail32.log"
+      ],
+      "input_paths": [
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/preparation_v1/tail32.jsonl",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/runs_v1/eta05_tail32/per_sample.jsonl"
+      ],
+      "job_id": "quality__sharpness_tail32__eta05_tail32",
+      "kind": "quality",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/logs/quality__eta05_tail32.log",
+      "logical_device": "cuda:0",
+      "output_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/quality/eta05_tail32/quality.json",
+      "physical_gpu": {
+        "physical_index": 1,
+        "uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "quality_output_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/quality/eta05_tail32/quality.json",
+      "retry_count": 0,
+      "role": "eta05_tail32",
+      "wave": "B"
+    },
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_r9_phase_evaluator.py",
+        "--request",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/arcface/eta025_tail32/request.json",
+        "--output",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/arcface/eta025_tail32/result.json"
+      ],
+      "dataset_id": "sharpness_tail32",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+      },
+      "fresh_output_paths": [
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/arcface/eta025_tail32/result.json",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/logs/arcface__eta025_tail32.log"
+      ],
+      "input_paths": [
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/arcface/eta025_tail32/request.json"
+      ],
+      "job_id": "arcface__sharpness_tail32__eta025_tail32",
+      "kind": "arcface",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/logs/arcface__eta025_tail32.log",
+      "logical_device": "cuda:0",
+      "output_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/arcface/eta025_tail32/result.json",
+      "physical_gpu": {
+        "physical_index": 0,
+        "uuid": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+      },
+      "request_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/arcface/eta025_tail32/request.json",
+      "result_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/arcface/eta025_tail32/result.json",
+      "retry_count": 0,
+      "role": "eta025_tail32",
+      "wave": "C"
+    },
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_r9_phase_evaluator.py",
+        "--request",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/arcface/eta05_tail32/request.json",
+        "--output",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/arcface/eta05_tail32/result.json"
+      ],
+      "dataset_id": "sharpness_tail32",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "fresh_output_paths": [
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/arcface/eta05_tail32/result.json",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/logs/arcface__eta05_tail32.log"
+      ],
+      "input_paths": [
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/arcface/eta05_tail32/request.json"
+      ],
+      "job_id": "arcface__sharpness_tail32__eta05_tail32",
+      "kind": "arcface",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/logs/arcface__eta05_tail32.log",
+      "logical_device": "cuda:0",
+      "output_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/arcface/eta05_tail32/result.json",
+      "physical_gpu": {
+        "physical_index": 1,
+        "uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "request_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/arcface/eta05_tail32/request.json",
+      "result_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/arcface/eta05_tail32/result.json",
+      "retry_count": 0,
+      "role": "eta05_tail32",
+      "wave": "C"
+    }
+  ],
+  "launch_waves": [
+    {
+      "job_ids": [
+        "quality__prefix128__native",
+        "quality__prefix128__eta025_prefix128",
+        "quality__prefix128__eta05_prefix128",
+        "quality__sharpness_tail32__native"
+      ],
+      "wave": "A"
+    },
+    {
+      "job_ids": [
+        "arcface__prefix128__eta025_prefix128",
+        "arcface__prefix128__eta05_prefix128",
+        "quality__sharpness_tail32__eta025_tail32",
+        "quality__sharpness_tail32__eta05_tail32"
+      ],
+      "wave": "B"
+    },
+    {
+      "job_ids": [
+        "arcface__sharpness_tail32__eta025_tail32",
+        "arcface__sharpness_tail32__eta05_tail32"
+      ],
+      "wave": "C"
+    }
+  ],
+  "r11_arcface_worker": {
+    "implementation": {
+      "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/src/safa/evaluation/r9_evaluator_worker.py",
+      "sha256": "1eff291bdc06e0371e249eb547e06a86804a93d7a0367452d7c1c82f89f7a9a3"
+    },
+    "output_contract": "safa_r11_arcface_evaluator_output_v1",
+    "pair_policy": "pairwise_exact_one_v1",
+    "request_contract": "safa_r11_arcface_evaluator_request_v1",
+    "wrapper": {
+      "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/scripts/run_r9_phase_evaluator.py",
+      "sha256": "1e7be33cd517305d4e18a094ab643993fff79f95dbaf970e5c31f67c901cda42"
+    }
   },
   "real_index": {
     "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/data/index/val_face_mixed_e14.jsonl",
     "sha256": "da14e23eacefecbc2948d1374fb93961a13d017a9183aa1fe2a2f62b33a4b4ea"
   },
+  "retry_count": 0,
   "run_contracts": {
     "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/preparation_v1/run_contracts.json",
     "sha256": "b8fa49398ddf5ebf05bdec9cdc5a27eed9b61054a5522692988219f517bf39f4"

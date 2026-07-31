@@ -164,9 +164,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             argv.extend(["--generation-result", str(generation_result)])
         if "kid" in metrics:
             argv.extend(["--kid-subset-size", str(arm_set.sample_count - 1)])
+        if (
+            arm_set.contract_type
+            != "safa_r11_initial_noise_evaluation_dataset_v1"
+        ):
+            argv.append("--reuse-valid-output")
         argv.extend(
             [
-                "--reuse-valid-output",
                 "--seed",
                 str(arm_set.seed),
                 "--device",
