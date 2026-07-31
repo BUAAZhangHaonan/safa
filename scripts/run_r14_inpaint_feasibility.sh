@@ -3,9 +3,9 @@ set -euo pipefail
 
 REPO_ROOT="/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization"
 PYTHON_BIN="/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python"
-CONFIG="configs/medium_v2/experiments/r14_inpaint_feasibility_256step.yaml"
+CONFIG="configs/medium_v2/experiments/r14_inpaint_feasibility_2560step.yaml"
 ARTIFACT_ROOT="artifacts/r14_inpaint_feasibility/v1"
-CHECKPOINT_ROOT="checkpoints/r14_inpaint_feasibility_256step"
+CHECKPOINT_ROOT="checkpoints/r14_inpaint_feasibility_2560step"
 SESSION="safa-r14-inpaint-v1"
 LOG="$ARTIFACT_ROOT/logs/pipeline.log"
 GPU_LIST="0,1,2,3"

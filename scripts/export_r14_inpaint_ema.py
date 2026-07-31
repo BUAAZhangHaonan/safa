@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export the only R14 256-step EMA without optimizer state."""
+"""Export the only R14 20-epoch/2560-step EMA without optimizer state."""
 from __future__ import annotations
 
 import argparse
@@ -36,8 +36,8 @@ def main() -> None:
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True, mmap=True)
     payload = _mapping(checkpoint, "checkpoint")
     metrics = _mapping(payload.get("metrics"), "checkpoint.metrics")
-    if metrics.get("global_step") != 256:
-        raise RuntimeError(f"R14 checkpoint must end at optimizer step 256, got {metrics.get('global_step')!r}")
+    if metrics.get("global_step") != 2560:
+        raise RuntimeError(f"R14 checkpoint must end at optimizer step 2560, got {metrics.get('global_step')!r}")
     model_config = _mapping(payload.get("model_config"), "checkpoint.model_config")
     if model_config.get("model_type") != "meanflow_sit_inpaint":
         raise RuntimeError("R14 checkpoint model_type must be meanflow_sit_inpaint")
@@ -78,7 +78,7 @@ def main() -> None:
         "schema_version": 1,
         "contract_type": "safa_r14_inpaint_ema_export_metadata_v1",
         "checkpoint_model": "ema",
-        "optimizer_steps": 256,
+        "optimizer_steps": 2560,
         "source_checkpoint": str(args.checkpoint),
         "output": str(args.output),
         "state_tensor_count": len(ema),

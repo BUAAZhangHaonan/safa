@@ -67,6 +67,12 @@ def main() -> None:
         "contract_type": "safa_r14_inpaint_feasibility_closeout_v1",
         "classification": classification,
         "reason": reason,
+        "training_contract": {
+            "epochs": 20,
+            "optimizer_steps": 2560,
+            "global_batch_size": 8,
+            "per_device_batch_size": 2,
+        },
         "regular32_gate": dict(gate),
         "metrics": evaluation.get("metrics"),
         "visual8": {
@@ -83,11 +89,13 @@ def main() -> None:
         handle.write("\n")
     conclusion = "\n".join(
         (
-            "# R14 face-region inpainting feasibility",
+            "# R14 20-epoch face-region inpainting feasibility",
             "",
             f"Classification: `{classification}`.",
             "",
             reason,
+            "",
+            "The only training arm ran 20 epochs and exactly 2,560 optimizer steps at global batch 8.",
             "",
             "This is regular32 feasibility evidence only. It is not a screening survivor, privacy proof, Full success, or formal winner.",
             "",

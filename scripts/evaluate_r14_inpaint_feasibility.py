@@ -143,7 +143,7 @@ def _official_arcface(rows: Sequence[Mapping[str, object]], output: Path) -> Map
     request = ArcFaceEvaluationRequest(
         phase="diagnose",
         logical_run_id="r14_inpaint_feasibility_regular32",
-        arm_id="r14_inpaint_256step",
+        arm_id="r14_inpaint_20ep_2560step",
         seed=91637,
         source_index_path=source_index_path,
         source_index_sha256=source_index_sha256,

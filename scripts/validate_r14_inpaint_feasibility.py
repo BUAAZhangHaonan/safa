@@ -16,9 +16,9 @@ import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-CONFIG = Path("configs/medium_v2/experiments/r14_inpaint_feasibility_256step.yaml")
+CONFIG = Path("configs/medium_v2/experiments/r14_inpaint_feasibility_2560step.yaml")
 ARTIFACT_ROOT = Path("artifacts/r14_inpaint_feasibility/v1")
-CHECKPOINT_ROOT = Path("checkpoints/r14_inpaint_feasibility_256step")
+CHECKPOINT_ROOT = Path("checkpoints/r14_inpaint_feasibility_2560step")
 SESSION = "safa-r14-inpaint-v1"
 E15_PATH = Path(
     "artifacts/checkpoints/e15_meanflow_sit_b_face_mixed_h100_resume_2400ep/"
@@ -114,7 +114,7 @@ def _validate_config(path: Path) -> None:
         _require_equal(config.get(key), expected, f"config.{key}")
     _require_equal(
         config.get("optimizer_step_contract"),
-        {"contract_type": "safa_r14_exact_optimizer_steps_v1", "required_steps": 256},
+        {"contract_type": "safa_r14_exact_optimizer_steps_v1", "required_steps": 2560},
         "config.optimizer_step_contract",
     )
     _require_equal(_mapping(config.get("distributed"), "config.distributed").get("backend"), "nccl", "config.distributed.backend")
@@ -147,7 +147,7 @@ def _validate_config(path: Path) -> None:
         _require_equal(data.get(key), expected, f"config.r14_spatial.{key}")
     stages = _mapping(config.get("stages"), "config.stages")
     stage2 = _mapping(stages.get("stage2"), "config.stages.stage2")
-    _require_equal(stage2.get("epochs"), 2, "config.stages.stage2.epochs")
+    _require_equal(stage2.get("epochs"), 20, "config.stages.stage2.epochs")
     _require_equal(config.get("train_index"), "data/index/train_face_mixed_e14_4029avail.jsonl", "config.train_index")
     _require_equal(config.get("train_features"), "artifacts/e0_features/train_face_mixed_e14_e0_medium_v1", "config.train_features")
     _require_equal(config.get("eval_index"), "data/index/val_face_mixed_e14.jsonl", "config.eval_index")
@@ -291,10 +291,10 @@ def validate_static() -> None:
     preparation = _read_json(REPO_ROOT / ARTIFACT_ROOT / "manifests/preparation_summary.json")
     _require_equal(preparation.get("train_pair_count"), 1024, "preparation.train_pair_count")
     _require_equal(preparation.get("global_batch_size"), 8, "preparation.global_batch_size")
-    _require_equal(preparation.get("optimizer_steps"), 256, "preparation.optimizer_steps")
+    _require_equal(preparation.get("optimizer_steps"), 2560, "preparation.optimizer_steps")
     _require_equal(
-        _optimizer_steps_from_geometry(1024, 8, 2),
-        256,
+        _optimizer_steps_from_geometry(1024, 8, 20),
+        2560,
         "R14 optimizer-step geometry",
     )
     eval_ids = regular_ids
@@ -433,7 +433,7 @@ def validate_artifact(stage: str) -> None:
             raise R14LaunchError("training did not produce a non-empty last.pt")
         payload = _read_json(REPO_ROOT / CHECKPOINT_ROOT / "completion.json")
         _require_equal(payload.get("contract_type"), "safa_r14_inpaint_exact_optimizer_steps_v1", "train.contract_type")
-        _require_equal(payload.get("optimizer_steps"), 256, "train.optimizer_steps")
+        _require_equal(payload.get("optimizer_steps"), 2560, "train.optimizer_steps")
         _require_equal(payload.get("completed"), True, "train.completed")
         _require_equal(payload.get("ema_available"), True, "train.ema_available")
     elif stage == "export":
@@ -442,7 +442,7 @@ def validate_artifact(stage: str) -> None:
             raise R14LaunchError("EMA export is missing or empty")
         payload = _read_json(REPO_ROOT / CHECKPOINT_ROOT / "final_ema.json")
         _require_equal(payload.get("checkpoint_model"), "ema", "export.checkpoint_model")
-        _require_equal(payload.get("optimizer_steps"), 256, "export.optimizer_steps")
+        _require_equal(payload.get("optimizer_steps"), 2560, "export.optimizer_steps")
     elif stage == "generation":
         payload = _read_json(root / "regular32_generation/completion.json")
         _require_equal(payload.get("sample_count"), 32, "generation.sample_count")
@@ -482,6 +482,16 @@ def validate_artifact(stage: str) -> None:
         }
         if payload.get("classification") not in allowed:
             raise R14LaunchError("R14 conclusion classification is missing or unlocked")
+        _require_equal(
+            payload.get("training_contract"),
+            {
+                "epochs": 20,
+                "optimizer_steps": 2560,
+                "global_batch_size": 8,
+                "per_device_batch_size": 2,
+            },
+            "conclusion.training_contract",
+        )
         if not (root / "conclusion.md").is_file():
             raise R14LaunchError("R14 conclusion.md is missing")
     else:

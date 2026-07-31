@@ -64,15 +64,17 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
 
 
 def test_locked_config_validates() -> None:
-    path = REPO / "configs/medium_v2/experiments/r14_inpaint_feasibility_256step.yaml"
+    path = REPO / "configs/medium_v2/experiments/r14_inpaint_feasibility_2560step.yaml"
     validator._validate_config(path)
     config = yaml.safe_load(path.read_text(encoding="utf-8"))
     _validate_train_g_config(config)
     assert config["amp"] is False
     assert config["global_batch_size"] == 8
     assert config["per_device_batch_size"] == 2
-    assert config["stages"]["stage2"]["epochs"] == 2
-    assert validator._optimizer_steps_from_geometry(1024, 8, 2) == 256
+    assert config["stages"]["stage2"]["epochs"] == 20
+    assert config["optimizer_step_contract"]["required_steps"] == 2560
+    assert config["optimizer_checkpoint_contract"]["save_steps"] == [0, 2560]
+    assert validator._optimizer_steps_from_geometry(1024, 8, 20) == 2560
     assert config["generator"]["inpaint"]["conditioning"] == "cached_source_z_only"
     assert config["eval_index"] == "data/index/val_face_mixed_e14.jsonl"
     assert config["eval_features"] == "artifacts/e0_features/val_face_mixed_e14_e0_medium_v1"

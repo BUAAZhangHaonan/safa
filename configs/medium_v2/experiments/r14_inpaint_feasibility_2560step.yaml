@@ -1,4 +1,4 @@
-experiment_name: r14_inpaint_feasibility_256step
+experiment_name: r14_inpaint_feasibility_2560step
 r14_contract: safa_r14_face_region_inpaint_feasibility_v1
 seed: 1337
 sampling_seed: 1337
@@ -31,7 +31,7 @@ r14_pairing:
   expression_relation: same
   identity_relation: different_sample_id
   require_source_target_distinct: true
-out_dir: checkpoints/r14_inpaint_feasibility_256step
+out_dir: checkpoints/r14_inpaint_feasibility_2560step
 allow_stage2_without_stage1_gate: true
 resume_from: artifacts/checkpoints/e15_meanflow_sit_b_face_mixed_h100_resume_2400ep/last_nopretrained.pt
 resume_from_sha256: 4690717781db58a6021d57d124300a9b212f0a5043cf3028fb5de4d9c835cc4d
@@ -41,10 +41,10 @@ resume_optimizer_state: false
 generator_trainable: full
 optimizer_step_contract:
   contract_type: safa_r14_exact_optimizer_steps_v1
-  required_steps: 256
+  required_steps: 2560
 optimizer_checkpoint_contract:
   contract_type: safa_r14_optimizer_checkpoint_steps_v1
-  save_steps: [0, 256]
+  save_steps: [0, 2560]
 ema:
   enabled: true
   decay: 0.9999
@@ -100,7 +100,7 @@ stages:
     epochs: 0
     require_face_detection_gate: false
   stage2:
-    epochs: 2
+    epochs: 20
     gradient_monitor:
       enabled: false
       interval: 20

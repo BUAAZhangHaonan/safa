@@ -4,7 +4,7 @@
   "eval_role": "single_S_cached_affect_original_context_mask",
   "global_batch_size": 8,
   "morphology": null,
-  "optimizer_steps": 256,
+  "optimizer_steps": 2560,
   "pairing_seed": 1337,
   "regular32_count": 32,
   "schema_version": 1,
