@@ -97,6 +97,8 @@ R9_EDEV_PHASES = (
     "confirm512",
     "full",
 )
+R11_CAUSAL_CONTRACT_TYPE = "safa_r11_transport_only_nfe5_v1"
+R11_EXTERNAL_NATIVE_CONTRACT_TYPE = "safa_r11_causal_external_native_v1"
 
 
 @dataclass(frozen=True)
@@ -328,7 +330,154 @@ def validate_guidance_config(config: Mapping[str, Any]) -> dict[str, Any]:
             validate_r9_semigroup_preflight_config(resolved)
     else:
         validate_r9_interval_guidance_config(resolved, mode=mode)
+    _validate_r11_causal_config(resolved)
     return resolved
+
+
+def _validate_r11_causal_config(
+    config: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    contract_type = config.get("causal_contract_type")
+    external = config.get("external_native_contract")
+    if contract_type is None and external is None:
+        return None
+    if contract_type != R11_CAUSAL_CONTRACT_TYPE:
+        raise ValueError(
+            f"causal_contract_type must be {R11_CAUSAL_CONTRACT_TYPE!r}"
+        )
+    if config.get("arm_name") != "transport_only_nfe5":
+        raise ValueError("R11 causal contract requires arm_name='transport_only_nfe5'")
+    if config.get("mode") != "paper_algorithm_split":
+        raise ValueError("R11 causal contract requires paper_algorithm_split mode")
+    if config.get("phase") != "calibrate":
+        raise ValueError("R11 causal contract requires the R9 calibrate phase")
+    if int(config.get("sampling_seed", config.get("seed", -1))) != 7919:
+        raise ValueError("R11 causal contract requires formal sampling_seed=7919")
+    interval = validate_r9_interval_guidance_config(config)
+    if interval is None:
+        raise ValueError("R11 causal contract requires the R9 interval contract")
+    if interval["active_guidance_intervals"] != []:
+        raise ValueError("R11 causal contract requires active_guidance_intervals=[]")
+    if int(interval["expected_algorithm_nfe"]) != 5:
+        raise ValueError("R11 causal contract requires expected algorithm NFE=5")
+    if not _edev_required_for_config(config):
+        raise ValueError("R11 causal contract requires effective Edev scoring")
+    if not isinstance(external, Mapping):
+        raise ValueError("R11 causal contract requires external_native_contract")
+    if external.get("schema_version") != 1:
+        raise ValueError("external_native_contract.schema_version must be 1")
+    if external.get("contract_type") != R11_EXTERNAL_NATIVE_CONTRACT_TYPE:
+        raise ValueError(
+            "external_native_contract.contract_type must be "
+            f"{R11_EXTERNAL_NATIVE_CONTRACT_TYPE!r}"
+        )
+    required = {
+        "schema_version",
+        "contract_type",
+        "manifest",
+        "manifest_sha256",
+        "sample_count",
+        "ordered_sample_id_sha256",
+    }
+    if set(external) != required:
+        raise ValueError(
+            "external_native_contract fields must be exactly "
+            f"{sorted(required)!r}"
+        )
+    if not str(external.get("manifest", "")).strip():
+        raise ValueError("external_native_contract.manifest must be non-empty")
+    _require_sha256(
+        external.get("manifest_sha256"),
+        "external_native_contract.manifest_sha256",
+    )
+    _require_sha256(
+        external.get("ordered_sample_id_sha256"),
+        "external_native_contract.ordered_sample_id_sha256",
+    )
+    _positive_int(
+        external.get("sample_count"),
+        "external_native_contract.sample_count",
+    )
+    return dict(external)
+
+
+def _load_external_native_bindings(
+    config: Mapping[str, Any],
+    selected: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]] | None]:
+    contract = _validate_r11_causal_config(config)
+    if contract is None:
+        return None, None
+    manifest_path = _repository_relative_candidate(contract["manifest"])
+    if _digest_path(manifest_path) != contract["manifest_sha256"]:
+        raise ValueError("external native manifest SHA-256 disagrees with contract")
+    rows = _read_optional_jsonl(manifest_path)
+    if len(rows) != int(contract["sample_count"]):
+        raise ValueError("external native manifest sample_count disagrees with contract")
+    expected_ids = [str(row["sample_id"]) for row in selected]
+    actual_ids = [str(row.get("sample_id", "")) for row in rows]
+    if actual_ids != expected_ids:
+        raise ValueError(
+            "external native manifest IDs/order disagree with deterministic shard"
+        )
+    actual_id_digest = _sample_id_digest(actual_ids)
+    if actual_id_digest != contract["ordered_sample_id_sha256"]:
+        raise ValueError(
+            "external native manifest ordered sample-ID SHA-256 disagrees with contract"
+        )
+    required_fields = {
+        "ordinal",
+        "sample_id",
+        "source",
+        "source_sha256",
+        "native",
+        "native_sha256",
+        "e0_cosine",
+        "edev_cosine",
+    }
+    bound_rows: list[dict[str, Any]] = []
+    for ordinal, (manifest_row, selected_row) in enumerate(
+        zip(rows, selected, strict=True)
+    ):
+        if set(manifest_row) != required_fields:
+            raise ValueError(
+                f"external native manifest row {ordinal} fields must be exactly "
+                f"{sorted(required_fields)!r}"
+            )
+        if manifest_row["ordinal"] != ordinal:
+            raise ValueError(
+                f"external native manifest row {ordinal} has wrong ordinal"
+            )
+        source_path = _repository_relative_candidate(manifest_row["source"])
+        selected_source = _repository_relative_candidate(selected_row["source"])
+        if source_path.resolve() != selected_source.resolve():
+            raise ValueError(
+                f"external native source binding mismatch at ordinal {ordinal}"
+            )
+        native_path = _repository_relative_candidate(manifest_row["native"])
+        for label, path, digest in (
+            ("source", source_path, manifest_row["source_sha256"]),
+            ("native", native_path, manifest_row["native_sha256"]),
+        ):
+            _require_sha256(digest, f"external native row {ordinal} {label}_sha256")
+            if _digest_path(path) != digest:
+                raise ValueError(
+                    f"external native row {ordinal} {label} SHA-256 mismatch"
+                )
+        for field in ("e0_cosine", "edev_cosine"):
+            value = float(manifest_row[field])
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"external native row {ordinal} {field} must be finite"
+                )
+        bound_rows.append(
+            {
+                **manifest_row,
+                "source": str(source_path),
+                "native": str(native_path),
+            }
+        )
+    return contract, bound_rows
 
 
 def finalize_effective_guidance_config(
@@ -1356,6 +1505,10 @@ def run_guidance_records(
                 "R9 run requires the validated interval guidance contract from config preflight"
             )
         assert_r9_strict_cuda_determinism(torch_module=torch)
+    external_native_contract, external_native_rows = _load_external_native_bindings(
+        resolved_config, selected
+    )
+    uses_external_native = external_native_rows is not None
     resolved_config = _bind_arm_config_digest(resolved_config)
     generated_dir = output / "generated_images"
     native_dir = output / "native_images"
@@ -1384,7 +1537,7 @@ def run_guidance_records(
         session_journal_path,
         completion_path,
     ]
-    if mode != "native":
+    if mode != "native" and not uses_external_native:
         owned_paths.append(native_dir)
     if mode == "semigroup":
         owned_paths.extend((semigroup_path, semigroup_split_dir))
@@ -1402,6 +1555,7 @@ def run_guidance_records(
         output,
         mode=mode,
         contact_sheets=contact_enabled,
+        external_native=uses_external_native,
     )
     edev_required = _edev_required_for_config(resolved_config)
     if edev_required and runtime.edev is None:
@@ -1413,7 +1567,7 @@ def run_guidance_records(
     output.mkdir(parents=True, exist_ok=True)
     _require_safe_output_root(output)
     _prepare_owned_directory(output, generated_dir, "generated image directory")
-    if mode != "native":
+    if mode != "native" and not uses_external_native:
         _prepare_owned_directory(output, native_dir, "native image directory")
     if mode == "semigroup":
         _prepare_owned_directory(
@@ -1470,6 +1624,7 @@ def run_guidance_records(
         },
         "heldout_e1": runtime.heldout_e1,
         "heldout_e2": runtime.heldout_e2,
+        "external_native_contract": external_native_contract,
         "r9_execution_contract": r9_execution_contract,
         "seed": int(
             resolved_config.get("sampling_seed", resolved_config.get("seed", 0))
@@ -1519,7 +1674,11 @@ def run_guidance_records(
 
     completed_rows = _read_optional_jsonl(per_sample_path)
     expected_bindings = _expected_row_bindings(
-        selected, generated_dir, native_dir, mode
+        selected,
+        generated_dir,
+        native_dir,
+        mode,
+        external_native_rows=external_native_rows,
     )
     semigroup_split_bindings = (
         _expected_semigroup_split_bindings(
@@ -1532,7 +1691,7 @@ def run_guidance_records(
     )
     for binding in expected_bindings:
         _require_contained(output, Path(str(binding["generated"])), "generated image")
-        if mode != "native":
+        if mode != "native" and not uses_external_native:
             _require_contained(output, Path(str(binding["native"])), "native image")
     _validate_resume_rows(
         completed_rows,
@@ -1548,6 +1707,7 @@ def run_guidance_records(
         expected_bindings=expected_bindings,
         completed_count=completed_count,
         mode=mode,
+        external_native=uses_external_native,
     )
     if mode == "semigroup":
         _validate_semigroup_split_state(
@@ -1563,6 +1723,10 @@ def run_guidance_records(
     )
     if not isinstance(record_final_latent_sha256, bool):
         raise ValueError("record_final_latent_sha256 must be boolean")
+    if uses_external_native and record_final_latent_sha256:
+        raise ValueError(
+            "external-native causal generation cannot record a native latent SHA-256"
+        )
     sampling_seed = int(
         resolved_config.get("sampling_seed", resolved_config.get("seed", 0))
     )
@@ -1641,6 +1805,9 @@ def run_guidance_records(
         if mode == "native":
             native_result = candidate_result
             native_seconds = 0.0
+        elif uses_external_native:
+            native_result = None
+            native_seconds = 0.0
         else:
             native_started = _algorithm_timer_start(runtime.device)
             native_result = execute_matched_native(
@@ -1662,11 +1829,20 @@ def run_guidance_records(
             source_io_seconds = time.perf_counter() - source_io_started
         with torch.no_grad():
             generated = runtime.codec.decode(candidate_result.latent)
-            native_images = (
-                generated
-                if mode == "native"
-                else runtime.codec.decode(native_result.latent)
-            )
+            if mode == "native":
+                native_images = generated
+            elif uses_external_native:
+                native_images = _load_source_images(
+                    [str(expected_bindings[completed_count + batch_start + index]["native"])
+                     for index in range(len(batch))],
+                    int(resolved_config.get("pixel_image_size", 256)),
+                    runtime.device,
+                    target_z0.dtype,
+                )
+            else:
+                if native_result is None:
+                    raise AssertionError("matched-native result was not produced")
+                native_images = runtime.codec.decode(native_result.latent)
             candidate_embedding = runtime.e0(normalize_for_e0(generated))["embedding"]
             native_embedding = runtime.e0(normalize_for_e0(native_images))["embedding"]
             candidate_cosine = F.cosine_similarity(
@@ -1716,7 +1892,7 @@ def run_guidance_records(
             binding = expected_bindings[ordinal]
             row_io_started = time.perf_counter()
             _atomic_save_image(generated[local_index], Path(binding["generated"]))
-            if mode != "native":
+            if mode != "native" and not uses_external_native:
                 _atomic_save_image(native_images[local_index], Path(binding["native"]))
             per_sample_candidate_seconds = candidate_seconds / len(sample_ids)
             per_sample_native_seconds = native_seconds / len(sample_ids)
@@ -1727,9 +1903,13 @@ def run_guidance_records(
                 "native_cosine": float(native_cosine[local_index].detach().cpu()),
                 "cosine": float(candidate_cosine[local_index].detach().cpu()),
                 "candidate_nfe": int(candidate_result.nfe),
-                "native_nfe": int(native_result.nfe),
+                "native_nfe": 0
+                if uses_external_native
+                else int(native_result.nfe),
                 "candidate_trace": list(candidate_result.diagnostics["flow_map_trace"]),
-                "native_trace": list(native_result.diagnostics["flow_map_trace"]),
+                "native_trace": []
+                if uses_external_native
+                else list(native_result.diagnostics["flow_map_trace"]),
                 "candidate_generation_seconds": per_sample_candidate_seconds,
                 "native_generation_seconds": per_sample_native_seconds,
                 "generation_seconds": per_sample_candidate_seconds
@@ -1744,6 +1924,8 @@ def run_guidance_records(
                 row["candidate_latent_sha256"] = _tensor_sha256(
                     candidate_result.latent[local_index]
                 )
+                if native_result is None:
+                    raise AssertionError("native latent result is unavailable")
                 row["native_latent_sha256"] = _tensor_sha256(
                     native_result.latent[local_index]
                 )
@@ -1934,7 +2116,14 @@ def run_guidance_records(
         "r9_execution_contract": _json_safe(r9_execution_contract),
         "artifacts": {
             "generated_dir": str(generated_dir),
-            "native_dir": str(native_dir) if mode != "native" else None,
+            "native_dir": str(native_dir)
+            if mode != "native" and not uses_external_native
+            else None,
+            "external_native_manifest": None
+            if external_native_contract is None
+            else str(
+                _repository_relative_candidate(external_native_contract["manifest"])
+            ),
             "per_sample_jsonl": str(per_sample_path),
             "semigroup_json": str(semigroup_path) if mode == "semigroup" else None,
             "resume_contract": str(resume_contract_path),
@@ -2280,13 +2469,25 @@ def _validate_generation_records(records: Sequence[Mapping[str, Any]]) -> None:
             raise ValueError(f"generation record {sample_id!r} requires source and z")
 
 
-def _expected_row_bindings(selected, generated_dir: Path, native_dir: Path, mode: str):
+def _expected_row_bindings(
+    selected,
+    generated_dir: Path,
+    native_dir: Path,
+    mode: str,
+    *,
+    external_native_rows: Sequence[Mapping[str, Any]] | None = None,
+):
+    if external_native_rows is not None and len(external_native_rows) != len(selected):
+        raise ValueError("external-native rows must match selected records one-to-one")
     bindings = []
     for ordinal, record in enumerate(selected):
         sample_id = str(record["sample_id"])
         filename = f"{ordinal:08d}__{_safe_sample_id(sample_id)}.png"
         generated = generated_dir / filename
-        native = generated if mode == "native" else native_dir / filename
+        if external_native_rows is not None:
+            native = Path(str(external_native_rows[ordinal]["native"]))
+        else:
+            native = generated if mode == "native" else native_dir / filename
         bindings.append(
             {
                 "ordinal": ordinal,
@@ -2500,14 +2701,20 @@ def _validate_resume_rows(
 
 
 def _validate_owned_png_state(
-    *, generated_dir, native_dir, expected_bindings, completed_count: int, mode: str
+    *,
+    generated_dir,
+    native_dir,
+    expected_bindings,
+    completed_count: int,
+    mode: str,
+    external_native: bool = False,
 ) -> None:
     actual_generated = {
         path.resolve() for path in generated_dir.iterdir() if path.is_file()
     }
     actual_native = (
         set()
-        if mode == "native"
+        if mode == "native" or external_native
         else {path.resolve() for path in native_dir.iterdir() if path.is_file()}
     )
     completed_generated = {
@@ -2516,7 +2723,7 @@ def _validate_owned_png_state(
     }
     completed_native = (
         set()
-        if mode == "native"
+        if mode == "native" or external_native
         else {
             Path(binding["native"]).resolve()
             for binding in expected_bindings[:completed_count]
@@ -2534,7 +2741,7 @@ def _validate_owned_png_state(
     if completed_count < len(expected_bindings):
         binding = expected_bindings[completed_count]
         allowed_orphan_generated.add(Path(binding["generated"]).resolve())
-        if mode != "native":
+        if mode != "native" and not external_native:
             allowed_orphan_native.add(Path(binding["native"]).resolve())
     extra = (actual_generated - completed_generated - allowed_orphan_generated) | (
         actual_native - completed_native - allowed_orphan_native
@@ -2546,7 +2753,13 @@ def _validate_owned_png_state(
         )
 
 
-def _validate_output_entries(output: Path, *, mode: str, contact_sheets: bool) -> None:
+def _validate_output_entries(
+    output: Path,
+    *,
+    mode: str,
+    contact_sheets: bool,
+    external_native: bool = False,
+) -> None:
     if not output.exists():
         return
     allowed = {
@@ -2560,7 +2773,7 @@ def _validate_output_entries(output: Path, *, mode: str, contact_sheets: bool) -
         "session_journal.json",
         "completion.json",
     }
-    if mode != "native":
+    if mode != "native" and not external_native:
         allowed.add("native_images")
     if mode == "semigroup":
         allowed.update({"semigroup.json", "semigroup_split_images"})
