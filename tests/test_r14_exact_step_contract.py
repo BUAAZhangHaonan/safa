@@ -107,10 +107,10 @@ def _resume_contract_inputs() -> tuple[dict, dict]:
         "source_per_device_batch_size": 2,
         "samples_per_epoch": 1024,
         "target_world_size": 2,
-        "target_global_batch_size": 4,
-        "target_per_device_batch_size": 2,
-        "additional_optimizer_steps": 256,
-        "target_global_step": 2688,
+        "target_global_batch_size": 8,
+        "target_per_device_batch_size": 4,
+        "additional_optimizer_steps": 128,
+        "target_global_step": 2560,
     }
     config.update(
         {
@@ -120,15 +120,15 @@ def _resume_contract_inputs() -> tuple[dict, dict]:
         }
     )
     config.pop("resume_from_sha256")
-    config["optimizer_step_contract"]["required_steps"] = 2688
-    config["optimizer_checkpoint_contract"]["save_steps"] = [2688]
+    config["optimizer_step_contract"]["required_steps"] = 2560
+    config["optimizer_checkpoint_contract"]["save_steps"] = [2560]
     kwargs.update(
         {
             "resume_mode": g_loop._RESUME_MODE_TRAINING_STATE,
             "resume_checkpoint_model": g_loop._RESUME_CHECKPOINT_MODEL_RAW,
-            "required_optimizer_steps": 2688,
-            "optimizer_checkpoint_steps": (2688,),
-            "batch_config": SimpleNamespace(per_device_batch_size=2, global_batch_size=4),
+            "required_optimizer_steps": 2560,
+            "optimizer_checkpoint_steps": (2560,),
+            "batch_config": SimpleNamespace(per_device_batch_size=4, global_batch_size=8),
         }
     )
     return config, kwargs
@@ -172,18 +172,18 @@ def test_r14_epoch_boundary_resume_contract_runs_one_full_world2_epoch() -> None
     contract = g_loop._r14_resume_contract(config)
 
     assert contract is not None
-    assert g_loop._optimizer_step_contract(config) == 2688
-    assert g_loop._optimizer_checkpoint_steps(config, 2688) == (2688,)
+    assert g_loop._optimizer_step_contract(config) == 2560
+    assert g_loop._optimizer_checkpoint_steps(config, 2560) == (2560,)
     g_loop._validate_r14_inpaint_training_contract(config, **kwargs)
     g_loop._validate_r14_resume_checkpoint(_resume_checkpoint(), "last.pt", contract)
     progress = g_loop._resume_stage_progress_from_metrics(_resume_checkpoint()["metrics"], "last.pt")
     assert g_loop._resume_stage_start_epoch("stage2", kwargs["stages"], progress) == 19
     step = 2432
-    for _ in range(256):
-        step, reached = g_loop._advance_global_step(step, 2688, optimizer_step_succeeded=True)
-    assert (step, reached) == (2688, True)
-    with pytest.raises(RuntimeError, match="exceeded required_steps=2688"):
-        g_loop._advance_global_step(step, 2688, optimizer_step_succeeded=True)
+    for _ in range(128):
+        step, reached = g_loop._advance_global_step(step, 2560, optimizer_step_succeeded=True)
+    assert (step, reached) == (2560, True)
+    with pytest.raises(RuntimeError, match="exceeded required_steps=2560"):
+        g_loop._advance_global_step(step, 2560, optimizer_step_succeeded=True)
 
 
 def test_r14_world2_epoch19_sampler_covers_1024_samples_once() -> None:
@@ -202,7 +202,7 @@ def test_r14_world2_epoch19_sampler_covers_1024_samples_once() -> None:
         sampler.set_epoch(19)
         shard = list(sampler)
         assert len(shard) == 512
-        assert len(shard) // 2 == 256
+        assert len(shard) // 4 == 128
         shards.append(shard)
     assert set(shards[0]).isdisjoint(shards[1])
     assert set(shards[0]) | set(shards[1]) == set(range(1024))
@@ -215,21 +215,21 @@ def test_r14_world2_epoch19_sampler_covers_1024_samples_once() -> None:
         ("weights_only", "training_state"),
         ("ema", "checkpoint_model='raw'"),
         ("optimizer_false", "optimizer_state=true"),
-        ("global8", "global_batch_size=4"),
+        ("global4", "per_device_batch_size=4"),
     ),
 )
 def test_r14_resume_rejects_partial_or_non_training_state_contract(mutation: str, match: str) -> None:
     config, kwargs = _resume_contract_inputs()
     if mutation == "half_epoch":
-        config["r14_resume_contract"]["target_global_step"] = 2560
+        config["r14_resume_contract"]["target_global_step"] = 2496
     elif mutation == "weights_only":
         kwargs["resume_mode"] = g_loop._RESUME_MODE_MODEL_WEIGHTS_ONLY
     elif mutation == "ema":
         kwargs["resume_checkpoint_model"] = g_loop._RESUME_CHECKPOINT_MODEL_EMA
     elif mutation == "optimizer_false":
         config["resume_optimizer_state"] = False
-    elif mutation == "global8":
-        kwargs["batch_config"] = SimpleNamespace(per_device_batch_size=2, global_batch_size=8)
+    elif mutation == "global4":
+        kwargs["batch_config"] = SimpleNamespace(per_device_batch_size=2, global_batch_size=4)
     else:
         raise AssertionError(mutation)
 
@@ -290,10 +290,10 @@ def test_r14_resume_completion_requires_twenty_epochs_and_1024_samples() -> None
             "stage": "stage2",
             "stage_epoch": 19,
             "stage_epoch_1based": 20,
-            "global_step": 2688,
+            "global_step": 2560,
             "world_size": 2,
-            "global_batch_size": 4,
-            "per_device_batch_size": 2,
+            "global_batch_size": 8,
+            "per_device_batch_size": 4,
             "epoch_sample_count": 1024,
         }
     )

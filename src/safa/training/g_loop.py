@@ -1439,10 +1439,10 @@ def _r14_resume_contract(config: Mapping) -> dict | None:
         "source_per_device_batch_size": 2,
         "samples_per_epoch": 1024,
         "target_world_size": 2,
-        "target_global_batch_size": 4,
-        "target_per_device_batch_size": 2,
-        "additional_optimizer_steps": 256,
-        "target_global_step": 2688,
+        "target_global_batch_size": 8,
+        "target_per_device_batch_size": 4,
+        "additional_optimizer_steps": 128,
+        "target_global_step": 2560,
     }
     if set(payload) != set(expected):
         raise ValueError(
@@ -3668,9 +3668,9 @@ def _validate_r14_inpaint_training_contract(
             raise ValueError("R14 inpaint four-GPU fresh run requires per_device_batch_size=2 and global_batch_size=8")
     else:
         if required_optimizer_steps != int(resume_contract["target_global_step"]):
-            raise ValueError("R14 resume requires optimizer target global_step=2688")
+            raise ValueError("R14 resume requires optimizer target global_step=2560")
         if optimizer_checkpoint_steps != (int(resume_contract["target_global_step"]),):
-            raise ValueError("R14 resume checkpoint steps must be exactly [2688]")
+            raise ValueError("R14 resume checkpoint steps must be exactly [2560]")
         if resume_mode != _RESUME_MODE_TRAINING_STATE:
             raise ValueError("R14 resume requires resume_mode='training_state'")
         if resume_checkpoint_model != _RESUME_CHECKPOINT_MODEL_RAW:
@@ -3683,7 +3683,7 @@ def _validate_r14_inpaint_training_contract(
             batch_config.per_device_batch_size != int(resume_contract["target_per_device_batch_size"])
             or batch_config.global_batch_size != int(resume_contract["target_global_batch_size"])
         ):
-            raise ValueError("R14 resume requires per_device_batch_size=2 and global_batch_size=4")
+            raise ValueError("R14 resume requires per_device_batch_size=4 and global_batch_size=8")
     if not generator_config.learned_null_condition:
         raise ValueError("R14 inpaint requires learned_null_condition=true")
     if "latent_perceptual_loss" in config:
