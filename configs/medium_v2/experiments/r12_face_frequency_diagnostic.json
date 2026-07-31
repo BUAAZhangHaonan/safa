@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "contract_type": "safa_r12_face_frequency_request_v1",
+  "arcface_request": "artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/full/evaluator_runs/arcface/winner/request.json",
+  "datasets": [
+    {
+      "dataset_id": "sharpness_tail32",
+      "sample_id_manifest": "artifacts/r11_initial_noise_sharpness_probe/preparation_v1/tail32.jsonl",
+      "methods": {
+        "native_nfe1": "artifacts/r11_causal_decomposition/preparation_v1/reuse/sharpness_tail32/native_reuse.jsonl",
+        "transport_nfe2": "artifacts/r11_schedule_nfe2/preparation_v1/runs/sharpness_tail32/schedule_nfe2/per_sample.jsonl",
+        "transport_nfe5": "artifacts/r11_causal_decomposition/preparation_v1/runs/sharpness_tail32/transport_only_nfe5/per_sample.jsonl",
+        "paper_nfe8": "artifacts/r11_causal_decomposition/preparation_v1/reuse/sharpness_tail32/paper_reuse.jsonl"
+      },
+      "decision_rule": {
+        "enabled": true,
+        "required_monotonic_count": 24,
+        "median_nfe5_ratio_max": 0.8
+      }
+    },
+    {
+      "dataset_id": "prefix32",
+      "sample_id_manifest": "artifacts/r10_triangle_exploration/preparation_v1/prefix32.jsonl",
+      "methods": {
+        "native_nfe1": "artifacts/r11_causal_decomposition/preparation_v1/reuse/prefix128/native_reuse.jsonl",
+        "transport_nfe2": "artifacts/r11_schedule_nfe2/preparation_v1/runs/prefix128/schedule_nfe2/per_sample.jsonl",
+        "transport_nfe5": "artifacts/r11_causal_decomposition/preparation_v1/runs/prefix128/transport_only_nfe5/per_sample.jsonl",
+        "paper_nfe8": "artifacts/r11_causal_decomposition/preparation_v1/reuse/prefix128/paper_reuse.jsonl"
+      },
+      "decision_rule": {
+        "enabled": false
+      }
+    },
+    {
+      "dataset_id": "prefix128",
+      "sample_id_manifest": "artifacts/r10_triangle_exploration/preparation_v1/prefix128.jsonl",
+      "methods": {
+        "native_nfe1": "artifacts/r11_causal_decomposition/preparation_v1/reuse/prefix128/native_reuse.jsonl",
+        "transport_nfe2": "artifacts/r11_schedule_nfe2/preparation_v1/runs/prefix128/schedule_nfe2/per_sample.jsonl",
+        "transport_nfe5": "artifacts/r11_causal_decomposition/preparation_v1/runs/prefix128/transport_only_nfe5/per_sample.jsonl",
+        "paper_nfe8": "artifacts/r11_causal_decomposition/preparation_v1/reuse/prefix128/paper_reuse.jsonl"
+      },
+      "decision_rule": {
+        "enabled": false
+      }
+    }
+  ]
+}
