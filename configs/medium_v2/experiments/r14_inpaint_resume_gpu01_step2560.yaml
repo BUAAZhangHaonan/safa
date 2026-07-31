@@ -1,4 +1,4 @@
-experiment_name: r14_inpaint_resume_gpu01_step2688
+experiment_name: r14_inpaint_resume_gpu01_step2560
 r14_contract: safa_r14_face_region_inpaint_feasibility_v1
 r14_resume_contract:
   contract_type: safa_r14_epoch_boundary_world_size_resume_v1
@@ -9,16 +9,16 @@ r14_resume_contract:
   source_per_device_batch_size: 2
   samples_per_epoch: 1024
   target_world_size: 2
-  target_global_batch_size: 4
-  target_per_device_batch_size: 2
-  additional_optimizer_steps: 256
-  target_global_step: 2688
+  target_global_batch_size: 8
+  target_per_device_batch_size: 4
+  additional_optimizer_steps: 128
+  target_global_step: 2560
 seed: 1337
 sampling_seed: 1337
 device: cuda:0
 num_workers: 4
-global_batch_size: 4
-per_device_batch_size: 2
+global_batch_size: 8
+per_device_batch_size: 4
 amp: false
 optimizer_type: adamw
 learning_rate: 0.0001
@@ -44,7 +44,7 @@ r14_pairing:
   expression_relation: same
   identity_relation: different_sample_id
   require_source_target_distinct: true
-out_dir: checkpoints/r14_inpaint_resume_gpu01_step2688
+out_dir: checkpoints/r14_inpaint_resume_gpu01_step2560
 allow_stage2_without_stage1_gate: true
 resume_from: checkpoints/r14_inpaint_feasibility_2560step/last.pt
 resume_mode: training_state
@@ -53,10 +53,10 @@ resume_optimizer_state: true
 generator_trainable: full
 optimizer_step_contract:
   contract_type: safa_r14_exact_optimizer_steps_v1
-  required_steps: 2688
+  required_steps: 2560
 optimizer_checkpoint_contract:
   contract_type: safa_r14_optimizer_checkpoint_steps_v1
-  save_steps: [2688]
+  save_steps: [2560]
 ema:
   enabled: true
   decay: 0.9999

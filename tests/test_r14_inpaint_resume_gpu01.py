@@ -24,18 +24,19 @@ def load_script(name: str):
 
 
 validator = load_script("validate_r14_inpaint_resume_gpu01.py")
+smoke = load_script("run_r14_inpaint_resume_batch4_smoke.py")
 
 
-def final_metrics(*, step: int = 2688, optimizer_resumed: bool = True) -> dict:
+def final_metrics(*, step: int = 2560, optimizer_resumed: bool = True) -> dict:
     return {
         "global_step": step,
-        "required_optimizer_steps": 2688,
+        "required_optimizer_steps": 2560,
         "stage": "stage2",
         "stage_epoch_0based": 19,
         "stage_epoch_1based": 20,
         "world_size": 2,
-        "global_batch_size": 4,
-        "per_device_batch_size": 2,
+        "global_batch_size": 8,
+        "per_device_batch_size": 4,
         "optimizer_resumed": optimizer_resumed,
     }
 
@@ -74,7 +75,7 @@ def source_checkpoint_payload(*, optimizer_state: bool = True) -> dict:
     }
 
 
-def final_checkpoint_payload(*, step: int = 2688, optimizer_state: bool = True) -> dict:
+def final_checkpoint_payload(*, step: int = 2560, optimizer_state: bool = True) -> dict:
     history = [{"global_step": 128 * (index + 1)} for index in range(19)]
     history.append(final_metrics(step=step))
     return {
@@ -84,8 +85,8 @@ def final_checkpoint_payload(*, step: int = 2688, optimizer_state: bool = True) 
             "r14_contract": "safa_r14_face_region_inpaint_feasibility_v1",
             "r14_resume_contract": validator.RESUME_CONTRACT,
             "world_size": 2,
-            "global_batch_size": 4,
-            "per_device_batch_size": 2,
+            "global_batch_size": 8,
+            "per_device_batch_size": 4,
         },
         "model_state_dict": {"weight": object()},
         "ema_model_state_dict": {"weight": object()},
@@ -100,22 +101,22 @@ def step_checkpoint_payload(*, optimizer_state: bool = True) -> dict:
     history = [{"global_step": 128 * (index + 1)} for index in range(19)]
     return {
         "metrics": {
-            "global_step": 2688,
-            "required_optimizer_steps": 2688,
+            "global_step": 2560,
+            "required_optimizer_steps": 2560,
             "stage": "stage2",
             "stage_epoch_0based": 19,
             "stage_epoch_1based": 20,
             "world_size": 2,
-            "global_batch_size": 4,
-            "per_device_batch_size": 2,
+            "global_batch_size": 8,
+            "per_device_batch_size": 4,
             "checkpoint_kind": "optimizer_step",
         },
         "history": history,
         "training_config": {
             "r14_resume_contract": validator.RESUME_CONTRACT,
             "world_size": 2,
-            "global_batch_size": 4,
-            "per_device_batch_size": 2,
+            "global_batch_size": 8,
+            "per_device_batch_size": 4,
         },
         "model_state_dict": {"weight": object()},
         "ema_model_state_dict": {"weight": object()},
@@ -146,11 +147,11 @@ def test_resume_config_is_exact_and_valid() -> None:
     assert config["resume_mode"] == "training_state"
     assert config["resume_checkpoint_model"] == "raw"
     assert config["resume_optimizer_state"] is True
-    assert config["global_batch_size"] == 4
-    assert config["per_device_batch_size"] == 2
+    assert config["global_batch_size"] == 8
+    assert config["per_device_batch_size"] == 4
     assert config["stages"]["stage2"]["epochs"] == 20
-    assert config["optimizer_step_contract"]["required_steps"] == 2688
-    assert config["optimizer_checkpoint_contract"]["save_steps"] == [2688]
+    assert config["optimizer_step_contract"]["required_steps"] == 2560
+    assert config["optimizer_checkpoint_contract"]["save_steps"] == [2560]
     assert "resume_from_sha256" not in config
 
 
@@ -161,7 +162,7 @@ def test_launcher_is_training_only_gpu01_and_independent() -> None:
     assert "NPROC=2" in text
     assert 'SESSION="safa-r14-inpaint-resume-gpu01-v1"' in text
     assert 'ARTIFACT_ROOT="artifacts/r14_inpaint_resume_gpu01/v1"' in text
-    assert 'CHECKPOINT_ROOT="checkpoints/r14_inpaint_resume_gpu01_step2688"' in text
+    assert 'CHECKPOINT_ROOT="checkpoints/r14_inpaint_resume_gpu01_step2560"' in text
     assert 'NCCL_IB_DISABLE_VALUE="1"' in text
     assert 'NCCL_P2P_DISABLE_VALUE="0"' in text
     assert 'export NCCL_IB_DISABLE="$NCCL_IB_DISABLE_VALUE"' in text
@@ -186,13 +187,52 @@ def test_launcher_is_training_only_gpu01_and_independent() -> None:
     assert result.returncode == 0, result.stderr
 
 
+def test_batch4_smoke_is_one_real_resume_update_without_production_writes() -> None:
+    path = REPO / "scripts/run_r14_inpaint_resume_batch4_smoke.py"
+    text = path.read_text(encoding="utf-8")
+    for required in (
+        "world_size != 2",
+        'config.get("per_device_batch_size") != 4',
+        'map_location=device, weights_only=True',
+        'checkpoint.get("model_state_dict")',
+        'checkpoint.get("optimizer_state_dict")',
+        'checkpoint.get("ema_model_state_dict")',
+        "loss.backward()",
+        "optimizer.step()",
+        "ema.update(",
+        "torch.cuda.max_memory_allocated",
+        "torch.cuda.max_memory_reserved",
+    ):
+        assert required in text
+    for forbidden in (
+        "checkpoints/r14_inpaint_resume_gpu01_step2560",
+        "export_r14",
+        "evaluate_r14",
+        "retry",
+    ):
+        assert forbidden not in text.lower()
+
+
+def test_batch4_smoke_reads_real_optimizer_steps() -> None:
+    import torch
+
+    parameter = torch.nn.Parameter(torch.tensor([1.0]))
+    optimizer = torch.optim.AdamW([parameter])
+    parameter.square().sum().backward()
+    optimizer.step()
+    assert smoke._optimizer_steps(optimizer) == {1}
+    empty = torch.optim.AdamW([torch.nn.Parameter(torch.tensor([1.0]))])
+    with pytest.raises(RuntimeError, match="optimizer state is empty"):
+        smoke._optimizer_steps(empty)
+
+
 def test_nccl_transport_and_gpu_binding_are_locked() -> None:
     assert validator.NCCL_TRANSPORT_ENV == {
         "NCCL_IB_DISABLE": "1",
         "NCCL_P2P_DISABLE": "0",
     }
     assert set(validator.GPU_BINDINGS) == {0, 1}
-    assert validator.PROJECTED_PEAK_MIB == 8192
+    assert validator.PROJECTED_PEAK_MIB == 0
     validator._validate_nccl_transport_environment(validator.NCCL_TRANSPORT_ENV)
     with pytest.raises(validator.R14ResumeError, match="NCCL_IB_DISABLE"):
         validator._validate_nccl_transport_environment({"NCCL_P2P_DISABLE": "0"})
@@ -263,10 +303,10 @@ def test_source_external_contract_rejects_wrong_step(
         validator._validate_source_files(load_checkpoint=False)
 
 
-def prepare_final_artifacts(root: Path, *, step: int = 2688) -> None:
+def prepare_final_artifacts(root: Path, *, step: int = 2560) -> None:
     checkpoint_root = root / validator.CHECKPOINT_ROOT
     checkpoint_root.mkdir(parents=True)
-    for name in ("last.pt", "step_00002688.pt"):
+    for name in ("last.pt", "step_00002560.pt"):
         (checkpoint_root / name).write_bytes(b"x")
     history = [{"global_step": 128 * (index + 1)} for index in range(19)]
     history.append(final_metrics(step=step))
@@ -284,7 +324,7 @@ def prepare_final_artifacts(root: Path, *, step: int = 2688) -> None:
         {
             "contract_type": "safa_r14_inpaint_exact_optimizer_steps_v1",
             "completed": True,
-            "optimizer_steps": 2688,
+            "optimizer_steps": 2560,
             "ema_available": True,
             "checkpoint": str(validator.CHECKPOINT_ROOT / "last.pt"),
             "manifest": str(validator.CHECKPOINT_ROOT / "manifest.json"),
@@ -294,7 +334,7 @@ def prepare_final_artifacts(root: Path, *, step: int = 2688) -> None:
     write_jsonl(checkpoint_root / "metrics_history.jsonl", [final_metrics(step=step)])
 
 
-def test_artifact_requires_step2688_resumed_optimizer_and_full_history(
+def test_artifact_requires_step2560_resumed_optimizer_and_full_history(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     prepare_final_artifacts(tmp_path)
@@ -304,14 +344,14 @@ def test_artifact_requires_step2688_resumed_optimizer_and_full_history(
         validator,
         "_load_checkpoint",
         lambda path: step_checkpoint_payload()
-        if path.name == "step_00002688.pt"
+        if path.name == "step_00002560.pt"
         else final_checkpoint_payload(),
     )
     validator.validate_artifact()
 
     write_json(
         tmp_path / validator.CHECKPOINT_ROOT / "last_metrics.json",
-        final_metrics(step=2687),
+        final_metrics(step=2559),
     )
     with pytest.raises(validator.R14ResumeError, match="last_metrics.global_step"):
         validator.validate_artifact()
@@ -327,7 +367,7 @@ def test_artifact_rejects_nonresumed_or_missing_optimizer(
         validator,
         "_load_checkpoint",
         lambda path: step_checkpoint_payload(optimizer_state=False)
-        if path.name == "step_00002688.pt"
+        if path.name == "step_00002560.pt"
         else final_checkpoint_payload(optimizer_state=False),
     )
     with pytest.raises(validator.R14ResumeError, match="raw, EMA, and optimizer"):
@@ -337,7 +377,7 @@ def test_artifact_rejects_nonresumed_or_missing_optimizer(
         validator,
         "_load_checkpoint",
         lambda path: step_checkpoint_payload()
-        if path.name == "step_00002688.pt"
+        if path.name == "step_00002560.pt"
         else final_checkpoint_payload(),
     )
     write_json(

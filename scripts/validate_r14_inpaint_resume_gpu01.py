@@ -17,14 +17,14 @@ import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-CONFIG = Path("configs/medium_v2/experiments/r14_inpaint_resume_gpu01_step2688.yaml")
+CONFIG = Path("configs/medium_v2/experiments/r14_inpaint_resume_gpu01_step2560.yaml")
 SOURCE_ROOT = Path("checkpoints/r14_inpaint_feasibility_2560step")
 SOURCE_CHECKPOINT = SOURCE_ROOT / "last.pt"
 SOURCE_CHECKPOINT_SIZE = 2_103_293_800
 SOURCE_CHECKPOINT_SHA256 = "a176d5521782a16ba488fe5d727cec61ddcf35d07fe75316f00f281ef423b7bf"
 SOURCE_METRICS_SHA256 = "d9801ef8289f7036f0ef80a34113ee117fad8eca825c9797e07a2ce6e4c9d401"
 SOURCE_HISTORY_SHA256 = "d823cb0918a44ddb59eedf7e50b6ef159238e3c56e917ad8aa2ef8c7771b577f"
-CHECKPOINT_ROOT = Path("checkpoints/r14_inpaint_resume_gpu01_step2688")
+CHECKPOINT_ROOT = Path("checkpoints/r14_inpaint_resume_gpu01_step2560")
 ARTIFACT_ROOT = Path("artifacts/r14_inpaint_resume_gpu01/v1")
 LOG_PATH = ARTIFACT_ROOT / "logs/train.log"
 SESSION = "safa-r14-inpaint-resume-gpu01-v1"
@@ -37,8 +37,8 @@ NCCL_TRANSPORT_ENV = {
     "NCCL_IB_DISABLE": "1",
     "NCCL_P2P_DISABLE": "0",
 }
-# Upper bound observed per rank in the completed R14 four-GPU batch=2 run.
-PROJECTED_PEAK_MIB = 8192
+# Set from the committed two-rank batch=4 smoke before formal launch is enabled.
+PROJECTED_PEAK_MIB = 0
 RESUME_CONTRACT = {
     "contract_type": "safa_r14_epoch_boundary_world_size_resume_v1",
     "source_global_step": 2432,
@@ -48,10 +48,10 @@ RESUME_CONTRACT = {
     "source_per_device_batch_size": 2,
     "samples_per_epoch": 1024,
     "target_world_size": 2,
-    "target_global_batch_size": 4,
-    "target_per_device_batch_size": 2,
-    "additional_optimizer_steps": 256,
-    "target_global_step": 2688,
+    "target_global_batch_size": 8,
+    "target_per_device_batch_size": 4,
+    "additional_optimizer_steps": 128,
+    "target_global_step": 2560,
 }
 ALLOWED_SOURCE_UNTRACKED = {
     str(SOURCE_ROOT / "last_metrics.json"),
@@ -137,12 +137,12 @@ def _validate_config(path: Path) -> Mapping[str, Any]:
         raise R14ResumeError(f"cannot read config {path}: {exc}") from exc
     config = _mapping(payload, str(path))
     required = {
-        "experiment_name": "r14_inpaint_resume_gpu01_step2688",
+        "experiment_name": "r14_inpaint_resume_gpu01_step2560",
         "r14_contract": "safa_r14_face_region_inpaint_feasibility_v1",
         "seed": 1337,
         "sampling_seed": 1337,
-        "global_batch_size": 4,
-        "per_device_batch_size": 2,
+        "global_batch_size": 8,
+        "per_device_batch_size": 4,
         "amp": False,
         "out_dir": str(CHECKPOINT_ROOT),
         "resume_from": str(SOURCE_CHECKPOINT),
@@ -158,12 +158,12 @@ def _validate_config(path: Path) -> Mapping[str, Any]:
     _require_equal(config.get("r14_resume_contract"), RESUME_CONTRACT, "config.r14_resume_contract")
     _require_equal(
         config.get("optimizer_step_contract"),
-        {"contract_type": "safa_r14_exact_optimizer_steps_v1", "required_steps": 2688},
+        {"contract_type": "safa_r14_exact_optimizer_steps_v1", "required_steps": 2560},
         "config.optimizer_step_contract",
     )
     _require_equal(
         config.get("optimizer_checkpoint_contract"),
-        {"contract_type": "safa_r14_optimizer_checkpoint_steps_v1", "save_steps": [2688]},
+        {"contract_type": "safa_r14_optimizer_checkpoint_steps_v1", "save_steps": [2560]},
         "config.optimizer_checkpoint_contract",
     )
     _require_equal(
@@ -381,12 +381,18 @@ def _validate_process_isolation(process_table: str, sessions: Sequence[str]) -> 
         raise R14ResumeError("the original R14 source-checkpoint writer is still running")
 
 
-def _validate_resources() -> None:
+def _validate_resources() -> Mapping[str, Any]:
+    if PROJECTED_PEAK_MIB <= 0:
+        raise R14ResumeError(
+            "formal launch is blocked until the two-rank batch4 smoke records a positive VRAM peak"
+        )
     cpu = _cpu_percent()
     memory, swap = _memory_and_swap_percent()
-    for label, value in (("CPU", cpu), ("main-memory", memory), ("swap", swap)):
+    for label, value in (("CPU", cpu), ("main-memory", memory)):
         if not math.isfinite(value) or value >= 90.0:
             raise R14ResumeError(f"{label} utilization must be below 90%, got {value:.2f}%")
+    if not math.isfinite(swap):
+        raise R14ResumeError("swap utilization could not be measured")
     free_disk = shutil.disk_usage(REPO_ROOT).free
     if free_disk < 24 * 1024**3:
         raise R14ResumeError(
@@ -436,18 +442,33 @@ def _validate_resources() -> None:
     present = [str(path) for path in generated if (REPO_ROOT / path).exists()]
     if present:
         raise R14ResumeError(f"refusing to reuse resume outputs: {present}")
+    return {
+        "cpu_percent": round(cpu, 2),
+        "main_memory_percent": round(memory, 2),
+        "swap_percent": round(swap, 2),
+        "disk_free_gib": round(free_disk / 1024**3, 2),
+        "projected_peak_mib": PROJECTED_PEAK_MIB,
+        "gpus": {
+            str(index): {
+                "memory_used_mib": observed[index][2],
+                "memory_free_mib": observed[index][3],
+                "utilization_percent": observed[index][4],
+            }
+            for index in GPU_BINDINGS
+        },
+    }
 
 
 def _validate_final_metrics(metrics: Mapping[str, Any], label: str) -> None:
     expected = {
-        "global_step": 2688,
-        "required_optimizer_steps": 2688,
+        "global_step": 2560,
+        "required_optimizer_steps": 2560,
         "stage": "stage2",
         "stage_epoch_0based": 19,
         "stage_epoch_1based": 20,
         "world_size": 2,
-        "global_batch_size": 4,
-        "per_device_batch_size": 2,
+        "global_batch_size": 8,
+        "per_device_batch_size": 4,
         "optimizer_resumed": True,
     }
     for key, value in expected.items():
@@ -467,7 +488,7 @@ def validate_artifact() -> None:
     _validate_source_files(load_checkpoint=False)
     root = REPO_ROOT / CHECKPOINT_ROOT
     last = root / "last.pt"
-    step = root / "step_00002688.pt"
+    step = root / "step_00002560.pt"
     manifest_path = root / "manifest.json"
     for path in (last, step, manifest_path):
         if not path.is_file() or path.stat().st_size <= 0:
@@ -476,7 +497,7 @@ def validate_artifact() -> None:
     expected_completion = {
         "contract_type": "safa_r14_inpaint_exact_optimizer_steps_v1",
         "completed": True,
-        "optimizer_steps": 2688,
+        "optimizer_steps": 2560,
         "ema_available": True,
         "checkpoint": str(CHECKPOINT_ROOT / "last.pt"),
         "manifest": str(CHECKPOINT_ROOT / "manifest.json"),
@@ -517,8 +538,8 @@ def validate_artifact() -> None:
     _require_equal(training.get("r14_resume_contract"), RESUME_CONTRACT, "checkpoint.training_config.r14_resume_contract")
     for key, value in {
         "world_size": 2,
-        "global_batch_size": 4,
-        "per_device_batch_size": 2,
+        "global_batch_size": 8,
+        "per_device_batch_size": 4,
     }.items():
         _require_equal(training.get(key), value, f"checkpoint.training_config.{key}")
     _validate_checkpoint_states(payload, "checkpoint")
@@ -526,14 +547,14 @@ def validate_artifact() -> None:
     step_payload = _load_checkpoint(step)
     step_metrics = _mapping(step_payload.get("metrics"), "step checkpoint.metrics")
     expected_step_metrics = {
-        "global_step": 2688,
-        "required_optimizer_steps": 2688,
+        "global_step": 2560,
+        "required_optimizer_steps": 2560,
         "stage": "stage2",
         "stage_epoch_0based": 19,
         "stage_epoch_1based": 20,
         "world_size": 2,
-        "global_batch_size": 4,
-        "per_device_batch_size": 2,
+        "global_batch_size": 8,
+        "per_device_batch_size": 4,
         "checkpoint_kind": "optimizer_step",
     }
     for key, value in expected_step_metrics.items():
@@ -555,8 +576,8 @@ def validate_artifact() -> None:
     )
     for key, value in {
         "world_size": 2,
-        "global_batch_size": 4,
-        "per_device_batch_size": 2,
+        "global_batch_size": 8,
+        "per_device_batch_size": 4,
     }.items():
         _require_equal(
             step_training.get(key), value, f"step checkpoint.training_config.{key}"
@@ -573,14 +594,18 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     os.chdir(REPO_ROOT)
+    resources: Mapping[str, Any] | None = None
     if args.mode == "static":
         validate_static()
     elif args.mode == "resource":
         validate_static()
-        _validate_resources()
+        resources = _validate_resources()
     else:
         validate_artifact()
-    print(json.dumps({"mode": args.mode, "status": "pass"}, sort_keys=True))
+    result: dict[str, Any] = {"mode": args.mode, "status": "pass"}
+    if resources is not None:
+        result["resources"] = resources
+    print(json.dumps(result, sort_keys=True))
 
 
 if __name__ == "__main__":

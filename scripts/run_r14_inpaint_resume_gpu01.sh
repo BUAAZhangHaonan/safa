@@ -3,9 +3,9 @@ set -euo pipefail
 
 REPO_ROOT="/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization"
 PYTHON_BIN="/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python"
-CONFIG="configs/medium_v2/experiments/r14_inpaint_resume_gpu01_step2688.yaml"
+CONFIG="configs/medium_v2/experiments/r14_inpaint_resume_gpu01_step2560.yaml"
 ARTIFACT_ROOT="artifacts/r14_inpaint_resume_gpu01/v1"
-CHECKPOINT_ROOT="checkpoints/r14_inpaint_resume_gpu01_step2688"
+CHECKPOINT_ROOT="checkpoints/r14_inpaint_resume_gpu01_step2560"
 SESSION="safa-r14-inpaint-resume-gpu01-v1"
 LOG="$ARTIFACT_ROOT/logs/train.log"
 GPU_LIST="0,1"
@@ -65,8 +65,8 @@ print_pipeline() {
   printf '%s\n' \
     "Locked R14 resume training (CUDA_VISIBLE_DEVICES=$GPU_LIST, nproc=$NPROC):" \
     "  source step: 2432" \
-    "  additional optimizer steps: 256" \
-    "  required final step: 2688" \
+    "  additional optimizer steps: 128" \
+    "  required final step: 2560" \
     "  output: $CHECKPOINT_ROOT"
   print_command "${TRAIN[@]}"
   print_command "${VERIFY[@]}"
