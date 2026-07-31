@@ -333,6 +333,16 @@ def evaluate_decision(rows: Sequence[Mapping[str, Any]], rule: Mapping[str, Any]
     enabled = rule.get("enabled")
     if not isinstance(enabled, bool):
         raise FrequencyDiagnosticError("decision rule enabled must be boolean")
+    def roi_high(row: Mapping[str, Any], method: str) -> float:
+        return finite_float(
+            require_mapping(
+                require_mapping(row.get("methods"), "sample methods").get(method),
+                f"sample {method} metrics",
+            )["roi"]["fft_energy"][PRIMARY_FREQUENCY_METRIC],
+            f"sample {method} ROI high-frequency energy",
+        )
+
+    has_method_metrics = all(isinstance(row.get("methods"), Mapping) for row in rows)
     monotonic_count = sum(bool(row.get("roi_nfe1_gt_nfe2_gt_nfe5")) for row in rows)
     nfe5_ratios = [
         finite_float(
@@ -352,6 +362,25 @@ def evaluate_decision(rows: Sequence[Mapping[str, Any]], rule: Mapping[str, Any]
         "monotonic_fraction": monotonic_count / len(rows),
         "median_nfe5_to_nfe1_roi_high_frequency_ratio": median_ratio,
     }
+    if has_method_metrics:
+        result["pairwise_counts"] = {
+            "nfe1_gt_nfe2": sum(
+                roi_high(row, "native_nfe1") > roi_high(row, "transport_nfe2")
+                for row in rows
+            ),
+            "nfe2_gt_nfe5": sum(
+                roi_high(row, "transport_nfe2") > roi_high(row, "transport_nfe5")
+                for row in rows
+            ),
+            "nfe1_gt_nfe5": sum(
+                roi_high(row, "native_nfe1") > roi_high(row, "transport_nfe5")
+                for row in rows
+            ),
+            "nfe5_gt_paper": sum(
+                roi_high(row, "transport_nfe5") > roi_high(row, "paper_nfe8")
+                for row in rows
+            ),
+        }
     if not enabled:
         result["classification"] = "descriptive_only"
         return result
@@ -445,18 +474,55 @@ def build_conclusion(summary: Mapping[str, Any]) -> str:
     tail = require_mapping(datasets.get("sharpness_tail32"), "tail32 summary")
     decision = require_mapping(tail.get("decision"), "tail32 decision")
     confirmed = decision.get("confirmed") is True
-    headline = (
-        "The aligned face ROI confirms a sampler/mean-flow high-frequency contraction."
-        if confirmed
-        else "The aligned face ROI does not confirm the predeclared sampler low-pass rule."
+    ratio_pass = decision.get("median_ratio_pass") is True
+    tail_methods = require_mapping(tail.get("methods"), "tail32 method summary")
+    tail_nfe5 = require_mapping(tail_methods.get("transport_nfe5"), "tail32 NFE5")
+    prefix = require_mapping(datasets.get("prefix128"), "prefix128 summary")
+    prefix_methods = require_mapping(prefix.get("methods"), "prefix128 method summary")
+    prefix_nfe5 = require_mapping(
+        prefix_methods.get("transport_nfe5"), "prefix128 NFE5"
     )
-    direction = (
-        "Stop eta, interval, and checkpoint searches. Preserve the one-step endpoint and "
-        "move to a faithful sampler-consistency or endpoint high-frequency objective."
-        if confirmed
-        else "Compare the full-image control with the aligned ROI before changing the model; "
-        "a full-image-only loss means the old sharpness gate is dominated by background or scale."
+    roi_median = finite_float(
+        require_mapping(tail_nfe5.get("roi"), "tail32 NFE5 ROI").get(
+            "median_high_frequency_ratio"
+        ),
+        "tail32 NFE5 ROI median",
     )
+    full_median = finite_float(
+        require_mapping(tail_nfe5.get("full"), "tail32 NFE5 full image").get(
+            "median_high_frequency_ratio"
+        ),
+        "tail32 NFE5 full median",
+    )
+    prefix_median = finite_float(
+        require_mapping(prefix_nfe5.get("roi"), "prefix128 NFE5 ROI").get(
+            "median_high_frequency_ratio"
+        ),
+        "prefix128 NFE5 ROI median",
+    )
+    if confirmed:
+        headline = "The aligned face ROI confirms the predeclared sampler low-pass rule."
+        direction = (
+            "Stop eta, interval, and checkpoint searches. Preserve the one-step endpoint and "
+            "move to a faithful sampler-consistency or endpoint high-frequency objective."
+        )
+    elif ratio_pass:
+        headline = (
+            "The contraction magnitude is large, but the aligned face ROI misses the "
+            "predeclared monotonic-count rule."
+        )
+        direction = (
+            "Do not call this a global sampler low-pass confirmation. The ROI and full-image "
+            "controls both lose high frequency on tail32, while prefix128 is near neutral; "
+            "the next diagnostic should explain the non-monotonic tail exceptions rather than "
+            "open another eta or schedule grid."
+        )
+    else:
+        headline = "The aligned face ROI does not confirm the predeclared sampler low-pass rule."
+        direction = (
+            "Compare the full-image control with the aligned ROI before changing the model; "
+            "a full-image-only loss means the old sharpness gate is dominated by background or scale."
+        )
     lines = [
         "# R12 face-frequency diagnostic",
         "",
@@ -468,6 +534,10 @@ def build_conclusion(summary: Mapping[str, Any]) -> str:
         f"`{decision['median_nfe5_to_nfe1_roi_high_frequency_ratio']:.6f}` "
         f"(required `<= {decision.get('median_nfe5_ratio_max')}`).",
         f"- Classification: `{decision['classification']}`.",
+        f"- Tail32 NFE5 median high-frequency ratio, ROI/full: "
+        f"`{roi_median:.6f}/{full_median:.6f}`.",
+        f"- Prefix128 NFE5 median aligned-ROI high-frequency ratio: "
+        f"`{prefix_median:.6f}`.",
         "",
         direction,
         "",

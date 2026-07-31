@@ -79,6 +79,16 @@ def test_multiscale_laplacian_is_finite_and_complete() -> None:
 def _decision_row(monotonic: bool, ratio: float) -> dict:
     return {
         "roi_nfe1_gt_nfe2_gt_nfe5": monotonic,
+        "methods": {
+            "native_nfe1": {"roi": {"fft_energy": {cli.PRIMARY_FREQUENCY_METRIC: 1.0}}},
+            "transport_nfe2": {
+                "roi": {"fft_energy": {cli.PRIMARY_FREQUENCY_METRIC: 0.9}}
+            },
+            "transport_nfe5": {
+                "roi": {"fft_energy": {cli.PRIMARY_FREQUENCY_METRIC: ratio}}
+            },
+            "paper_nfe8": {"roi": {"fft_energy": {cli.PRIMARY_FREQUENCY_METRIC: 0.7}}},
+        },
         "transfers": {
             "transport_nfe5": {
                 "roi": {
@@ -97,6 +107,7 @@ def test_predeclared_decision_boundary_passes_at_24_and_0p8() -> None:
     )
     assert result["confirmed"] is True
     assert result["classification"] == "face_roi_sampler_low_pass_confirmed"
+    assert result["pairwise_counts"]["nfe1_gt_nfe2"] == 32
 
 
 @pytest.mark.parametrize(
