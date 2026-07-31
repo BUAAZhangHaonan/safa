@@ -1,0 +1,118 @@
+{
+  "contract_type": "safa_r12_latent_fourier_replay_result_v1",
+  "criteria": {
+    "checks": {
+      "regular_abs_rho_below_0p20_and_ci_contains_zero_both": false,
+      "tail_bootstrap_lower_positive_at_least_one": false,
+      "tail_bottom8_overlap_at_least4_both": false,
+      "tail_rho_at_least_0p40_both": false,
+      "tail_same_positive_sign": true
+    },
+    "fourier_projection_licensed": false,
+    "regular": {
+      "12": {
+        "bootstrap_dropped_degenerate": 0,
+        "bootstrap_kept": 10000,
+        "spearman": 0.251099706744868,
+        "spearman_ci95": [
+          -0.08113833311368078,
+          0.5570465981908137
+        ]
+      },
+      "16": {
+        "bootstrap_dropped_degenerate": 0,
+        "bootstrap_kept": 10000,
+        "spearman": 0.2639296187683284,
+        "spearman_ci95": [
+          -0.06414303762159806,
+          0.5522176600413332
+        ]
+      }
+    },
+    "stop_required": true,
+    "tail": {
+      "12": {
+        "bootstrap_dropped_degenerate": 0,
+        "bootstrap_kept": 10000,
+        "bottom8_worst8": {
+          "bottom_h_sample_ids": [
+            "val:Manually_Annotated_Images/1033/453278846470d1167e58391d4524cf70060d30411c4fc7a6bf1101e3.jpg",
+            "val:Manually_Annotated_Images/335/87ffb18955eb3a1f795bc871a6d13df905de11c2acf18a95955a4de0.jpg",
+            "val:Manually_Annotated_Images/367/48b04504311e2b1d5e16271e31af9505c8e8b92ad0b523e6113c114a.jpg",
+            "val:Manually_Annotated_Images/402/286d6bb5a94023a3af0bfa0dda0a20aa37e5a1fc57a81cfe4034ae44.jpg",
+            "val:Manually_Annotated_Images/506/2b4f84de47a39905a2d05b94a530b07429508954dabd853fd5682525.jpg",
+            "val:Manually_Annotated_Images/824/9fb5d0d4fc3006585fee96350d654fa93b68dd4e55ca770a62cb14de.JPG",
+            "val:Manually_Annotated_Images/924/63e6e7a91e1a4660523042b35fac286716b8db45da5c647b68d0842d.jpg",
+            "val:Manually_Annotated_Images/964/b89f9b0b9cad82ee9c5b39fa6ccbaa23b301c959be6705736277ad24.jpg"
+          ],
+          "k": 8,
+          "overlap": 3,
+          "worst_retention_sample_ids": [
+            "val:Manually_Annotated_Images/221/c31512157111047e5f13fb96ee6ecc777ea618b84eb8950a54b45ad2.jpg",
+            "val:Manually_Annotated_Images/224/bdc7eaef76c1e5ee142bcc51b761d5bab5beb4e9e561ea73df8f53fa.jpg",
+            "val:Manually_Annotated_Images/402/286d6bb5a94023a3af0bfa0dda0a20aa37e5a1fc57a81cfe4034ae44.jpg",
+            "val:Manually_Annotated_Images/461/4fcb8fee0175233066f8dd5f83c34bc9a261017a728751b67317f11d.jpg",
+            "val:Manually_Annotated_Images/506/2b4f84de47a39905a2d05b94a530b07429508954dabd853fd5682525.jpg",
+            "val:Manually_Annotated_Images/640/dfb056319186e05d62d1b341bc812c55ba7bf8599a46fc98d8315e5b.jpg",
+            "val:Manually_Annotated_Images/685/a5591f517485d01fc68fcd5ab7111b35aae7517caa1b3d1174b1413c.jpg",
+            "val:Manually_Annotated_Images/824/9fb5d0d4fc3006585fee96350d654fa93b68dd4e55ca770a62cb14de.JPG"
+          ]
+        },
+        "spearman": 0.19098240469208208,
+        "spearman_ci95": [
+          -0.19234010001459206,
+          0.535332079650602
+        ]
+      },
+      "16": {
+        "bootstrap_dropped_degenerate": 0,
+        "bootstrap_kept": 10000,
+        "bottom8_worst8": {
+          "bottom_h_sample_ids": [
+            "val:Manually_Annotated_Images/335/87ffb18955eb3a1f795bc871a6d13df905de11c2acf18a95955a4de0.jpg",
+            "val:Manually_Annotated_Images/367/48b04504311e2b1d5e16271e31af9505c8e8b92ad0b523e6113c114a.jpg",
+            "val:Manually_Annotated_Images/402/286d6bb5a94023a3af0bfa0dda0a20aa37e5a1fc57a81cfe4034ae44.jpg",
+            "val:Manually_Annotated_Images/506/2b4f84de47a39905a2d05b94a530b07429508954dabd853fd5682525.jpg",
+            "val:Manually_Annotated_Images/614/54a981169e9a44241d0665da64ac8ceeac475dbeac30ffe4795f1f80.jpg",
+            "val:Manually_Annotated_Images/685/a5591f517485d01fc68fcd5ab7111b35aae7517caa1b3d1174b1413c.jpg",
+            "val:Manually_Annotated_Images/924/63e6e7a91e1a4660523042b35fac286716b8db45da5c647b68d0842d.jpg",
+            "val:Manually_Annotated_Images/964/b89f9b0b9cad82ee9c5b39fa6ccbaa23b301c959be6705736277ad24.jpg"
+          ],
+          "k": 8,
+          "overlap": 3,
+          "worst_retention_sample_ids": [
+            "val:Manually_Annotated_Images/221/c31512157111047e5f13fb96ee6ecc777ea618b84eb8950a54b45ad2.jpg",
+            "val:Manually_Annotated_Images/224/bdc7eaef76c1e5ee142bcc51b761d5bab5beb4e9e561ea73df8f53fa.jpg",
+            "val:Manually_Annotated_Images/402/286d6bb5a94023a3af0bfa0dda0a20aa37e5a1fc57a81cfe4034ae44.jpg",
+            "val:Manually_Annotated_Images/461/4fcb8fee0175233066f8dd5f83c34bc9a261017a728751b67317f11d.jpg",
+            "val:Manually_Annotated_Images/506/2b4f84de47a39905a2d05b94a530b07429508954dabd853fd5682525.jpg",
+            "val:Manually_Annotated_Images/640/dfb056319186e05d62d1b341bc812c55ba7bf8599a46fc98d8315e5b.jpg",
+            "val:Manually_Annotated_Images/685/a5591f517485d01fc68fcd5ab7111b35aae7517caa1b3d1174b1413c.jpg",
+            "val:Manually_Annotated_Images/824/9fb5d0d4fc3006585fee96350d654fa93b68dd4e55ca770a62cb14de.JPG"
+          ]
+        },
+        "spearman": 0.2613636363636363,
+        "spearman_ci95": [
+          -0.13078142353862293,
+          0.5908758534761619
+        ]
+      }
+    }
+  },
+  "high_frequency_definition": "per_channel_rfft_radius_at_least_nyquist_over_2",
+  "loss_history_binding": "exact_passed",
+  "merge_order_binding": "exact_passed",
+  "projection_implemented": false,
+  "sample_counts": {
+    "regular32": 32,
+    "sharpness_tail32": 32
+  },
+  "schema_version": 1,
+  "snapshot_steps": [
+    0,
+    12,
+    16
+  ],
+  "status": "complete",
+  "training_started": false
+}

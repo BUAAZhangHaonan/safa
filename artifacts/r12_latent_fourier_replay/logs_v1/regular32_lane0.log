@@ -1,0 +1,19 @@
+{
+  "batch_size": 2,
+  "candidate_nfe": 17,
+  "contract_type": "safa_r12_latent_fourier_replay_lane_v1",
+  "cuda_visible_devices": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6",
+  "dataset_id": "regular32",
+  "lane_count": 2,
+  "lane_index": 0,
+  "ordered_sample_id_sha256": "a8e5a36b55045d62b14198452685f55b924035764f3d18404b87e08e2b7d0fef",
+  "sample_count": 16,
+  "schema_version": 1,
+  "seed": 7919,
+  "snapshot_steps": [
+    0,
+    12,
+    16
+  ],
+  "status": "complete"
+}
