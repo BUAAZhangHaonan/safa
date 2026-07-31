@@ -596,7 +596,7 @@ def build_conclusion(summary: Mapping[str, Any]) -> str:
     lines.extend(
         [
             "",
-            "The locked source-candidate minus source-native gate remains unchanged at `<= 0.02`. ",
+            "The locked source-candidate minus source-native gate remains unchanged at `<= 0.02`.",
             "This closed-set diagnostic only distinguishes baseline-conditioned relative-metric "
             "geometry from supported retrieval leakage on the existing 64-source gallery.",
             "",
