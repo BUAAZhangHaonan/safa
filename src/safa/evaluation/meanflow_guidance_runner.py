@@ -98,7 +98,58 @@ R9_EDEV_PHASES = (
     "full",
 )
 R11_CAUSAL_CONTRACT_TYPE = "safa_r11_transport_only_nfe5_v1"
+R11_SCHEDULE_NFE2_CONTRACT_TYPE = "safa_r11_schedule_nfe2_v1"
+R11_NFE2_SCHEDULE_CONTRACT_FIELD = "r11_nfe2_schedule_contract"
 R11_EXTERNAL_NATIVE_CONTRACT_TYPE = "safa_r11_causal_external_native_v1"
+
+
+def locked_r11_nfe2_schedule_contract() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "contract_type": "safa_r11_schedule_nfe2_coarse_schedule_v1",
+        "times": [1.0, 0.25, 0.0],
+        "guided_times": [1.0, 0.25],
+        "unguided_times": [0.25, 0.0],
+        "expected_algorithm_nfe": 2,
+        "expected_diagnostic_nfe": 0,
+        "expected_algorithm_trace": [
+            {
+                "t": 1.0,
+                "r": 0.25,
+                "kind": "paper_algorithm_split",
+            },
+            {
+                "t": 0.25,
+                "r": 0.0,
+                "kind": "paper_algorithm_split",
+            },
+        ],
+        "expected_diagnostic_trace": [],
+    }
+
+
+def validate_r11_nfe2_schedule_contract(
+    config: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    if config.get("causal_contract_type") != R11_SCHEDULE_NFE2_CONTRACT_TYPE:
+        if R11_NFE2_SCHEDULE_CONTRACT_FIELD in config:
+            raise ValueError(
+                f"{R11_NFE2_SCHEDULE_CONTRACT_FIELD} requires "
+                f"causal_contract_type={R11_SCHEDULE_NFE2_CONTRACT_TYPE!r}"
+            )
+        return None
+    expected = locked_r11_nfe2_schedule_contract()
+    if config.get(R11_NFE2_SCHEDULE_CONTRACT_FIELD) != expected:
+        raise ValueError(
+            f"{R11_NFE2_SCHEDULE_CONTRACT_FIELD} must be the exact locked "
+            "coarse schedule [1, 0.25, 0]"
+        )
+    for field in ("guided_times", "unguided_times"):
+        if not _float_sequences_equal(config.get(field), expected[field]):
+            raise ValueError(
+                f"R11 NFE2 config {field} must be exactly {expected[field]!r}"
+            )
+    return expected
 
 
 @dataclass(frozen=True)
@@ -341,12 +392,21 @@ def _validate_r11_causal_config(
     external = config.get("external_native_contract")
     if contract_type is None and external is None:
         return None
-    if contract_type != R11_CAUSAL_CONTRACT_TYPE:
+    supported_contracts = {
+        R11_CAUSAL_CONTRACT_TYPE: ("transport_only_nfe5", 5),
+        R11_SCHEDULE_NFE2_CONTRACT_TYPE: ("schedule_nfe2", 2),
+    }
+    if contract_type not in supported_contracts:
         raise ValueError(
-            f"causal_contract_type must be {R11_CAUSAL_CONTRACT_TYPE!r}"
+            "causal_contract_type must be one of "
+            f"{sorted(supported_contracts)!r}"
         )
-    if config.get("arm_name") != "transport_only_nfe5":
-        raise ValueError("R11 causal contract requires arm_name='transport_only_nfe5'")
+    expected_arm, expected_nfe = supported_contracts[str(contract_type)]
+    if config.get("arm_name") != expected_arm:
+        raise ValueError(
+            f"R11 causal contract {contract_type!r} requires "
+            f"arm_name={expected_arm!r}"
+        )
     if config.get("mode") != "paper_algorithm_split":
         raise ValueError("R11 causal contract requires paper_algorithm_split mode")
     if config.get("phase") != "calibrate":
@@ -358,8 +418,25 @@ def _validate_r11_causal_config(
         raise ValueError("R11 causal contract requires the R9 interval contract")
     if interval["active_guidance_intervals"] != []:
         raise ValueError("R11 causal contract requires active_guidance_intervals=[]")
-    if int(interval["expected_algorithm_nfe"]) != 5:
-        raise ValueError("R11 causal contract requires expected algorithm NFE=5")
+    if int(interval["expected_algorithm_nfe"]) != expected_nfe:
+        raise ValueError(
+            f"R11 causal contract {contract_type!r} requires expected "
+            f"algorithm NFE={expected_nfe}"
+        )
+    if int(interval["expected_diagnostic_nfe"]) != 0:
+        raise ValueError("R11 causal contract requires diagnostic NFE=0")
+    if contract_type == R11_SCHEDULE_NFE2_CONTRACT_TYPE:
+        schedule_contract = validate_r11_nfe2_schedule_contract(config)
+        if schedule_contract is None:
+            raise AssertionError("R11 NFE2 schedule contract was not resolved")
+        if interval["expected_algorithm_trace"] != schedule_contract[
+            "expected_algorithm_trace"
+        ]:
+            raise ValueError("R11 NFE2 algorithm trace differs from the locked trace")
+    elif R11_NFE2_SCHEDULE_CONTRACT_FIELD in config:
+        raise ValueError(
+            f"{R11_NFE2_SCHEDULE_CONTRACT_FIELD} is forbidden for NFE5"
+        )
     if not _edev_required_for_config(config):
         raise ValueError("R11 causal contract requires effective Edev scoring")
     if not isinstance(external, Mapping):
@@ -658,10 +735,23 @@ def validate_r9_interval_guidance_config(
                 f"R9 paper_algorithm_split rejects unused official algorithm fields: {ignored!r}"
             )
 
+    nfe2_schedule = validate_r11_nfe2_schedule_contract(config)
+    guided_times = (
+        nfe2_schedule["guided_times"]
+        if nfe2_schedule is not None
+        else [1.0, 0.75, 0.5, 0.25]
+    )
+    unguided_times = (
+        nfe2_schedule["unguided_times"]
+        if nfe2_schedule is not None
+        else [0.25, 0.125, 0.0]
+    )
     expected_algorithm_trace, expected_diagnostic_trace = _expected_r9_interval_traces(
         resolved_mode,
         canonical_active,
         collect=collect,
+        guided_times=guided_times,
+        unguided_times=unguided_times,
     )
     contract = {
         "schema_version": 1,
@@ -686,15 +776,16 @@ def _expected_r9_interval_traces(
     active_guidance_intervals: Sequence[str],
     *,
     collect: bool,
+    guided_times: Sequence[float],
+    unguided_times: Sequence[float],
 ) -> tuple[list[dict[str, float | str]], list[dict[str, float | str]]]:
     active = set(active_guidance_intervals)
     algorithm_trace: list[dict[str, float | str]] = []
     diagnostic_trace: list[dict[str, float | str]] = []
-    for interval_id, t, s in (
-        ("I1", 1.0, 0.75),
-        ("I2", 0.75, 0.5),
-        ("I3", 0.5, 0.25),
+    for interval_index, (t, s) in enumerate(
+        zip(guided_times, guided_times[1:]), start=1
     ):
+        interval_id = f"I{interval_index}"
         if mode == "official_head_current_xt":
             if interval_id in active:
                 algorithm_trace.append({"t": t, "r": 0.0, "kind": mode})
@@ -717,10 +808,8 @@ def _expected_r9_interval_traces(
                     {"t": s, "r": 0.0, "kind": "interval_diagnostic"}
                 )
     algorithm_trace.extend(
-        (
-            {"t": 0.25, "r": 0.125, "kind": mode},
-            {"t": 0.125, "r": 0.0, "kind": mode},
-        )
+        {"t": t, "r": r, "kind": mode}
+        for t, r in zip(unguided_times, unguided_times[1:])
     )
     return algorithm_trace, diagnostic_trace
 
@@ -1166,11 +1255,21 @@ def resolve_locked_schedule(
             raise ValueError(
                 f"locked schedule {field} disagrees with the uniform schedule"
             )
-    for field, expected in (("guided_times", guided), ("unguided_times", unguided)):
-        if field in config and not _float_sequences_equal(config[field], expected):
-            raise ValueError(
-                f"config {field} disagrees with the locked uniform schedule"
-            )
+    nfe2_schedule = validate_r11_nfe2_schedule_contract(config)
+    if nfe2_schedule is None:
+        for field, expected in (
+            ("guided_times", guided),
+            ("unguided_times", unguided),
+        ):
+            if field in config and not _float_sequences_equal(config[field], expected):
+                raise ValueError(
+                    f"config {field} disagrees with the locked uniform schedule"
+                )
+        effective_guided = guided
+        effective_unguided = unguided
+    else:
+        effective_guided = list(nfe2_schedule["guided_times"])
+        effective_unguided = list(nfe2_schedule["unguided_times"])
     report_path = _locked_path_binding(config, manifest, "semigroup_report")
     report_sha256 = _require_sha256(
         manifest.get("semigroup_report_sha256"), "semigroup_report_sha256"
@@ -1208,10 +1307,18 @@ def resolve_locked_schedule(
         "semigroup_sample_id_manifest": str(sample_manifest_path),
         "semigroup_sample_id_manifest_sha256": sample_manifest_sha256,
         "t_cut": t_cut,
-        "guided_times": guided,
-        "unguided_times": unguided,
+        "guided_times": effective_guided,
+        "unguided_times": effective_unguided,
         "gate_passed": True,
     }
+    if nfe2_schedule is not None:
+        resolved_schedule.update(
+            {
+                "parent_guided_times": guided,
+                "parent_unguided_times": unguided,
+                R11_NFE2_SCHEDULE_CONTRACT_FIELD: nfe2_schedule,
+            }
+        )
     if r9_contract:
         gate_contract = validate_r9_locked_schedule_bindings(config, manifest)
         for field in (

@@ -342,6 +342,90 @@ def test_locked_schedule_is_uniform_and_rejects_t_cut_or_hash_disagreement(tmp_p
             )
 
 
+def test_r11_nfe2_resolves_exact_coarse_schedule_from_locked_parent(
+    tmp_path: Path,
+) -> None:
+    _, config = _write_locked_schedule_fixture(tmp_path)
+    schedule_contract = runner_module.locked_r11_nfe2_schedule_contract()
+    nfe2 = {
+        **config,
+        "causal_contract_type": runner_module.R11_SCHEDULE_NFE2_CONTRACT_TYPE,
+        runner_module.R11_NFE2_SCHEDULE_CONTRACT_FIELD: schedule_contract,
+        "guided_times": [1.0, 0.25],
+        "unguided_times": [0.25, 0.0],
+    }
+
+    schedule = resolve_locked_schedule(nfe2, checkpoint_sha256="a" * 64)
+
+    assert schedule["guided_times"] == [1.0, 0.25]
+    assert schedule["unguided_times"] == [0.25, 0.0]
+    assert schedule["parent_guided_times"] == [1.0, 0.75, 0.5, 0.25]
+    assert schedule["parent_unguided_times"] == [0.25, 0.125, 0.0]
+    assert (
+        schedule[runner_module.R11_NFE2_SCHEDULE_CONTRACT_FIELD]
+        == schedule_contract
+    )
+
+    for field, value in (
+        ("guided_times", [1.0, 0.5, 0.25]),
+        ("unguided_times", [0.25, 0.125, 0.0]),
+    ):
+        with pytest.raises(ValueError, match=field):
+            resolve_locked_schedule(
+                {**nfe2, field: value},
+                checkpoint_sha256="a" * 64,
+            )
+
+
+def test_r11_nfe2_interval_contract_locks_trace_and_rejects_drift() -> None:
+    schedule_contract = runner_module.locked_r11_nfe2_schedule_contract()
+    config = {
+        "experiment_contract": R9_EXPERIMENT_CONTRACT,
+        "causal_contract_type": runner_module.R11_SCHEDULE_NFE2_CONTRACT_TYPE,
+        "mode": "paper_algorithm_split",
+        "step_size": 0.125,
+        "active_guidance_intervals": [],
+        "collect_interval_diagnostics": False,
+        "guided_times": [1.0, 0.25],
+        "unguided_times": [0.25, 0.0],
+        runner_module.R11_NFE2_SCHEDULE_CONTRACT_FIELD: schedule_contract,
+    }
+
+    interval = runner_module.validate_r9_interval_guidance_config(config)
+
+    assert interval is not None
+    assert interval["expected_algorithm_nfe"] == 2
+    assert interval["expected_diagnostic_nfe"] == 0
+    assert interval["expected_algorithm_trace"] == schedule_contract[
+        "expected_algorithm_trace"
+    ]
+    assert interval["expected_diagnostic_trace"] == []
+
+    invalid = dict(config, active_guidance_intervals=["I1"])
+    interval = runner_module.validate_r9_interval_guidance_config(invalid)
+    assert interval is not None
+    with pytest.raises(ValueError, match="active_guidance_intervals"):
+        runner_module._validate_r11_causal_config(
+            {
+                **invalid,
+                "arm_name": "schedule_nfe2",
+                "phase": "calibrate",
+                "sampling_seed": 7919,
+                "external_native_contract": {
+                    "schema_version": 1,
+                    "contract_type": "safa_r11_causal_external_native_v1",
+                    "manifest": "native.jsonl",
+                    "manifest_sha256": "a" * 64,
+                    "sample_count": 1,
+                    "ordered_sample_id_sha256": "b" * 64,
+                },
+                "r9_phase_contract": {
+                    "edev_required": True,
+                },
+            }
+        )
+
+
 def test_locked_schedule_rejects_report_manifest_or_self_digest_tampering(tmp_path: Path) -> None:
     schedule_path, config = _write_locked_schedule_fixture(tmp_path)
     report_path = Path(config["semigroup_report"])

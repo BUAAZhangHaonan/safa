@@ -550,7 +550,6 @@ def _resolve_active_guidance_intervals(
     default_ids = tuple(f"I{index + 1}" for index in range(len(guided_times) - 1))
     if active_guidance_intervals is None:
         return default_ids
-    _require_locked_guidance_schedule(guided_times)
     if isinstance(active_guidance_intervals, (str, bytes)):
         raise ValueError("active_guidance_intervals must be a sequence of interval IDs")
     requested = tuple(active_guidance_intervals)
@@ -560,6 +559,9 @@ def _resolve_active_guidance_intervals(
         raise ValueError(
             "active_guidance_intervals must not contain duplicate interval IDs"
         )
+    if not requested:
+        return ()
+    _require_locked_guidance_schedule(guided_times)
     known_ids = {interval_id for interval_id, _, _ in _LOCKED_GUIDANCE_INTERVALS}
     unknown_ids = sorted(set(requested) - known_ids)
     if unknown_ids:

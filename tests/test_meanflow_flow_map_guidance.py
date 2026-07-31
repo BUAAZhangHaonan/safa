@@ -207,6 +207,7 @@ def _run_paper(
     step_size=0.5,
     guided_times=GUIDED_TIMES,
     unguided_times=UNGUIDED_TIMES,
+    active_guidance_intervals=None,
 ):
     generator, codec, e0 = _frozen_guidance_stack()
     x_init, condition, target = _guidance_inputs()
@@ -221,8 +222,37 @@ def _run_paper(
         guided_times=guided_times,
         unguided_times=unguided_times,
         step_size=step_size,
+        active_guidance_intervals=active_guidance_intervals,
     )
     return result, generator
+
+
+def test_transport_only_coarse_schedule_executes_exact_legal_nfe2_trace() -> None:
+    result, generator = _run_paper(
+        step_size=0.125,
+        guided_times=[1.0, 0.25],
+        unguided_times=[0.25, 0.0],
+        active_guidance_intervals=[],
+    )
+
+    assert result.nfe == 2
+    assert result.diagnostics["algorithm_nfe"] == 2
+    assert result.diagnostics["diagnostic_nfe"] == 0
+    assert result.diagnostics["diagnostic_flow_map_trace"] == []
+    assert result.diagnostics["active_guidance_intervals"] == []
+    assert [(t, r) for t, r, _ in generator.calls] == [
+        (1.0, 0.25),
+        (0.25, 0.0),
+    ]
+
+
+def test_coarse_schedule_rejects_any_active_guidance_interval() -> None:
+    with pytest.raises(ValueError, match="locked schedule"):
+        _run_paper(
+            guided_times=[1.0, 0.25],
+            unguided_times=[0.25, 0.0],
+            active_guidance_intervals=["I1"],
+        )
 
 
 def _analytic_endpoint_gradient(x: torch.Tensor, t: float = 1.0) -> torch.Tensor:
