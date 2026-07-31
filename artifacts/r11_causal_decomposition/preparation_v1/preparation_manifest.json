@@ -1,0 +1,49 @@
+{
+  "causal_contract": {
+    "path": "artifacts/r11_causal_decomposition/preparation_v1/causal_contract.json",
+    "sha256": "fe943df00d69b32411ebad3d2e221e186b85e98865d815d055999edc893bd301"
+  },
+  "configs": [
+    {
+      "path": "configs/medium_v2/experiments/r11_transport_only_nfe5_prefix128.yaml",
+      "sha256": "846c45b043929b17285920323cbdbb339c867cc03893e57ad9dddc6d7a76e6b1"
+    },
+    {
+      "path": "configs/medium_v2/experiments/r11_transport_only_nfe5_sharpness_tail32.yaml",
+      "sha256": "9ab2b88d953c5491545d6520e15f009a64d7d40078d81d63de99efa2c59a4316"
+    }
+  ],
+  "contract_type": "safa_r11_causal_preparation_v1",
+  "formal_reuse": {
+    "arm": "paper_eta_0p125",
+    "campaign": "r9-report-only-formal-v9",
+    "full_verdict": "failed_locked_winner",
+    "regeneration": {
+      "native": false,
+      "paper": false
+    },
+    "sample_count": 2048,
+    "seed": 7919,
+    "shards": 16
+  },
+  "invariants": {
+    "active_guidance_intervals": [],
+    "checkpoint": "E15",
+    "effective_edev": true,
+    "expected_algorithm_nfe": 5,
+    "retry_limit": 0,
+    "sampling_seed": 7919,
+    "step_size": 0.125,
+    "vae_digest": "ac188e7f6ff31ff1a3bbde37fea3c345ec72f9e10589cf8aa8a3ec7e86afb188"
+  },
+  "job_counts": {
+    "generation": 2,
+    "quality": 6
+  },
+  "launch_ledger": {
+    "path": "artifacts/r11_causal_decomposition/preparation_v1/launch_ledger.json",
+    "sha256": "1cee02e0255836527952adb2cfac86ad17a4b334b8503e9c2f2974ce784392af"
+  },
+  "schema_version": 1,
+  "status": "go_not_launched"
+}

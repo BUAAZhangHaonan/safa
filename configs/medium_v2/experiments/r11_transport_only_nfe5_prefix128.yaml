@@ -1,0 +1,201 @@
+experiment_name: r11_causal__transport_only_nfe5__prefix128
+experiment_contract: safa_r9_meanflow_v1
+out_dir: artifacts/r11_causal_decomposition/preparation_v1/runs/prefix128/transport_only_nfe5
+mode: paper_algorithm_split
+phase: calibrate
+seed: 7919
+sampling_seed: 7919
+device: cuda:0
+attention_backend: native
+determinism_policy:
+  schema_version: 1
+  cublas_workspace_config: :4096:8
+  deterministic_algorithms: true
+  deterministic_warn_only: false
+  cudnn_deterministic: true
+  cudnn_benchmark: false
+  cuda_matmul_allow_tf32: false
+  cudnn_allow_tf32: false
+determinism_policy_sha256: ea6a4e81627a993066d9b1a3ca4ae791a0bcb3e21e399a5d2cb27811aa22147f
+semigroup_preflight_contract_sha256: 9e81c68ceddb9aafa473ccbb334e9185007284195bb49c64c1f157d182c3a00d
+checkpoint: artifacts/checkpoints/e15_meanflow_sit_b_face_mixed_h100_resume_2400ep/last_nopretrained.pt
+checkpoint_sha256: 4690717781db58a6021d57d124300a9b212f0a5043cf3028fb5de4d9c835cc4d
+checkpoint_model: ema
+expected_stage: stage2
+expected_stage_epoch_1based: 1652
+expected_model_type: meanflow_sit
+expected_sit_patch_size: 4
+transport_condition: learned_null_condition
+e0_checkpoint: artifacts/checkpoints/e0_medium_v1/best.pt
+e0_sha256: d7d2c57a552155776b8c15a4e52e43ec5082fc046aa0aabb4e9709685f7e3d1a
+edev_checkpoint: artifacts/checkpoints/e0_resnet18/best.pt
+edev_sha256: 373b331c917834467e854ddf3fe20f39000532f189ec73f76a1abc55d82e560e
+heldout_e1_checkpoint: artifacts/checkpoints/e0_dinov2_large_v2/best.pt
+heldout_e1_sha256: cce0de2f1eab097cb6091886f587a9f334dd84ced1ca4dd5e08c3a765718a14c
+heldout_e2_checkpoint: artifacts/checkpoints/e0_convnext_tiny/best.pt
+heldout_e2_sha256: 09c88bd416057222abefeba52ebe88d710715ede791ec34198a23ae5e6e850a8
+heldout_eval: prospective_after_winner_lock
+vae_path: artifacts/checkpoints/external/sd-vae-ft-ema
+vae_digest: ac188e7f6ff31ff1a3bbde37fea3c345ec72f9e10589cf8aa8a3ec7e86afb188
+vae_scaling_factor: 0.18215
+index: data/index/val_face_mixed_e14.jsonl
+index_sha256: da14e23eacefecbc2948d1374fb93961a13d017a9183aa1fe2a2f62b33a4b4ea
+feature_source: cached_features
+features: artifacts/e0_features/val_face_mixed_e14_e0_medium_v1
+features_digest: 287b8163f093f290e75e8ef09fbbedc986e6934ab0ac458ad786e655889fbe45
+sample_id_manifest: artifacts/r10_triangle_exploration/preparation_v1/prefix128.jsonl
+sample_id_manifest_sha256: 9e1bfa90057c9b72f02a29340d91f0d87d4d4f35119733824b9659bd7ee8db89
+calibration_sample_id_manifest: artifacts/r10_triangle_exploration/preparation_v1/prefix128.jsonl
+calibration_sample_id_manifest_sha256: 9e1bfa90057c9b72f02a29340d91f0d87d4d4f35119733824b9659bd7ee8db89
+asset_digest_cache: artifacts/r11_causal_decomposition/preparation_v1/asset_digests/prefix128.json
+pixel_image_size: 256
+batch_size: 2
+num_workers: 4
+max_samples: 128
+calibration_samples: 128
+visual_review_samples: 64
+quality_metrics:
+- fid
+- kid
+- niqe
+- sharpness
+calibration_metrics:
+- e0_cosine
+- edev_cosine
+- kid
+- niqe
+- sharpness
+registered_t_cut_candidates:
+- 0.75
+- 0.5
+- 0.25
+split_times:
+- 0.25
+- 0.5
+- 0.75
+semigroup_thresholds:
+  median: 0.1
+  p90: 0.2
+  endpoint_e0_cosine: 0.95
+  visual_pass: true
+contact_sheets: false
+r9_campaign_id: r9-report-only-formal-v9
+r9_campaign_runtime_sha256: 9bd986bfbb55b56ce3ff34a0050b4399fee2a41e2704ec40e9ade9b347307067
+r9_manifest_contracts_sha256: 19ef690a20f80463b700075721367ce1c24437204fbc2d95cd1a32f55bf18236
+r9_phase_manifest_sha256: ba760481941505b2d519951b8077026cdc0cdf97bcd44b5eac7e0e9329b36b68
+r9_continuation_contract_sha256: 62f65c392f7dab088660be44b8dc302886cab396e50934cbecbb9b7409b92962
+r9_generation_batch_benchmark_sha256: efb5075062473fdc25ec89e1d72a97dcc79201e791af9122679ef6c7bd2b3e0f
+r9_generation_gpu_slot_claim_bytes: 4987027456
+r9_generation_ram_slot_budget_bytes: 3691402036
+r9_generation_slots_per_gpu: 2
+r9_semigroup_closure_seal: artifacts/r9_meanflow_flow_map_guidance/semigroup_campaign_closures/r9-semigroup-report-only-policy-v2__for__r9-report-only-formal-v2/closure_seal.json
+r9_semigroup_closure_seal_sha256: 15257e92f0c249f16dc7b8c15e98daf5cf5b72f25be653170966afc93c21d291
+r9_semigroup_closure_contract_sha256: 88d83d2f47c67ecc84405e5332b8436185f2e6b7a542b3e829d16e7b0f54aa28
+r9_semigroup_bootstrap_campaign_id: r9-node2-semigroup-bootstrap-v5
+step_size: 0.125
+active_guidance_intervals: []
+collect_interval_diagnostics: false
+schedule_manifest: artifacts/r9_meanflow_flow_map_guidance/semigroup_campaign_closures/r9-semigroup-report-only-policy-v2__for__r9-report-only-formal-v2/locked_schedule_manifest.json
+schedule_contract_sha256: 8a11bc868953bf793bfbe456c8d89ff19aed35ac4eb5d238549766e66e3c4b3e
+semigroup_report: artifacts/r9_meanflow_flow_map_guidance/semigroup_campaign_closures/r9-semigroup-report-only-policy-v2__for__r9-report-only-formal-v2/semigroup_report.json
+semigroup_sample_id_manifest: configs/medium_v2/experiments/r9_manifests/calibration_64.jsonl
+semigroup_sample_id_manifest_sha256: ffc1f04f671533ee1498f4b03565826920afcc4e5c6ab244fc6f9b7aa680f964
+semigroup_preflight_contract: artifacts/r9_meanflow_flow_map_guidance/semigroup_campaign_closures/r9-semigroup-report-only-policy-v2__for__r9-report-only-formal-v2/preflight_contract.json
+r9_semigroup_gate_contract: artifacts/r9_meanflow_flow_map_guidance/semigroup_campaign_closures/r9-semigroup-report-only-policy-v2__for__r9-report-only-formal-v2/gate_contract.json
+r9_semigroup_gate_contract_sha256: f1adcd806e7dd50e293791f6dc8cd0283879299c23d71ac892d92ba1dc1b0765
+locked_schedule:
+  manifest: artifacts/r9_meanflow_flow_map_guidance/semigroup_campaign_closures/r9-semigroup-report-only-policy-v2__for__r9-report-only-formal-v2/locked_schedule_manifest.json
+  manifest_sha256: cd111cf403f622090d9bd79a7a19fdad4c6af4e54577e37947c894de722e472b
+  schedule_contract_sha256: 8a11bc868953bf793bfbe456c8d89ff19aed35ac4eb5d238549766e66e3c4b3e
+  checkpoint_sha256: 4690717781db58a6021d57d124300a9b212f0a5043cf3028fb5de4d9c835cc4d
+  semigroup_report: artifacts/r9_meanflow_flow_map_guidance/semigroup_campaign_closures/r9-semigroup-report-only-policy-v2__for__r9-report-only-formal-v2/semigroup_report.json
+  semigroup_report_sha256: d93a3cf4b518d4377784dc27a4a204a8127597acb8c10d2e60e4a82957721cce
+  semigroup_sample_id_manifest: configs/medium_v2/experiments/r9_manifests/calibration_64.jsonl
+  semigroup_sample_id_manifest_sha256: ffc1f04f671533ee1498f4b03565826920afcc4e5c6ab244fc6f9b7aa680f964
+  t_cut: 0.25
+  guided_times:
+  - 1.0
+  - 0.75
+  - 0.5
+  - 0.25
+  unguided_times:
+  - 0.25
+  - 0.125
+  - 0.0
+  gate_passed: true
+  semigroup_preflight_contract: artifacts/r9_meanflow_flow_map_guidance/semigroup_campaign_closures/r9-semigroup-report-only-policy-v2__for__r9-report-only-formal-v2/preflight_contract.json
+  semigroup_preflight_contract_sha256: 9e81c68ceddb9aafa473ccbb334e9185007284195bb49c64c1f157d182c3a00d
+  r9_semigroup_gate_contract: artifacts/r9_meanflow_flow_map_guidance/semigroup_campaign_closures/r9-semigroup-report-only-policy-v2__for__r9-report-only-formal-v2/gate_contract.json
+  r9_semigroup_gate_contract_sha256: f1adcd806e7dd50e293791f6dc8cd0283879299c23d71ac892d92ba1dc1b0765
+  r9_gate_contract:
+    arm_config_sha256: 1822161cc9b674243ff3cc6a4b904dd3512c17b90942d4c85e50e5eb1d5449c9
+    attention_backend_requested: native
+    attention_backend_resolved: native
+    checkpoint_sha256: 4690717781db58a6021d57d124300a9b212f0a5043cf3028fb5de4d9c835cc4d
+    contract_type: safa_r9_semigroup_recovery_gate_v2
+    determinism_policy_sha256: ea6a4e81627a993066d9b1a3ca4ae791a0bcb3e21e399a5d2cb27811aa22147f
+    effective_config_sha256: dda5fca4387ec8cd4c2524a2c45b4cc6a886eb2fd979f69fb8c069ed9c29266c
+    experiment_contract: safa_r9_meanflow_v1
+    gate_contract_sha256: 767cde319ff431c8f760c101f265070138bdade80879241eb5065c18f037b295
+    gate_passed: true
+    numerical_metrics_role: report_only
+    preflight_contract_sha256: 9e81c68ceddb9aafa473ccbb334e9185007284195bb49c64c1f157d182c3a00d
+    recovery_policy_sha256: b82d3725658b04b7dd7c5cd2a3061be6bca37acfbfd797617001e0c4221a0d23
+    registered_t_cut_candidates:
+    - 0.75
+    - 0.5
+    - 0.25
+    sample_id_manifest_sha256: ffc1f04f671533ee1498f4b03565826920afcc4e5c6ab244fc6f9b7aa680f964
+    schedule_contract_sha256: 8a11bc868953bf793bfbe456c8d89ff19aed35ac4eb5d238549766e66e3c4b3e
+    schema_version: 2
+    selected_t_cut: 0.25
+    selection_rule: policy_locked_t_cut_0p25_report_only
+    semigroup_report_sha256: d93a3cf4b518d4377784dc27a4a204a8127597acb8c10d2e60e4a82957721cce
+    split_times:
+    - 0.25
+    - 0.5
+    - 0.75
+arm_name: transport_only_nfe5
+causal_contract_type: safa_r11_transport_only_nfe5_v1
+external_native_contract:
+  schema_version: 1
+  contract_type: safa_r11_causal_external_native_v1
+  manifest: artifacts/r11_causal_decomposition/preparation_v1/reuse/prefix128/native_external.jsonl
+  manifest_sha256: 42f1716db882af3a1c7dff5b0d3c5f06b6a99c3055d62f9629a24b3d4ff71c06
+  sample_count: 128
+  ordered_sample_id_sha256: 3af3ecd3f844f61b7e7e5a25519ed97fa30dc56663e52fc2ee84cdd9cabac2d5
+r9_phase_contract:
+  schema_version: 1
+  phase: calibrate
+  edev_required: true
+  required_per_sample_edev_fields:
+  - edev_cosine
+  - native_edev_cosine
+  required_summary_edev_fields:
+  - candidate_edev_source
+  - native_edev_source
+r9_guidance_interval_contract:
+  schema_version: 1
+  mode: paper_algorithm_split
+  active_guidance_intervals: []
+  collect_interval_diagnostics: false
+  expected_algorithm_nfe: 5
+  expected_diagnostic_nfe: 0
+  expected_algorithm_trace:
+  - t: 1.0
+    r: 0.75
+    kind: paper_algorithm_split
+  - t: 0.75
+    r: 0.5
+    kind: paper_algorithm_split
+  - t: 0.5
+    r: 0.25
+    kind: paper_algorithm_split
+  - t: 0.25
+    r: 0.125
+    kind: paper_algorithm_split
+  - t: 0.125
+    r: 0.0
+    kind: paper_algorithm_split
+  expected_diagnostic_trace: []
+arm_config_sha256: 93d7808aa89861854425c1a3fef9447d703681a658b6207b355af2733e5803ad

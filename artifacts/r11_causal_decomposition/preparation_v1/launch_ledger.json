@@ -1,0 +1,302 @@
+{
+  "contract_type": "safa_r11_causal_launch_ledger_v1",
+  "jobs": [
+    {
+      "argv": [
+        "scripts/run_meanflow_flow_map_guidance.py",
+        "--config",
+        "configs/medium_v2/experiments/r11_transport_only_nfe5_prefix128.yaml"
+      ],
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+      },
+      "fresh_output": "artifacts/r11_causal_decomposition/preparation_v1/runs/prefix128/transport_only_nfe5",
+      "gpu": {
+        "index": 0,
+        "uuid": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+      },
+      "job_id": "generate__prefix128",
+      "job_type": "generation",
+      "retry_limit": 0,
+      "wave": 0
+    },
+    {
+      "argv": [
+        "scripts/run_r11_quality_evaluation.py",
+        "--real-index",
+        "data/index/val_face_mixed_e14.jsonl",
+        "--generated-dir",
+        "artifacts/r11_causal_decomposition/preparation_v1/flat/prefix128/native",
+        "--output",
+        "artifacts/r11_causal_decomposition/preparation_v1/quality/prefix128/native/quality.json",
+        "--sample-id-manifest",
+        "artifacts/r10_triangle_exploration/preparation_v1/prefix128.jsonl",
+        "--per-sample-jsonl",
+        "artifacts/r11_causal_decomposition/preparation_v1/reuse/prefix128/native_reuse.jsonl",
+        "--device",
+        "cuda:0",
+        "--metrics",
+        "fid",
+        "kid",
+        "niqe",
+        "sharpness",
+        "--kid-subset-size",
+        "127"
+      ],
+      "classifier_metrics": [
+        "niqe",
+        "sharpness"
+      ],
+      "dataset_id": "prefix128",
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+      },
+      "fid_kid_role": "descriptive_only",
+      "gpu": {
+        "index": 0,
+        "uuid": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+      },
+      "job_id": "quality__prefix128__native",
+      "job_type": "quality",
+      "retry_limit": 0,
+      "role": "native",
+      "wave": 1
+    },
+    {
+      "argv": [
+        "scripts/run_r11_quality_evaluation.py",
+        "--real-index",
+        "data/index/val_face_mixed_e14.jsonl",
+        "--generated-dir",
+        "artifacts/r11_causal_decomposition/preparation_v1/flat/prefix128/paper_eta_0p125",
+        "--output",
+        "artifacts/r11_causal_decomposition/preparation_v1/quality/prefix128/paper_eta_0p125/quality.json",
+        "--sample-id-manifest",
+        "artifacts/r10_triangle_exploration/preparation_v1/prefix128.jsonl",
+        "--per-sample-jsonl",
+        "artifacts/r11_causal_decomposition/preparation_v1/reuse/prefix128/paper_reuse.jsonl",
+        "--device",
+        "cuda:0",
+        "--metrics",
+        "fid",
+        "kid",
+        "niqe",
+        "sharpness",
+        "--kid-subset-size",
+        "127"
+      ],
+      "classifier_metrics": [
+        "niqe",
+        "sharpness"
+      ],
+      "dataset_id": "prefix128",
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "fid_kid_role": "descriptive_only",
+      "gpu": {
+        "index": 1,
+        "uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "job_id": "quality__prefix128__paper_eta_0p125",
+      "job_type": "quality",
+      "retry_limit": 0,
+      "role": "paper_eta_0p125",
+      "wave": 1
+    },
+    {
+      "argv": [
+        "scripts/run_r11_quality_evaluation.py",
+        "--real-index",
+        "data/index/val_face_mixed_e14.jsonl",
+        "--generated-dir",
+        "artifacts/r11_causal_decomposition/preparation_v1/runs/prefix128/transport_only_nfe5/generated_images",
+        "--output",
+        "artifacts/r11_causal_decomposition/preparation_v1/quality/prefix128/transport_only_nfe5/quality.json",
+        "--sample-id-manifest",
+        "artifacts/r10_triangle_exploration/preparation_v1/prefix128.jsonl",
+        "--per-sample-jsonl",
+        "artifacts/r11_causal_decomposition/preparation_v1/runs/prefix128/transport_only_nfe5/per_sample.jsonl",
+        "--device",
+        "cuda:0",
+        "--metrics",
+        "fid",
+        "kid",
+        "niqe",
+        "sharpness",
+        "--kid-subset-size",
+        "127"
+      ],
+      "classifier_metrics": [
+        "niqe",
+        "sharpness"
+      ],
+      "dataset_id": "prefix128",
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "GPU-e27fe71d-eaf7-3eb5-d0ff-c1c63b4f6b02"
+      },
+      "fid_kid_role": "descriptive_only",
+      "gpu": {
+        "index": 2,
+        "uuid": "GPU-e27fe71d-eaf7-3eb5-d0ff-c1c63b4f6b02"
+      },
+      "job_id": "quality__prefix128__transport_only_nfe5",
+      "job_type": "quality",
+      "retry_limit": 0,
+      "role": "transport_only_nfe5",
+      "wave": 1
+    },
+    {
+      "argv": [
+        "scripts/run_meanflow_flow_map_guidance.py",
+        "--config",
+        "configs/medium_v2/experiments/r11_transport_only_nfe5_sharpness_tail32.yaml"
+      ],
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "fresh_output": "artifacts/r11_causal_decomposition/preparation_v1/runs/sharpness_tail32/transport_only_nfe5",
+      "gpu": {
+        "index": 1,
+        "uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "job_id": "generate__sharpness_tail32",
+      "job_type": "generation",
+      "retry_limit": 0,
+      "wave": 0
+    },
+    {
+      "argv": [
+        "scripts/run_r11_quality_evaluation.py",
+        "--real-index",
+        "data/index/val_face_mixed_e14.jsonl",
+        "--generated-dir",
+        "artifacts/r11_causal_decomposition/preparation_v1/flat/sharpness_tail32/native",
+        "--output",
+        "artifacts/r11_causal_decomposition/preparation_v1/quality/sharpness_tail32/native/quality.json",
+        "--sample-id-manifest",
+        "artifacts/r11_initial_noise_sharpness_probe/preparation_v1/tail32.jsonl",
+        "--per-sample-jsonl",
+        "artifacts/r11_causal_decomposition/preparation_v1/reuse/sharpness_tail32/native_reuse.jsonl",
+        "--device",
+        "cuda:0",
+        "--metrics",
+        "niqe",
+        "sharpness"
+      ],
+      "classifier_metrics": [
+        "niqe",
+        "sharpness"
+      ],
+      "dataset_id": "sharpness_tail32",
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "GPU-61ea2925-9905-7f56-cd64-7a792a32efef"
+      },
+      "fid_kid_role": "forbidden",
+      "gpu": {
+        "index": 3,
+        "uuid": "GPU-61ea2925-9905-7f56-cd64-7a792a32efef"
+      },
+      "job_id": "quality__sharpness_tail32__native",
+      "job_type": "quality",
+      "retry_limit": 0,
+      "role": "native",
+      "wave": 1
+    },
+    {
+      "argv": [
+        "scripts/run_r11_quality_evaluation.py",
+        "--real-index",
+        "data/index/val_face_mixed_e14.jsonl",
+        "--generated-dir",
+        "artifacts/r11_causal_decomposition/preparation_v1/flat/sharpness_tail32/paper_eta_0p125",
+        "--output",
+        "artifacts/r11_causal_decomposition/preparation_v1/quality/sharpness_tail32/paper_eta_0p125/quality.json",
+        "--sample-id-manifest",
+        "artifacts/r11_initial_noise_sharpness_probe/preparation_v1/tail32.jsonl",
+        "--per-sample-jsonl",
+        "artifacts/r11_causal_decomposition/preparation_v1/reuse/sharpness_tail32/paper_reuse.jsonl",
+        "--device",
+        "cuda:0",
+        "--metrics",
+        "niqe",
+        "sharpness"
+      ],
+      "classifier_metrics": [
+        "niqe",
+        "sharpness"
+      ],
+      "dataset_id": "sharpness_tail32",
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+      },
+      "fid_kid_role": "forbidden",
+      "gpu": {
+        "index": 0,
+        "uuid": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+      },
+      "job_id": "quality__sharpness_tail32__paper_eta_0p125",
+      "job_type": "quality",
+      "retry_limit": 0,
+      "role": "paper_eta_0p125",
+      "wave": 2
+    },
+    {
+      "argv": [
+        "scripts/run_r11_quality_evaluation.py",
+        "--real-index",
+        "data/index/val_face_mixed_e14.jsonl",
+        "--generated-dir",
+        "artifacts/r11_causal_decomposition/preparation_v1/runs/sharpness_tail32/transport_only_nfe5/generated_images",
+        "--output",
+        "artifacts/r11_causal_decomposition/preparation_v1/quality/sharpness_tail32/transport_only_nfe5/quality.json",
+        "--sample-id-manifest",
+        "artifacts/r11_initial_noise_sharpness_probe/preparation_v1/tail32.jsonl",
+        "--per-sample-jsonl",
+        "artifacts/r11_causal_decomposition/preparation_v1/runs/sharpness_tail32/transport_only_nfe5/per_sample.jsonl",
+        "--device",
+        "cuda:0",
+        "--metrics",
+        "niqe",
+        "sharpness"
+      ],
+      "classifier_metrics": [
+        "niqe",
+        "sharpness"
+      ],
+      "dataset_id": "sharpness_tail32",
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "fid_kid_role": "forbidden",
+      "gpu": {
+        "index": 1,
+        "uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "job_id": "quality__sharpness_tail32__transport_only_nfe5",
+      "job_type": "quality",
+      "retry_limit": 0,
+      "role": "transport_only_nfe5",
+      "wave": 2
+    }
+  ],
+  "resource_policy": {
+    "cpu_memory_max_fraction": 0.9,
+    "gpu_indices": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "gpu_memory_max_fraction": 0.9,
+    "gpu_uuids": [
+      "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6",
+      "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1",
+      "GPU-e27fe71d-eaf7-3eb5-d0ff-c1c63b4f6b02",
+      "GPU-61ea2925-9905-7f56-cd64-7a792a32efef"
+    ]
+  },
+  "retry_limit": 0,
+  "schema_version": 1,
+  "status": "prepared_not_launched"
+}

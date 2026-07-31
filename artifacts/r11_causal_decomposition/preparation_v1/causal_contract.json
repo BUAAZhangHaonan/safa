@@ -1,0 +1,100 @@
+{
+  "classifier": {
+    "candidate_promotion": "forbidden",
+    "geometry": "not_evaluated",
+    "metrics": [
+      "niqe",
+      "sharpness"
+    ],
+    "prefix_fid_kid": "descriptive_only",
+    "privacy": "not_evaluated",
+    "rule": "correction_limited iff transport passes NIQE<=native+0.10 and sharpness>=0.95*native on both datasets while paper fails either quality gate on at least one dataset",
+    "tail_fid_kid": "forbidden"
+  },
+  "contract_type": "safa_r11_transport_causal_decomposition_v1",
+  "datasets": [
+    {
+      "dataset_id": "prefix128",
+      "ordered_sample_id_sha256": "3af3ecd3f844f61b7e7e5a25519ed97fa30dc56663e52fc2ee84cdd9cabac2d5",
+      "roles": {
+        "native": {
+          "quality_output": {
+            "expected_absent_at_preparation": true,
+            "path": "artifacts/r11_causal_decomposition/preparation_v1/quality/prefix128/native/quality.json"
+          },
+          "representation_rows": {
+            "path": "artifacts/r11_causal_decomposition/preparation_v1/reuse/prefix128/native_reuse.jsonl",
+            "sha256": "23846726cf2acbb6539973fd468531177aec132c03e622709d65cb18cdecf47b"
+          }
+        },
+        "paper_eta_0p125": {
+          "quality_output": {
+            "expected_absent_at_preparation": true,
+            "path": "artifacts/r11_causal_decomposition/preparation_v1/quality/prefix128/paper_eta_0p125/quality.json"
+          },
+          "representation_rows": {
+            "path": "artifacts/r11_causal_decomposition/preparation_v1/reuse/prefix128/paper_reuse.jsonl",
+            "sha256": "07e525ecc424dbd0f9bbceb5f185a38cddf36127ce111ad645d01eb9c3e8ad9d"
+          }
+        },
+        "transport_only_nfe5": {
+          "quality_output": {
+            "expected_absent_at_preparation": true,
+            "path": "artifacts/r11_causal_decomposition/preparation_v1/quality/prefix128/transport_only_nfe5/quality.json"
+          },
+          "representation_rows": {
+            "expected_absent_at_preparation": true,
+            "path": "artifacts/r11_causal_decomposition/preparation_v1/runs/prefix128/transport_only_nfe5/per_sample.jsonl"
+          }
+        }
+      },
+      "sample_count": 128,
+      "selection_manifest": {
+        "path": "artifacts/r10_triangle_exploration/preparation_v1/prefix128.jsonl",
+        "sha256": "9e1bfa90057c9b72f02a29340d91f0d87d4d4f35119733824b9659bd7ee8db89"
+      }
+    },
+    {
+      "dataset_id": "sharpness_tail32",
+      "ordered_sample_id_sha256": "0df6a923d37a45c67910d5f9f118700392403e12bdf6e8a6dbb04edfde86987f",
+      "roles": {
+        "native": {
+          "quality_output": {
+            "expected_absent_at_preparation": true,
+            "path": "artifacts/r11_causal_decomposition/preparation_v1/quality/sharpness_tail32/native/quality.json"
+          },
+          "representation_rows": {
+            "path": "artifacts/r11_causal_decomposition/preparation_v1/reuse/sharpness_tail32/native_reuse.jsonl",
+            "sha256": "93c94022c5f7ce14f3e99eeff583208088d2d65da9e274c33b4a4240eda47f6c"
+          }
+        },
+        "paper_eta_0p125": {
+          "quality_output": {
+            "expected_absent_at_preparation": true,
+            "path": "artifacts/r11_causal_decomposition/preparation_v1/quality/sharpness_tail32/paper_eta_0p125/quality.json"
+          },
+          "representation_rows": {
+            "path": "artifacts/r11_causal_decomposition/preparation_v1/reuse/sharpness_tail32/paper_reuse.jsonl",
+            "sha256": "49c8a21d48db4e07ece27d1c28e154c7b518d47747b8ea09172b3964af48e348"
+          }
+        },
+        "transport_only_nfe5": {
+          "quality_output": {
+            "expected_absent_at_preparation": true,
+            "path": "artifacts/r11_causal_decomposition/preparation_v1/quality/sharpness_tail32/transport_only_nfe5/quality.json"
+          },
+          "representation_rows": {
+            "expected_absent_at_preparation": true,
+            "path": "artifacts/r11_causal_decomposition/preparation_v1/runs/sharpness_tail32/transport_only_nfe5/per_sample.jsonl"
+          }
+        }
+      },
+      "sample_count": 32,
+      "selection_manifest": {
+        "path": "artifacts/r11_initial_noise_sharpness_probe/preparation_v1/tail32.jsonl",
+        "sha256": "f38fb6f6542c267b6c7d9cbec9ce57abdf9b0657edfe8d060fe533178a9f5b29"
+      }
+    }
+  ],
+  "schema_version": 1
+}
