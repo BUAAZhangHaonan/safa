@@ -1,0 +1,67 @@
+experiment_name: r12_initial_noise_fixed_eta05_u12_tail32
+experiment_contract: safa_r9_meanflow_v1
+out_dir: artifacts/r12_seed_aligned_trajectory/runs_v1/u12_tail32
+mode: initial_noise
+phase: diagnose
+projection: fixed_radius
+eta: 0.5
+num_updates: 12
+registered_eta_candidates: [0.25, 0.5, 1.0, 2.0]
+seed: 7919
+sampling_seed: 7919
+device: cuda:0
+attention_backend: native
+determinism_policy:
+  schema_version: 1
+  cublas_workspace_config: ":4096:8"
+  deterministic_algorithms: true
+  deterministic_warn_only: false
+  cudnn_deterministic: true
+  cudnn_benchmark: false
+  cuda_matmul_allow_tf32: false
+  cudnn_allow_tf32: false
+determinism_policy_sha256: ea6a4e81627a993066d9b1a3ca4ae791a0bcb3e21e399a5d2cb27811aa22147f
+checkpoint: artifacts/checkpoints/e15_meanflow_sit_b_face_mixed_h100_resume_2400ep/last_nopretrained.pt
+checkpoint_sha256: 4690717781db58a6021d57d124300a9b212f0a5043cf3028fb5de4d9c835cc4d
+checkpoint_model: ema
+expected_stage: stage2
+expected_stage_epoch_1based: 1652
+expected_model_type: meanflow_sit
+expected_sit_patch_size: 4
+transport_condition: learned_null_condition
+schedule_manifest: artifacts/r8_meanflow_flow_map_guidance/semigroup/locked_schedule_manifest.json
+e0_checkpoint: artifacts/checkpoints/e0_medium_v1/best.pt
+e0_sha256: d7d2c57a552155776b8c15a4e52e43ec5082fc046aa0aabb4e9709685f7e3d1a
+edev_checkpoint: artifacts/checkpoints/e0_resnet18/best.pt
+edev_sha256: 373b331c917834467e854ddf3fe20f39000532f189ec73f76a1abc55d82e560e
+heldout_e1_checkpoint: artifacts/checkpoints/e0_dinov2_large_v2/best.pt
+heldout_e1_sha256: cce0de2f1eab097cb6091886f587a9f334dd84ced1ca4dd5e08c3a765718a14c
+heldout_e2_checkpoint: artifacts/checkpoints/e0_convnext_tiny/best.pt
+heldout_e2_sha256: 09c88bd416057222abefeba52ebe88d710715ede791ec34198a23ae5e6e850a8
+heldout_eval: prospective_after_winner_lock
+vae_path: artifacts/checkpoints/external/sd-vae-ft-ema
+vae_digest: ac188e7f6ff31ff1a3bbde37fea3c345ec72f9e10589cf8aa8a3ec7e86afb188
+vae_scaling_factor: 0.18215
+index: data/index/val_face_mixed_e14.jsonl
+index_sha256: da14e23eacefecbc2948d1374fb93961a13d017a9183aa1fe2a2f62b33a4b4ea
+feature_source: cached_features
+features: artifacts/e0_features/val_face_mixed_e14_e0_medium_v1
+features_digest: 287b8163f093f290e75e8ef09fbbedc986e6934ab0ac458ad786e655889fbe45
+sample_id_manifest: artifacts/r11_initial_noise_sharpness_probe/preparation_v1/tail32.jsonl
+sample_id_manifest_sha256: f38fb6f6542c267b6c7d9cbec9ce57abdf9b0657edfe8d060fe533178a9f5b29
+calibration_sample_id_manifest: artifacts/r11_initial_noise_sharpness_probe/preparation_v1/tail32.jsonl
+calibration_sample_id_manifest_sha256: f38fb6f6542c267b6c7d9cbec9ce57abdf9b0657edfe8d060fe533178a9f5b29
+full_sample_id_manifest: artifacts/r8_meanflow_flow_map_guidance/manifests/full_2048.jsonl
+full_sample_id_manifest_sha256: 7f830ad3f84089bcf83d092fbffaf2b5c3335cf68a4b397f04b65f362f79ae5b
+asset_digest_cache: artifacts/r8_meanflow_flow_map_guidance/shared/asset_digests.json
+pixel_image_size: 256
+batch_size: 2
+num_workers: 4
+max_samples: 32
+calibration_samples: 32
+full_samples: 2048
+visual_review_samples: 64
+contact_sheets: false
+contact_sheet_rows: 8
+quality_metrics: [niqe, sharpness]
+calibration_metrics: [e0_cosine, edev_cosine, niqe, sharpness]

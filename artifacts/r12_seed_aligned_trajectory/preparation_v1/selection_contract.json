@@ -1,0 +1,70 @@
+{
+  "advance_rule": "one_horizon_may_advance_only_if_both_datasets_pass_all_gates",
+  "contract_type": "safa_r12_seed_aligned_selection_v1",
+  "gates": {
+    "arcface_point_delta_max": 0.02,
+    "delta_e0_min": 0.3,
+    "delta_edev_min": 0.05,
+    "e0_min": 0.75,
+    "fid_kid": "forbidden_at_stage32",
+    "niqe_max": "native+0.10",
+    "sharpness_min": "max(300,0.95*native)",
+    "source_native_candidate_exact_one": "32/32"
+  },
+  "hard_stop": {
+    "no_128_512_full_without_selected_pair_survivor": true,
+    "no_additional_eta": true,
+    "no_additional_update_horizon": true,
+    "no_training": true
+  },
+  "legacy_tail_scope": {
+    "allowed_claim": "full_image_sharpness_gate_recovery_or_failure",
+    "forbidden_claim_without_agreeing_roi_evidence": "face_detail_restoration",
+    "known_confound": "background_high_frequency_content",
+    "post_hoc_roi_tail_reselection": "forbidden",
+    "selection_basis": "full_image_laplacian_sharpness"
+  },
+  "outcomes": [
+    "early_stop_quality_recovery",
+    "early_stop_gate_recovery",
+    "early_stop_not_needed_at32",
+    "full_horizon_required",
+    "early_stop_representation_limited",
+    "initial_noise_quality_limited",
+    "tail_fragility",
+    "face_or_privacy_limited",
+    "protocol_binding_failure"
+  ],
+  "pair_score": "minimum_R_Q_P_across_regular32_and_tail32",
+  "paired_horizons": [
+    {
+      "candidate_nfe_reduction_vs_u16": 0.23529411764705882,
+      "num_updates": 12,
+      "preregistered_reason": "12/16 updates is the natural 75% compute horizon and historical aggregate E0 clears 0.75 by more than 0.02 on both datasets",
+      "regular_arm_id": "u12_regular32",
+      "role": "natural_75_percent_update_budget",
+      "selection_eligible": true,
+      "tail_arm_id": "u12_tail32",
+      "update_budget_reduction_vs_u16": 0.25
+    },
+    {
+      "num_updates": 16,
+      "regular_arm_id": "u16_regular32",
+      "role": "aligned_original_horizon_comparator",
+      "selection_eligible": true,
+      "tail_arm_id": "u16_tail32"
+    }
+  ],
+  "prefix_binding": {
+    "mismatch_action": "protocol_binding_failure_no_metric_interpretation",
+    "native_bytes_equal_across_horizons_and_formal_seed7919": true,
+    "same_ordered_sample_ids_and_batch_pairs": true,
+    "u12_candidate_nfe": 13,
+    "u12_loss_history_equals_u16_prefix": true,
+    "u12_loss_history_length": 13,
+    "u16_candidate_nfe": 17,
+    "u16_loss_history_length": 17
+  },
+  "schema_version": 1,
+  "stage": 32
+}

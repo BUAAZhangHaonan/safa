@@ -1,0 +1,140 @@
+{
+  "attempt_limit": 1,
+  "contract_type": "safa_r12_seed_aligned_generation_ledger_v1",
+  "jobs": [
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_meanflow_flow_map_guidance.py",
+        "--config",
+        "configs/medium_v2/experiments/r12_initial_noise_fixed_eta05_u12_regular32.yaml",
+        "--output-dir",
+        "artifacts/r12_seed_aligned_trajectory/runs_v1/u12_regular32",
+        "--shard-index",
+        "0",
+        "--num-shards",
+        "1"
+      ],
+      "arm_id": "u12_regular32",
+      "attempt_limit": 1,
+      "dataset_id": "regular32",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+      },
+      "expected_candidate_nfe": 13,
+      "job_id": "generate__u12_regular32",
+      "kind": "generation",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/logs_v1/u12_regular32.log",
+      "logical_device": "cuda:0",
+      "num_updates": 12,
+      "output_dir": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/runs_v1/u12_regular32",
+      "physical_gpu": {
+        "physical_index": 0,
+        "uuid": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+      },
+      "retry_count": 0,
+      "tmux_session": "safa-r12-u12-regular32"
+    },
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_meanflow_flow_map_guidance.py",
+        "--config",
+        "configs/medium_v2/experiments/r12_initial_noise_fixed_eta05_u16_regular32.yaml",
+        "--output-dir",
+        "artifacts/r12_seed_aligned_trajectory/runs_v1/u16_regular32",
+        "--shard-index",
+        "0",
+        "--num-shards",
+        "1"
+      ],
+      "arm_id": "u16_regular32",
+      "attempt_limit": 1,
+      "dataset_id": "regular32",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "expected_candidate_nfe": 17,
+      "job_id": "generate__u16_regular32",
+      "kind": "generation",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/logs_v1/u16_regular32.log",
+      "logical_device": "cuda:0",
+      "num_updates": 16,
+      "output_dir": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/runs_v1/u16_regular32",
+      "physical_gpu": {
+        "physical_index": 1,
+        "uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "retry_count": 0,
+      "tmux_session": "safa-r12-u16-regular32"
+    },
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_meanflow_flow_map_guidance.py",
+        "--config",
+        "configs/medium_v2/experiments/r12_initial_noise_fixed_eta05_u12_tail32.yaml",
+        "--output-dir",
+        "artifacts/r12_seed_aligned_trajectory/runs_v1/u12_tail32",
+        "--shard-index",
+        "0",
+        "--num-shards",
+        "1"
+      ],
+      "arm_id": "u12_tail32",
+      "attempt_limit": 1,
+      "dataset_id": "sharpness_tail32",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-e27fe71d-eaf7-3eb5-d0ff-c1c63b4f6b02"
+      },
+      "expected_candidate_nfe": 13,
+      "job_id": "generate__u12_tail32",
+      "kind": "generation",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/logs_v1/u12_tail32.log",
+      "logical_device": "cuda:0",
+      "num_updates": 12,
+      "output_dir": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/runs_v1/u12_tail32",
+      "physical_gpu": {
+        "physical_index": 2,
+        "uuid": "GPU-e27fe71d-eaf7-3eb5-d0ff-c1c63b4f6b02"
+      },
+      "retry_count": 0,
+      "tmux_session": "safa-r12-u12-tail32"
+    },
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_meanflow_flow_map_guidance.py",
+        "--config",
+        "configs/medium_v2/experiments/r12_initial_noise_fixed_eta05_u16_tail32.yaml",
+        "--output-dir",
+        "artifacts/r12_seed_aligned_trajectory/runs_v1/u16_tail32",
+        "--shard-index",
+        "0",
+        "--num-shards",
+        "1"
+      ],
+      "arm_id": "u16_tail32",
+      "attempt_limit": 1,
+      "dataset_id": "sharpness_tail32",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-61ea2925-9905-7f56-cd64-7a792a32efef"
+      },
+      "expected_candidate_nfe": 17,
+      "job_id": "generate__u16_tail32",
+      "kind": "generation",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/logs_v1/u16_tail32.log",
+      "logical_device": "cuda:0",
+      "num_updates": 16,
+      "output_dir": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/runs_v1/u16_tail32",
+      "physical_gpu": {
+        "physical_index": 3,
+        "uuid": "GPU-61ea2925-9905-7f56-cd64-7a792a32efef"
+      },
+      "retry_count": 0,
+      "tmux_session": "safa-r12-u16-tail32"
+    }
+  ],
+  "retry_count": 0,
+  "schema_version": 1
+}

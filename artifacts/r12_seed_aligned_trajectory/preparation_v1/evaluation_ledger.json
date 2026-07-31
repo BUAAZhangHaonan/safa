@@ -1,0 +1,438 @@
+{
+  "arcface_jobs": [
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_r9_phase_evaluator.py",
+        "--request",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/regular32/arcface/u12_regular32/request.json",
+        "--output",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/regular32/arcface/u12_regular32/result.json"
+      ],
+      "attempt_limit": 1,
+      "dataset_id": "regular32",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+      },
+      "job_id": "arcface__regular32__u12_regular32",
+      "kind": "arcface",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/regular32/logs/arcface__u12_regular32.log",
+      "output_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/regular32/arcface/u12_regular32/result.json",
+      "physical_gpu": {
+        "physical_index": 0,
+        "uuid": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+      },
+      "request_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/regular32/arcface/u12_regular32/request.json",
+      "retry_count": 0,
+      "role": "u12_regular32"
+    },
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_r9_phase_evaluator.py",
+        "--request",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/regular32/arcface/u16_regular32/request.json",
+        "--output",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/regular32/arcface/u16_regular32/result.json"
+      ],
+      "attempt_limit": 1,
+      "dataset_id": "regular32",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "job_id": "arcface__regular32__u16_regular32",
+      "kind": "arcface",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/regular32/logs/arcface__u16_regular32.log",
+      "output_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/regular32/arcface/u16_regular32/result.json",
+      "physical_gpu": {
+        "physical_index": 1,
+        "uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "request_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/regular32/arcface/u16_regular32/request.json",
+      "retry_count": 0,
+      "role": "u16_regular32"
+    },
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_r9_phase_evaluator.py",
+        "--request",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/sharpness_tail32/arcface/u12_tail32/request.json",
+        "--output",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/sharpness_tail32/arcface/u12_tail32/result.json"
+      ],
+      "attempt_limit": 1,
+      "dataset_id": "sharpness_tail32",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-e27fe71d-eaf7-3eb5-d0ff-c1c63b4f6b02"
+      },
+      "job_id": "arcface__sharpness_tail32__u12_tail32",
+      "kind": "arcface",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/sharpness_tail32/logs/arcface__u12_tail32.log",
+      "output_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/sharpness_tail32/arcface/u12_tail32/result.json",
+      "physical_gpu": {
+        "physical_index": 2,
+        "uuid": "GPU-e27fe71d-eaf7-3eb5-d0ff-c1c63b4f6b02"
+      },
+      "request_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/sharpness_tail32/arcface/u12_tail32/request.json",
+      "retry_count": 0,
+      "role": "u12_tail32"
+    },
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_r9_phase_evaluator.py",
+        "--request",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/sharpness_tail32/arcface/u16_tail32/request.json",
+        "--output",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/sharpness_tail32/arcface/u16_tail32/result.json"
+      ],
+      "attempt_limit": 1,
+      "dataset_id": "sharpness_tail32",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-61ea2925-9905-7f56-cd64-7a792a32efef"
+      },
+      "job_id": "arcface__sharpness_tail32__u16_tail32",
+      "kind": "arcface",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/sharpness_tail32/logs/arcface__u16_tail32.log",
+      "output_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/sharpness_tail32/arcface/u16_tail32/result.json",
+      "physical_gpu": {
+        "physical_index": 3,
+        "uuid": "GPU-61ea2925-9905-7f56-cd64-7a792a32efef"
+      },
+      "request_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/sharpness_tail32/arcface/u16_tail32/request.json",
+      "retry_count": 0,
+      "role": "u16_tail32"
+    }
+  ],
+  "attempt_limit": 1,
+  "contract_type": "safa_r12_seed_aligned_evaluation_ledger_v1",
+  "fid_kid_interpretation": "forbidden",
+  "postprocess_job": {
+    "argv": [
+      "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+      "scripts/classify_r12_seed_aligned_trajectory.py",
+      "--preparation-root",
+      "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/preparation_v1",
+      "--output-dir",
+      "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/results_v1"
+    ],
+    "retry_count": 0
+  },
+  "quality_jobs": [
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_r11_quality_evaluation.py",
+        "--real-index",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/data/index/val_face_mixed_e14.jsonl",
+        "--generated-dir",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/preparation_v1/formal_native/regular32",
+        "--output",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/regular32/quality/native/quality.json",
+        "--sample-id-manifest",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/prefix32.jsonl",
+        "--per-sample-jsonl",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/preparation_v1/formal_native_bindings/regular32.jsonl",
+        "--seed",
+        "7919",
+        "--device",
+        "cuda:0",
+        "--metrics",
+        "niqe",
+        "sharpness"
+      ],
+      "attempt_limit": 1,
+      "dataset_id": "regular32",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+      },
+      "fid_kid_interpretation": "forbidden",
+      "job_id": "quality__regular32__native",
+      "kind": "quality",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/regular32/logs/quality__native.log",
+      "metrics": [
+        "niqe",
+        "sharpness"
+      ],
+      "output_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/regular32/quality/native/quality.json",
+      "physical_gpu": {
+        "physical_index": 0,
+        "uuid": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+      },
+      "retry_count": 0,
+      "role": "native"
+    },
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_r11_quality_evaluation.py",
+        "--real-index",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/data/index/val_face_mixed_e14.jsonl",
+        "--generated-dir",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/runs_v1/u12_regular32/generated_images",
+        "--output",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/regular32/quality/u12_regular32/quality.json",
+        "--sample-id-manifest",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/prefix32.jsonl",
+        "--per-sample-jsonl",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/runs_v1/u12_regular32/per_sample.jsonl",
+        "--seed",
+        "7919",
+        "--device",
+        "cuda:0",
+        "--metrics",
+        "niqe",
+        "sharpness",
+        "--generation-result",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/runs_v1/u12_regular32/generation_result.json"
+      ],
+      "attempt_limit": 1,
+      "dataset_id": "regular32",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "fid_kid_interpretation": "forbidden",
+      "job_id": "quality__regular32__u12_regular32",
+      "kind": "quality",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/regular32/logs/quality__u12_regular32.log",
+      "metrics": [
+        "niqe",
+        "sharpness"
+      ],
+      "output_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/regular32/quality/u12_regular32/quality.json",
+      "physical_gpu": {
+        "physical_index": 1,
+        "uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "retry_count": 0,
+      "role": "u12_regular32"
+    },
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_r11_quality_evaluation.py",
+        "--real-index",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/data/index/val_face_mixed_e14.jsonl",
+        "--generated-dir",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/runs_v1/u16_regular32/generated_images",
+        "--output",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/regular32/quality/u16_regular32/quality.json",
+        "--sample-id-manifest",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/prefix32.jsonl",
+        "--per-sample-jsonl",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/runs_v1/u16_regular32/per_sample.jsonl",
+        "--seed",
+        "7919",
+        "--device",
+        "cuda:0",
+        "--metrics",
+        "niqe",
+        "sharpness",
+        "--generation-result",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/runs_v1/u16_regular32/generation_result.json"
+      ],
+      "attempt_limit": 1,
+      "dataset_id": "regular32",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-e27fe71d-eaf7-3eb5-d0ff-c1c63b4f6b02"
+      },
+      "fid_kid_interpretation": "forbidden",
+      "job_id": "quality__regular32__u16_regular32",
+      "kind": "quality",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/regular32/logs/quality__u16_regular32.log",
+      "metrics": [
+        "niqe",
+        "sharpness"
+      ],
+      "output_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/regular32/quality/u16_regular32/quality.json",
+      "physical_gpu": {
+        "physical_index": 2,
+        "uuid": "GPU-e27fe71d-eaf7-3eb5-d0ff-c1c63b4f6b02"
+      },
+      "retry_count": 0,
+      "role": "u16_regular32"
+    },
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_r11_quality_evaluation.py",
+        "--real-index",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/data/index/val_face_mixed_e14.jsonl",
+        "--generated-dir",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/preparation_v1/formal_native/sharpness_tail32",
+        "--output",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/sharpness_tail32/quality/native/quality.json",
+        "--sample-id-manifest",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/preparation_v1/tail32.jsonl",
+        "--per-sample-jsonl",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/preparation_v1/formal_native_bindings/sharpness_tail32.jsonl",
+        "--seed",
+        "7919",
+        "--device",
+        "cuda:0",
+        "--metrics",
+        "niqe",
+        "sharpness"
+      ],
+      "attempt_limit": 1,
+      "dataset_id": "sharpness_tail32",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-61ea2925-9905-7f56-cd64-7a792a32efef"
+      },
+      "fid_kid_interpretation": "forbidden",
+      "job_id": "quality__sharpness_tail32__native",
+      "kind": "quality",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/sharpness_tail32/logs/quality__native.log",
+      "metrics": [
+        "niqe",
+        "sharpness"
+      ],
+      "output_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/sharpness_tail32/quality/native/quality.json",
+      "physical_gpu": {
+        "physical_index": 3,
+        "uuid": "GPU-61ea2925-9905-7f56-cd64-7a792a32efef"
+      },
+      "retry_count": 0,
+      "role": "native"
+    },
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_r11_quality_evaluation.py",
+        "--real-index",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/data/index/val_face_mixed_e14.jsonl",
+        "--generated-dir",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/runs_v1/u12_tail32/generated_images",
+        "--output",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/sharpness_tail32/quality/u12_tail32/quality.json",
+        "--sample-id-manifest",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/preparation_v1/tail32.jsonl",
+        "--per-sample-jsonl",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/runs_v1/u12_tail32/per_sample.jsonl",
+        "--seed",
+        "7919",
+        "--device",
+        "cuda:0",
+        "--metrics",
+        "niqe",
+        "sharpness",
+        "--generation-result",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/runs_v1/u12_tail32/generation_result.json"
+      ],
+      "attempt_limit": 1,
+      "dataset_id": "sharpness_tail32",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+      },
+      "fid_kid_interpretation": "forbidden",
+      "job_id": "quality__sharpness_tail32__u12_tail32",
+      "kind": "quality",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/sharpness_tail32/logs/quality__u12_tail32.log",
+      "metrics": [
+        "niqe",
+        "sharpness"
+      ],
+      "output_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/sharpness_tail32/quality/u12_tail32/quality.json",
+      "physical_gpu": {
+        "physical_index": 0,
+        "uuid": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+      },
+      "retry_count": 0,
+      "role": "u12_tail32"
+    },
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_r11_quality_evaluation.py",
+        "--real-index",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/data/index/val_face_mixed_e14.jsonl",
+        "--generated-dir",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/runs_v1/u16_tail32/generated_images",
+        "--output",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/sharpness_tail32/quality/u16_tail32/quality.json",
+        "--sample-id-manifest",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/preparation_v1/tail32.jsonl",
+        "--per-sample-jsonl",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/runs_v1/u16_tail32/per_sample.jsonl",
+        "--seed",
+        "7919",
+        "--device",
+        "cuda:0",
+        "--metrics",
+        "niqe",
+        "sharpness",
+        "--generation-result",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/runs_v1/u16_tail32/generation_result.json"
+      ],
+      "attempt_limit": 1,
+      "dataset_id": "sharpness_tail32",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "fid_kid_interpretation": "forbidden",
+      "job_id": "quality__sharpness_tail32__u16_tail32",
+      "kind": "quality",
+      "log_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/sharpness_tail32/logs/quality__u16_tail32.log",
+      "metrics": [
+        "niqe",
+        "sharpness"
+      ],
+      "output_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/sharpness_tail32/quality/u16_tail32/quality.json",
+      "physical_gpu": {
+        "physical_index": 1,
+        "uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "retry_count": 0,
+      "role": "u16_tail32"
+    }
+  ],
+  "request_build_jobs": [
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/build_fixed32_arcface_requests.py",
+        "--diagnostic-manifest",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/preparation_v1/evaluation_contracts/regular32.json",
+        "--selection-manifest",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/prefix32.jsonl",
+        "--runs-root",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/runs_v1",
+        "--template-request",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/full/evaluator_runs/arcface/winner/request.json",
+        "--output-root",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/regular32/arcface",
+        "--device",
+        "cuda:0"
+      ],
+      "attempt_limit": 1,
+      "job_id": "arcface_request_build__regular32",
+      "kind": "cpu_preparation",
+      "retry_count": 0
+    },
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/build_fixed32_arcface_requests.py",
+        "--diagnostic-manifest",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/preparation_v1/evaluation_contracts/sharpness_tail32.json",
+        "--selection-manifest",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/preparation_v1/tail32.jsonl",
+        "--runs-root",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/runs_v1",
+        "--template-request",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/full/evaluator_runs/arcface/winner/request.json",
+        "--output-root",
+        "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_seed_aligned_trajectory/evaluation_v1/sharpness_tail32/arcface",
+        "--device",
+        "cuda:0"
+      ],
+      "attempt_limit": 1,
+      "job_id": "arcface_request_build__sharpness_tail32",
+      "kind": "cpu_preparation",
+      "retry_count": 0
+    }
+  ],
+  "retry_count": 0,
+  "schema_version": 1
+}

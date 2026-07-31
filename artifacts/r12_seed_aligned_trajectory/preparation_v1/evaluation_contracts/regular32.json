@@ -1,0 +1,40 @@
+{
+  "arms": [
+    {
+      "arm_id": "u12_regular32",
+      "dataset_id": "regular32",
+      "effective_arm_config_sha256": "4c6e31f15359a95a4877d50f55b87b42d9b78f80f376e3c9bf882e6d7d138f6f",
+      "gpu_index": 0,
+      "num_updates": 12,
+      "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/configs/medium_v2/experiments/r12_initial_noise_fixed_eta05_u12_regular32.yaml",
+      "sha256": "cd2cd42b9113dbb0610201ffe01992f886e989695b1741a73cb7d9287ab997a2"
+    },
+    {
+      "arm_id": "u16_regular32",
+      "dataset_id": "regular32",
+      "effective_arm_config_sha256": "f6bf6460217cffc50805a1cdd34877b6de26ba581a7b551d74a55340dae73d35",
+      "gpu_index": 1,
+      "num_updates": 16,
+      "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/configs/medium_v2/experiments/r12_initial_noise_fixed_eta05_u16_regular32.yaml",
+      "sha256": "e3e1315598278bc530501a701ba49d0651e3425708df612ac9626cd85f74ec90"
+    }
+  ],
+  "baseline_arm_id": "u12_regular32",
+  "contract_type": "safa_r12_seed_aligned_evaluation_dataset_v1",
+  "quality_metrics": [
+    "niqe",
+    "sharpness"
+  ],
+  "registration": "seed_aligned_fixed_radius_trajectory",
+  "sample_count": 32,
+  "sampling_seed": 7919,
+  "schema_version": 1,
+  "selection_manifest": {
+    "ordered_sample_id_sha256": "c14443c77cac8511fef8c9f4562112bddf024992f9e274ef874a7e60e31667d1",
+    "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/prefix32.jsonl",
+    "sample_count": 32,
+    "sha256": "fc47ae9372f23667e6b59ab2f33b22bc6cc8405be0095aaee1565d1158be1b05"
+  },
+  "selection_role": "regular32",
+  "stage": 32
+}

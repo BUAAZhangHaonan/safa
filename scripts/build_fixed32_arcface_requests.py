@@ -27,6 +27,10 @@ DEFAULT_RUNTIME_CONFIG = (
     "r9-report-only-formal-v9/full/evaluator_runs/arcface/winner/request.json"
 )
 ARM_IDS = LEGACY_ARM_IDS
+PAIRWISE_CONTRACT_TYPES = {
+    "safa_r11_initial_noise_evaluation_dataset_v1",
+    "safa_r12_seed_aligned_evaluation_dataset_v1",
+}
 
 
 class Fixed32ArcFaceRequestError(RuntimeError):
@@ -273,9 +277,7 @@ def build_requests(
             device=device,
             work_root=resolved_output_root / arm_id / "work",
         )
-        is_r11 = (
-            arm_set.contract_type == "safa_r11_initial_noise_evaluation_dataset_v1"
-        )
+        is_pairwise = arm_set.contract_type in PAIRWISE_CONTRACT_TYPES
         request = ArcFaceEvaluationRequest(
             phase="diagnose",
             logical_run_id=(
@@ -283,9 +285,14 @@ def build_requests(
                 if arm_set.contract_type
                 == "safa_r11_initial_noise_evaluation_dataset_v1"
                 else (
-                    f"r10_triangle_fixed32__{arm_id}"
-                    if arm_set.arm_ids == ARM_IDS
-                    else f"r10_triangle32__{arm_id}"
+                    f"r12_seed_aligned__{arm_set.selection_role}__{arm_id}"
+                    if arm_set.contract_type
+                    == "safa_r12_seed_aligned_evaluation_dataset_v1"
+                    else (
+                        f"r10_triangle_fixed32__{arm_id}"
+                        if arm_set.arm_ids == ARM_IDS
+                        else f"r10_triangle32__{arm_id}"
+                    )
                 )
             ),
             arm_id=arm_id,
@@ -295,7 +302,7 @@ def build_requests(
             samples=samples,
             pair_policy=(
                 "pairwise_exact_one_v1"
-                if is_r11
+                if is_pairwise
                 else "all_roles_exact_one_v1"
             ),
         )
@@ -308,7 +315,7 @@ def build_requests(
                     config=config,
                     contract_type=(
                         "safa_r11_arcface_evaluator_request_v1"
-                        if is_r11
+                        if is_pairwise
                         else "safa_r9_phase_evaluator_request_v1"
                     ),
                 ),
@@ -343,9 +350,14 @@ def build_requests(
             if arm_set.contract_type
             == "safa_r11_initial_noise_evaluation_dataset_v1"
             else (
-                "safa_r10_triangle_fixed32_arcface_request_build_v1"
-                if arm_set.arm_ids == ARM_IDS
-                else "safa_r10_triangle32_arcface_request_build_v1"
+                "safa_r12_seed_aligned_arcface_request_build_v1"
+                if arm_set.contract_type
+                == "safa_r12_seed_aligned_evaluation_dataset_v1"
+                else (
+                    "safa_r10_triangle_fixed32_arcface_request_build_v1"
+                    if arm_set.arm_ids == ARM_IDS
+                    else "safa_r10_triangle32_arcface_request_build_v1"
+                )
             )
         ),
         "selection_role": arm_set.selection_role,
@@ -387,8 +399,7 @@ def build_requests(
                             resolved_runs_root / arm_id / "per_sample.jsonl"
                         ),
                     }
-                    if arm_set.contract_type
-                    == "safa_r11_initial_noise_evaluation_dataset_v1"
+                    if arm_set.contract_type in PAIRWISE_CONTRACT_TYPES
                     else {}
                 ),
             }

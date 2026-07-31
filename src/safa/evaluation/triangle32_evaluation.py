@@ -249,6 +249,80 @@ def load_arm_set(path: Path | None) -> Triangle32ArmSet:
             quality_metrics=tuple(expected["quality_metrics"]),
             selection_sample_id_sha256=sample_id_sha256,
         )
+    if contract_type == "safa_r12_seed_aligned_evaluation_dataset_v1":
+        if (
+            value.get("schema_version") != 1
+            or value.get("registration")
+            != "seed_aligned_fixed_radius_trajectory"
+            or value.get("sampling_seed") != 7919
+            or value.get("stage") != 32
+            or value.get("sample_count") != 32
+            or value.get("quality_metrics") != ["niqe", "sharpness"]
+        ):
+            raise TriangleScreeningError("R12 evaluation registration differs")
+        role = value.get("selection_role")
+        if role not in {"regular32", "sharpness_tail32"}:
+            raise TriangleScreeningError("R12 selection role differs")
+        sample_binding = value.get("selection_manifest")
+        selection = _bound_file(sample_binding, "R12 selection manifest")
+        if (
+            not isinstance(sample_binding, Mapping)
+            or sample_binding.get("sample_count") != 32
+        ):
+            raise TriangleScreeningError("R12 selection manifest count differs")
+        sample_id_sha256 = sample_binding.get("ordered_sample_id_sha256")
+        ordered_ids: list[str] = []
+        for line_number, line in enumerate(
+            selection.read_text(encoding="utf-8").splitlines(), 1
+        ):
+            row = json.loads(line)
+            sample_id = row.get("sample_id") if isinstance(row, Mapping) else None
+            if not isinstance(sample_id, str) or not sample_id:
+                raise TriangleScreeningError(
+                    f"R12 selection row {line_number} has invalid sample_id"
+                )
+            ordered_ids.append(sample_id)
+        actual_sample_id_sha256 = hashlib.sha256(
+            "".join(f"{sample_id}\n" for sample_id in ordered_ids).encode("utf-8")
+        ).hexdigest()
+        if (
+            len(ordered_ids) != 32
+            or len(set(ordered_ids)) != 32
+            or actual_sample_id_sha256 != sample_id_sha256
+        ):
+            raise TriangleScreeningError("R12 ordered selection binding differs")
+        arms = value.get("arms")
+        if not isinstance(arms, list):
+            raise TriangleScreeningError("R12 evaluation arms are missing")
+        arm_ids = _arm_ids(
+            [arm.get("arm_id") if isinstance(arm, Mapping) else None for arm in arms],
+            "R12 evaluation",
+        )
+        expected_arm_ids = (
+            ("u12_regular32", "u16_regular32")
+            if role == "regular32"
+            else ("u12_tail32", "u16_tail32")
+        )
+        if arm_ids != expected_arm_ids:
+            raise TriangleScreeningError("R12 arm IDs/order differ")
+        baseline_arm_id = value.get("baseline_arm_id")
+        if baseline_arm_id != expected_arm_ids[0]:
+            raise TriangleScreeningError("R12 baseline arm differs")
+        return Triangle32ArmSet(
+            contract_type=str(contract_type),
+            manifest_path=manifest_path,
+            arm_ids=arm_ids,
+            selection_manifest=selection,
+            selection_manifest_sha256=str(sample_binding["sha256"]),
+            seed=7919,
+            result_filename="generation_result.json",
+            baseline_arm_id=str(baseline_arm_id),
+            selection_role=str(role),
+            sample_count=32,
+            stage=32,
+            quality_metrics=("niqe", "sharpness"),
+            selection_sample_id_sha256=str(sample_id_sha256),
+        )
     if contract_type != "safa_r10_triangle32_pilot_preparation_v1":
         raise TriangleScreeningError("unknown triangle32 arm-set contract")
     if value.get("candidate_count") != 24 or value.get("generation_only") is not True:
@@ -310,10 +384,10 @@ def validate_generation_result(
             or result.get("sample_count") != arm_set.sample_count
         ):
             raise TriangleScreeningError(f"{arm_id} generation is not complete")
-        if (
-            arm_set.contract_type
-            == "safa_r11_initial_noise_evaluation_dataset_v1"
-        ):
+        if arm_set.contract_type in {
+            "safa_r11_initial_noise_evaluation_dataset_v1",
+            "safa_r12_seed_aligned_evaluation_dataset_v1",
+        }:
             completion_path = run_root / "completion.json"
             completion = read_json(completion_path, f"{arm_id} completion")
             if (
