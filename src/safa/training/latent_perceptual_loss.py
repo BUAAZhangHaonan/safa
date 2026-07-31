@@ -1,3 +1,14 @@
+"""Paper-faithful decoder latent perceptual loss for the R13 bounded trial.
+
+The ICLR 2025 Flow-OT formula estimates the clean latent from an instantaneous
+velocity.  A MeanFlow output at ``r < t`` is instead an interval-average flow,
+so R13 applies LPL only where the existing training draw has ``r == t`` and
+``t / (1 - t) <= 3``.  It deliberately does not issue an unvalidated second
+query at ``r=0``.  Decoder comparison uses all spatial positions; there is no
+morphology mask or local validity heuristic.  Non-finite or zero prediction
+variance therefore fails closed instead of being hidden by an epsilon.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
