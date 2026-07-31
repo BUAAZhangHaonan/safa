@@ -1,0 +1,11 @@
+{
+  "regular32": {
+    "u12_regular32": [
+      "arcface_delta"
+    ],
+    "u16_regular32": [
+      "arcface_delta"
+    ]
+  },
+  "sharpness_tail32": {}
+}
