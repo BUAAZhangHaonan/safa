@@ -30,6 +30,81 @@ ATTENTION_BACKENDS = (
 ATTENTION_BACKEND_PRIORITY = (ATTENTION_BACKEND_FA4, ATTENTION_BACKEND_FA2, ATTENTION_BACKEND_SDPA, ATTENTION_BACKEND_NATIVE)
 
 
+MEANFLOW_SIT_INPAINT_CONTRACT = "safa_meanflow_sit_inpaint_v1"
+
+
+def mask_source_pixels(source_pixels: torch.Tensor, pixel_mask: torch.Tensor) -> torch.Tensor:
+    """Remove every source pixel inside the declared generation region."""
+    mask = _validate_spatial_mask("pixel_mask", pixel_mask, source_pixels)
+    return torch.where(mask.expand_as(source_pixels), torch.zeros_like(source_pixels), source_pixels)
+
+
+def assemble_inpainted_pixels(
+    original_pixels: torch.Tensor,
+    generated_pixels: torch.Tensor,
+    pixel_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Declare the model output: generated face pixels and bit-exact original background."""
+    if not isinstance(generated_pixels, torch.Tensor):
+        raise TypeError(f"generated_pixels must be a torch.Tensor, got {type(generated_pixels).__name__}")
+    if generated_pixels.shape != original_pixels.shape:
+        raise ValueError(
+            "generated_pixels must have the same shape as original_pixels, "
+            f"got {tuple(generated_pixels.shape)} and {tuple(original_pixels.shape)}"
+        )
+    if generated_pixels.device != original_pixels.device or generated_pixels.dtype != original_pixels.dtype:
+        raise ValueError("generated_pixels must match original_pixels device and dtype")
+    if not torch.isfinite(generated_pixels).all().item():
+        raise ValueError("generated_pixels contains non-finite values")
+    mask = _validate_spatial_mask("pixel_mask", pixel_mask, original_pixels)
+    return torch.where(mask.expand_as(original_pixels), generated_pixels, original_pixels)
+
+
+def encode_masked_context_latent(latent_codec, context_pixels, pixel_mask):
+    """Encode only a context image whose declared face pixels are already absent."""
+    mask = _validate_spatial_mask("pixel_mask", pixel_mask, context_pixels)
+    if torch.count_nonzero(context_pixels.masked_select(mask.expand_as(context_pixels))).item():
+        raise ValueError("context_pixels must be exactly zero inside pixel_mask before VAE encoding")
+    context_latent_raw = latent_codec.encode(context_pixels)
+    if not isinstance(context_latent_raw, torch.Tensor) or context_latent_raw.ndim != 4:
+        raise RuntimeError("latent codec encode must return a rank-4 tensor")
+    if not torch.isfinite(context_latent_raw).all().item():
+        raise RuntimeError("encoded context latent contains non-finite values")
+    latent_mask = F.interpolate(
+        mask.to(dtype=context_latent_raw.dtype),
+        size=context_latent_raw.shape[-2:],
+        mode="nearest",
+    ).to(dtype=torch.bool)
+    context_latent = torch.where(
+        latent_mask.expand_as(context_latent_raw),
+        torch.zeros_like(context_latent_raw),
+        context_latent_raw,
+    )
+    return context_latent, latent_mask
+
+
+def encode_inpaint_training_latents(
+    latent_codec,
+    target_pixels,
+    context_pixels,
+    pixel_mask,
+):
+    """Encode B as the clean target and masked B as the only spatial context."""
+    if not isinstance(target_pixels, torch.Tensor) or target_pixels.shape != context_pixels.shape:
+        raise ValueError("target_pixels and context_pixels must be tensors with the same shape")
+    target_latent = latent_codec.encode(target_pixels)
+    if not isinstance(target_latent, torch.Tensor) or target_latent.ndim != 4:
+        raise RuntimeError("latent codec encode must return a rank-4 target tensor")
+    if not torch.isfinite(target_latent).all().item():
+        raise RuntimeError("encoded target latent contains non-finite values")
+    context_latent, latent_mask = encode_masked_context_latent(
+        latent_codec, context_pixels, pixel_mask
+    )
+    if target_latent.shape != context_latent.shape:
+        raise RuntimeError("target and context latent shapes differ")
+    return target_latent, context_latent, latent_mask
+
+
 def resolve_meanflow_sit_attention_backend(requested_backend: str = ATTENTION_BACKEND_AUTO) -> str:
     requested = _normalize_attention_backend(requested_backend)
     if requested == ATTENTION_BACKEND_AUTO:
@@ -139,7 +214,7 @@ def _first_tensor(result):
     return result[0] if isinstance(result, tuple) else result
 
 
-def build_meanflow_sit_generator(config):
+def build_meanflow_sit_generator(config, *, inpaint: bool = False):
     class TimestepEmbedder(nn.Module):
         def __init__(self, hidden_size: int, frequency_embedding_size: int):
             super().__init__()
@@ -269,15 +344,30 @@ def build_meanflow_sit_generator(config):
                 nn.SiLU(),
                 nn.Linear(hidden_size, hidden_size),
             )
+            self.context_embedder = (
+                nn.Conv2d(
+                    config.sit_input_channels + 1,
+                    hidden_size,
+                    kernel_size=config.sit_patch_size,
+                    stride=config.sit_patch_size,
+                )
+                if inpaint else None
+            )
             self.blocks = nn.ModuleList([SiTBlock() for _ in range(config.sit_depth)])
             self.requested_attention_backend = config.attention_backend
             self.resolved_attention_backend = self.blocks[0].attn.resolved_attention_backend
             self.final_layer = FinalLayer()
             self._initialize_weights()
 
-        def forward(self, x, r, t, z):
+        def forward(self, x, r, t, z, *, context_latent=None, latent_mask=None):
             self._validate_inputs(x, r, t, z)
             hidden = self.x_embedder(x).flatten(2).transpose(1, 2)
+            if inpaint:
+                context, mask = _validate_inpaint_context(x, z, context_latent, latent_mask)
+                context_input = torch.cat((context, mask.to(dtype=context.dtype)), dim=1)
+                hidden = hidden + self.context_embedder(context_input).flatten(2).transpose(1, 2)
+            elif context_latent is not None or latent_mask is not None:
+                raise TypeError("legacy meanflow_sit does not accept inpaint context")
             hidden = hidden + self.pos_embed.to(device=hidden.device, dtype=hidden.dtype)
             horizon = (t - r).clamp_min(0.0)
             condition = self.t_embedder(t) + self.r_embedder(horizon) + self.z_embedder(z)
@@ -321,6 +411,9 @@ def build_meanflow_sit_generator(config):
             nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
             nn.init.constant_(self.final_layer.linear.weight, 0)
             nn.init.constant_(self.final_layer.linear.bias, 0)
+            if self.context_embedder is not None:
+                nn.init.constant_(self.context_embedder.weight, 0)
+                nn.init.constant_(self.context_embedder.bias, 0)
 
     class _MeanFlowSiTGenerator(nn.Module):
         def __init__(self):
@@ -328,6 +421,8 @@ def build_meanflow_sit_generator(config):
             self.config = config
             self.embedding_dim = config.embedding_dim
             self.image_size = config.image_size
+            self.inpaint = bool(inpaint)
+            self.inpaint_contract = MEANFLOW_SIT_INPAINT_CONTRACT if inpaint else None
             self.vector_field = MeanFlowSiTBackbone()
             self.null_condition = LearnedNullCondition(config.embedding_dim) if config.learned_null_condition else None
             self.requested_attention_backend = self.vector_field.requested_attention_backend
@@ -337,10 +432,39 @@ def build_meanflow_sit_generator(config):
         def attention_backend(self) -> str:
             return self.vector_field.resolved_attention_backend
 
-        def forward(self, z):
-            return self.sample(z, steps=1)
+        def forward(
+            self,
+            z,
+            *,
+            context_latent=None,
+            latent_mask=None,
+            x_init=None,
+            clamp_output: bool = True,
+        ):
+            if self.inpaint:
+                return self.sample(
+                    z,
+                    steps=1,
+                    x_init=x_init,
+                    clamp_output=clamp_output,
+                    context_latent=context_latent,
+                    latent_mask=latent_mask,
+                )
+            if context_latent is not None or latent_mask is not None or x_init is not None:
+                raise TypeError("legacy meanflow_sit forward accepts only z")
+            return self.sample(z, steps=1, clamp_output=clamp_output)
 
-        def sample(self, z, steps: int | None = None, checkpoint_steps: bool = False, *, x_init=None, clamp_output: bool = True):
+        def sample(
+            self,
+            z,
+            steps: int | None = None,
+            checkpoint_steps: bool = False,
+            *,
+            x_init=None,
+            clamp_output: bool = True,
+            context_latent=None,
+            latent_mask=None,
+        ):
             del checkpoint_steps
             self._validate_z(z)
             requested_steps = 1 if steps is None else int(steps)
@@ -360,13 +484,29 @@ def build_meanflow_sit_generator(config):
             else:
                 self._validate_x_init(x_init, z)
                 x = x_init
-            x = self.flow_map(x, z, t=1.0, r=0.0)
+            if self.inpaint:
+                context, mask = _validate_inpaint_context(
+                    x, z, context_latent, latent_mask
+                )
+                x = _project_inpaint_state(x, context, mask)
+                x = self.flow_map(
+                    x,
+                    z,
+                    t=1.0,
+                    r=0.0,
+                    context_latent=context,
+                    latent_mask=mask,
+                )
+            else:
+                if context_latent is not None or latent_mask is not None:
+                    raise TypeError("legacy meanflow_sit sample does not accept inpaint context")
+                x = self.flow_map(x, z, t=1.0, r=0.0)
             # DDP: keep null_condition.embedding in autograd graph even when unused
             if self.null_condition is not None:
                 x = x + 0.0 * self.null_condition.embedding.sum()
             return self._model_to_data_space(x, clamp_output=clamp_output)
 
-        def flow_map(self, x, z, *, t, r):
+        def flow_map(self, x, z, *, t, r, context_latent=None, latent_mask=None):
             self._validate_z(z)
             self._validate_x_init(x, z)
             t_batch = self._expand_flow_time("t", t, z)
@@ -374,10 +514,34 @@ def build_meanflow_sit_generator(config):
             if torch.any(r_batch > t_batch).item():
                 raise ValueError("MeanFlow flow_map requires r <= t for every sample")
             horizon = (t_batch - r_batch).view(-1, 1, 1, 1)
+            if self.inpaint:
+                context, mask = _validate_inpaint_context(x, z, context_latent, latent_mask)
+                projected = _project_inpaint_state(x, context, mask)
+                velocity = self._predict_velocity(
+                    projected,
+                    r_batch,
+                    t_batch,
+                    z,
+                    context,
+                    mask,
+                )
+                advanced = projected - horizon * velocity
+                return _project_inpaint_state(advanced, context, mask)
+            if context_latent is not None or latent_mask is not None:
+                raise TypeError("legacy meanflow_sit flow_map does not accept inpaint context")
             velocity = self.vector_field(x, r_batch, t_batch, z)
             return x - horizon * velocity
 
-        def flow_matching_loss(self, x_1, z, generator=None, *, return_clean_latents: bool = False):
+        def flow_matching_loss(
+            self,
+            x_1,
+            z,
+            generator=None,
+            *,
+            return_clean_latents: bool = False,
+            context_latent=None,
+            latent_mask=None,
+        ):
             if not isinstance(return_clean_latents, bool):
                 raise TypeError(
                     f"return_clean_latents must be a bool, got {type(return_clean_latents).__name__}"
@@ -391,15 +555,43 @@ def build_meanflow_sit_generator(config):
             eps = torch.randn(x_data.shape, device=x_data.device, dtype=x_data.dtype, generator=generator)
             r, t = self._sample_t_r(x_data.shape[0], device=x_data.device, dtype=x_data.dtype, generator=generator)
             view_t = t.view(-1, 1, 1, 1)
-            z_t = (1.0 - view_t) * x_data + view_t * eps
-            target_velocity = eps - x_data
-            predicted_velocity = self.vector_field(z_t, r, t, z)
-            meanflow_target = self._meanflow_target(z_t, r, t, z, target_velocity)
+            interpolated = (1.0 - view_t) * x_data + view_t * eps
+            if self.inpaint:
+                context, mask = _validate_inpaint_context(
+                    x_data, z, context_latent, latent_mask, require_nonempty=True
+                )
+                expanded_mask = mask.expand_as(x_data)
+                z_t = torch.where(expanded_mask, interpolated, context)
+                target_velocity = torch.where(expanded_mask, eps - x_data, torch.zeros_like(x_data))
+                predicted_velocity = self._predict_velocity(z_t, r, t, z, context, mask)
+                meanflow_target = self._meanflow_target(
+                    z_t,
+                    r,
+                    t,
+                    z,
+                    target_velocity,
+                    context_latent=context,
+                    latent_mask=mask,
+                )
+            else:
+                if context_latent is not None or latent_mask is not None:
+                    raise TypeError("legacy meanflow_sit loss does not accept inpaint context")
+                mask = None
+                z_t = interpolated
+                target_velocity = eps - x_data
+                predicted_velocity = self.vector_field(z_t, r, t, z)
+                meanflow_target = self._meanflow_target(z_t, r, t, z, target_velocity)
             error = predicted_velocity - meanflow_target.detach()
-            raw_mse = error.square().mean()
-            loss = self._weighted_loss(error)
+            per_sample_mse = self._per_sample_mse(error, mask)
+            raw_mse = per_sample_mse.mean()
+            loss = self._weighted_loss(per_sample_mse)
             clean_latents = None
             if return_clean_latents:
+                target_clean = (
+                    _project_inpaint_state(x_data, context, mask)
+                    if self.inpaint
+                    else x_data
+                )
                 if config.sit_data_space != "latent" or config.sit_input_channels != 4:
                     raise RuntimeError(
                         "return_clean_latents requires latent MeanFlow with sit_data_space='latent' "
@@ -412,7 +604,7 @@ def build_meanflow_sit_generator(config):
                 active_mask = torch.eq(r, t) & (snr <= 3.0)
                 predicted_clean = z_t - view_t * predicted_velocity
                 for name, value in (
-                    ("target_clean_latent", x_data),
+                    ("target_clean_latent", target_clean),
                     ("predicted_clean_latent", predicted_clean),
                     ("noisy_latent", z_t),
                     ("sampled_interval_velocity", predicted_velocity),
@@ -423,7 +615,7 @@ def build_meanflow_sit_generator(config):
                     if not torch.isfinite(value).all().item():
                         raise RuntimeError(f"MeanFlow {name} contains non-finite values")
                 clean_latents = {
-                    "target_clean_latent": x_data[active_mask].detach(),
+                    "target_clean_latent": target_clean[active_mask].detach(),
                     "predicted_clean_latent": predicted_clean[active_mask],
                     "sampled_noise": eps.detach(),
                     "noisy_latent": z_t.detach(),
@@ -452,6 +644,11 @@ def build_meanflow_sit_generator(config):
                 "target_velocity_abs_mean": target_velocity.detach().abs().mean(),
                 "predicted_velocity_abs_mean": predicted_velocity.detach().abs().mean(),
             }
+            if self.inpaint:
+                metrics.update(
+                    meanflow_inpaint_contract=MEANFLOW_SIT_INPAINT_CONTRACT,
+                    meanflow_inpaint_mask_fraction=mask.detach().float().mean(),
+                )
             if clean_latents is not None:
                 return loss, metrics, clean_latents
             return loss, metrics
@@ -460,6 +657,10 @@ def build_meanflow_sit_generator(config):
             if self.null_condition is None:
                 raise RuntimeError("learned_null_condition is disabled for this generator")
             return self.null_condition(batch_size=batch_size, device=device, dtype=dtype)
+
+        @staticmethod
+        def assemble_output_pixels(original_pixels, generated_pixels, pixel_mask):
+            return assemble_inpainted_pixels(original_pixels, generated_pixels, pixel_mask)
 
         def load_pretrained(self, checkpoint_path: str | Path | None, *, state_key: str | None = None, strict: bool = False, allow_missing: bool = False):
             path = Path(checkpoint_path) if checkpoint_path else None
@@ -513,13 +714,32 @@ def build_meanflow_sit_generator(config):
                 return config.meanflow_ratio_r_not_equal_t
             return 1.0 - config.meanflow_ratio
 
-        def _meanflow_target(self, z_t, r, t, z, target_velocity):
+        def _meanflow_target(
+            self,
+            z_t,
+            r,
+            t,
+            z,
+            target_velocity,
+            *,
+            context_latent=None,
+            latent_mask=None,
+        ):
             horizon = (t - r).view(-1, 1, 1, 1)
             if config.meanflow_jvp_mode == "first_order":
                 return target_velocity
             from torch.func import jvp
 
             def field_fn(x_arg, r_arg, t_arg, z_arg):
+                if self.inpaint:
+                    return self._predict_velocity(
+                        x_arg,
+                        r_arg,
+                        t_arg,
+                        z_arg,
+                        context_latent,
+                        latent_mask,
+                    )
                 return self.vector_field(x_arg, r_arg, t_arg, z_arg)
 
             z_t_jvp = _jvp_safe_tensor(z_t)
@@ -539,8 +759,33 @@ def build_meanflow_sit_generator(config):
             )
             return target_velocity - horizon * dudt
 
-        def _weighted_loss(self, error):
-            per_sample = error.flatten(1).square().mean(dim=1)
+        def _predict_velocity(self, state, r, t, z, context_latent, latent_mask):
+            velocity = self.vector_field(
+                state,
+                r,
+                t,
+                z,
+                context_latent=context_latent,
+                latent_mask=latent_mask,
+            )
+            return torch.where(
+                latent_mask.expand_as(velocity),
+                velocity,
+                torch.zeros_like(velocity),
+            )
+
+        @staticmethod
+        def _per_sample_mse(error, latent_mask):
+            if latent_mask is None:
+                return error.flatten(1).square().mean(dim=1)
+            expanded_mask = latent_mask.expand_as(error)
+            active = expanded_mask.flatten(1).sum(dim=1)
+            if torch.any(active <= 0).item():
+                raise ValueError("each inpaint sample must contain at least one active latent element")
+            squared = torch.where(expanded_mask, error.square(), torch.zeros_like(error))
+            return squared.flatten(1).sum(dim=1) / active.to(dtype=error.dtype)
+
+        def _weighted_loss(self, per_sample):
             if not config.meanflow_adaptive_weighting:
                 return per_sample.mean()
             weights = (per_sample.detach() + config.meanflow_norm_eps).pow(-config.meanflow_norm_p)
@@ -595,6 +840,62 @@ def build_meanflow_sit_generator(config):
             return time
 
     return _MeanFlowSiTGenerator()
+
+def _validate_spatial_mask(name, mask, reference):
+    if not isinstance(reference, torch.Tensor) or reference.ndim != 4:
+        raise ValueError(f"{name} reference must be a rank-4 tensor")
+    if not torch.isfinite(reference).all().item():
+        raise ValueError(f"{name} reference contains non-finite values")
+    if not isinstance(mask, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor, got {type(mask).__name__}")
+    expected = (reference.shape[0], 1, reference.shape[2], reference.shape[3])
+    if tuple(mask.shape) != expected:
+        raise ValueError(f"{name} must have shape {expected}, got {tuple(mask.shape)}")
+    if mask.device != reference.device:
+        raise ValueError(f"{name} device must match the reference tensor")
+    if mask.dtype == torch.bool:
+        return mask
+    if not torch.isfinite(mask).all().item():
+        raise ValueError(f"{name} contains non-finite values")
+    if not torch.all((mask == 0) | (mask == 1)).item():
+        raise ValueError(f"{name} must be binary with values exactly 0 or 1")
+    return mask.to(dtype=torch.bool)
+
+
+def _validate_inpaint_context(
+    state,
+    z,
+    context_latent,
+    latent_mask,
+    *,
+    require_nonempty=False,
+):
+    if not isinstance(context_latent, torch.Tensor):
+        raise TypeError("context_latent must be a torch.Tensor")
+    if context_latent.shape != state.shape:
+        raise ValueError(
+            f"context_latent must have shape {tuple(state.shape)}, got {tuple(context_latent.shape)}"
+        )
+    if context_latent.device != state.device or context_latent.dtype != state.dtype:
+        raise ValueError("context_latent must match state device and dtype")
+    if not torch.isfinite(context_latent).all().item():
+        raise ValueError("context_latent contains non-finite values")
+    mask = _validate_spatial_mask("latent_mask", latent_mask, state)
+    if state.shape[0] != z.shape[0]:
+        raise ValueError("inpaint state batch must match condition batch")
+    if torch.count_nonzero(
+        context_latent.masked_select(mask.expand_as(context_latent))
+    ).item():
+        raise ValueError("context_latent must be exactly zero inside latent_mask")
+    if require_nonempty:
+        active = mask.flatten(1).sum(dim=1)
+        if torch.any(active <= 0).item():
+            raise ValueError("each inpaint training sample must have a non-empty latent_mask")
+    return context_latent, mask
+
+
+def _project_inpaint_state(state, context_latent, latent_mask):
+    return torch.where(latent_mask.expand_as(state), state, context_latent)
 
 
 def _jvp_safe_tensor(tensor):

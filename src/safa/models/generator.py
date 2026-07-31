@@ -7,6 +7,7 @@ from typing import Any
 GENERATOR_MODEL_TYPE_FLOW = "conditional_flow_matching"
 GENERATOR_MODEL_TYPE_MEANFLOW = "meanflow"
 GENERATOR_MODEL_TYPE_MEANFLOW_SIT = "meanflow_sit"
+GENERATOR_MODEL_TYPE_MEANFLOW_SIT_INPAINT = "meanflow_sit_inpaint"
 GENERATOR_MODEL_TYPE_RECTIFIED_FLOW_SIT = "rectified_flow_sit"
 GENERATOR_MODEL_TYPE_SIT_DIFFUSION = "sit_diffusion"
 GENERATOR_MODEL_TYPE_LATENT_CONSISTENCY = "latent_consistency"
@@ -15,6 +16,7 @@ GENERATOR_MODEL_TYPES = (
     GENERATOR_MODEL_TYPE_FLOW,
     GENERATOR_MODEL_TYPE_MEANFLOW,
     GENERATOR_MODEL_TYPE_MEANFLOW_SIT,
+    GENERATOR_MODEL_TYPE_MEANFLOW_SIT_INPAINT,
     GENERATOR_MODEL_TYPE_RECTIFIED_FLOW_SIT,
     GENERATOR_MODEL_TYPE_SIT_DIFFUSION,
     GENERATOR_MODEL_TYPE_LATENT_CONSISTENCY,
@@ -22,6 +24,7 @@ GENERATOR_MODEL_TYPES = (
 )
 SIT_GENERATOR_MODEL_TYPES = (
     GENERATOR_MODEL_TYPE_MEANFLOW_SIT,
+    GENERATOR_MODEL_TYPE_MEANFLOW_SIT_INPAINT,
     GENERATOR_MODEL_TYPE_RECTIFIED_FLOW_SIT,
     GENERATOR_MODEL_TYPE_SIT_DIFFUSION,
     GENERATOR_MODEL_TYPE_LATENT_CONSISTENCY,
@@ -189,7 +192,11 @@ class FlowGeneratorConfig:
         }
         if self.learned_null_condition:
             payload["learned_null_condition"] = True
-        if self.model_type in {GENERATOR_MODEL_TYPE_MEANFLOW, GENERATOR_MODEL_TYPE_MEANFLOW_SIT}:
+        if self.model_type in {
+            GENERATOR_MODEL_TYPE_MEANFLOW,
+            GENERATOR_MODEL_TYPE_MEANFLOW_SIT,
+            GENERATOR_MODEL_TYPE_MEANFLOW_SIT_INPAINT,
+        }:
             payload.update(
                 {
                     "meanflow_ratio": self.meanflow_ratio,
@@ -199,7 +206,10 @@ class FlowGeneratorConfig:
                     "meanflow_jvp_mode": self.meanflow_jvp_mode,
                 }
             )
-        if self.model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT:
+        if self.model_type in {
+            GENERATOR_MODEL_TYPE_MEANFLOW_SIT,
+            GENERATOR_MODEL_TYPE_MEANFLOW_SIT_INPAINT,
+        }:
             payload["meanflow_ratio_r_not_equal_t"] = (
                 self.meanflow_ratio_r_not_equal_t if self.meanflow_ratio_r_not_equal_t >= 0.0 else 1.0 - self.meanflow_ratio
             )
@@ -807,6 +817,38 @@ class MeanFlowSiTGenerator:
         return generator
 
 
+class MeanFlowSiTInpaintGenerator:
+    """Versioned spatially-conditioned MeanFlow-SiT generator."""
+
+    def __new__(cls, config: FlowGeneratorConfig | dict[str, Any] | None = None, **kwargs):
+        from safa.models.meanflow_sit import build_meanflow_sit_generator
+
+        cfg_payload = {}
+        if isinstance(config, FlowGeneratorConfig):
+            cfg = config
+        elif config is None and not kwargs:
+            cfg = FlowGeneratorConfig(
+                model_type=GENERATOR_MODEL_TYPE_MEANFLOW_SIT_INPAINT,
+                sampler="meanflow",
+                sample_steps=1,
+                train_cycle_steps=1,
+            )
+        else:
+            if config is not None:
+                cfg_payload.update(config)
+            cfg_payload.update(kwargs)
+            cfg_payload.setdefault("model_type", GENERATOR_MODEL_TYPE_MEANFLOW_SIT_INPAINT)
+            cfg_payload.setdefault("sampler", "meanflow")
+            cfg = FlowGeneratorConfig.from_dict(cfg_payload)
+        _validate_config(cfg)
+        if cfg.model_type != GENERATOR_MODEL_TYPE_MEANFLOW_SIT_INPAINT:
+            raise ValueError(
+                "MeanFlowSiTInpaintGenerator requires "
+                f"model_type={GENERATOR_MODEL_TYPE_MEANFLOW_SIT_INPAINT!r}, got {cfg.model_type!r}"
+            )
+        return build_meanflow_sit_generator(cfg, inpaint=True)
+
+
 class RectifiedFlowSiTGenerator:
     def __new__(cls, config: FlowGeneratorConfig | dict[str, Any] | None = None, **kwargs):
         from safa.models.rectified_flow_sit import build_rectified_flow_sit_generator
@@ -1174,6 +1216,8 @@ def build_generator(config: dict[str, Any] | FlowGeneratorConfig | None = None, 
             return MeanFlowGenerator(config)
         if config.model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT:
             return MeanFlowSiTGenerator(config)
+        if config.model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT_INPAINT:
+            return MeanFlowSiTInpaintGenerator(config)
         if config.model_type == GENERATOR_MODEL_TYPE_RECTIFIED_FLOW_SIT:
             return RectifiedFlowSiTGenerator(config)
         if config.model_type == GENERATOR_MODEL_TYPE_SIT_DIFFUSION:
@@ -1195,6 +1239,8 @@ def build_generator(config: dict[str, Any] | FlowGeneratorConfig | None = None, 
         return MeanFlowGenerator(payload)
     if model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT:
         return MeanFlowSiTGenerator(payload)
+    if model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT_INPAINT:
+        return MeanFlowSiTInpaintGenerator(payload)
     if model_type == GENERATOR_MODEL_TYPE_RECTIFIED_FLOW_SIT:
         return RectifiedFlowSiTGenerator(payload)
     if model_type == GENERATOR_MODEL_TYPE_SIT_DIFFUSION:
@@ -1243,7 +1289,11 @@ def _validate_config(config: FlowGeneratorConfig) -> None:
         raise ValueError(f"train_cycle_steps must be positive, got {config.train_cycle_steps}")
     if config.model_type == GENERATOR_MODEL_TYPE_FLOW and config.sampler not in {"euler", "heun"}:
         raise ValueError(f"sampler must be euler or heun, got {config.sampler}")
-    if config.model_type in {GENERATOR_MODEL_TYPE_MEANFLOW, GENERATOR_MODEL_TYPE_MEANFLOW_SIT}:
+    if config.model_type in {
+        GENERATOR_MODEL_TYPE_MEANFLOW,
+        GENERATOR_MODEL_TYPE_MEANFLOW_SIT,
+        GENERATOR_MODEL_TYPE_MEANFLOW_SIT_INPAINT,
+    }:
         if config.sampler != "meanflow":
             raise ValueError(f"meanflow sampler must be 'meanflow', got {config.sampler!r}")
         if config.sample_steps != 1:
@@ -1252,7 +1302,10 @@ def _validate_config(config: FlowGeneratorConfig) -> None:
             raise ValueError(f"meanflow train_cycle_steps must be 1, got {config.train_cycle_steps}")
         if config.meanflow_ratio < 0.0 or config.meanflow_ratio > 1.0:
             raise ValueError(f"meanflow_ratio must be in [0, 1], got {config.meanflow_ratio}")
-        if config.model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT and config.meanflow_ratio_r_not_equal_t != -1.0:
+        if config.model_type in {
+            GENERATOR_MODEL_TYPE_MEANFLOW_SIT,
+            GENERATOR_MODEL_TYPE_MEANFLOW_SIT_INPAINT,
+        } and config.meanflow_ratio_r_not_equal_t != -1.0:
             if config.meanflow_ratio_r_not_equal_t < 0.0 or config.meanflow_ratio_r_not_equal_t > 1.0:
                 raise ValueError(f"meanflow_ratio_r_not_equal_t must be in [0, 1], got {config.meanflow_ratio_r_not_equal_t}")
         if config.meanflow_norm_p < 0.0:
@@ -1354,6 +1407,14 @@ def _validate_config(config: FlowGeneratorConfig) -> None:
             raise ValueError(f"sit_data_space must be one of {SIT_DATA_SPACES}, got {config.sit_data_space!r}")
         if config.attention_backend not in SIT_ATTENTION_BACKENDS:
             raise ValueError(f"attention_backend must be one of {SIT_ATTENTION_BACKENDS}, got {config.attention_backend!r}")
+        if config.model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT_INPAINT:
+            if config.sit_data_space != SIT_DATA_SPACE_LATENT:
+                raise ValueError("meanflow_sit_inpaint requires sit_data_space='latent'")
+            if config.sit_input_channels != 4:
+                raise ValueError(
+                    "meanflow_sit_inpaint requires sit_input_channels=4, "
+                    f"got {config.sit_input_channels}"
+                )
     if config.model_type == GENERATOR_MODEL_TYPE_DDIM:
         if config.sampler != "ddim":
             raise ValueError(f"ddim sampler must be 'ddim', got {config.sampler!r}")
