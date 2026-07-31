@@ -240,13 +240,46 @@ def test_batch4_smoke_reads_real_optimizer_steps() -> None:
         smoke._optimizer_steps(empty)
 
 
+def test_batch4_smoke_peak_artifact_is_locked(tmp_path: Path) -> None:
+    path = tmp_path / "summary.json"
+    payload = {
+        "contract_type": "safa_r14_resume_batch4_memory_smoke_v1",
+        "source_checkpoint": str(validator.SOURCE_CHECKPOINT),
+        "source_global_step": 2432,
+        "smoke_optimizer_step": 2433,
+        "formal_target_global_step": 2560,
+        "world_size": 2,
+        "per_device_batch_size": 4,
+        "global_batch_size": 8,
+        "sample_count": 8,
+        "ddp_backward_and_adamw_step": True,
+        "ema_loaded_and_updated": True,
+        "source_face_pixels_enter_context_encoder": False,
+        "source_z_finite_l2_normalized": True,
+        "loss_finite": True,
+        "gradients_finite": True,
+        "vae_frozen": True,
+        "max_peak_reserved_mib": 5744.0,
+        "per_rank_memory": [
+            {"rank": 0, "peak_reserved_mib": 5744.0},
+            {"rank": 1, "peak_reserved_mib": 5744.0},
+        ],
+    }
+    write_json(path, payload)
+    assert validator._validate_batch4_smoke(path) == 5744
+    payload["max_peak_reserved_mib"] = 5743.0
+    write_json(path, payload)
+    with pytest.raises(validator.R14ResumeError, match="max_peak_reserved_mib"):
+        validator._validate_batch4_smoke(path)
+
+
 def test_nccl_transport_and_gpu_binding_are_locked() -> None:
     assert validator.NCCL_TRANSPORT_ENV == {
         "NCCL_IB_DISABLE": "1",
         "NCCL_P2P_DISABLE": "0",
     }
     assert set(validator.GPU_BINDINGS) == {0, 1}
-    assert validator.PROJECTED_PEAK_MIB == 0
+    assert validator.PROJECTED_PEAK_MIB == 5744
     validator._validate_nccl_transport_environment(validator.NCCL_TRANSPORT_ENV)
     with pytest.raises(validator.R14ResumeError, match="NCCL_IB_DISABLE"):
         validator._validate_nccl_transport_environment({"NCCL_P2P_DISABLE": "0"})

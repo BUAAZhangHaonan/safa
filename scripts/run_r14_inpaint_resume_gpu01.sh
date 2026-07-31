@@ -95,7 +95,7 @@ case "$MODE" in
     printf '%s\n' \
       "Source checkpoint: checkpoints/r14_inpaint_feasibility_2560step/last.pt" \
       "Source SHA256: a176d5521782a16ba488fe5d727cec61ddcf35d07fe75316f00f281ef423b7bf" \
-      "Per-GPU preflight peak: 8192 MiB (R14 four-GPU measured upper bound)"
+      "Per-GPU preflight peak: 5744 MiB (two-rank batch4 smoke max reserved)"
     print_pipeline
     run_pipeline
     ;;

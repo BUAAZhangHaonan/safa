@@ -27,6 +27,7 @@ SOURCE_HISTORY_SHA256 = "d823cb0918a44ddb59eedf7e50b6ef159238e3c56e917ad8aa2ef8c
 CHECKPOINT_ROOT = Path("checkpoints/r14_inpaint_resume_gpu01_step2560")
 ARTIFACT_ROOT = Path("artifacts/r14_inpaint_resume_gpu01/v1")
 LOG_PATH = ARTIFACT_ROOT / "logs/train.log"
+SMOKE_SUMMARY = Path("artifacts/r14_inpaint_resume_gpu01/batch4_smoke_v1/summary.json")
 SESSION = "safa-r14-inpaint-resume-gpu01-v1"
 SOURCE_WRITER_SESSION = "safa-r14-inpaint-v1"
 GPU_BINDINGS = {
@@ -37,8 +38,8 @@ NCCL_TRANSPORT_ENV = {
     "NCCL_IB_DISABLE": "1",
     "NCCL_P2P_DISABLE": "0",
 }
-# Set from the committed two-rank batch=4 smoke before formal launch is enabled.
-PROJECTED_PEAK_MIB = 0
+# Max reserved VRAM observed on both ranks in the full-state batch=4 smoke.
+PROJECTED_PEAK_MIB = 5744
 RESUME_CONTRACT = {
     "contract_type": "safa_r14_epoch_boundary_world_size_resume_v1",
     "source_global_step": 2432,
@@ -99,6 +100,45 @@ def _read_jsonl(path: Path) -> list[Mapping[str, Any]]:
     except (OSError, json.JSONDecodeError) as exc:
         raise R14ResumeError(f"cannot read JSONL {path}: {exc}") from exc
     return rows
+
+
+def _validate_batch4_smoke(path: Path | None = None) -> int:
+    summary_path = REPO_ROOT / SMOKE_SUMMARY if path is None else path
+    payload = _read_json(summary_path)
+    expected = {
+        "contract_type": "safa_r14_resume_batch4_memory_smoke_v1",
+        "source_checkpoint": str(SOURCE_CHECKPOINT),
+        "source_global_step": 2432,
+        "smoke_optimizer_step": 2433,
+        "formal_target_global_step": 2560,
+        "world_size": 2,
+        "per_device_batch_size": 4,
+        "global_batch_size": 8,
+        "sample_count": 8,
+        "ddp_backward_and_adamw_step": True,
+        "ema_loaded_and_updated": True,
+        "source_face_pixels_enter_context_encoder": False,
+        "source_z_finite_l2_normalized": True,
+        "loss_finite": True,
+        "gradients_finite": True,
+        "vae_frozen": True,
+        "max_peak_reserved_mib": float(PROJECTED_PEAK_MIB),
+    }
+    for key, value in expected.items():
+        _require_equal(payload.get(key), value, f"batch4 smoke.{key}")
+    rows = _sequence(payload.get("per_rank_memory"), "batch4 smoke.per_rank_memory")
+    _require_equal(len(rows), 2, "batch4 smoke rank count")
+    _require_equal(
+        {int(_mapping(row, "batch4 smoke rank").get("rank")) for row in rows},
+        {0, 1},
+        "batch4 smoke ranks",
+    )
+    for row in rows:
+        reserved = _mapping(row, "batch4 smoke rank").get("peak_reserved_mib")
+        if not isinstance(reserved, (int, float)) or not math.isfinite(float(reserved)):
+            raise R14ResumeError("batch4 smoke rank peak_reserved_mib is missing or non-finite")
+        _require_equal(float(reserved), float(PROJECTED_PEAK_MIB), "batch4 smoke rank peak_reserved_mib")
+    return PROJECTED_PEAK_MIB
 
 
 def _run(argv: Sequence[str]) -> str:
@@ -382,10 +422,7 @@ def _validate_process_isolation(process_table: str, sessions: Sequence[str]) -> 
 
 
 def _validate_resources() -> Mapping[str, Any]:
-    if PROJECTED_PEAK_MIB <= 0:
-        raise R14ResumeError(
-            "formal launch is blocked until the two-rank batch4 smoke records a positive VRAM peak"
-        )
+    measured_peak_mib = _validate_batch4_smoke()
     cpu = _cpu_percent()
     memory, swap = _memory_and_swap_percent()
     for label, value in (("CPU", cpu), ("main-memory", memory)):
@@ -414,17 +451,17 @@ def _validate_resources() -> Mapping[str, Any]:
             raise R14ResumeError(f"GPU{index} is unavailable")
         uuid, total_mib, used_mib, free_mib, utilization = observed[index]
         _require_equal(uuid, expected_uuid, f"GPU{index} UUID")
-        projected_used_mib = used_mib + PROJECTED_PEAK_MIB
-        projected_free_mib = free_mib - PROJECTED_PEAK_MIB
+        projected_used_mib = used_mib + measured_peak_mib
+        projected_free_mib = free_mib - measured_peak_mib
         if total_mib <= 0 or projected_used_mib / total_mib >= 0.85:
             raise R14ResumeError(
                 f"GPU{index} projected memory occupancy with the measured "
-                f"{PROJECTED_PEAK_MIB} MiB R14 peak must remain below 85%"
+                f"{measured_peak_mib} MiB R14 peak must remain below 85%"
             )
         if projected_free_mib < 4096:
             raise R14ResumeError(
                 f"GPU{index} must retain at least 4 GiB after the measured "
-                f"{PROJECTED_PEAK_MIB} MiB R14 peak"
+                f"{measured_peak_mib} MiB R14 peak"
             )
         if utilization >= 90:
             raise R14ResumeError(f"GPU{index} utilization must be below 90%, got {utilization}%")
@@ -447,7 +484,7 @@ def _validate_resources() -> Mapping[str, Any]:
         "main_memory_percent": round(memory, 2),
         "swap_percent": round(swap, 2),
         "disk_free_gib": round(free_disk / 1024**3, 2),
-        "projected_peak_mib": PROJECTED_PEAK_MIB,
+        "projected_peak_mib": measured_peak_mib,
         "gpus": {
             str(index): {
                 "memory_used_mib": observed[index][2],
