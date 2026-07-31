@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "contract_type": "safa_r12_arcface_absolute_identity_risk_request_v1",
+  "arcface_request": "artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/full/evaluator_runs/arcface/winner/request.json",
+  "gallery": {
+    "ordered_datasets": [
+      "regular32",
+      "sharpness_tail32"
+    ],
+    "expected_source_count": 64,
+    "ranking": "strict_true_score_greater_than_every_impostor",
+    "percentile": "(gallery_size-rank)/(gallery_size-1)"
+  },
+  "statistics": {
+    "bootstrap_seed": 91637,
+    "bootstrap_iterations": 10000,
+    "paired_resampling_unit": "sample_id",
+    "top_k": 8
+  },
+  "locked_gate_context": {
+    "relative_arcface_delta_direction": "source_candidate_minus_source_native",
+    "relative_arcface_delta_upper_bound": 0.02,
+    "gate_is_unchanged": true
+  },
+  "decision_rule": {
+    "candidate_cosine_top8_median_max_for_baseline_geometry": 0.1,
+    "source_native_spearman_max_for_baseline_geometry": -0.5,
+    "top8_enrichment_threshold": 2.0,
+    "high_true_source_rank": "candidate_rank_le_5",
+    "positive_margin": "candidate_true_source_score_gt_max_impostor",
+    "actual_retrieval_leakage_supported": "both_regular_arms_have_percentile_and_recall5_paired_delta_ci95_lower_gt_0_and_top8_recall5_and_positive_margin_enrichment_ge_2",
+    "baseline_conditioned_metric_geometry": "both_regular_arms_fail_locked_relative_delta_and_have_source_native_spearman_le_minus_0p5_and_top8_candidate_cosine_median_le_0p1_and_both_top8_enrichments_lt_2_and_no_arm_has_joint_supported_percentile_and_recall5_increase",
+    "otherwise": "identity_risk_inconclusive"
+  },
+  "numeric_contract": {
+    "embedding_dimension": 512,
+    "embedding_norm_absolute_tolerance": 0.00001,
+    "archived_cosine_absolute_tolerance": 0.000001,
+    "missing_nonfinite_or_non_exact_one": "fail_closed"
+  },
+  "datasets": [
+    {
+      "dataset_id": "regular32",
+      "formal_native_bindings": "artifacts/r12_seed_aligned_trajectory/preparation_v1/formal_native_bindings/regular32.jsonl",
+      "arms": {
+        "u12": {
+          "run_rows": "artifacts/r12_seed_aligned_trajectory/runs_v1/u12_regular32/per_sample.jsonl",
+          "arcface": "artifacts/r12_seed_aligned_trajectory/evaluation_v1/regular32/arcface/u12_regular32/result.json"
+        },
+        "u16": {
+          "run_rows": "artifacts/r12_seed_aligned_trajectory/runs_v1/u16_regular32/per_sample.jsonl",
+          "arcface": "artifacts/r12_seed_aligned_trajectory/evaluation_v1/regular32/arcface/u16_regular32/result.json"
+        }
+      }
+    },
+    {
+      "dataset_id": "sharpness_tail32",
+      "formal_native_bindings": "artifacts/r12_seed_aligned_trajectory/preparation_v1/formal_native_bindings/sharpness_tail32.jsonl",
+      "arms": {
+        "u12": {
+          "run_rows": "artifacts/r12_seed_aligned_trajectory/runs_v1/u12_tail32/per_sample.jsonl",
+          "arcface": "artifacts/r12_seed_aligned_trajectory/evaluation_v1/sharpness_tail32/arcface/u12_tail32/result.json"
+        },
+        "u16": {
+          "run_rows": "artifacts/r12_seed_aligned_trajectory/runs_v1/u16_tail32/per_sample.jsonl",
+          "arcface": "artifacts/r12_seed_aligned_trajectory/evaluation_v1/sharpness_tail32/arcface/u16_tail32/result.json"
+        }
+      }
+    }
+  ]
+}
