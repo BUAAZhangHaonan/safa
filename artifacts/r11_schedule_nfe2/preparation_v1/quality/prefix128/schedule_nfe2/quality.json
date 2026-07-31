@@ -1,0 +1,700 @@
+{
+  "fid": 129.05474853515625,
+  "iqa": {
+    "mean": 4.773836980227261,
+    "method": "niqe",
+    "std": 0.9232871641388516
+  },
+  "kid_mean": 0.03452190384268761,
+  "kid_std": 0.00040982579230330884,
+  "metrics": [
+    "fid",
+    "kid",
+    "niqe",
+    "sharpness"
+  ],
+  "num_generated": 128,
+  "num_real": 128,
+  "per_sample_metrics": {
+    "contract_type": "safa_r9_quality_per_sample_metrics_v1",
+    "metric_fields": [
+      "niqe",
+      "sharpness"
+    ],
+    "ordered_sample_id_sha256": "3af3ecd3f844f61b7e7e5a25519ed97fa30dc56663e52fc2ee84cdd9cabac2d5",
+    "per_sample_metrics_sha256": "c163e7f2b1666a96ab0cef83075bbe6637d1ea8c2f7a2614b4bd6d664b01338e",
+    "rows": [
+      {
+        "niqe": 5.153193462050729,
+        "sample_id": "val:Manually_Annotated_Images/957/90282a4518444270514aea5a11b000c5f49764879b4814fd3bf591e5.jpg",
+        "sharpness": 267.80023860931396
+      },
+      {
+        "niqe": 4.8088975733921995,
+        "sample_id": "val:Manually_Annotated_Images/952/2c9f6a125b9e299507b42f3ff68a743637deaf0071b13b9182b01d03.jpg",
+        "sharpness": 364.21404572553
+      },
+      {
+        "niqe": 5.04604153681323,
+        "sample_id": "val:Manually_Annotated_Images/117/986d38d55654b351433d557bd5dfcce7e7378d2008ffd510fb16d800.jpg",
+        "sharpness": 984.2394001334906
+      },
+      {
+        "niqe": 5.463677939953781,
+        "sample_id": "val:Manually_Annotated_Images/963/eca7d8795dac0e9e106ac98d556a382ee0accce2785eecff0f72aaf0.jpg",
+        "sharpness": 796.1921082658228
+      },
+      {
+        "niqe": 4.337946047506835,
+        "sample_id": "val:Manually_Annotated_Images/495/91f3e5a312eb553cf2552fbefcddb2c7e62aa81cdef1c87389ad7f1f.JPG",
+        "sharpness": 221.76899174205028
+      },
+      {
+        "niqe": 5.092596337206621,
+        "sample_id": "val:Manually_Annotated_Images/493/2d9782361c7c15f3c64fca50dda7904b165bdf5c6b03e430482b42be.jpg",
+        "sharpness": 387.78059367625974
+      },
+      {
+        "niqe": 4.214802765791469,
+        "sample_id": "val:Manually_Annotated_Images/59/585ba63d00889ec44aa30bd32723290e440c305a4d3a6e8b9919c596.jpg",
+        "sharpness": 802.7018979822751
+      },
+      {
+        "niqe": 5.140054778887868,
+        "sample_id": "val:Manually_Annotated_Images/462/f47a25cfd2e73e1fc1f5cae15f91b7875581ca0c82467e3dc43eb862.jpg",
+        "sharpness": 1087.5175471967086
+      },
+      {
+        "niqe": 4.506410847833425,
+        "sample_id": "val:Manually_Annotated_Images/970/975a7156dbc3efd8202a25b4f912de08a05d5b59e6db207f421bfec6.jpg",
+        "sharpness": 242.19062260142528
+      },
+      {
+        "niqe": 4.494056952060234,
+        "sample_id": "val:Manually_Annotated_Images/659/fe0d94bfe4e15267e07af4667a79736f57abc2f7ea6f14a236b98560.jpg",
+        "sharpness": 502.64367270097136
+      },
+      {
+        "niqe": 4.788403552061252,
+        "sample_id": "val:Manually_Annotated_Images/910/6b048ae4d7318a7d788203240bb088fd6fdd83382827d0707441c97e.jpg",
+        "sharpness": 780.2413936704397
+      },
+      {
+        "niqe": 4.066030720537859,
+        "sample_id": "val:Manually_Annotated_Images/840/2277bf4f991d8349f45a31afc662f15a280ab174e4b2c428ad9b7b5b.jpg",
+        "sharpness": 1504.152256116271
+      },
+      {
+        "niqe": 5.245175833070837,
+        "sample_id": "val:Manually_Annotated_Images/658/0e129e33342847f002e7831ab2e8378c4c3a642607516ba41acf942a.jpg",
+        "sharpness": 342.2391903770622
+      },
+      {
+        "niqe": 6.087118517768307,
+        "sample_id": "val:Manually_Annotated_Images/1051/99eb7f04c34277bfa425c1df6dcb863afde2b696e20c3255aa7f59ad.png",
+        "sharpness": 482.9659461826086
+      },
+      {
+        "niqe": 4.073286955716162,
+        "sample_id": "val:Manually_Annotated_Images/1043/8e11682faf7c35401eb6f12e72fab39197c42681853b76766c67e640.jpg",
+        "sharpness": 622.0156682990491
+      },
+      {
+        "niqe": 3.1146154864877373,
+        "sample_id": "val:Manually_Annotated_Images/164/ada5800c80190560c9e1ef14f7071287d3db7ae44d9cd5e5871dbed6.jpg",
+        "sharpness": 1073.8562631194945
+      },
+      {
+        "niqe": 4.728677057887955,
+        "sample_id": "val:Manually_Annotated_Images/644/d7646c7d93b6b572129272dda8579eba52002cf140cfbdb84e197a27.jpg",
+        "sharpness": 336.60061857826076
+      },
+      {
+        "niqe": 3.923774944163133,
+        "sample_id": "val:Manually_Annotated_Images/985/84967b42ad57c442fe62fac4a5fb72ce2b83c07e23fc447f8450468c.jpg",
+        "sharpness": 390.8604229183402
+      },
+      {
+        "niqe": 4.416506278660723,
+        "sample_id": "val:Manually_Annotated_Images/901/b2c7cf5fe3428b27069a16a1d9228d30a47b42d2d19e4697cdadce56.jpg",
+        "sharpness": 671.6551434993744
+      },
+      {
+        "niqe": 5.072155990395496,
+        "sample_id": "val:Manually_Annotated_Images/1049/64e00802544020505ea22b8a027a0f4a2ec02446b2b0cdb513b45937.jpg",
+        "sharpness": 1165.2402356320526
+      },
+      {
+        "niqe": 5.55637408604676,
+        "sample_id": "val:Manually_Annotated_Images/848/c6e8db65950ea6412f33803e0b0fb4f37016f7e15df8db431844af12.jpg",
+        "sharpness": 343.09308514161967
+      },
+      {
+        "niqe": 4.152269302542409,
+        "sample_id": "val:Manually_Annotated_Images/683/4088c8523b4d891adbe29a808ecb840351135095700ba7488a91c366.png",
+        "sharpness": 626.5106747893151
+      },
+      {
+        "niqe": 3.552566368737982,
+        "sample_id": "val:Manually_Annotated_Images/981/1a7ce16d877f85e71a99a2f5771c2ebcaece23993af22d3368d38bac.jpg",
+        "sharpness": 711.4574422498699
+      },
+      {
+        "niqe": 4.509115680136021,
+        "sample_id": "val:Manually_Annotated_Images/986/6afda6dd23d754a7e8b1fb6a3f9192ac069d0e8d149e0198af87a7ae.jpg",
+        "sharpness": 1386.1072939296719
+      },
+      {
+        "niqe": 4.285238136328765,
+        "sample_id": "val:Manually_Annotated_Images/921/eee126016abdd00e87371094b98783cf7a87377800d319b7e3ba2f24.jpg",
+        "sharpness": 198.65286290622316
+      },
+      {
+        "niqe": 5.390196766388165,
+        "sample_id": "val:Manually_Annotated_Images/743/c80189f4862f1b364a2a5a3dcfe1aad7d53974d00f19067cc7c6ebc7.jpg",
+        "sharpness": 428.4920067638159
+      },
+      {
+        "niqe": 4.220524786953086,
+        "sample_id": "val:Manually_Annotated_Images/968/606de9c3409e875c847a14837cfa46fc42153bb7080cef7f099e0e30.jpg",
+        "sharpness": 711.3588622396346
+      },
+      {
+        "niqe": 4.234108195351578,
+        "sample_id": "val:Manually_Annotated_Images/714/4f4c200a12caafba195d425e946c7aa3c857bd757e0ca1897c5476b3.jpg",
+        "sharpness": 1052.08021288272
+      },
+      {
+        "niqe": 4.9060305703301,
+        "sample_id": "val:Manually_Annotated_Images/706/3b99315ac29b78e3c08f2d665142958160ef4fb23b24878ac06e6760.jpg",
+        "sharpness": 339.8401419536676
+      },
+      {
+        "niqe": 5.02327468528939,
+        "sample_id": "val:Manually_Annotated_Images/804/87c37a268a173e5c92d4be9c783936f9af5cfb450a6348f38c9c25a1.jpg",
+        "sharpness": 348.02117740525864
+      },
+      {
+        "niqe": 4.703864332524715,
+        "sample_id": "val:Manually_Annotated_Images/895/7965f207a0b0f8fa82773f40644c4b31aaeab63403e012068a2942d6.jpg",
+        "sharpness": 709.0098194142338
+      },
+      {
+        "niqe": 6.29854230832404,
+        "sample_id": "val:Manually_Annotated_Images/801/f54ba5349959622f4474f54549a85647abdff11d823d0f5737617346.jpg",
+        "sharpness": 975.9643062204123
+      },
+      {
+        "niqe": 5.880431849106729,
+        "sample_id": "val:Manually_Annotated_Images/852/566efef58738337a9393e747221513d4e1fa5bfbcc6a5edfa0a98027.jpg",
+        "sharpness": 149.29642897821032
+      },
+      {
+        "niqe": 4.256305951813889,
+        "sample_id": "val:Manually_Annotated_Images/384/db77f1b304a5c5c388ecd3f597b0054321a3a0cd5af901484ce445fb.jpg",
+        "sharpness": 409.04691479331814
+      },
+      {
+        "niqe": 3.8567899788522406,
+        "sample_id": "val:Manually_Annotated_Images/1265/fe32556af75ec176c91aded80dd9f8ea8744cb333c340c97df1035aa.jpg",
+        "sharpness": 625.1316220760345
+      },
+      {
+        "niqe": 4.988071427720316,
+        "sample_id": "val:Manually_Annotated_Images/694/379a238a0dd1043d5a2600be279277631375b3a5014c000a89d00bd4.jpg",
+        "sharpness": 7013.203737340635
+      },
+      {
+        "niqe": 4.711262329754201,
+        "sample_id": "val:Manually_Annotated_Images/299/0b0ecfc864496e8d629f118f3abe82f6162cfc299813f2f71db83c8c.jpg",
+        "sharpness": 227.00622394308448
+      },
+      {
+        "niqe": 4.830493472089673,
+        "sample_id": "val:Manually_Annotated_Images/112/61a59ed9561bb3c18d2142e6ad87efac60225c58c8b239923440363d.jpg",
+        "sharpness": 439.0870308727026
+      },
+      {
+        "niqe": 5.372754398698435,
+        "sample_id": "val:Manually_Annotated_Images/1040/1fae31e5154d8db0d0f004c84e802d6a6141fdf1a2bd45047353729d.JPG",
+        "sharpness": 681.6174697726965
+      },
+      {
+        "niqe": 7.733430529656022,
+        "sample_id": "val:Manually_Annotated_Images/835/68749913677f26fe2678b14dc1d8b4b3c35afcac593c133a0ea9e48d.jpg",
+        "sharpness": 1377.6245100048836
+      },
+      {
+        "niqe": 6.666620886299353,
+        "sample_id": "val:Manually_Annotated_Images/152/035d6391a5bf15df1d04d0f4fe3fca9ab81cda2f24b8d1e2aefeeec1.jpg",
+        "sharpness": 146.55366947408766
+      },
+      {
+        "niqe": 4.915801857159783,
+        "sample_id": "val:Manually_Annotated_Images/645/a9266c2ab34ec4b4cafa7e30137d4d09e401fc17837e7cd6d587b155.jpg",
+        "sharpness": 374.9077299570199
+      },
+      {
+        "niqe": 4.150932176313429,
+        "sample_id": "val:Manually_Annotated_Images/867/b84139c17ac6cc6ae3e4872ff6298d147916ffdc397430dd1e14a608.jpg",
+        "sharpness": 632.5736841501202
+      },
+      {
+        "niqe": 5.230753750331607,
+        "sample_id": "val:Manually_Annotated_Images/758/2fd0fe42a7e805a7f4c59899fd899d2c05548bdac93fb6e6e999ac3b.jpg",
+        "sharpness": 1173.0154883181676
+      },
+      {
+        "niqe": 5.1919756336661855,
+        "sample_id": "val:Manually_Annotated_Images/411/1ea70830d01ed765a7e380f37991981e915e2f631708b8b78d4ee33b.jpg",
+        "sharpness": 167.35358647606336
+      },
+      {
+        "niqe": 3.9619450525213864,
+        "sample_id": "val:Manually_Annotated_Images/745/41b25d7ab48090b69b993d03dcd36acbc46b2d0137fa689d3b14674b.jpg",
+        "sharpness": 361.3839738869574
+      },
+      {
+        "niqe": 5.4742027482083095,
+        "sample_id": "val:Manually_Annotated_Images/753/ad7bfba875e4647c37413e87d42ce1e690ba6d8bc65ecad7509749fe.jpg",
+        "sharpness": 895.7935001568403
+      },
+      {
+        "niqe": 6.021237813756465,
+        "sample_id": "val:Manually_Annotated_Images/269/9ce4b66c503bd3448103eb6572412eb8c24525e4d546b949bf0fa0e9.jpg",
+        "sharpness": 1649.0365465634968
+      },
+      {
+        "niqe": 5.070385289920536,
+        "sample_id": "val:Manually_Annotated_Images/495/054272db36a10a3779cdbb707952a363e244c8b6cf1e5d7cad585043.jpg",
+        "sharpness": 313.11245988309383
+      },
+      {
+        "niqe": 4.551317379765653,
+        "sample_id": "val:Manually_Annotated_Images/690/8f927a2bf3d04bf4ff5a77372175958b4ba43692a2345203ffd91b11.jpg",
+        "sharpness": 473.5316708830651
+      },
+      {
+        "niqe": 4.594639603204547,
+        "sample_id": "val:Manually_Annotated_Images/520/05b5341eca341f205456942c5911dae191d3302371dd25c76b682db2.png",
+        "sharpness": 601.6454134425148
+      },
+      {
+        "niqe": 6.719225427792611,
+        "sample_id": "val:Manually_Annotated_Images/685/a5591f517485d01fc68fcd5ab7111b35aae7517caa1b3d1174b1413c.jpg",
+        "sharpness": 3820.0301246494055
+      },
+      {
+        "niqe": 5.286112497626974,
+        "sample_id": "val:Manually_Annotated_Images/718/d577c7f5087061a62f85e5ba91a8ec2e5914c242b857911434c31a7f.jpg",
+        "sharpness": 215.64934627129696
+      },
+      {
+        "niqe": 5.506917164335562,
+        "sample_id": "val:Manually_Annotated_Images/1292/d571112897c32e78d30ce56450157ad6e995e0cec583c371ffa8f36e.jpg",
+        "sharpness": 337.97218879684806
+      },
+      {
+        "niqe": 2.8781219824013755,
+        "sample_id": "val:Manually_Annotated_Images/456/f00642b995ca236a5b317d7cb2fa7274b77c815168b91cb90bc9e8f2.jpg",
+        "sharpness": 735.0158652083483
+      },
+      {
+        "niqe": 3.6775246193665008,
+        "sample_id": "val:Manually_Annotated_Images/718/7ee407fac747b7a25cec2fc428411e356eb6fe52f738ae9fc0b01304.jpg",
+        "sharpness": 1025.9867606228217
+      },
+      {
+        "niqe": 6.295345814334761,
+        "sample_id": "val:Manually_Annotated_Images/637/857dde1c3f275d426c6ad26669e9bf7ccf3dee3ffeabdcdf4a3d2819.jpg",
+        "sharpness": 261.1771417921409
+      },
+      {
+        "niqe": 4.5476905831509535,
+        "sample_id": "val:Manually_Annotated_Images/960/fff1e48c3e93a94d3dee4eb7fd514f131a530abedd2ef261431066fe.jpg",
+        "sharpness": 338.36559422221035
+      },
+      {
+        "niqe": 4.331836568247444,
+        "sample_id": "val:Manually_Annotated_Images/432/fa6fac6402ce9c3a2b4efd93b2b0e6615795acde6893a71a497728db.jpg",
+        "sharpness": 520.9449856132269
+      },
+      {
+        "niqe": 4.800032143051886,
+        "sample_id": "val:Manually_Annotated_Images/922/26a326d6389cc3a49261c70d73c90994f0bc80b01ab1a32c954d84f4.jpg",
+        "sharpness": 852.6366283649113
+      },
+      {
+        "niqe": 6.953201152352404,
+        "sample_id": "val:Manually_Annotated_Images/466/dbf51eebb8472b3ac838718bf4e175dfbc32528eb8529b0846209bf5.jpg",
+        "sharpness": 22.69113038480282
+      },
+      {
+        "niqe": 4.099088483654421,
+        "sample_id": "val:Manually_Annotated_Images/882/a28c96628f2d0cfe023a4b61a41311a3c5dd27595e68733c4be5c992.jpg",
+        "sharpness": 528.1512703746557
+      },
+      {
+        "niqe": 3.429092484652337,
+        "sample_id": "val:Manually_Annotated_Images/488/62c845cb910e734640c4d000dfde5acb057bcff2fd50af8747e63cf8.jpg",
+        "sharpness": 669.6020407527685
+      },
+      {
+        "niqe": 3.1393169039989215,
+        "sample_id": "val:Manually_Annotated_Images/715/9cebf8b8938fedc8ce005813a3966de9ed011015efea12213a46e63f.jpg",
+        "sharpness": 1556.3802490234375
+      },
+      {
+        "niqe": 5.8261138082058235,
+        "sample_id": "val:Manually_Annotated_Images/482/8e9e72119dccae2c5dd29ea5767d9a478fe730f4bab7a51671a94c61.png",
+        "sharpness": 167.18299599154852
+      },
+      {
+        "niqe": 3.1742029818800845,
+        "sample_id": "val:Manually_Annotated_Images/972/3f16b92de14bfc2788d23a158e4536d8e150304b1ba689f2511197d8.jpg",
+        "sharpness": 459.15402280702256
+      },
+      {
+        "niqe": 3.7397958169286105,
+        "sample_id": "val:Manually_Annotated_Images/984/d277422a0a994f1ec733e0d8c87c9d152a4dc0ee4e3b2a4029c38bb4.jpg",
+        "sharpness": 782.2782407691702
+      },
+      {
+        "niqe": 6.15550775650679,
+        "sample_id": "val:Manually_Annotated_Images/755/916daacccecbba6a3511d8f7c0e0b66ae868698ef1b4cfb9f95df901.jpg",
+        "sharpness": 940.7723497764673
+      },
+      {
+        "niqe": 4.588915339029624,
+        "sample_id": "val:Manually_Annotated_Images/752/fbbda6aae931fc11d0bf1fe7dfd35036421ef70268294baa7acf5825.jpg",
+        "sharpness": 290.9219244827982
+      },
+      {
+        "niqe": 4.011225709099521,
+        "sample_id": "val:Manually_Annotated_Images/668/85628ed80e89a6b35a6fc987e5c69435a56f0e2c0b0de7c3455919ac.png",
+        "sharpness": 522.3374916603789
+      },
+      {
+        "niqe": 4.4397120958846035,
+        "sample_id": "val:Manually_Annotated_Images/440/8d3b9daf6276683c0a57de7b147736cd93beeea2b2cb2dc8344a1364.jpg",
+        "sharpness": 660.4637612700462
+      },
+      {
+        "niqe": 4.108841328424151,
+        "sample_id": "val:Manually_Annotated_Images/952/a4a78974d9b8c96b9d3fbf5e0d4c56684ff62614f2b43924fa17338e.jpg",
+        "sharpness": 1003.4339527552947
+      },
+      {
+        "niqe": 6.03997236435185,
+        "sample_id": "val:Manually_Annotated_Images/918/00411982cad24a500062d3b8a5dd441a79c7bb6bdcef08bf78c007d3.jpg",
+        "sharpness": 151.21009897976182
+      },
+      {
+        "niqe": 4.810155884476935,
+        "sample_id": "val:Manually_Annotated_Images/510/f982596cc4b98e4993d6ca66dbcc2f4cec2c4bfd685ee344bf3091ff.jpg",
+        "sharpness": 336.2344224816188
+      },
+      {
+        "niqe": 6.682566910010655,
+        "sample_id": "val:Manually_Annotated_Images/354/5b8e9bcda728ffdd33b9c3f979b5af139f4a27f499499683b5a3975f.jpg",
+        "sharpness": 561.0595010370016
+      },
+      {
+        "niqe": 5.8686394734529355,
+        "sample_id": "val:Manually_Annotated_Images/414/0187bdf7007109b487865b6a9d388997a6817acf052a6a7cdd5b39d9.jpg",
+        "sharpness": 1037.0250868713483
+      },
+      {
+        "niqe": 4.650748096577608,
+        "sample_id": "val:Manually_Annotated_Images/503/12289496b7c39113e9253e794d52dc41004d41dcc8e5fcd433acc723.jpg",
+        "sharpness": 256.90710437949747
+      },
+      {
+        "niqe": 4.239951274634605,
+        "sample_id": "val:Manually_Annotated_Images/951/c37fca528f44120969027d451253bcee20791d50d7070f8517c2d818.jpg",
+        "sharpness": 423.25901703885756
+      },
+      {
+        "niqe": 4.644121526002193,
+        "sample_id": "val:Manually_Annotated_Images/622/3b2f597e101d84c1d08954999c0a16c1144afd5c94efcca93701d4a2.jpg",
+        "sharpness": 742.5333809514996
+      },
+      {
+        "niqe": 4.151170134559506,
+        "sample_id": "val:Manually_Annotated_Images/845/b9cdb62aca3e39fc389fc4b6ab2620f445c88b77f3aebd3cdb80e186.JPG",
+        "sharpness": 841.3609067760408
+      },
+      {
+        "niqe": 7.491846067176831,
+        "sample_id": "val:Manually_Annotated_Images/976/0b3ed8170dea1892460f39e107493955c39b1455ea8a1d9ccfb2b76e.jpg",
+        "sharpness": 65.60329806967638
+      },
+      {
+        "niqe": 4.263774323216386,
+        "sample_id": "val:Manually_Annotated_Images/506/34c9f10d9ec8cb5342e9d0f1f80c51f60eeaad21324a193cfa606510.jpg",
+        "sharpness": 522.2130755549297
+      },
+      {
+        "niqe": 4.356502156207836,
+        "sample_id": "val:Manually_Annotated_Images/488/99e109b9d93581152ac7ac8f8366754ab2679a1f364ab8dd86c88e11.jpg",
+        "sharpness": 731.4993402340915
+      },
+      {
+        "niqe": 4.057425620628934,
+        "sample_id": "val:Manually_Annotated_Images/829/26fab5c68c5ebd2d25bbae9ef986f4cafd118091435671c9254532d8.jpg",
+        "sharpness": 811.994009426795
+      },
+      {
+        "niqe": 5.679432441482347,
+        "sample_id": "val:Manually_Annotated_Images/1057/7473f2ae1e664eff078fa295e40b6b3e2288e22961a087292d43f98c.jpg",
+        "sharpness": 109.89223855733871
+      },
+      {
+        "niqe": 4.3336232469642,
+        "sample_id": "val:Manually_Annotated_Images/652/6f2e3b2a45f814605f672af9c0f8b6abcdde42a63aa5abafeeac3740.jpg",
+        "sharpness": 452.0853544464335
+      },
+      {
+        "niqe": 5.2997918915658335,
+        "sample_id": "val:Manually_Annotated_Images/650/ae5bbb6342f1c6b3c57f60e212abecafa3de4799bdcfededb50ccc43.jpg",
+        "sharpness": 1310.856869455427
+      },
+      {
+        "niqe": 5.211789362359583,
+        "sample_id": "val:Manually_Annotated_Images/160/fffeb2f7e57489284d2f07577b9f60b6643bdca9b87dff5621cac631.jpg",
+        "sharpness": 1437.5095138826873
+      },
+      {
+        "niqe": 5.323768265529388,
+        "sample_id": "val:Manually_Annotated_Images/995/90e2603b886602da264ff00c7599122b8b599b9f06d68cb46bb38222.jpg",
+        "sharpness": 165.5991415900644
+      },
+      {
+        "niqe": 5.247153077627294,
+        "sample_id": "val:Manually_Annotated_Images/746/1fa37edf8e5a3c604d6c5d91f1b7d31d969311cfe808d32d14b6a329.jpg",
+        "sharpness": 422.531545012258
+      },
+      {
+        "niqe": 5.567245071529258,
+        "sample_id": "val:Manually_Annotated_Images/415/47bf41c6677b17387754ca5e27a6ceab29cb239b5b61991b0ddae22e.jpg",
+        "sharpness": 675.0341635865625
+      },
+      {
+        "niqe": 3.3913073032648664,
+        "sample_id": "val:Manually_Annotated_Images/618/8a10d58988d5f132e9d13a8594d6f55c6a97609e700ef3d2eb8c05d8.jpg",
+        "sharpness": 1324.678344025975
+      },
+      {
+        "niqe": 4.376421968046652,
+        "sample_id": "val:Manually_Annotated_Images/612/535b49e4c625d711cc7beb4aa3cd3536b16eab09f1ba3cd31518eac9.jpg",
+        "sharpness": 133.72831819951534
+      },
+      {
+        "niqe": 4.004834728235657,
+        "sample_id": "val:Manually_Annotated_Images/1030/2b5111ef4344a7c0ab484c79c7798ca10557c469c827eb847fe792d2.jpg",
+        "sharpness": 533.342133164173
+      },
+      {
+        "niqe": 4.211965647263122,
+        "sample_id": "val:Manually_Annotated_Images/422/53ba5330c78a1be4171524ac6f447f4226506fd1e62061ca28d605c0.jpg",
+        "sharpness": 541.6349302770104
+      },
+      {
+        "niqe": 4.524258883752483,
+        "sample_id": "val:Manually_Annotated_Images/269/009bb5e8da23b99643208e9b5565ea94ebc6ec58fb4e52ebb3807a73.jpg",
+        "sharpness": 889.398619008949
+      },
+      {
+        "niqe": 4.625277570337499,
+        "sample_id": "val:Manually_Annotated_Images/1045/c4f8afc26d293aaebe320d74afe459a6106f19cc89723eaa9a93874d.jpg",
+        "sharpness": 275.907970986329
+      },
+      {
+        "niqe": 4.285763907355708,
+        "sample_id": "val:Manually_Annotated_Images/957/d7cc98d9ce9e90210f8b3ffdd0fb8b27827b14722588bc425de60794.jpg",
+        "sharpness": 391.0367226218805
+      },
+      {
+        "niqe": 4.396020046303569,
+        "sample_id": "val:Manually_Annotated_Images/678/9b87c4ff7aafbb5daf194e097e2ac11c7faac394542932344be1f3fc.jpg",
+        "sharpness": 807.6267753017601
+      },
+      {
+        "niqe": 2.9112450438343656,
+        "sample_id": "val:Manually_Annotated_Images/984/42cefef5be2dd2c2e95d7695fc928ae8198bafd231cb7c1bf99bdd72.jpg",
+        "sharpness": 772.2360473496374
+      },
+      {
+        "niqe": 4.755484031894258,
+        "sample_id": "val:Manually_Annotated_Images/513/a534f96f30ca804796f374d870188e3c66bc040e58255f5c6665a7b6.jpg",
+        "sharpness": 310.0342089300975
+      },
+      {
+        "niqe": 4.861317050243821,
+        "sample_id": "val:Manually_Annotated_Images/73/eff867679f960ec8f93d131419810fc83a592825701b256e77548614.jpg",
+        "sharpness": 463.42458480224013
+      },
+      {
+        "niqe": 3.804100558433203,
+        "sample_id": "val:Manually_Annotated_Images/484/4e3297922ea8f3f1f04283636fced3be8369f96a9ca8fdd9cf0586f9.jpg",
+        "sharpness": 922.2763967514038
+      },
+      {
+        "niqe": 6.881088920426174,
+        "sample_id": "val:Manually_Annotated_Images/461/3b46a0d071bf270ee19094824f29258a1f2d38ef61eb38388481444c.jpg",
+        "sharpness": 1018.4968564510345
+      },
+      {
+        "niqe": 5.4138093767568,
+        "sample_id": "val:Manually_Annotated_Images/200/47f138a50b4940b70c9f71909514c1abd99b84f44da580240a1a9a90.jpg",
+        "sharpness": 294.34632705315016
+      },
+      {
+        "niqe": 3.3395575057301543,
+        "sample_id": "val:Manually_Annotated_Images/856/f94018d451575b041d470506c8d24403a986318938b9a8c701be08df.jpg",
+        "sharpness": 523.092895626789
+      },
+      {
+        "niqe": 3.0539456491203327,
+        "sample_id": "val:Manually_Annotated_Images/700/3eebc2ac9a5dd2226aacd70338e05e4b2166fb484cf6b9a9649dc0ce.JPG",
+        "sharpness": 558.0306250965223
+      },
+      {
+        "niqe": 3.574599413469996,
+        "sample_id": "val:Manually_Annotated_Images/1032/b44734710df444971b7ea6ea12602e28b531109ac9faa07054ae067c.jpg",
+        "sharpness": 1475.122467953479
+      },
+      {
+        "niqe": 4.708969181516314,
+        "sample_id": "val:Manually_Annotated_Images/724/0d4921f5e8623f79088e83987b642316151dca548b41096288ce048c.jpg",
+        "sharpness": 316.7409729154315
+      },
+      {
+        "niqe": 4.216803493588534,
+        "sample_id": "val:Manually_Annotated_Images/361/647631bfa3aaf50e85766436648b41ee8f2c78078ad3aab9ec3748c4.jpg",
+        "sharpness": 457.80841493955813
+      },
+      {
+        "niqe": 5.272498496438225,
+        "sample_id": "val:Manually_Annotated_Images/706/a6741d2f78bbd402b49b73326dbe61d0ff7e5b9e97c56ab8fa4084ab.JPG",
+        "sharpness": 524.3981082998216
+      },
+      {
+        "niqe": 6.377802161601948,
+        "sample_id": "val:Manually_Annotated_Images/656/0c6392414db854066ba41c908465662be3ccefcd6a5fe8ca93ceff51.jpg",
+        "sharpness": 1539.8316772347316
+      },
+      {
+        "niqe": 4.8918485020599185,
+        "sample_id": "val:Manually_Annotated_Images/978/0b37865277e15d74a65e1c5c0802074f89289b744350547cbeeb7356.jpg",
+        "sharpness": 296.6183325937018
+      },
+      {
+        "niqe": 4.985094023402186,
+        "sample_id": "val:Manually_Annotated_Images/950/34c63a05714b84aee038f6b3bcbc668c44a6cfa83beaf5d6b14124b3.jpg",
+        "sharpness": 404.96112921251915
+      },
+      {
+        "niqe": 4.952424990990651,
+        "sample_id": "val:Manually_Annotated_Images/875/0c03247875c67ebd077b228224dc23932f3544d100490360bf52af28.jpg",
+        "sharpness": 564.6201273342595
+      },
+      {
+        "niqe": 4.239838132014057,
+        "sample_id": "val:Manually_Annotated_Images/385/92721652c15cbc1d5b11707865b465dd6d2c16e1b72f4112ec60ebab.jpg",
+        "sharpness": 865.4336441585328
+      },
+      {
+        "niqe": 4.850061816024803,
+        "sample_id": "val:Manually_Annotated_Images/409/b16b3dd1da47916ee6f154c2d50ce2dfb09a03c2720fc9f902a9bfc7.jpg",
+        "sharpness": 271.2147822640836
+      },
+      {
+        "niqe": 5.172382580369001,
+        "sample_id": "val:Manually_Annotated_Images/854/7f7b47bac68c2685f46eb421be4cc395f2869a97ffbd783d8d52315b.jpg",
+        "sharpness": 471.49132434255444
+      },
+      {
+        "niqe": 3.8586946947545386,
+        "sample_id": "val:Manually_Annotated_Images/657/667689ba20d7a73db40ea100f2f689ccb040831fe8a3f398eac2db61.jpg",
+        "sharpness": 639.0537322477903
+      },
+      {
+        "niqe": 3.0898850536292044,
+        "sample_id": "val:Manually_Annotated_Images/657/9c32427218756bf1b6e15ea295423f0f19447255f8c7296a4693d4a8.jpg",
+        "sharpness": 1567.513025178574
+      },
+      {
+        "niqe": 5.640185909117811,
+        "sample_id": "val:Manually_Annotated_Images/750/8093144481c1803162523683041db35b24ed1d3ee69eef98fd088c05.jpg",
+        "sharpness": 147.47824790980667
+      },
+      {
+        "niqe": 5.17489560224349,
+        "sample_id": "val:Manually_Annotated_Images/994/c5bbe80ea497c05826013b5b9e39b39ddd7a1cd4cdedf4fe139ba598.jpg",
+        "sharpness": 368.10451380815357
+      },
+      {
+        "niqe": 5.188547793668619,
+        "sample_id": "val:Manually_Annotated_Images/891/c6a913bbe91fda7963fb5a7ba346295d9c9e40b4e6f78f05f67add45.JPG",
+        "sharpness": 670.0735407918692
+      },
+      {
+        "niqe": 4.5523432716604075,
+        "sample_id": "val:Manually_Annotated_Images/601/3649b858eb4ffa73a578560b1a7fde22c0a5808f2969f5875a0169a3.jpg",
+        "sharpness": 1041.6869635672774
+      },
+      {
+        "niqe": 4.59147788217652,
+        "sample_id": "val:Manually_Annotated_Images/984/6f0b0d15029a3808b76b4b23cd1563ff1daa8b60fdb51c156f25c174.jpg",
+        "sharpness": 354.98594749881886
+      },
+      {
+        "niqe": 4.152466840144559,
+        "sample_id": "val:Manually_Annotated_Images/740/2f4dedf79df530f1077aeab3938a38a9ceb95f23afb31de4ce706faa.jpg",
+        "sharpness": 509.515663202852
+      },
+      {
+        "niqe": 4.8289956584515465,
+        "sample_id": "val:Manually_Annotated_Images/970/79146949a40aed539f562696c30e544beb7e04d4d79e9557e7cde159.jpg",
+        "sharpness": 565.4598264263477
+      },
+      {
+        "niqe": 4.20254100545129,
+        "sample_id": "val:Manually_Annotated_Images/379/5119af3d5f00c8dc7d7025a68915b12a0118a56975af8215cac1d318.jpg",
+        "sharpness": 900.6104039764032
+      }
+    ],
+    "sample_count": 128,
+    "schema_version": 1
+  },
+  "quality_contract": {
+    "arm_config_sha256": "fa23185dfc55c0dad1f23266714fcac80b648955b4406d6241ad80717b62d240",
+    "generated_asset_manifest_sha256": "8dbe3f0b1cede187a814f02c1c0d92a8760820971a9a0c9dfe08f1ec7e6d82fa",
+    "generation_result_sha256": "fc146d4a155dc6b925d05cdd9da408e81ca6433635c96dc14fc76acdd427dfa8",
+    "kid_subset_size": 127,
+    "metrics": [
+      "fid",
+      "kid",
+      "niqe",
+      "sharpness"
+    ],
+    "per_sample_jsonl_sha256": "b596a5b82bfc59bc645a7f07c68e426fcefef495eebe44efcf7abcb3b9058f7d",
+    "real_asset_manifest_sha256": "8a2b8a3b1e01a18ff420c97129738a0b6effafeee64abbdb09c2d4b685777fde",
+    "sample_id_manifest_sha256": "9e1bfa90057c9b72f02a29340d91f0d87d4d4f35119733824b9659bd7ee8db89",
+    "schema_version": 1
+  },
+  "sample_id_count": 128,
+  "sample_id_manifest": "artifacts/r10_triangle_exploration/preparation_v1/prefix128.jsonl",
+  "sample_id_sha256": "3af3ecd3f844f61b7e7e5a25519ed97fa30dc56663e52fc2ee84cdd9cabac2d5",
+  "sharpness": {
+    "definition": "grayscale_laplacian_variance",
+    "mean": 695.6715354634434,
+    "median": 530.7467017694144,
+    "p05": 149.96621347875333,
+    "p10": 219.93309810082428,
+    "p90": 1214.367902659345,
+    "p95": 1493.9918302592935,
+    "std": 728.142321057299
+  }
+}

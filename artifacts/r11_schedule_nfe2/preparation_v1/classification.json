@@ -1,0 +1,155 @@
+{
+  "candidate_promotion": {
+    "reason": "schedule_nfe2_is_a_causal_diagnostic_not_a_survivor",
+    "status": "forbidden"
+  },
+  "classification": "mixed_guidance_failure",
+  "classifier_metrics": [
+    "niqe",
+    "sharpness"
+  ],
+  "contract_type": "safa_r11_schedule_nfe2_classification_v1",
+  "datasets": [
+    {
+      "dataset_id": "prefix128",
+      "nfe2_quality_pass": true,
+      "parent_paper_report_only": {
+        "niqe": 4.63751790452691,
+        "sharpness": 610.0669062602483
+      },
+      "quality": {
+        "native": {
+          "niqe": 4.824457852977514,
+          "sharpness": 717.1769678387209
+        },
+        "schedule_nfe2": {
+          "niqe": 4.773836980227261,
+          "sharpness": 695.6715354634434
+        }
+      },
+      "representation_report_only": {
+        "native": {
+          "e0_cosine": 0.02612048335140571,
+          "edev_cosine": 0.2790244557436381
+        },
+        "paper_eta_0p125": {
+          "e0_cosine": 0.7758094512537355,
+          "edev_cosine": 0.5387252270083991
+        },
+        "schedule_nfe2": {
+          "e0_cosine": 0.031228970692609437,
+          "edev_cosine": 0.2794471734086983
+        }
+      },
+      "sample_count": 128,
+      "thresholds": {
+        "niqe_max": 4.924457852977514,
+        "sharpness_min": 681.3181194467849
+      }
+    },
+    {
+      "dataset_id": "sharpness_tail32",
+      "nfe2_quality_pass": false,
+      "parent_paper_report_only": {
+        "niqe": 4.183993127769778,
+        "sharpness": 1680.244390766151
+      },
+      "quality": {
+        "native": {
+          "niqe": 5.090843535905125,
+          "sharpness": 3535.388118545321
+        },
+        "schedule_nfe2": {
+          "niqe": 4.788907541799859,
+          "sharpness": 3039.4989579284957
+        }
+      },
+      "representation_report_only": {
+        "native": {
+          "e0_cosine": 0.19696582667529583,
+          "edev_cosine": 0.3993251916253939
+        },
+        "paper_eta_0p125": {
+          "e0_cosine": 0.843318629078567,
+          "edev_cosine": 0.6002199128270149
+        },
+        "schedule_nfe2": {
+          "e0_cosine": 0.24309154771617614,
+          "edev_cosine": 0.4124856043199543
+        }
+      },
+      "sample_count": 32,
+      "thresholds": {
+        "niqe_max": 5.190843535905125,
+        "sharpness_min": 3358.618712618055
+      }
+    }
+  ],
+  "descriptive_metrics": {
+    "prefix128": {
+      "metrics": {
+        "native": {
+          "fid": 128.7110137939453,
+          "kid_mean": 0.03515849635004997,
+          "kid_std": 0.0004066128167323768
+        },
+        "paper_eta_0p125": {
+          "fid": 119.99856567382812,
+          "kid_mean": 0.02495909482240677,
+          "kid_std": 0.00031472687260247767
+        },
+        "schedule_nfe2": {
+          "fid": 129.05474853515625,
+          "kid_mean": 0.03452190384268761,
+          "kid_std": 0.00040982579230330884
+        }
+      },
+      "status": "descriptive_only_not_used_for_classification"
+    }
+  },
+  "geometry": {
+    "status": "not_evaluated"
+  },
+  "nfe2_quality_passes_both_datasets": false,
+  "privacy": {
+    "status": "not_evaluated"
+  },
+  "provenance": {
+    "nfe2_configs": {
+      "prefix128": {
+        "arm_config_sha256": "fa23185dfc55c0dad1f23266714fcac80b648955b4406d6241ad80717b62d240",
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/configs/medium_v2/experiments/r11_schedule_nfe2_prefix128.yaml",
+        "sha256": "3d16becaa92f0ccc027e40b8e2938e169e718704e143155a6997debdd1890325"
+      },
+      "sharpness_tail32": {
+        "arm_config_sha256": "fa23185dfc55c0dad1f23266714fcac80b648955b4406d6241ad80717b62d240",
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/configs/medium_v2/experiments/r11_schedule_nfe2_sharpness_tail32.yaml",
+        "sha256": "02eff63e14c6ef5a0298b65aa8cb8468e8e0421412c24d256363cca7d47c3147"
+      }
+    },
+    "parent_causal_classification": {
+      "classification": "schedule_branch",
+      "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_causal_decomposition/preparation_v1/causal_classification.json",
+      "sha256": "668fb9f529c98b7ee5f17fd03628677e835e2fa84bf37b40bd0d249b6e09ef14"
+    },
+    "reuse_asset_bindings": {
+      "prefix128": {
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_schedule_nfe2/preparation_v1/reuse_asset_bindings/prefix128.jsonl",
+        "sha256": "9840459dbcbdc3e49f447d5d9efb37ca49f786f0d2a803a77c340da632bfe975"
+      },
+      "sharpness_tail32": {
+        "path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_schedule_nfe2/preparation_v1/reuse_asset_bindings/sharpness_tail32.jsonl",
+        "sha256": "8fceabd9c17494ec08413533b562f9701d25450939fadfdbfbe24c8a54545e97"
+      }
+    }
+  },
+  "representation": {
+    "status": "report_only",
+    "used_for_classification": false
+  },
+  "schema_version": 1,
+  "split_route": {
+    "status": "stop",
+    "stop_required": true
+  }
+}

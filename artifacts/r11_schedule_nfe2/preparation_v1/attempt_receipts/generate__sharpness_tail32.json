@@ -1,0 +1,39 @@
+{
+  "argv": [
+    "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+    "scripts/run_meanflow_flow_map_guidance.py",
+    "--config",
+    "configs/medium_v2/experiments/r11_schedule_nfe2_sharpness_tail32.yaml",
+    "--output-dir",
+    "artifacts/r11_schedule_nfe2/preparation_v1/runs/sharpness_tail32/schedule_nfe2"
+  ],
+  "attempt_count": 1,
+  "config_binding": {
+    "path": "configs/medium_v2/experiments/r11_schedule_nfe2_sharpness_tail32.yaml",
+    "sha256": "02eff63e14c6ef5a0298b65aa8cb8468e8e0421412c24d256363cca7d47c3147"
+  },
+  "contract_type": "safa_r11_schedule_nfe2_attempt_receipt_v1",
+  "env": {
+    "CUDA_VISIBLE_DEVICES": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+  },
+  "exit_status": 0,
+  "finished_at_utc": "2026-07-31T09:30:17.004276+00:00",
+  "gpu": {
+    "index": 1,
+    "uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+  },
+  "job_id": "generate__sharpness_tail32",
+  "ledger_path": "artifacts/r11_schedule_nfe2/preparation_v1/launch_ledger.json",
+  "ledger_sha256": "95d1fe075b2831552bf4388c6dda04ec5337d235a551b60621a26a54edd7c87f",
+  "retry_count": 0,
+  "schema_version": 1,
+  "started_at_utc": "2026-07-31T09:29:37.470768+00:00",
+  "status": "complete",
+  "success_output_paths": [
+    "artifacts/r11_schedule_nfe2/preparation_v1/runs/sharpness_tail32/schedule_nfe2/completion.json",
+    "artifacts/r11_schedule_nfe2/preparation_v1/runs/sharpness_tail32/schedule_nfe2/generation_result.json",
+    "artifacts/r11_schedule_nfe2/preparation_v1/runs/sharpness_tail32/schedule_nfe2/per_sample.jsonl",
+    "artifacts/r11_schedule_nfe2/preparation_v1/runs/sharpness_tail32/schedule_nfe2/sample_id_manifest.jsonl",
+    "artifacts/r11_schedule_nfe2/preparation_v1/asset_digests/sharpness_tail32.json"
+  ]
+}

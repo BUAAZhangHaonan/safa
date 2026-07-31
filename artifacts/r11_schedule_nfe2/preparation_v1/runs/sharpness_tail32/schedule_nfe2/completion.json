@@ -1,0 +1,9 @@
+{
+  "arm_config_sha256": "fa23185dfc55c0dad1f23266714fcac80b648955b4406d6241ad80717b62d240",
+  "generation_result": "artifacts/r11_schedule_nfe2/preparation_v1/runs/sharpness_tail32/schedule_nfe2/generation_result.json",
+  "run_manifest": "artifacts/r11_schedule_nfe2/preparation_v1/runs/sharpness_tail32/schedule_nfe2/run_manifest.json",
+  "sample_count": 32,
+  "sample_id_sha256": "0df6a923d37a45c67910d5f9f118700392403e12bdf6e8a6dbb04edfde86987f",
+  "schema_version": 1,
+  "status": "complete"
+}

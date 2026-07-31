@@ -1,0 +1,142 @@
+{
+  "schema_version": 1,
+  "contract_type": "safa_r11_schedule_nfe2_terminal_closeout_v1",
+  "status": "complete",
+  "diagnostic": {
+    "arm": "schedule_nfe2",
+    "sampling_seed": 7919,
+    "schedule_times": [
+      1.0,
+      0.25,
+      0.0
+    ],
+    "candidate_algorithm_nfe": 2,
+    "candidate_diagnostic_nfe": 0,
+    "matched_native_nfe": 0
+  },
+  "parent_causal_classification": {
+    "path": "artifacts/r11_causal_decomposition/preparation_v1/causal_classification.json",
+    "sha256": "668fb9f529c98b7ee5f17fd03628677e835e2fa84bf37b40bd0d249b6e09ef14",
+    "classification": "schedule_branch"
+  },
+  "execution_contract": {
+    "path": "artifacts/r11_schedule_nfe2/preparation_v1/launch_ledger.json",
+    "sha256": "95d1fe075b2831552bf4388c6dda04ec5337d235a551b60621a26a54edd7c87f",
+    "attempt_limit": 1,
+    "retry_limit": 0
+  },
+  "attempt_receipts": [
+    {
+      "job_id": "generate__prefix128",
+      "path": "artifacts/r11_schedule_nfe2/preparation_v1/attempt_receipts/generate__prefix128.json",
+      "sha256": "9e5cc0f50d79344a67e0ca313db64038bbfdc4ccf6f268984dd12ddb5881b4a7",
+      "status": "complete",
+      "exit_status": 0,
+      "attempt_count": 1,
+      "retry_count": 0
+    },
+    {
+      "job_id": "quality__prefix128__schedule_nfe2",
+      "path": "artifacts/r11_schedule_nfe2/preparation_v1/attempt_receipts/quality__prefix128__schedule_nfe2.json",
+      "sha256": "2f87861e7dc2b8285149e8ff260875399da834336eb07b06814e6051dc6f6cae",
+      "status": "complete",
+      "exit_status": 0,
+      "attempt_count": 1,
+      "retry_count": 0
+    },
+    {
+      "job_id": "generate__sharpness_tail32",
+      "path": "artifacts/r11_schedule_nfe2/preparation_v1/attempt_receipts/generate__sharpness_tail32.json",
+      "sha256": "c79a1fb84abfe46cae95dbdda25e76a17e8be5a80ebf643d579e290480a19e26",
+      "status": "complete",
+      "exit_status": 0,
+      "attempt_count": 1,
+      "retry_count": 0
+    },
+    {
+      "job_id": "quality__sharpness_tail32__schedule_nfe2",
+      "path": "artifacts/r11_schedule_nfe2/preparation_v1/attempt_receipts/quality__sharpness_tail32__schedule_nfe2.json",
+      "sha256": "9021904b7cbd845098ed09bdf6470cc2edf2ad128ddcf983cb3118dd2c17fa4e",
+      "status": "complete",
+      "exit_status": 0,
+      "attempt_count": 1,
+      "retry_count": 0
+    }
+  ],
+  "datasets": [
+    {
+      "dataset_id": "prefix128",
+      "sample_count": 128,
+      "ordered_sample_id_sha256": "3af3ecd3f844f61b7e7e5a25519ed97fa30dc56663e52fc2ee84cdd9cabac2d5",
+      "generation_result": {
+        "path": "artifacts/r11_schedule_nfe2/preparation_v1/runs/prefix128/schedule_nfe2/generation_result.json",
+        "sha256": "fc146d4a155dc6b925d05cdd9da408e81ca6433635c96dc14fc76acdd427dfa8"
+      },
+      "quality_output": {
+        "path": "artifacts/r11_schedule_nfe2/preparation_v1/quality/prefix128/schedule_nfe2/quality.json",
+        "sha256": "72736a1a11c6905f1c825affdd03eb2d0660ccf15af0361b0a8ace36c1cd3186"
+      },
+      "classifier_metrics": {
+        "niqe": 4.773836980227261,
+        "sharpness": 695.6715354634434
+      },
+      "thresholds": {
+        "niqe_max": 4.924457852977514,
+        "sharpness_min": 681.3181194467849
+      },
+      "quality_pass": true,
+      "descriptive_only": {
+        "fid": 129.05474853515625,
+        "kid_mean": 0.03452190384268761,
+        "kid_std": 0.00040982579230330884
+      }
+    },
+    {
+      "dataset_id": "sharpness_tail32",
+      "sample_count": 32,
+      "ordered_sample_id_sha256": "0df6a923d37a45c67910d5f9f118700392403e12bdf6e8a6dbb04edfde86987f",
+      "generation_result": {
+        "path": "artifacts/r11_schedule_nfe2/preparation_v1/runs/sharpness_tail32/schedule_nfe2/generation_result.json",
+        "sha256": "8d4b48881eb8df0389831821e4f5e7307c5bb5c940aee6eda6104f63b4c5329e"
+      },
+      "quality_output": {
+        "path": "artifacts/r11_schedule_nfe2/preparation_v1/quality/sharpness_tail32/schedule_nfe2/quality.json",
+        "sha256": "a2dbdca513fc5ecc5dc3692e37d1ab729609d39b5054c2b9ebfa082b39d016fa"
+      },
+      "classifier_metrics": {
+        "niqe": 4.788907541799859,
+        "sharpness": 3039.4989579284957
+      },
+      "thresholds": {
+        "niqe_max": 5.190843535905125,
+        "sharpness_min": 3358.618712618055
+      },
+      "quality_pass": false,
+      "failure": {
+        "metric": "sharpness",
+        "observed": 3039.4989579284957,
+        "minimum": 3358.618712618055
+      }
+    }
+  ],
+  "classification": {
+    "path": "artifacts/r11_schedule_nfe2/preparation_v1/classification.json",
+    "sha256": "d7744ab69892030d6ad2ed00ecd350c572455d41017d93220e8b3a373aa0c76e",
+    "result": "mixed_guidance_failure",
+    "nfe2_quality_passes_both_datasets": false,
+    "split_route": {
+      "status": "stop",
+      "stop_required": true
+    }
+  },
+  "downstream": {
+    "split_route_continuation": "forbidden",
+    "additional_schedule_or_composition_diagnostics": "forbidden",
+    "candidate_promotion": "forbidden",
+    "lpips": "ineligible",
+    "training": "ineligible",
+    "stage512": "ineligible",
+    "arcface": "not_evaluated",
+    "privacy": "not_evaluated"
+  }
+}
