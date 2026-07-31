@@ -1,0 +1,398 @@
+{
+  "regular32": {
+    "u12": [
+      {
+        "candidate_max_impostor_margin": -0.014831817189549346,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 1,
+        "candidate_retrieval_percentile": 0.9682539682539683,
+        "candidate_true_source_rank": 3,
+        "locked_relative_delta": 0.12625411534462896,
+        "rank": 1,
+        "sample_id": "val:Manually_Annotated_Images/1049/64e00802544020505ea22b8a027a0f4a2ec02446b2b0cdb513b45937.jpg",
+        "source_candidate_cosine": 0.1389986477769177,
+        "source_native_cosine": 0.012744532432288734
+      },
+      {
+        "candidate_max_impostor_margin": -0.11743281109820232,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.47619047619047616,
+        "candidate_true_source_rank": 34,
+        "locked_relative_delta": 0.11233122882189414,
+        "rank": 2,
+        "sample_id": "val:Manually_Annotated_Images/921/eee126016abdd00e87371094b98783cf7a87377800d319b7e3ba2f24.jpg",
+        "source_candidate_cosine": 0.016506112175112764,
+        "source_native_cosine": -0.09582511664678138
+      },
+      {
+        "candidate_max_impostor_margin": -0.06259741376805922,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.9047619047619048,
+        "candidate_true_source_rank": 7,
+        "locked_relative_delta": 0.11031188651704978,
+        "rank": 3,
+        "sample_id": "val:Manually_Annotated_Images/164/ada5800c80190560c9e1ef14f7071287d3db7ae44d9cd5e5871dbed6.jpg",
+        "source_candidate_cosine": 0.0729891468567157,
+        "source_native_cosine": -0.03732273966033407
+      },
+      {
+        "candidate_max_impostor_margin": -0.11480704467267996,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.7619047619047619,
+        "candidate_true_source_rank": 16,
+        "locked_relative_delta": 0.10869666339749032,
+        "rank": 4,
+        "sample_id": "val:Manually_Annotated_Images/706/3b99315ac29b78e3c08f2d665142958160ef4fb23b24878ac06e6760.jpg",
+        "source_candidate_cosine": 0.04104909356223287,
+        "source_native_cosine": -0.06764756983525744
+      },
+      {
+        "candidate_max_impostor_margin": -0.12154478686794923,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.6031746031746031,
+        "candidate_true_source_rank": 26,
+        "locked_relative_delta": 0.08962595245039362,
+        "rank": 5,
+        "sample_id": "val:Manually_Annotated_Images/895/7965f207a0b0f8fa82773f40644c4b31aaeab63403e012068a2942d6.jpg",
+        "source_candidate_cosine": 0.01734878310483748,
+        "source_native_cosine": -0.07227716934555614
+      },
+      {
+        "candidate_max_impostor_margin": -0.09176882713185454,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.5396825396825397,
+        "candidate_true_source_rank": 30,
+        "locked_relative_delta": 0.0881499917155284,
+        "rank": 6,
+        "sample_id": "val:Manually_Annotated_Images/1043/8e11682faf7c35401eb6f12e72fab39197c42681853b76766c67e640.jpg",
+        "source_candidate_cosine": -0.011005491194436376,
+        "source_native_cosine": -0.09915548290996477
+      },
+      {
+        "candidate_max_impostor_margin": -0.07699438020515738,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.8888888888888888,
+        "candidate_true_source_rank": 8,
+        "locked_relative_delta": 0.08314712237424052,
+        "rank": 7,
+        "sample_id": "val:Manually_Annotated_Images/495/91f3e5a312eb553cf2552fbefcddb2c7e62aa81cdef1c87389ad7f1f.JPG",
+        "source_candidate_cosine": 0.065106079775151,
+        "source_native_cosine": -0.018041042599089528
+      },
+      {
+        "candidate_max_impostor_margin": -0.17664947075202003,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.4603174603174603,
+        "candidate_true_source_rank": 35,
+        "locked_relative_delta": 0.08183892206125325,
+        "rank": 8,
+        "sample_id": "val:Manually_Annotated_Images/714/4f4c200a12caafba195d425e946c7aa3c857bd757e0ca1897c5476b3.jpg",
+        "source_candidate_cosine": 0.005486654137481145,
+        "source_native_cosine": -0.0763522679237721
+      }
+    ],
+    "u16": [
+      {
+        "candidate_max_impostor_margin": -0.07541158490679428,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.9047619047619048,
+        "candidate_true_source_rank": 7,
+        "locked_relative_delta": 0.14772840336499818,
+        "rank": 1,
+        "sample_id": "val:Manually_Annotated_Images/1043/8e11682faf7c35401eb6f12e72fab39197c42681853b76766c67e640.jpg",
+        "source_candidate_cosine": 0.0485729204550334,
+        "source_native_cosine": -0.09915548290996477
+      },
+      {
+        "candidate_max_impostor_margin": 0.016069300630108835,
+        "candidate_recall_at_1": 1,
+        "candidate_recall_at_5": 1,
+        "candidate_retrieval_percentile": 1.0,
+        "candidate_true_source_rank": 1,
+        "locked_relative_delta": 0.13163593964494125,
+        "rank": 2,
+        "sample_id": "val:Manually_Annotated_Images/462/f47a25cfd2e73e1fc1f5cae15f91b7875581ca0c82467e3dc43eb862.jpg",
+        "source_candidate_cosine": 0.1651105626051505,
+        "source_native_cosine": 0.03347462296020927
+      },
+      {
+        "candidate_max_impostor_margin": -0.10489802161386698,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.42857142857142855,
+        "candidate_true_source_rank": 37,
+        "locked_relative_delta": 0.1080382225597909,
+        "rank": 3,
+        "sample_id": "val:Manually_Annotated_Images/921/eee126016abdd00e87371094b98783cf7a87377800d319b7e3ba2f24.jpg",
+        "source_candidate_cosine": 0.012213105913009519,
+        "source_native_cosine": -0.09582511664678138
+      },
+      {
+        "candidate_max_impostor_margin": -0.17513296255986283,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.4603174603174603,
+        "candidate_true_source_rank": 35,
+        "locked_relative_delta": 0.07960669976554532,
+        "rank": 4,
+        "sample_id": "val:Manually_Annotated_Images/714/4f4c200a12caafba195d425e946c7aa3c857bd757e0ca1897c5476b3.jpg",
+        "source_candidate_cosine": 0.0032544318417732226,
+        "source_native_cosine": -0.0763522679237721
+      },
+      {
+        "candidate_max_impostor_margin": -0.11402666046360566,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.8253968253968254,
+        "candidate_true_source_rank": 12,
+        "locked_relative_delta": 0.07819712080170042,
+        "rank": 5,
+        "sample_id": "val:Manually_Annotated_Images/164/ada5800c80190560c9e1ef14f7071287d3db7ae44d9cd5e5871dbed6.jpg",
+        "source_candidate_cosine": 0.04087438114136635,
+        "source_native_cosine": -0.03732273966033407
+      },
+      {
+        "candidate_max_impostor_margin": -0.1076189211152184,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.47619047619047616,
+        "candidate_true_source_rank": 34,
+        "locked_relative_delta": 0.07663738904357026,
+        "rank": 6,
+        "sample_id": "val:Manually_Annotated_Images/895/7965f207a0b0f8fa82773f40644c4b31aaeab63403e012068a2942d6.jpg",
+        "source_candidate_cosine": 0.004360219698014121,
+        "source_native_cosine": -0.07227716934555614
+      },
+      {
+        "candidate_max_impostor_margin": -0.07606025935345448,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.6190476190476191,
+        "candidate_true_source_rank": 25,
+        "locked_relative_delta": 0.06141439792774827,
+        "rank": 7,
+        "sample_id": "val:Manually_Annotated_Images/804/87c37a268a173e5c92d4be9c783936f9af5cfb450a6348f38c9c25a1.jpg",
+        "source_candidate_cosine": 0.028689720869070394,
+        "source_native_cosine": -0.032724677058677876
+      },
+      {
+        "candidate_max_impostor_margin": -0.15447379412686482,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.38095238095238093,
+        "candidate_true_source_rank": 40,
+        "locked_relative_delta": 0.05149617712634553,
+        "rank": 8,
+        "sample_id": "val:Manually_Annotated_Images/706/3b99315ac29b78e3c08f2d665142958160ef4fb23b24878ac06e6760.jpg",
+        "source_candidate_cosine": -0.01615139270891191,
+        "source_native_cosine": -0.06764756983525744
+      }
+    ]
+  },
+  "sharpness_tail32": {
+    "u12": [
+      {
+        "candidate_max_impostor_margin": -0.08088488904999863,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.7142857142857143,
+        "candidate_true_source_rank": 19,
+        "locked_relative_delta": 0.11445929355526901,
+        "rank": 1,
+        "sample_id": "val:Manually_Annotated_Images/506/2b4f84de47a39905a2d05b94a530b07429508954dabd853fd5682525.jpg",
+        "source_candidate_cosine": 0.019713296643658507,
+        "source_native_cosine": -0.09474599691161051
+      },
+      {
+        "candidate_max_impostor_margin": -0.08398285938053962,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.5555555555555556,
+        "candidate_true_source_rank": 29,
+        "locked_relative_delta": 0.1025271241685464,
+        "rank": 2,
+        "sample_id": "val:Manually_Annotated_Images/694/379a238a0dd1043d5a2600be279277631375b3a5014c000a89d00bd4.jpg",
+        "source_candidate_cosine": 0.009834934325629513,
+        "source_native_cosine": -0.09269218984291688
+      },
+      {
+        "candidate_max_impostor_margin": -0.15505001235227034,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.7301587301587301,
+        "candidate_true_source_rank": 18,
+        "locked_relative_delta": 0.07676164416277456,
+        "rank": 3,
+        "sample_id": "val:Manually_Annotated_Images/964/b89f9b0b9cad82ee9c5b39fa6ccbaa23b301c959be6705736277ad24.jpg",
+        "source_candidate_cosine": 0.03818937884093793,
+        "source_native_cosine": -0.03857226532183662
+      },
+      {
+        "candidate_max_impostor_margin": -0.13020349115284208,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.5079365079365079,
+        "candidate_true_source_rank": 32,
+        "locked_relative_delta": 0.0483171658266582,
+        "rank": 4,
+        "sample_id": "val:Manually_Annotated_Images/419/86b747e5e50c506e234d8c15ddec01fa964dce75306846bdd74d4ac9.jpg",
+        "source_candidate_cosine": -0.0034964100153903038,
+        "source_native_cosine": -0.05181357584204851
+      },
+      {
+        "candidate_max_impostor_margin": -0.09258135824313024,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.7142857142857143,
+        "candidate_true_source_rank": 19,
+        "locked_relative_delta": 0.04229419596530738,
+        "rank": 5,
+        "sample_id": "val:Manually_Annotated_Images/461/4fcb8fee0175233066f8dd5f83c34bc9a261017a728751b67317f11d.jpg",
+        "source_candidate_cosine": 0.04115153076726377,
+        "source_native_cosine": -0.0011426651980436103
+      },
+      {
+        "candidate_max_impostor_margin": -0.18854121352975897,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.38095238095238093,
+        "candidate_true_source_rank": 40,
+        "locked_relative_delta": 0.04200230452239942,
+        "rank": 6,
+        "sample_id": "val:Manually_Annotated_Images/382/2fbedb0de3d7096f73ea8bde503a3b45748c87d4a56dda069e312738.jpg",
+        "source_candidate_cosine": -0.024647264199001834,
+        "source_native_cosine": -0.06664956872140125
+      },
+      {
+        "candidate_max_impostor_margin": 0.0011551675947799184,
+        "candidate_recall_at_1": 1,
+        "candidate_recall_at_5": 1,
+        "candidate_retrieval_percentile": 1.0,
+        "candidate_true_source_rank": 1,
+        "locked_relative_delta": 0.039253583767733816,
+        "rank": 7,
+        "sample_id": "val:Manually_Annotated_Images/824/9fb5d0d4fc3006585fee96350d654fa93b68dd4e55ca770a62cb14de.JPG",
+        "source_candidate_cosine": 0.1051181745989802,
+        "source_native_cosine": 0.06586459083124638
+      },
+      {
+        "candidate_max_impostor_margin": -0.11644321656824083,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.5396825396825397,
+        "candidate_true_source_rank": 30,
+        "locked_relative_delta": 0.03637198966128053,
+        "rank": 8,
+        "sample_id": "val:Manually_Annotated_Images/648/80c68779bffc1b20011ef20f323a26694e59f1723528fc4cb3b5d5dc.jpg",
+        "source_candidate_cosine": -0.004399046247573127,
+        "source_native_cosine": -0.040771035908853656
+      }
+    ],
+    "u16": [
+      {
+        "candidate_max_impostor_margin": -0.06098527338605256,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.9047619047619048,
+        "candidate_true_source_rank": 7,
+        "locked_relative_delta": 0.1619412668149453,
+        "rank": 1,
+        "sample_id": "val:Manually_Annotated_Images/694/379a238a0dd1043d5a2600be279277631375b3a5014c000a89d00bd4.jpg",
+        "source_candidate_cosine": 0.06924907697202842,
+        "source_native_cosine": -0.09269218984291688
+      },
+      {
+        "candidate_max_impostor_margin": -0.13823219468373207,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.6031746031746031,
+        "candidate_true_source_rank": 26,
+        "locked_relative_delta": 0.11324174515019514,
+        "rank": 2,
+        "sample_id": "val:Manually_Annotated_Images/506/2b4f84de47a39905a2d05b94a530b07429508954dabd853fd5682525.jpg",
+        "source_candidate_cosine": 0.018495748238584638,
+        "source_native_cosine": -0.09474599691161051
+      },
+      {
+        "candidate_max_impostor_margin": -0.17695686185512388,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.7777777777777778,
+        "candidate_true_source_rank": 15,
+        "locked_relative_delta": 0.0825357385706163,
+        "rank": 3,
+        "sample_id": "val:Manually_Annotated_Images/964/b89f9b0b9cad82ee9c5b39fa6ccbaa23b301c959be6705736277ad24.jpg",
+        "source_candidate_cosine": 0.04396347324877968,
+        "source_native_cosine": -0.03857226532183662
+      },
+      {
+        "candidate_max_impostor_margin": -0.0746408839976997,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.8253968253968254,
+        "candidate_true_source_rank": 12,
+        "locked_relative_delta": 0.06947490736376116,
+        "rank": 4,
+        "sample_id": "val:Manually_Annotated_Images/402/286d6bb5a94023a3af0bfa0dda0a20aa37e5a1fc57a81cfe4034ae44.jpg",
+        "source_candidate_cosine": 0.05651965749132397,
+        "source_native_cosine": -0.012955249872437201
+      },
+      {
+        "candidate_max_impostor_margin": -0.1315674845984327,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.5396825396825397,
+        "candidate_true_source_rank": 30,
+        "locked_relative_delta": 0.05352495520669995,
+        "rank": 5,
+        "sample_id": "val:Manually_Annotated_Images/419/86b747e5e50c506e234d8c15ddec01fa964dce75306846bdd74d4ac9.jpg",
+        "source_candidate_cosine": 0.00171137936465144,
+        "source_native_cosine": -0.05181357584204851
+      },
+      {
+        "candidate_max_impostor_margin": -0.10484781367019116,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.5714285714285714,
+        "candidate_true_source_rank": 28,
+        "locked_relative_delta": 0.05197082021224681,
+        "rank": 6,
+        "sample_id": "val:Manually_Annotated_Images/648/80c68779bffc1b20011ef20f323a26694e59f1723528fc4cb3b5d5dc.jpg",
+        "source_candidate_cosine": 0.011199784303393155,
+        "source_native_cosine": -0.040771035908853656
+      },
+      {
+        "candidate_max_impostor_margin": -0.16011414305983052,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.2698412698412698,
+        "candidate_true_source_rank": 47,
+        "locked_relative_delta": 0.049844754189981785,
+        "rank": 7,
+        "sample_id": "val:Manually_Annotated_Images/367/48b04504311e2b1d5e16271e31af9505c8e8b92ad0b523e6113c114a.jpg",
+        "source_candidate_cosine": -0.024447144119873976,
+        "source_native_cosine": -0.07429189830985576
+      },
+      {
+        "candidate_max_impostor_margin": -0.2214903423335503,
+        "candidate_recall_at_1": 0,
+        "candidate_recall_at_5": 0,
+        "candidate_retrieval_percentile": 0.15873015873015872,
+        "candidate_true_source_rank": 54,
+        "locked_relative_delta": 0.04897360081712085,
+        "rank": 8,
+        "sample_id": "val:Manually_Annotated_Images/456/0bb310e9ba27fe565412efbb57a5116169bbae76d8724f6707da9357.jpg",
+        "source_candidate_cosine": -0.05390479495861071,
+        "source_native_cosine": -0.10287839577573156
+      }
+    ]
+  }
+}
