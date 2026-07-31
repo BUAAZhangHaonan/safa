@@ -1,0 +1,145 @@
+{
+  "classifier": {
+    "candidate_promotion": "forbidden",
+    "classifier_output": {
+      "expected_absent_at_preparation": true,
+      "path": "artifacts/r11_schedule_nfe2/preparation_v1/classification.json"
+    },
+    "geometry": "not_evaluated",
+    "metrics": [
+      "niqe",
+      "sharpness"
+    ],
+    "prefix_fid_kid": "descriptive_only",
+    "privacy": "not_evaluated",
+    "representation": "report_only",
+    "rule": "schedule_limited iff schedule_nfe2 passes NIQE<=native+0.10 and sharpness>=0.95*native on both datasets; otherwise mixed_guidance_failure and stop the split route",
+    "tail_fid_kid": "forbidden"
+  },
+  "contract_type": "safa_r11_schedule_nfe2_diagnostic_v1",
+  "datasets": [
+    {
+      "dataset_id": "prefix128",
+      "external_native_contract": {
+        "path": "artifacts/r11_causal_decomposition/preparation_v1/reuse/prefix128/native_external.jsonl",
+        "sha256": "42f1716db882af3a1c7dff5b0d3c5f06b6a99c3055d62f9629a24b3d4ff71c06"
+      },
+      "nfe2_config": {
+        "path": "configs/medium_v2/experiments/r11_schedule_nfe2_prefix128.yaml",
+        "sha256": "3d16becaa92f0ccc027e40b8e2938e169e718704e143155a6997debdd1890325"
+      },
+      "nfe2_generation_result": {
+        "expected_absent_at_preparation": true,
+        "path": "artifacts/r11_schedule_nfe2/preparation_v1/runs/prefix128/schedule_nfe2/generation_result.json"
+      },
+      "ordered_sample_id_sha256": "3af3ecd3f844f61b7e7e5a25519ed97fa30dc56663e52fc2ee84cdd9cabac2d5",
+      "reuse_asset_bindings": {
+        "path": "artifacts/r11_schedule_nfe2/preparation_v1/reuse_asset_bindings/prefix128.jsonl",
+        "sha256": "9840459dbcbdc3e49f447d5d9efb37ca49f786f0d2a803a77c340da632bfe975"
+      },
+      "roles": {
+        "native": {
+          "quality_output": {
+            "path": "artifacts/r11_causal_decomposition/preparation_v1/quality/prefix128/native/quality.json",
+            "sha256": "190752ef69d45a42e6d9e16bf3b5392ea8b8c1dd65e5c1f27cb3e2f1c605f7ad"
+          },
+          "representation_rows": {
+            "path": "artifacts/r11_causal_decomposition/preparation_v1/reuse/prefix128/native_reuse.jsonl",
+            "sha256": "23846726cf2acbb6539973fd468531177aec132c03e622709d65cb18cdecf47b"
+          }
+        },
+        "paper_eta_0p125": {
+          "quality_output": {
+            "path": "artifacts/r11_causal_decomposition/preparation_v1/quality/prefix128/paper_eta_0p125/quality.json",
+            "sha256": "73aed8fb41604d8aabe170000136306d5a344b1c03805ddbd36b22f5fb616615"
+          },
+          "representation_rows": {
+            "path": "artifacts/r11_causal_decomposition/preparation_v1/reuse/prefix128/paper_reuse.jsonl",
+            "sha256": "07e525ecc424dbd0f9bbceb5f185a38cddf36127ce111ad645d01eb9c3e8ad9d"
+          }
+        },
+        "schedule_nfe2": {
+          "quality_output": {
+            "expected_absent_at_preparation": true,
+            "path": "artifacts/r11_schedule_nfe2/preparation_v1/quality/prefix128/schedule_nfe2/quality.json"
+          },
+          "representation_rows": {
+            "expected_absent_at_preparation": true,
+            "path": "artifacts/r11_schedule_nfe2/preparation_v1/runs/prefix128/schedule_nfe2/per_sample.jsonl"
+          }
+        }
+      },
+      "sample_count": 128,
+      "selection_manifest": {
+        "path": "artifacts/r10_triangle_exploration/preparation_v1/prefix128.jsonl",
+        "sha256": "9e1bfa90057c9b72f02a29340d91f0d87d4d4f35119733824b9659bd7ee8db89"
+      }
+    },
+    {
+      "dataset_id": "sharpness_tail32",
+      "external_native_contract": {
+        "path": "artifacts/r11_causal_decomposition/preparation_v1/reuse/sharpness_tail32/native_external.jsonl",
+        "sha256": "ba486db7f2da149496d1154f95eea2ce05a842547ac4136342201cf7bd3e2ef5"
+      },
+      "nfe2_config": {
+        "path": "configs/medium_v2/experiments/r11_schedule_nfe2_sharpness_tail32.yaml",
+        "sha256": "02eff63e14c6ef5a0298b65aa8cb8468e8e0421412c24d256363cca7d47c3147"
+      },
+      "nfe2_generation_result": {
+        "expected_absent_at_preparation": true,
+        "path": "artifacts/r11_schedule_nfe2/preparation_v1/runs/sharpness_tail32/schedule_nfe2/generation_result.json"
+      },
+      "ordered_sample_id_sha256": "0df6a923d37a45c67910d5f9f118700392403e12bdf6e8a6dbb04edfde86987f",
+      "reuse_asset_bindings": {
+        "path": "artifacts/r11_schedule_nfe2/preparation_v1/reuse_asset_bindings/sharpness_tail32.jsonl",
+        "sha256": "8fceabd9c17494ec08413533b562f9701d25450939fadfdbfbe24c8a54545e97"
+      },
+      "roles": {
+        "native": {
+          "quality_output": {
+            "path": "artifacts/r11_causal_decomposition/preparation_v1/quality/sharpness_tail32/native/quality.json",
+            "sha256": "0e40affd0ebc7c9ff6937bbd6c8c739b15a6bf44de3bd550448b2863e162d2ea"
+          },
+          "representation_rows": {
+            "path": "artifacts/r11_causal_decomposition/preparation_v1/reuse/sharpness_tail32/native_reuse.jsonl",
+            "sha256": "93c94022c5f7ce14f3e99eeff583208088d2d65da9e274c33b4a4240eda47f6c"
+          }
+        },
+        "paper_eta_0p125": {
+          "quality_output": {
+            "path": "artifacts/r11_causal_decomposition/preparation_v1/quality/sharpness_tail32/paper_eta_0p125/quality.json",
+            "sha256": "e3c229f2a7e8b0615ce331713a72c450af7cd273c7834da838524cbd5d10f62a"
+          },
+          "representation_rows": {
+            "path": "artifacts/r11_causal_decomposition/preparation_v1/reuse/sharpness_tail32/paper_reuse.jsonl",
+            "sha256": "49c8a21d48db4e07ece27d1c28e154c7b518d47747b8ea09172b3964af48e348"
+          }
+        },
+        "schedule_nfe2": {
+          "quality_output": {
+            "expected_absent_at_preparation": true,
+            "path": "artifacts/r11_schedule_nfe2/preparation_v1/quality/sharpness_tail32/schedule_nfe2/quality.json"
+          },
+          "representation_rows": {
+            "expected_absent_at_preparation": true,
+            "path": "artifacts/r11_schedule_nfe2/preparation_v1/runs/sharpness_tail32/schedule_nfe2/per_sample.jsonl"
+          }
+        }
+      },
+      "sample_count": 32,
+      "selection_manifest": {
+        "path": "artifacts/r11_initial_noise_sharpness_probe/preparation_v1/tail32.jsonl",
+        "sha256": "f38fb6f6542c267b6c7d9cbec9ce57abdf9b0657edfe8d060fe533178a9f5b29"
+      }
+    }
+  ],
+  "parent_causal_classification": {
+    "path": "artifacts/r11_causal_decomposition/preparation_v1/causal_classification.json",
+    "sha256": "668fb9f529c98b7ee5f17fd03628677e835e2fa84bf37b40bd0d249b6e09ef14"
+  },
+  "parent_causal_contract": {
+    "path": "artifacts/r11_causal_decomposition/preparation_v1/causal_contract.json",
+    "sha256": "fe943df00d69b32411ebad3d2e221e186b85e98865d815d055999edc893bd301"
+  },
+  "schema_version": 1
+}

@@ -1,0 +1,319 @@
+{
+  "attempt_limit": 1,
+  "contract_type": "safa_r11_schedule_nfe2_launch_ledger_v1",
+  "execution": {
+    "automatic_retry": false,
+    "durable_attempt_receipts": true,
+    "mode": "independent_one_job_per_tmux",
+    "runner": "scripts/run_r11_schedule_nfe2_job.py"
+  },
+  "jobs": [
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_meanflow_flow_map_guidance.py",
+        "--config",
+        "configs/medium_v2/experiments/r11_schedule_nfe2_prefix128.yaml",
+        "--output-dir",
+        "artifacts/r11_schedule_nfe2/preparation_v1/runs/prefix128/schedule_nfe2"
+      ],
+      "asset_digest_path": "artifacts/r11_schedule_nfe2/preparation_v1/asset_digests/prefix128.json",
+      "attempt_limit": 1,
+      "attempt_receipt_path": "artifacts/r11_schedule_nfe2/preparation_v1/attempt_receipts/generate__prefix128.json",
+      "config_binding": {
+        "path": "configs/medium_v2/experiments/r11_schedule_nfe2_prefix128.yaml",
+        "sha256": "3d16becaa92f0ccc027e40b8e2938e169e718704e143155a6997debdd1890325"
+      },
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+      },
+      "expected_algorithm_nfe": 2,
+      "expected_diagnostic_nfe": 0,
+      "expected_matched_native_nfe": 0,
+      "fresh_output_paths": [
+        "artifacts/r11_schedule_nfe2/preparation_v1/runs/prefix128/schedule_nfe2",
+        "artifacts/r11_schedule_nfe2/preparation_v1/asset_digests/prefix128.json",
+        "artifacts/r11_schedule_nfe2/preparation_v1/logs/generate__prefix128.log",
+        "artifacts/r11_schedule_nfe2/preparation_v1/attempt_receipts/generate__prefix128.json"
+      ],
+      "gpu": {
+        "index": 0,
+        "uuid": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+      },
+      "job_id": "generate__prefix128",
+      "job_type": "generation",
+      "log_path": "artifacts/r11_schedule_nfe2/preparation_v1/logs/generate__prefix128.log",
+      "output_path": "artifacts/r11_schedule_nfe2/preparation_v1/runs/prefix128/schedule_nfe2",
+      "prerequisite_paths": [
+        "configs/medium_v2/experiments/r11_schedule_nfe2_prefix128.yaml"
+      ],
+      "retry_limit": 0,
+      "success_output_paths": [
+        "artifacts/r11_schedule_nfe2/preparation_v1/runs/prefix128/schedule_nfe2/completion.json",
+        "artifacts/r11_schedule_nfe2/preparation_v1/runs/prefix128/schedule_nfe2/generation_result.json",
+        "artifacts/r11_schedule_nfe2/preparation_v1/runs/prefix128/schedule_nfe2/per_sample.jsonl",
+        "artifacts/r11_schedule_nfe2/preparation_v1/runs/prefix128/schedule_nfe2/sample_id_manifest.jsonl",
+        "artifacts/r11_schedule_nfe2/preparation_v1/asset_digests/prefix128.json"
+      ],
+      "tmux": {
+        "argv": [
+          "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+          "scripts/run_r11_schedule_nfe2_job.py",
+          "--ledger",
+          "artifacts/r11_schedule_nfe2/preparation_v1/launch_ledger.json",
+          "--job-id",
+          "generate__prefix128"
+        ],
+        "gpu_uuid": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6",
+        "remain_on_exit": true,
+        "session": "safa-r11-nfe2-generate-prefix128"
+      },
+      "wave": 0
+    },
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_r11_quality_evaluation.py",
+        "--real-index",
+        "data/index/val_face_mixed_e14.jsonl",
+        "--generated-dir",
+        "artifacts/r11_schedule_nfe2/preparation_v1/runs/prefix128/schedule_nfe2/generated_images",
+        "--output",
+        "artifacts/r11_schedule_nfe2/preparation_v1/quality/prefix128/schedule_nfe2/quality.json",
+        "--sample-id-manifest",
+        "artifacts/r10_triangle_exploration/preparation_v1/prefix128.jsonl",
+        "--per-sample-jsonl",
+        "artifacts/r11_schedule_nfe2/preparation_v1/runs/prefix128/schedule_nfe2/per_sample.jsonl",
+        "--device",
+        "cuda:0",
+        "--metrics",
+        "fid",
+        "kid",
+        "niqe",
+        "sharpness",
+        "--kid-subset-size",
+        "127",
+        "--generation-result",
+        "artifacts/r11_schedule_nfe2/preparation_v1/runs/prefix128/schedule_nfe2/generation_result.json"
+      ],
+      "attempt_limit": 1,
+      "attempt_receipt_path": "artifacts/r11_schedule_nfe2/preparation_v1/attempt_receipts/quality__prefix128__schedule_nfe2.json",
+      "classifier_metrics": [
+        "niqe",
+        "sharpness"
+      ],
+      "config_binding": {
+        "path": "configs/medium_v2/experiments/r11_schedule_nfe2_prefix128.yaml",
+        "sha256": "3d16becaa92f0ccc027e40b8e2938e169e718704e143155a6997debdd1890325"
+      },
+      "dataset_id": "prefix128",
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+      },
+      "fid_kid_role": "descriptive_only",
+      "fresh_output_paths": [
+        "artifacts/r11_schedule_nfe2/preparation_v1/quality/prefix128/schedule_nfe2/quality.json",
+        "artifacts/r11_schedule_nfe2/preparation_v1/logs/quality__prefix128__schedule_nfe2.log",
+        "artifacts/r11_schedule_nfe2/preparation_v1/attempt_receipts/quality__prefix128__schedule_nfe2.json"
+      ],
+      "gpu": {
+        "index": 0,
+        "uuid": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+      },
+      "job_id": "quality__prefix128__schedule_nfe2",
+      "job_type": "quality",
+      "log_path": "artifacts/r11_schedule_nfe2/preparation_v1/logs/quality__prefix128__schedule_nfe2.log",
+      "metrics": [
+        "fid",
+        "kid",
+        "niqe",
+        "sharpness"
+      ],
+      "output_path": "artifacts/r11_schedule_nfe2/preparation_v1/quality/prefix128/schedule_nfe2/quality.json",
+      "prerequisite_paths": [
+        "configs/medium_v2/experiments/r11_schedule_nfe2_prefix128.yaml",
+        "artifacts/r11_schedule_nfe2/preparation_v1/runs/prefix128/schedule_nfe2/generation_result.json"
+      ],
+      "retry_limit": 0,
+      "role": "schedule_nfe2",
+      "sample_count": 128,
+      "success_output_paths": [
+        "artifacts/r11_schedule_nfe2/preparation_v1/quality/prefix128/schedule_nfe2/quality.json"
+      ],
+      "tmux": {
+        "argv": [
+          "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+          "scripts/run_r11_schedule_nfe2_job.py",
+          "--ledger",
+          "artifacts/r11_schedule_nfe2/preparation_v1/launch_ledger.json",
+          "--job-id",
+          "quality__prefix128__schedule_nfe2"
+        ],
+        "gpu_uuid": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6",
+        "remain_on_exit": true,
+        "session": "safa-r11-nfe2-quality-prefix128-schedule-nfe2"
+      },
+      "wave": 1
+    },
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_meanflow_flow_map_guidance.py",
+        "--config",
+        "configs/medium_v2/experiments/r11_schedule_nfe2_sharpness_tail32.yaml",
+        "--output-dir",
+        "artifacts/r11_schedule_nfe2/preparation_v1/runs/sharpness_tail32/schedule_nfe2"
+      ],
+      "asset_digest_path": "artifacts/r11_schedule_nfe2/preparation_v1/asset_digests/sharpness_tail32.json",
+      "attempt_limit": 1,
+      "attempt_receipt_path": "artifacts/r11_schedule_nfe2/preparation_v1/attempt_receipts/generate__sharpness_tail32.json",
+      "config_binding": {
+        "path": "configs/medium_v2/experiments/r11_schedule_nfe2_sharpness_tail32.yaml",
+        "sha256": "02eff63e14c6ef5a0298b65aa8cb8468e8e0421412c24d256363cca7d47c3147"
+      },
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "expected_algorithm_nfe": 2,
+      "expected_diagnostic_nfe": 0,
+      "expected_matched_native_nfe": 0,
+      "fresh_output_paths": [
+        "artifacts/r11_schedule_nfe2/preparation_v1/runs/sharpness_tail32/schedule_nfe2",
+        "artifacts/r11_schedule_nfe2/preparation_v1/asset_digests/sharpness_tail32.json",
+        "artifacts/r11_schedule_nfe2/preparation_v1/logs/generate__sharpness_tail32.log",
+        "artifacts/r11_schedule_nfe2/preparation_v1/attempt_receipts/generate__sharpness_tail32.json"
+      ],
+      "gpu": {
+        "index": 1,
+        "uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "job_id": "generate__sharpness_tail32",
+      "job_type": "generation",
+      "log_path": "artifacts/r11_schedule_nfe2/preparation_v1/logs/generate__sharpness_tail32.log",
+      "output_path": "artifacts/r11_schedule_nfe2/preparation_v1/runs/sharpness_tail32/schedule_nfe2",
+      "prerequisite_paths": [
+        "configs/medium_v2/experiments/r11_schedule_nfe2_sharpness_tail32.yaml"
+      ],
+      "retry_limit": 0,
+      "success_output_paths": [
+        "artifacts/r11_schedule_nfe2/preparation_v1/runs/sharpness_tail32/schedule_nfe2/completion.json",
+        "artifacts/r11_schedule_nfe2/preparation_v1/runs/sharpness_tail32/schedule_nfe2/generation_result.json",
+        "artifacts/r11_schedule_nfe2/preparation_v1/runs/sharpness_tail32/schedule_nfe2/per_sample.jsonl",
+        "artifacts/r11_schedule_nfe2/preparation_v1/runs/sharpness_tail32/schedule_nfe2/sample_id_manifest.jsonl",
+        "artifacts/r11_schedule_nfe2/preparation_v1/asset_digests/sharpness_tail32.json"
+      ],
+      "tmux": {
+        "argv": [
+          "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+          "scripts/run_r11_schedule_nfe2_job.py",
+          "--ledger",
+          "artifacts/r11_schedule_nfe2/preparation_v1/launch_ledger.json",
+          "--job-id",
+          "generate__sharpness_tail32"
+        ],
+        "gpu_uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1",
+        "remain_on_exit": true,
+        "session": "safa-r11-nfe2-generate-sharpness-tail32"
+      },
+      "wave": 0
+    },
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "scripts/run_r11_quality_evaluation.py",
+        "--real-index",
+        "data/index/val_face_mixed_e14.jsonl",
+        "--generated-dir",
+        "artifacts/r11_schedule_nfe2/preparation_v1/runs/sharpness_tail32/schedule_nfe2/generated_images",
+        "--output",
+        "artifacts/r11_schedule_nfe2/preparation_v1/quality/sharpness_tail32/schedule_nfe2/quality.json",
+        "--sample-id-manifest",
+        "artifacts/r11_initial_noise_sharpness_probe/preparation_v1/tail32.jsonl",
+        "--per-sample-jsonl",
+        "artifacts/r11_schedule_nfe2/preparation_v1/runs/sharpness_tail32/schedule_nfe2/per_sample.jsonl",
+        "--device",
+        "cuda:0",
+        "--metrics",
+        "niqe",
+        "sharpness",
+        "--generation-result",
+        "artifacts/r11_schedule_nfe2/preparation_v1/runs/sharpness_tail32/schedule_nfe2/generation_result.json"
+      ],
+      "attempt_limit": 1,
+      "attempt_receipt_path": "artifacts/r11_schedule_nfe2/preparation_v1/attempt_receipts/quality__sharpness_tail32__schedule_nfe2.json",
+      "classifier_metrics": [
+        "niqe",
+        "sharpness"
+      ],
+      "config_binding": {
+        "path": "configs/medium_v2/experiments/r11_schedule_nfe2_sharpness_tail32.yaml",
+        "sha256": "02eff63e14c6ef5a0298b65aa8cb8468e8e0421412c24d256363cca7d47c3147"
+      },
+      "dataset_id": "sharpness_tail32",
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "fid_kid_role": "forbidden",
+      "fresh_output_paths": [
+        "artifacts/r11_schedule_nfe2/preparation_v1/quality/sharpness_tail32/schedule_nfe2/quality.json",
+        "artifacts/r11_schedule_nfe2/preparation_v1/logs/quality__sharpness_tail32__schedule_nfe2.log",
+        "artifacts/r11_schedule_nfe2/preparation_v1/attempt_receipts/quality__sharpness_tail32__schedule_nfe2.json"
+      ],
+      "gpu": {
+        "index": 1,
+        "uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "job_id": "quality__sharpness_tail32__schedule_nfe2",
+      "job_type": "quality",
+      "log_path": "artifacts/r11_schedule_nfe2/preparation_v1/logs/quality__sharpness_tail32__schedule_nfe2.log",
+      "metrics": [
+        "niqe",
+        "sharpness"
+      ],
+      "output_path": "artifacts/r11_schedule_nfe2/preparation_v1/quality/sharpness_tail32/schedule_nfe2/quality.json",
+      "prerequisite_paths": [
+        "configs/medium_v2/experiments/r11_schedule_nfe2_sharpness_tail32.yaml",
+        "artifacts/r11_schedule_nfe2/preparation_v1/runs/sharpness_tail32/schedule_nfe2/generation_result.json"
+      ],
+      "retry_limit": 0,
+      "role": "schedule_nfe2",
+      "sample_count": 32,
+      "success_output_paths": [
+        "artifacts/r11_schedule_nfe2/preparation_v1/quality/sharpness_tail32/schedule_nfe2/quality.json"
+      ],
+      "tmux": {
+        "argv": [
+          "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+          "scripts/run_r11_schedule_nfe2_job.py",
+          "--ledger",
+          "artifacts/r11_schedule_nfe2/preparation_v1/launch_ledger.json",
+          "--job-id",
+          "quality__sharpness_tail32__schedule_nfe2"
+        ],
+        "gpu_uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1",
+        "remain_on_exit": true,
+        "session": "safa-r11-nfe2-quality-sharpness-tail32-schedule-nfe2"
+      },
+      "wave": 1
+    }
+  ],
+  "resource_policy": {
+    "cpu_memory_max_fraction": 0.9,
+    "gpu_indices": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "gpu_memory_max_fraction": 0.9,
+    "gpu_uuids": [
+      "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6",
+      "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1",
+      "GPU-e27fe71d-eaf7-3eb5-d0ff-c1c63b4f6b02",
+      "GPU-61ea2925-9905-7f56-cd64-7a792a32efef"
+    ]
+  },
+  "retry_limit": 0,
+  "schema_version": 1,
+  "status": "prepared_not_launched"
+}

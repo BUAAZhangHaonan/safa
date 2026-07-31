@@ -1,0 +1,74 @@
+{
+  "classifier": {
+    "argv": [
+      "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+      "scripts/classify_r11_schedule_nfe2.py",
+      "--contract",
+      "artifacts/r11_schedule_nfe2/preparation_v1/diagnostic_contract.json",
+      "--output",
+      "artifacts/r11_schedule_nfe2/preparation_v1/classification.json"
+    ],
+    "output": {
+      "expected_absent_at_preparation": true,
+      "path": "artifacts/r11_schedule_nfe2/preparation_v1/classification.json"
+    }
+  },
+  "configs": [
+    {
+      "path": "configs/medium_v2/experiments/r11_schedule_nfe2_prefix128.yaml",
+      "sha256": "3d16becaa92f0ccc027e40b8e2938e169e718704e143155a6997debdd1890325"
+    },
+    {
+      "path": "configs/medium_v2/experiments/r11_schedule_nfe2_sharpness_tail32.yaml",
+      "sha256": "02eff63e14c6ef5a0298b65aa8cb8468e8e0421412c24d256363cca7d47c3147"
+    }
+  ],
+  "contract_type": "safa_r11_schedule_nfe2_preparation_v1",
+  "diagnostic_contract": {
+    "path": "artifacts/r11_schedule_nfe2/preparation_v1/diagnostic_contract.json",
+    "sha256": "c737ffc6bd1dc20c887536c1c03d0e9288ee7e61229451567e63b33eb03f9e36"
+  },
+  "invariants": {
+    "active_guidance_intervals": [],
+    "attempt_limit": 1,
+    "batch_size": 2,
+    "candidate_promotion": "forbidden",
+    "checkpoint": "E15",
+    "effective_edev": true,
+    "expected_algorithm_nfe": 2,
+    "expected_diagnostic_nfe": 0,
+    "expected_matched_native_nfe": 0,
+    "retry_limit": 0,
+    "sampling_seed": 7919,
+    "schedule_times": [
+      1.0,
+      0.25,
+      0.0
+    ]
+  },
+  "job_counts": {
+    "generation": 2,
+    "quality": 2
+  },
+  "launch_ledger": {
+    "path": "artifacts/r11_schedule_nfe2/preparation_v1/launch_ledger.json",
+    "sha256": "95d1fe075b2831552bf4388c6dda04ec5337d235a551b60621a26a54edd7c87f"
+  },
+  "parent_evidence": {
+    "causal_classification": {
+      "path": "artifacts/r11_causal_decomposition/preparation_v1/causal_classification.json",
+      "sha256": "668fb9f529c98b7ee5f17fd03628677e835e2fa84bf37b40bd0d249b6e09ef14"
+    },
+    "causal_contract": {
+      "path": "artifacts/r11_causal_decomposition/preparation_v1/causal_contract.json",
+      "sha256": "fe943df00d69b32411ebad3d2e221e186b85e98865d815d055999edc893bd301"
+    },
+    "classification": "schedule_branch",
+    "formal_campaign": "r9-report-only-formal-v9",
+    "formal_seed": 7919,
+    "native_regeneration": false,
+    "paper_regeneration": false
+  },
+  "schema_version": 1,
+  "status": "prepared_not_launched"
+}

@@ -10,6 +10,7 @@ from safa.evaluation.r8_arm_contracts import canonical_arm_config_digest
 
 R9_EXPERIMENT_CONTRACT = "safa_r9_meanflow_v1"
 R9_ATTENTION_BACKEND = "native"
+R11_NFE2_SCHEDULE_CONTRACT_FIELD = "r11_nfe2_schedule_contract"
 R9_DETERMINISM_POLICY: dict[str, Any] = {
     "schema_version": 1,
     "cublas_workspace_config": ":4096:8",
@@ -137,7 +138,7 @@ def canonical_r9_arm_config_payload(config: Mapping[str, Any]) -> dict[str, Any]
         if value is not None:
             value = _require_sha256(value, field)
         bound_digests[field] = value
-    return {
+    payload = {
         "schema_version": 1,
         "experiment_contract": R9_EXPERIMENT_CONTRACT,
         "base_arm_config_sha256": canonical_arm_config_digest(config),
@@ -147,6 +148,31 @@ def canonical_r9_arm_config_payload(config: Mapping[str, Any]) -> dict[str, Any]
         "active_guidance_intervals": active_intervals,
         **bound_digests,
     }
+    if R11_NFE2_SCHEDULE_CONTRACT_FIELD in config:
+        schedule_contract = config.get(R11_NFE2_SCHEDULE_CONTRACT_FIELD)
+        if not isinstance(schedule_contract, Mapping):
+            raise ValueError("R11 NFE2 schedule contract must be a mapping")
+        guided_times = config.get("guided_times")
+        unguided_times = config.get("unguided_times")
+        if not isinstance(guided_times, list) or not isinstance(
+            unguided_times, list
+        ):
+            raise ValueError(
+                "R11 NFE2 arm digest requires effective guided/unguided times"
+            )
+        if (
+            schedule_contract.get("guided_times") != guided_times
+            or schedule_contract.get("unguided_times") != unguided_times
+        ):
+            raise ValueError(
+                "R11 NFE2 effective schedule differs from its schedule contract"
+            )
+        payload["r11_nfe2_effective_schedule"] = {
+            "guided_times": list(guided_times),
+            "unguided_times": list(unguided_times),
+            "schedule_contract": dict(schedule_contract),
+        }
+    return payload
 
 
 def canonical_r9_arm_config_digest(config: Mapping[str, Any]) -> str:
