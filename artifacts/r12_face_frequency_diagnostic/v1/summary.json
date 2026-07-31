@@ -1,0 +1,299 @@
+{
+  "boundary": {
+    "existing_images_only": true,
+    "formal_gate": false,
+    "new_generation": false,
+    "privacy_evaluated": false
+  },
+  "contract_type": "safa_r12_face_frequency_summary_v1",
+  "datasets": {
+    "prefix128": {
+      "decision": {
+        "classification": "descriptive_only",
+        "enabled": false,
+        "median_nfe5_to_nfe1_roi_high_frequency_ratio": 0.9407818245131072,
+        "monotonic_count": 46,
+        "monotonic_fraction": 0.359375,
+        "pairwise_counts": {
+          "nfe1_gt_nfe2": 80,
+          "nfe1_gt_nfe5": 76,
+          "nfe2_gt_nfe5": 72,
+          "nfe5_gt_paper": 38
+        },
+        "sample_count": 128
+      },
+      "methods": {
+        "native_nfe1": {
+          "full": {
+            "mean_high_frequency_ratio": 1.0,
+            "mean_laplacian_ratio_scale_1p00": 1.0,
+            "median_high_frequency_ratio": 1.0,
+            "median_laplacian_ratio_scale_1p00": 1.0
+          },
+          "roi": {
+            "mean_high_frequency_ratio": 1.0,
+            "mean_laplacian_ratio_scale_1p00": 1.0,
+            "median_high_frequency_ratio": 1.0,
+            "median_laplacian_ratio_scale_1p00": 1.0
+          }
+        },
+        "paper_nfe8": {
+          "full": {
+            "mean_high_frequency_ratio": 1.1127455260137549,
+            "mean_laplacian_ratio_scale_1p00": 0.9747972640264242,
+            "median_high_frequency_ratio": 1.0266573405053712,
+            "median_laplacian_ratio_scale_1p00": 0.9667351532336863
+          },
+          "roi": {
+            "mean_high_frequency_ratio": 1.2064513116185185,
+            "mean_laplacian_ratio_scale_1p00": 1.0692284251667006,
+            "median_high_frequency_ratio": 1.0564477865437345,
+            "median_laplacian_ratio_scale_1p00": 1.0103259653873797
+          }
+        },
+        "transport_nfe2": {
+          "full": {
+            "mean_high_frequency_ratio": 0.9985486595568631,
+            "mean_laplacian_ratio_scale_1p00": 0.978030027280731,
+            "median_high_frequency_ratio": 0.9949724232599981,
+            "median_laplacian_ratio_scale_1p00": 0.9828882019016356
+          },
+          "roi": {
+            "mean_high_frequency_ratio": 0.9662543702199383,
+            "mean_laplacian_ratio_scale_1p00": 0.9547831805400355,
+            "median_high_frequency_ratio": 0.9638425729251248,
+            "median_laplacian_ratio_scale_1p00": 0.9563383640251839
+          }
+        },
+        "transport_nfe5": {
+          "full": {
+            "mean_high_frequency_ratio": 0.9850923944723968,
+            "mean_laplacian_ratio_scale_1p00": 0.9160848610299295,
+            "median_high_frequency_ratio": 0.9408082392763717,
+            "median_laplacian_ratio_scale_1p00": 0.9276053316315123
+          },
+          "roi": {
+            "mean_high_frequency_ratio": 0.9945388140466596,
+            "mean_laplacian_ratio_scale_1p00": 0.9343694421336497,
+            "median_high_frequency_ratio": 0.9407818245131072,
+            "median_laplacian_ratio_scale_1p00": 0.9286954712686852
+          }
+        }
+      },
+      "primary_metric": "roi.fft_energy.radial_0p50_1p00",
+      "sample_count": 128
+    },
+    "prefix32": {
+      "decision": {
+        "classification": "descriptive_only",
+        "enabled": false,
+        "median_nfe5_to_nfe1_roi_high_frequency_ratio": 0.9578933076309781,
+        "monotonic_count": 10,
+        "monotonic_fraction": 0.3125,
+        "pairwise_counts": {
+          "nfe1_gt_nfe2": 19,
+          "nfe1_gt_nfe5": 19,
+          "nfe2_gt_nfe5": 17,
+          "nfe5_gt_paper": 10
+        },
+        "sample_count": 32
+      },
+      "methods": {
+        "native_nfe1": {
+          "full": {
+            "mean_high_frequency_ratio": 1.0,
+            "mean_laplacian_ratio_scale_1p00": 1.0,
+            "median_high_frequency_ratio": 1.0,
+            "median_laplacian_ratio_scale_1p00": 1.0
+          },
+          "roi": {
+            "mean_high_frequency_ratio": 1.0,
+            "mean_laplacian_ratio_scale_1p00": 1.0,
+            "median_high_frequency_ratio": 1.0,
+            "median_laplacian_ratio_scale_1p00": 1.0
+          }
+        },
+        "paper_nfe8": {
+          "full": {
+            "mean_high_frequency_ratio": 1.3852859235229846,
+            "mean_laplacian_ratio_scale_1p00": 1.0633930544177597,
+            "median_high_frequency_ratio": 1.0611101532582263,
+            "median_laplacian_ratio_scale_1p00": 0.9552753184936504
+          },
+          "roi": {
+            "mean_high_frequency_ratio": 1.4070005362099118,
+            "mean_laplacian_ratio_scale_1p00": 1.206205183650928,
+            "median_high_frequency_ratio": 1.1524622011399424,
+            "median_laplacian_ratio_scale_1p00": 1.0000091328064673
+          }
+        },
+        "transport_nfe2": {
+          "full": {
+            "mean_high_frequency_ratio": 1.0227899384652317,
+            "mean_laplacian_ratio_scale_1p00": 0.9970905582681409,
+            "median_high_frequency_ratio": 1.0016379668209647,
+            "median_laplacian_ratio_scale_1p00": 0.9992945430813567
+          },
+          "roi": {
+            "mean_high_frequency_ratio": 0.9976851934726885,
+            "mean_laplacian_ratio_scale_1p00": 0.9641727088017121,
+            "median_high_frequency_ratio": 0.9669257656304784,
+            "median_laplacian_ratio_scale_1p00": 0.9675814459430134
+          }
+        },
+        "transport_nfe5": {
+          "full": {
+            "mean_high_frequency_ratio": 1.0570177249407793,
+            "mean_laplacian_ratio_scale_1p00": 0.9711913047225793,
+            "median_high_frequency_ratio": 1.0035190723405725,
+            "median_laplacian_ratio_scale_1p00": 0.9817780555620595
+          },
+          "roi": {
+            "mean_high_frequency_ratio": 1.031598035948971,
+            "mean_laplacian_ratio_scale_1p00": 0.942946018798027,
+            "median_high_frequency_ratio": 0.9578933076309781,
+            "median_laplacian_ratio_scale_1p00": 0.9129669689936473
+          }
+        }
+      },
+      "primary_metric": "roi.fft_energy.radial_0p50_1p00",
+      "sample_count": 32
+    },
+    "sharpness_tail32": {
+      "decision": {
+        "classification": "face_roi_sampler_low_pass_not_confirmed",
+        "confirmed": false,
+        "enabled": true,
+        "median_nfe5_ratio_max": 0.8,
+        "median_nfe5_to_nfe1_roi_high_frequency_ratio": 0.6769850835797921,
+        "median_ratio_pass": true,
+        "monotonic_count": 21,
+        "monotonic_count_pass": false,
+        "monotonic_fraction": 0.65625,
+        "pairwise_counts": {
+          "nfe1_gt_nfe2": 25,
+          "nfe1_gt_nfe5": 27,
+          "nfe2_gt_nfe5": 28,
+          "nfe5_gt_paper": 13
+        },
+        "required_monotonic_count": 24,
+        "sample_count": 32
+      },
+      "methods": {
+        "native_nfe1": {
+          "full": {
+            "mean_high_frequency_ratio": 1.0,
+            "mean_laplacian_ratio_scale_1p00": 1.0,
+            "median_high_frequency_ratio": 1.0,
+            "median_laplacian_ratio_scale_1p00": 1.0
+          },
+          "roi": {
+            "mean_high_frequency_ratio": 1.0,
+            "mean_laplacian_ratio_scale_1p00": 1.0,
+            "median_high_frequency_ratio": 1.0,
+            "median_laplacian_ratio_scale_1p00": 1.0
+          }
+        },
+        "paper_nfe8": {
+          "full": {
+            "mean_high_frequency_ratio": 0.508123318756873,
+            "mean_laplacian_ratio_scale_1p00": 0.48565765566185554,
+            "median_high_frequency_ratio": 0.4665172167383713,
+            "median_laplacian_ratio_scale_1p00": 0.45495690278868367
+          },
+          "roi": {
+            "mean_high_frequency_ratio": 0.778343107553472,
+            "mean_laplacian_ratio_scale_1p00": 0.6837851485363142,
+            "median_high_frequency_ratio": 0.6788433487983407,
+            "median_laplacian_ratio_scale_1p00": 0.6361464795441114
+          }
+        },
+        "transport_nfe2": {
+          "full": {
+            "mean_high_frequency_ratio": 0.8627220197206615,
+            "mean_laplacian_ratio_scale_1p00": 0.8670708550980679,
+            "median_high_frequency_ratio": 0.9057785356406967,
+            "median_laplacian_ratio_scale_1p00": 0.8892049900866008
+          },
+          "roi": {
+            "mean_high_frequency_ratio": 0.8783123145219696,
+            "mean_laplacian_ratio_scale_1p00": 0.8753791291154212,
+            "median_high_frequency_ratio": 0.8985691695211742,
+            "median_laplacian_ratio_scale_1p00": 0.8698908313798631
+          }
+        },
+        "transport_nfe5": {
+          "full": {
+            "mean_high_frequency_ratio": 0.5789592150675729,
+            "mean_laplacian_ratio_scale_1p00": 0.5729649814867928,
+            "median_high_frequency_ratio": 0.5391949449687747,
+            "median_laplacian_ratio_scale_1p00": 0.5603654127339781
+          },
+          "roi": {
+            "mean_high_frequency_ratio": 0.7224452066741992,
+            "mean_laplacian_ratio_scale_1p00": 0.7031372369739346,
+            "median_high_frequency_ratio": 0.6769850835797921,
+            "median_laplacian_ratio_scale_1p00": 0.6647062428500122
+          }
+        }
+      },
+      "primary_metric": "roi.fft_energy.radial_0p50_1p00",
+      "sample_count": 32
+    }
+  },
+  "inputs": {
+    "aligned_roi_size": [
+      112,
+      112
+    ],
+    "arcface_request": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/full/evaluator_runs/arcface/winner/request.json",
+    "det_size": [
+      224,
+      224
+    ],
+    "detector": "buffalo_l",
+    "device": "cuda:0",
+    "ordered_dataset_ids": [
+      "sharpness_tail32",
+      "prefix32",
+      "prefix128"
+    ],
+    "request": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/configs/medium_v2/experiments/r12_face_frequency_diagnostic.json"
+  },
+  "metric_contract": {
+    "alignment": "ArcFace five-point norm_crop mode=arcface",
+    "fft_band_radius_normalization": "distance divided by corner Nyquist radius",
+    "fft_bands": [
+      {
+        "lower_inclusive": 0.0,
+        "name": "radial_0p00_0p25",
+        "upper": 0.25
+      },
+      {
+        "lower_inclusive": 0.25,
+        "name": "radial_0p25_0p50",
+        "upper": 0.5
+      },
+      {
+        "lower_inclusive": 0.5,
+        "name": "radial_0p50_0p75",
+        "upper": 0.75
+      },
+      {
+        "lower_inclusive": 0.75,
+        "name": "radial_0p75_1p00",
+        "upper": 1.0
+      }
+    ],
+    "fft_window": "separable_hann",
+    "laplacian_scales": [
+      1.0,
+      0.75,
+      0.5
+    ],
+    "primary_frequency_metric": "radial_0p50_1p00"
+  },
+  "row_count": 192,
+  "schema_version": 1,
+  "unique_image_count": 636
+}
