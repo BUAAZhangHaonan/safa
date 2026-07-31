@@ -1,0 +1,177 @@
+{
+  "schema_version": 1,
+  "contract_type": "safa_r14_spatial_factorization_closeout_v1",
+  "source_head_before_closeout": "489859355246ba2119e867e1146467acd793c392",
+  "scope": {
+    "formal_winner": null,
+    "screening_survivor": null,
+    "new_generation": false,
+    "new_training": false,
+    "bulk_evidence_copied": false,
+    "hash_chain_added": false
+  },
+  "R12": {
+    "outcome": "no_paired_survivor",
+    "classifier": "face_or_privacy_limited",
+    "selected_horizon": null,
+    "protocol": {
+      "method": "initial_noise_fixed_radius_eta0p5",
+      "horizons": [12, 16],
+      "datasets": {"regular32": 32, "sharpness_tail32": 32},
+      "exact_one_native_candidate": "32/32 for every arm and dataset",
+      "stage": 32,
+      "fid_kid_interpretation": "forbidden",
+      "later_stages_launched": false
+    },
+    "regular32": {
+      "u12_arcface_delta": 0.029658931405432118,
+      "u16_arcface_delta": 0.02172728977508751,
+      "required_max": 0.02,
+      "failure_axis": "privacy"
+    },
+    "sharpness_tail32": {
+      "u12_retention": 0.6520038208156369,
+      "u16_retention": 0.69258783903967,
+      "required_min": 0.95,
+      "failure_axis": "full_image_sharpness",
+      "selection_confound": "background_high_frequency_content"
+    },
+    "rejected_followups": {
+      "native_anchor_lpips_conflict_projection": {
+        "licensed": false,
+        "reason": "regular privacy and tail sharpness both missed the preregistered association rule",
+        "result_commit": "73bc919"
+      },
+      "latent_fourier_shell_projection": {
+        "licensed": false,
+        "stop_required": true,
+        "images_written_or_evaluated": false,
+        "projection_or_training_run": false,
+        "result_commit": "4bb9fbf"
+      }
+    },
+    "commits": {
+      "preparation": "c2b6e15",
+      "result": "ac4ade2",
+      "lpips_implementation": "742f9b7",
+      "lpips_result": "73bc919",
+      "fourier_implementation": "69cedf1",
+      "fourier_result": "4bb9fbf"
+    }
+  },
+  "R13": {
+    "outcome": "scale_transfer_no_go",
+    "formal_training_launched": false,
+    "protocol": {
+      "arms": ["control", "latent_perceptual_loss"],
+      "optimizer_steps_per_arm": 8,
+      "same_e15_ema_source": true,
+      "same_first_32_samples": true,
+      "byte_identical_flow_rng_ledger": true,
+      "allowed_trainable_tensors": 30,
+      "vae_trainable": false,
+      "formal_plan_steps": 7500
+    },
+    "scale_evidence": {
+      "raw_lpl_to_fm": 7473.3,
+      "weighted_lpl_to_fm": 22420.0,
+      "preclip_gradient_control": 0.88825,
+      "preclip_gradient_lpl": 52419.49,
+      "gradient_ratio": 59014.6,
+      "up_block_2_3_raw_lpl_fraction": 0.72,
+      "interpretation": "clipping controls magnitude while LPL controls direction"
+    },
+    "boundary": {
+      "valid_negative_probe": true,
+      "implementation_failure": false,
+      "lpl_scientifically_disproved": false
+    },
+    "commits": {
+      "conditioning_ema_fix": "aa08e7d",
+      "lpl_core": "3b8b4a0",
+      "decoder_feature_fix": "0b6cb69",
+      "exact_step_integration": "4010f1d",
+      "evaluator_contract": "54b58fd",
+      "result": "8047731"
+    }
+  },
+  "R14": {
+    "outcome": "background_preserving_face_only_generation_supported",
+    "architecture_support_only": true,
+    "screening_survivor": false,
+    "protocol": {
+      "existing_images_only": true,
+      "datasets": {"regular32": 32, "sharpness_tail32": 32},
+      "arms": ["u12", "u16"],
+      "mask": "original-coordinate union of locked buffalo_l/224 exact-one native and candidate bboxes",
+      "bbox_expansion_pixels": 0,
+      "morphology": null,
+      "primary_energy": "centered squared Laplacian with exact official-sharpness reconstruction",
+      "corroboration": "equal-mean Sobel squared-gradient at Gaussian sigma 0, 1, 2",
+      "bootstrap_seed": 91637,
+      "bootstrap_iterations": 10000,
+      "bootstrap_unit": "paired sample_id"
+    },
+    "support_rule": "tail32 point and bootstrap lower bound must both be strictly above 0.5 at u12 and u16",
+    "laplacian_background_share": {
+      "u12": {"point": 0.7269967284363915, "ci95": [0.6776147306820327, 0.7802195826967112]},
+      "u16": {"point": 0.6915172853988837, "ci95": [0.5891796275668902, 0.7747686745511122]}
+    },
+    "gradient_background_share": {
+      "u12": {"point": 0.7334562537912012, "ci95": [0.6698436076174024, 0.799827279287354]},
+      "u16": {"point": 0.7196324264129211, "ci95": [0.6478898987106635, 0.7980745843523044]}
+    },
+    "limits": {
+      "regular32_laplacian_lower_bounds_above_0p5": false,
+      "universal_blur_claim": false,
+      "privacy_evaluated": false,
+      "formal_gate": false,
+      "winner": false
+    },
+    "commits": {
+      "implementation": "944138c",
+      "official_grayscale_binding": "2f110d2",
+      "result": "4898593"
+    }
+  },
+  "next_direction": {
+    "name": "versioned_face_region_inpainting_feasibility_probe",
+    "status": "single_bounded_probe_only",
+    "model": {
+      "identity": "meanflow_sit_inpaint",
+      "modify_e15_semantics": false,
+      "initial_mask": "unexpanded AffectNet annotated face bbox without morphology",
+      "mask_claim": "detector-defined feasibility region, not complete privacy boundary",
+      "context": "remove original face before context encoding",
+      "flow_and_loss": "inside latent mask only",
+      "outside_mask_latent": "project back to context after every flow map",
+      "outside_mask_pixels": "bit-exact native pixels by model definition",
+      "pairing": "embedding identity A with same-expression different-identity target B",
+      "required_assertion": "source_sample_id != target_sample_id"
+    },
+    "execution": {
+      "smoke_samples": 8,
+      "starting_weights": "E15 EMA",
+      "arms": 1,
+      "optimizer_steps": 256,
+      "devices": [0, 1, 2, 3],
+      "parallelism": "DDP",
+      "batch_per_gpu": 2,
+      "evaluation_dataset": "regular32",
+      "search_forbidden": ["mask", "learning_rate", "loss_weight", "training_steps"]
+    },
+    "hard_stops": [
+      "smoke8 must prove original face pixels never enter the context encoder",
+      "smoke8 must prove outside-mask output is bit-exact, seeds deterministic, and masked loss and gradients finite",
+      "regular32 ArcFace candidate exact-one must be 32/32",
+      "regular32 provisional representation and privacy gates must pass",
+      "full-image and detector-face ROI NIQE and sharpness gates must both pass",
+      "all 8 fixed visual-review images must have severe=0",
+      "full-image pass with face-ROI failure is copied-background metric inflation and immediate NO-GO",
+      "any exact-one, representation, privacy, or ROI-quality failure stops without tuning",
+      "only all-pass regular32 may enter one stage128; never jump directly to stage512"
+    ],
+    "claim_boundary": "feasibility evidence only; not survivor, privacy proof, Full success, or formal winner"
+  },
+  "final_classification": "proceed_to_one_face_region_inpainting_feasibility_probe"
+}
