@@ -118,6 +118,8 @@ _R14_OPTIMIZER_CHECKPOINT_CONTRACT = "safa_r14_optimizer_checkpoint_steps_v1"
 _R14_COMPLETION_CONTRACT = "safa_r14_inpaint_exact_optimizer_steps_v1"
 _R14_REQUIRED_OPTIMIZER_STEPS = 2560
 _R14_REQUIRED_STAGE2_EPOCHS = 20
+_R14_RESUME_CONTRACT = "safa_r14_epoch_boundary_world_size_resume_v1"
+_R14_RESUME_SOURCE_CHECKPOINT = "checkpoints/r14_inpaint_feasibility_2560step/last.pt"
 _R14_SPATIAL_TRAINING_CONTRACT = "safa_r14_spatial_training_v1"
 _R13_OPTIMIZER_CHECKPOINT_CONTRACT = "safa_r13_optimizer_checkpoint_steps_v1"
 _R13_LOCKED_TRAIN_ORDER_CONTRACT = "safa_r13_locked_train_order_v1"
@@ -1422,6 +1424,39 @@ def _verify_resume_checkpoint_sha256(config: Mapping, checkpoint_path: Path) -> 
         raise ValueError(f"resume_from checkpoint SHA-256 mismatch: {checkpoint_path}")
 
 
+def _r14_resume_contract(config: Mapping) -> dict | None:
+    payload = config.get("r14_resume_contract")
+    if payload is None:
+        return None
+    if not isinstance(payload, Mapping):
+        raise ValueError("train_g config.r14_resume_contract must be a mapping")
+    expected = {
+        "contract_type": _R14_RESUME_CONTRACT,
+        "source_global_step": 2432,
+        "source_completed_stage2_epochs": 19,
+        "source_world_size": 4,
+        "source_global_batch_size": 8,
+        "source_per_device_batch_size": 2,
+        "samples_per_epoch": 1024,
+        "target_world_size": 2,
+        "target_global_batch_size": 4,
+        "target_per_device_batch_size": 2,
+        "additional_optimizer_steps": 256,
+        "target_global_step": 2688,
+    }
+    if set(payload) != set(expected):
+        raise ValueError(
+            "train_g config.r14_resume_contract fields differ from the registered schema"
+        )
+    for field, expected_value in expected.items():
+        if payload.get(field) != expected_value:
+            raise ValueError(
+                f"train_g config.r14_resume_contract.{field} must be "
+                f"{expected_value!r}, got {payload.get(field)!r}"
+            )
+    return dict(payload)
+
+
 def _optimizer_step_contract(config: Mapping) -> int | None:
     payload = config.get("optimizer_step_contract")
     if payload is None:
@@ -1474,9 +1509,12 @@ def _optimizer_checkpoint_steps(config: Mapping, required_steps: int | None) -> 
     steps = tuple(int(step) for step in raw_steps)
     if steps != tuple(sorted(set(steps))):
         raise ValueError(f"{context}.save_steps must be strictly increasing and unique")
-    if steps[0] != 0 or steps[-1] != required_steps:
+    if steps[-1] != required_steps:
+        raise ValueError(f"{context}.save_steps must end at required_steps={required_steps}")
+    if steps[0] != 0 and _r14_resume_contract(config) is None:
         raise ValueError(
-            f"{context}.save_steps must start at 0 and end at required_steps={required_steps}"
+            f"{context}.save_steps must start at 0 unless a registered R14 "
+            "epoch-boundary resume contract is active"
         )
     return steps
 
@@ -1685,6 +1723,129 @@ def _resume_global_step(checkpoint: Mapping, checkpoint_path: str, required_step
             "no optimizer step remains to execute"
         )
     return int(global_step)
+
+
+def _validate_r14_resume_checkpoint(
+    checkpoint: Mapping,
+    checkpoint_path: str,
+    contract: Mapping,
+) -> None:
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError(f"R14 resume checkpoint must be a mapping: {checkpoint_path}")
+    source_global_batch = int(contract["source_global_batch_size"])
+    samples_per_epoch = int(contract["samples_per_epoch"])
+    completed_epochs = int(contract["source_completed_stage2_epochs"])
+    source_steps_per_epoch, source_remainder = divmod(samples_per_epoch, source_global_batch)
+    if source_remainder or completed_epochs * source_steps_per_epoch != int(contract["source_global_step"]):
+        raise ValueError("R14 resume contract does not describe an exact source epoch boundary")
+    target_global_batch = int(contract["target_global_batch_size"])
+    target_steps_per_epoch, target_remainder = divmod(samples_per_epoch, target_global_batch)
+    if target_remainder or target_steps_per_epoch != int(contract["additional_optimizer_steps"]):
+        raise ValueError("R14 resume contract does not describe one complete target epoch")
+    if int(contract["source_global_step"]) + target_steps_per_epoch != int(contract["target_global_step"]):
+        raise ValueError("R14 resume contract target_global_step is inconsistent")
+
+    metrics = checkpoint.get("metrics")
+    if not isinstance(metrics, Mapping):
+        raise ValueError(f"R14 resume checkpoint metrics must be a mapping: {checkpoint_path}")
+    expected_metrics = {
+        "stage": "stage2",
+        "stage_epoch": completed_epochs - 1,
+        "stage_epoch_0based": completed_epochs - 1,
+        "stage_epoch_1based": completed_epochs,
+        "global_step": int(contract["source_global_step"]),
+        "required_optimizer_steps": _R14_REQUIRED_OPTIMIZER_STEPS,
+        "world_size": int(contract["source_world_size"]),
+        "global_batch_size": source_global_batch,
+        "per_device_batch_size": int(contract["source_per_device_batch_size"]),
+    }
+    for field, expected_value in expected_metrics.items():
+        if metrics.get(field) != expected_value:
+            raise ValueError(
+                f"R14 resume checkpoint metrics.{field} must be {expected_value!r}, "
+                f"got {metrics.get(field)!r}: {checkpoint_path}"
+            )
+
+    history = checkpoint.get("history")
+    if not isinstance(history, list) or len(history) != completed_epochs:
+        raise ValueError(
+            f"R14 resume checkpoint history must contain {completed_epochs} completed epochs: "
+            f"{checkpoint_path}"
+        )
+    for epoch_index, row in enumerate(history):
+        if not isinstance(row, Mapping):
+            raise ValueError(f"R14 resume checkpoint history[{epoch_index}] must be a mapping")
+        expected_step = (epoch_index + 1) * source_steps_per_epoch
+        row_expected = {
+            "stage": "stage2",
+            "stage_epoch": epoch_index,
+            "global_step": expected_step,
+            "world_size": int(contract["source_world_size"]),
+            "global_batch_size": source_global_batch,
+            "per_device_batch_size": int(contract["source_per_device_batch_size"]),
+        }
+        for field, expected_value in row_expected.items():
+            if row.get(field) != expected_value:
+                raise ValueError(
+                    f"R14 resume checkpoint history[{epoch_index}].{field} must be "
+                    f"{expected_value!r}, got {row.get(field)!r}"
+                )
+        _validate_last_checkpoint_metrics(dict(row), f"R14 resume history item {epoch_index}")
+
+    training_config = checkpoint.get("training_config")
+    if not isinstance(training_config, Mapping):
+        raise ValueError(f"R14 resume checkpoint training_config must be a mapping: {checkpoint_path}")
+    for field, expected_value in (
+        ("world_size", int(contract["source_world_size"])),
+        ("global_batch_size", source_global_batch),
+        ("per_device_batch_size", int(contract["source_per_device_batch_size"])),
+    ):
+        if training_config.get(field) != expected_value:
+            raise ValueError(
+                f"R14 resume checkpoint training_config.{field} must be {expected_value!r}, "
+                f"got {training_config.get(field)!r}"
+            )
+    for field in ("optimizer_state_dict", "ema_model_state_dict"):
+        state = checkpoint.get(field)
+        if not isinstance(state, Mapping) or not state:
+            raise ValueError(f"R14 resume checkpoint requires non-empty {field}: {checkpoint_path}")
+    optimizer_state = checkpoint["optimizer_state_dict"]
+    if not isinstance(optimizer_state.get("state"), Mapping) or not optimizer_state["state"]:
+        raise ValueError(f"R14 resume checkpoint optimizer state is empty: {checkpoint_path}")
+    if not isinstance(optimizer_state.get("param_groups"), list) or not optimizer_state["param_groups"]:
+        raise ValueError(f"R14 resume checkpoint optimizer param_groups are empty: {checkpoint_path}")
+
+
+def _validate_r14_training_state_load(missing, unexpected) -> None:
+    if missing or unexpected:
+        raise RuntimeError(
+            "R14 training-state resume must load the complete trained topology; "
+            f"missing={sorted(missing)!r} unexpected={sorted(unexpected)!r}"
+        )
+
+
+def _validate_r14_resume_completion(history: list[dict], contract: Mapping) -> None:
+    completed_epochs = int(contract["source_completed_stage2_epochs"]) + 1
+    if len(history) != completed_epochs:
+        raise RuntimeError(
+            f"R14 resume must end with {completed_epochs} completed epochs, got {len(history)}"
+        )
+    metrics = history[-1]
+    expected = {
+        "stage": "stage2",
+        "stage_epoch": completed_epochs - 1,
+        "stage_epoch_1based": completed_epochs,
+        "global_step": int(contract["target_global_step"]),
+        "world_size": int(contract["target_world_size"]),
+        "global_batch_size": int(contract["target_global_batch_size"]),
+        "per_device_batch_size": int(contract["target_per_device_batch_size"]),
+        "epoch_sample_count": int(contract["samples_per_epoch"]),
+    }
+    for field, expected_value in expected.items():
+        if metrics.get(field) != expected_value:
+            raise RuntimeError(
+                f"R14 resume completion {field} must be {expected_value!r}, got {metrics.get(field)!r}"
+            )
 
 
 def _advance_global_step(
@@ -2179,6 +2340,7 @@ def train_g_from_config(config: dict) -> dict:
     ):
         (out_dir / "completion.json").unlink(missing_ok=True)
     latent_perceptual_loss_runtime = latent_perceptual_loss_runtime_from_config(config, generator_config)
+    r14_resume_contract = _r14_resume_contract(config)
     required_optimizer_steps = _optimizer_step_contract(config)
     optimizer_checkpoint_steps = _optimizer_checkpoint_steps(config, required_optimizer_steps)
     flow_matching_rng_contract = _flow_matching_rng_contract(config)
@@ -2243,6 +2405,12 @@ def train_g_from_config(config: dict) -> dict:
             raise FileNotFoundError(f"resume_from checkpoint not found: {resume_path}")
         _verify_resume_checkpoint_sha256(config, resume_path)
         ckpt = torch.load(resume_path, map_location=device, weights_only=True)
+        if r14_resume_contract is not None:
+            _validate_r14_resume_checkpoint(
+                ckpt,
+                str(resume_path),
+                r14_resume_contract,
+            )
         checkpoint_model_state, checkpoint_model_state_key = _resume_checkpoint_state_dict(
             ckpt,
             resume_checkpoint_model,
@@ -2256,29 +2424,33 @@ def train_g_from_config(config: dict) -> dict:
         _is_peft_lora = (stage2_objective is not None and stage2_objective.type in {_PEFT_LORA, _LORA_SWEEP}) or (stage2_objective is not None and stage2_objective.type == _POINT_PROJECTED_TWO_STEP and bool(config.get("stages", {}).get("stage2", {}).get("stage2_objective", {}).get("lora_target_modules")))
         missing, unexpected = generator.load_state_dict(checkpoint_model_state, strict=False)
         if generator_config.model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT_INPAINT:
-            expected_missing = {
-                "vector_field.context_embedder.weight",
-                "vector_field.context_embedder.bias",
-            }
-            if set(missing) != expected_missing:
-                raise RuntimeError(
-                    "R14 E15 EMA load must miss only the zero-init context embedder; "
-                    f"missing={sorted(missing)!r}"
-                )
-            if unexpected:
-                raise RuntimeError(
-                    "R14 E15 EMA load contains unexpected keys: "
-                    f"{sorted(unexpected)!r}"
-                )
-            context_embedder = generator.vector_field.context_embedder
-            if context_embedder is None:
-                raise RuntimeError("R14 inpaint generator has no context embedder")
-            if (
-                torch.count_nonzero(context_embedder.weight).item() != 0
-                or torch.count_nonzero(context_embedder.bias).item() != 0
-            ):
-                raise RuntimeError("R14 context embedder is not exactly zero after E15 EMA load")
-            print("[R14] loaded E15 EMA; context embedder remains exactly zero")
+            if r14_resume_contract is not None:
+                _validate_r14_training_state_load(missing, unexpected)
+                print("[R14] restored complete raw training state")
+            else:
+                expected_missing = {
+                    "vector_field.context_embedder.weight",
+                    "vector_field.context_embedder.bias",
+                }
+                if set(missing) != expected_missing:
+                    raise RuntimeError(
+                        "R14 E15 EMA load must miss only the zero-init context embedder; "
+                        f"missing={sorted(missing)!r}"
+                    )
+                if unexpected:
+                    raise RuntimeError(
+                        "R14 E15 EMA load contains unexpected keys: "
+                        f"{sorted(unexpected)!r}"
+                    )
+                context_embedder = generator.vector_field.context_embedder
+                if context_embedder is None:
+                    raise RuntimeError("R14 inpaint generator has no context embedder")
+                if (
+                    torch.count_nonzero(context_embedder.weight).item() != 0
+                    or torch.count_nonzero(context_embedder.bias).item() != 0
+                ):
+                    raise RuntimeError("R14 context embedder is not exactly zero after E15 EMA load")
+                print("[R14] loaded E15 EMA; context embedder remains exactly zero")
         else:
             if missing:
                 if _is_peft_lora:
@@ -2422,7 +2594,7 @@ def train_g_from_config(config: dict) -> dict:
     stage1_stable_hits = 0
     allow_stage2_without_stage1_gate = _require_bool(config, "allow_stage2_without_stage1_gate", "train_g config")
 
-    if 0 in optimizer_checkpoint_steps and distributed.is_main:
+    if global_step == 0 and 0 in optimizer_checkpoint_steps and distributed.is_main:
         initial_metrics = {
             "stage": "stage2",
             "stage_epoch": 0,
@@ -2739,6 +2911,13 @@ def train_g_from_config(config: dict) -> dict:
                 if optimizer_step_limit_reached:
                     break
 
+            if r14_resume_contract is not None:
+                expected_local_samples = int(r14_resume_contract["samples_per_epoch"]) // distributed.world_size
+                if seen != expected_local_samples:
+                    raise RuntimeError(
+                        "R14 epoch-boundary resume did not consume one complete local shard: "
+                        f"seen={seen}, expected={expected_local_samples}"
+                    )
             metrics = _reduce_epoch_metrics(totals, seen, device, distributed)
             should_break = False
             if distributed.is_main:
@@ -2760,6 +2939,8 @@ def train_g_from_config(config: dict) -> dict:
                 if required_optimizer_steps is not None:
                     metrics["global_step"] = int(global_step)
                     metrics["required_optimizer_steps"] = int(required_optimizer_steps)
+                if r14_resume_contract is not None:
+                    metrics["epoch_sample_count"] = int(r14_resume_contract["samples_per_epoch"])
                 if flow_matching_rng_contract is not None:
                     metrics["r13_cumulative_active_rows"] = int(r13_cumulative_active_rows)
                     _validate_r13_active_row_probe_metrics(config, metrics)
@@ -2897,6 +3078,8 @@ def train_g_from_config(config: dict) -> dict:
         }
         _write_json(out_dir / "manifest.json", manifest)
         if generator_config.model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT_INPAINT:
+            if r14_resume_contract is not None:
+                _validate_r14_resume_completion(history, r14_resume_contract)
             last_checkpoint = out_dir / "last.pt"
             if not last_checkpoint.is_file() or last_checkpoint.stat().st_size <= 0:
                 raise RuntimeError("R14 exact-step training did not produce a non-empty last.pt")
@@ -3459,26 +3642,48 @@ def _validate_r14_inpaint_training_contract(
 ):
     if config["optimizer_step_contract"].get("contract_type") != _R14_OPTIMIZER_STEP_CONTRACT:
         raise ValueError("R14 inpaint requires the registered optimizer-step contract")
-    if required_optimizer_steps != _R14_REQUIRED_OPTIMIZER_STEPS:
-        raise ValueError("R14 inpaint requires exactly 2560 optimizer steps")
     checkpoint_contract = _require_mapping(
         config, "optimizer_checkpoint_contract", "train_g config"
     )
     if checkpoint_contract.get("contract_type") != _R14_OPTIMIZER_CHECKPOINT_CONTRACT:
         raise ValueError("R14 inpaint requires the registered optimizer-checkpoint contract")
-    if optimizer_checkpoint_steps != (0, _R14_REQUIRED_OPTIMIZER_STEPS):
-        raise ValueError("R14 inpaint checkpoint steps must be exactly [0, 2560]")
     if generator_trainable_mode != _GENERATOR_TRAINABLE_FULL:
         raise ValueError("R14 inpaint requires generator_trainable='full'")
-    if resume_mode != _RESUME_MODE_MODEL_WEIGHTS_ONLY:
-        raise ValueError("R14 inpaint requires resume_mode='model_weights_only'")
-    if resume_checkpoint_model != _RESUME_CHECKPOINT_MODEL_EMA:
-        raise ValueError("R14 inpaint requires resume_checkpoint_model='ema'")
-    if (
-        config.get("resume_from") != R13_SOURCE_CHECKPOINT
-        or config.get("resume_from_sha256") != R13_SOURCE_CHECKPOINT_SHA256
-    ):
-        raise ValueError("R14 inpaint requires the locked E15 EMA source")
+    resume_contract = _r14_resume_contract(config)
+    if resume_contract is None:
+        if required_optimizer_steps != _R14_REQUIRED_OPTIMIZER_STEPS:
+            raise ValueError("R14 inpaint fresh run requires exactly 2560 optimizer steps")
+        if optimizer_checkpoint_steps != (0, _R14_REQUIRED_OPTIMIZER_STEPS):
+            raise ValueError("R14 inpaint fresh-run checkpoint steps must be exactly [0, 2560]")
+        if resume_mode != _RESUME_MODE_MODEL_WEIGHTS_ONLY:
+            raise ValueError("R14 inpaint fresh run requires resume_mode='model_weights_only'")
+        if resume_checkpoint_model != _RESUME_CHECKPOINT_MODEL_EMA:
+            raise ValueError("R14 inpaint fresh run requires resume_checkpoint_model='ema'")
+        if (
+            config.get("resume_from") != R13_SOURCE_CHECKPOINT
+            or config.get("resume_from_sha256") != R13_SOURCE_CHECKPOINT_SHA256
+        ):
+            raise ValueError("R14 inpaint fresh run requires the locked E15 EMA source")
+        if batch_config.per_device_batch_size != 2 or batch_config.global_batch_size != 8:
+            raise ValueError("R14 inpaint four-GPU fresh run requires per_device_batch_size=2 and global_batch_size=8")
+    else:
+        if required_optimizer_steps != int(resume_contract["target_global_step"]):
+            raise ValueError("R14 resume requires optimizer target global_step=2688")
+        if optimizer_checkpoint_steps != (int(resume_contract["target_global_step"]),):
+            raise ValueError("R14 resume checkpoint steps must be exactly [2688]")
+        if resume_mode != _RESUME_MODE_TRAINING_STATE:
+            raise ValueError("R14 resume requires resume_mode='training_state'")
+        if resume_checkpoint_model != _RESUME_CHECKPOINT_MODEL_RAW:
+            raise ValueError("R14 resume requires resume_checkpoint_model='raw'")
+        if config.get("resume_optimizer_state") is not True:
+            raise ValueError("R14 resume requires resume_optimizer_state=true")
+        if config.get("resume_from") != _R14_RESUME_SOURCE_CHECKPOINT:
+            raise ValueError(f"R14 resume requires source checkpoint {_R14_RESUME_SOURCE_CHECKPOINT!r}")
+        if (
+            batch_config.per_device_batch_size != int(resume_contract["target_per_device_batch_size"])
+            or batch_config.global_batch_size != int(resume_contract["target_global_batch_size"])
+        ):
+            raise ValueError("R14 resume requires per_device_batch_size=2 and global_batch_size=4")
     if not generator_config.learned_null_condition:
         raise ValueError("R14 inpaint requires learned_null_condition=true")
     if "latent_perceptual_loss" in config:
@@ -3499,8 +3704,6 @@ def _validate_r14_inpaint_training_contract(
         raise ValueError("R14 inpaint feasibility requires validation.enabled=false")
     if not ema_config["enabled"] or not ema_config["save_ema_checkpoint"]:
         raise ValueError("R14 inpaint requires enabled, checkpointed EMA")
-    if batch_config.per_device_batch_size != 2 or batch_config.global_batch_size != 8:
-        raise ValueError("R14 inpaint four-GPU run requires per_device_batch_size=2 and global_batch_size=8")
     spatial = _require_mapping(config, "r14_spatial", "train_g config")
     expected_spatial = {
         "contract_type",
@@ -3878,6 +4081,13 @@ def _stage2_training_uses_resume_checkpoint(stages: dict, resume_progress: _Resu
 def _resume_history_for_checkpoint_selection(history: list[dict], checkpoint_path: str, config: dict, stages: dict) -> list[dict]:
     if not isinstance(history, list):
         raise ValueError(f"resume_from checkpoint history must be a list: {checkpoint_path}")
+    validation = config.get("validation")
+    if isinstance(validation, Mapping) and validation.get("enabled") is False:
+        for index, item in enumerate(history):
+            if not isinstance(item, dict):
+                raise ValueError(f"resume history item {index} must be a mapping")
+            _validate_last_checkpoint_metrics(item, f"resume history item {index}")
+        return list(history)
     invalid_history = []
     for index, item in enumerate(history):
         try:
@@ -5758,6 +5968,10 @@ def _save_generator(
             training_config[field] = metrics[field]
         elif field in train_config:
             training_config[field] = train_config[field]
+    if "r14_contract" in train_config:
+        training_config["r14_contract"] = train_config["r14_contract"]
+    if "r14_resume_contract" in train_config:
+        training_config["r14_resume_contract"] = dict(train_config["r14_resume_contract"])
     if "loss_weighting" in train_config:
         training_config["loss_weighting"] = train_config["loss_weighting"]
     if "resume_from_legacy_stage1_metrics" in train_config:
