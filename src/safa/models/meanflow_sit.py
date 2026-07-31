@@ -425,6 +425,7 @@ def build_meanflow_sit_generator(config):
                 clean_latents = {
                     "target_clean_latent": x_data[active_mask].detach(),
                     "predicted_clean_latent": predicted_clean[active_mask],
+                    "sampled_noise": eps.detach(),
                     "noisy_latent": z_t.detach(),
                     "sampled_interval_velocity": predicted_velocity,
                     "sampled_r": r.detach(),

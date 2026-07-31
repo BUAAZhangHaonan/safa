@@ -257,20 +257,113 @@ def test_meanflow_clean_latent_rejects_pixel_mode_and_non_bool_opt_in() -> None:
         )
 
 
-def test_r13_seed1337_eight_step_probe_has_sparse_but_nonzero_active_rows() -> None:
-    from safa.models.generator import build_generator
+def _flow_rng_contract() -> dict:
+    return {
+        "contract_type": "safa_r13_dedicated_flow_rng_v1",
+        "seed": 1337,
+        "algorithm": "torch.Generator",
+        "draw_order": ["eps", "r_t_pairs", "equality_mask"],
+        "ledger_filename": "flow_rng_ledger.jsonl",
+    }
+
+
+def test_r13_batch4_eight_step_probe_uses_true_flow_draw_order_and_lpl_gradient() -> None:
+    from safa.models.generator import FlowGeneratorConfig, build_generator
+    from safa.training.g_loop import _GeneratorTrainingStep
+    from safa.training.latent_codec import LatentCodec, LatentCodecConfig
+    from safa.training.latent_perceptual_loss import LatentPerceptualLossRuntime
 
     config = _latent_meanflow_config()
     config["meanflow_ratio_r_not_equal_t"] = 0.75
-    generator = build_generator(config)
-    rng = torch.Generator().manual_seed(1337)
-    active_counts = []
-    for _ in range(8):
-        r, t = generator._sample_t_r(2, device="cpu", dtype=torch.float32, generator=rng)
-        active_counts.append(int(((r == t) & (t / (1.0 - t) <= 3.0)).sum().item()))
+    generator_config = FlowGeneratorConfig.from_dict(config)
+    control_generator = build_generator(config)
+    lpl_generator = build_generator(config)
+    with torch.no_grad():
+        control_generator.vector_field.final_layer.linear.weight.normal_()
+        control_generator.vector_field.final_layer.linear.bias.normal_()
+    lpl_generator.load_state_dict(control_generator.state_dict())
+    codec = LatentCodec(_FakeVAE(), LatentCodecConfig(source="fake", scaling_factor=1.0))
+    control = _GeneratorTrainingStep(
+        control_generator,
+        nn.Identity(),
+        generator_config,
+        1337,
+        latent_codec=codec,
+        latent_perceptual_loss_runtime=LatentPerceptualLossRuntime(enabled=False),
+        flow_matching_rng_contract=_flow_rng_contract(),
+    )
+    lpl = _GeneratorTrainingStep(
+        lpl_generator,
+        nn.Identity(),
+        generator_config,
+        1337,
+        latent_codec=codec,
+        latent_perceptual_loss_runtime=LatentPerceptualLossRuntime(enabled=True),
+        flow_matching_rng_contract=_flow_rng_contract(),
+    )
+    encoded = torch.randn(4, 4, 8, 8)
+    condition = torch.randn(4, 8)
+    cumulative_active = 0
+    observed_nonzero_lpl_gradient = False
 
-    assert active_counts == [2, 0, 0, 0, 0, 0, 0, 0]
-    assert sum(active_counts) > 0
+    for _ in range(8):
+        control_generator.zero_grad(set_to_none=True)
+        lpl_generator.zero_grad(set_to_none=True)
+        control_loss, control_metrics = control._compute_flow_loss(
+            encoded, condition, "embedding", encoded_flow_images=encoded
+        )
+        lpl_loss, lpl_metrics = lpl._compute_flow_loss(
+            encoded, condition, "embedding", encoded_flow_images=encoded
+        )
+        assert control._last_flow_rng_draw == lpl._last_flow_rng_draw
+        assert torch.equal(control_metrics["flow_matching_mse"], lpl_metrics["flow_matching_mse"])
+        cumulative_active += int(lpl._last_flow_rng_draw["active_count"])
+        control_loss.backward()
+        lpl_loss.backward()
+        control_gradients = dict(control_generator.named_parameters())
+        for name, lpl_parameter in lpl_generator.named_parameters():
+            control_gradient = control_gradients[name].grad
+            lpl_gradient = lpl_parameter.grad
+            if (
+                control_gradient is not None
+                and lpl_gradient is not None
+                and not torch.equal(control_gradient, lpl_gradient)
+            ):
+                observed_nonzero_lpl_gradient = True
+
+    assert cumulative_active > 0
+    assert observed_nonzero_lpl_gradient
+
+
+def test_non_r13_flow_rng_keeps_legacy_global_rng_semantics() -> None:
+    from safa.models.generator import FlowGeneratorConfig, build_generator
+    from safa.training.g_loop import _GeneratorTrainingStep
+    from safa.training.latent_perceptual_loss import LatentPerceptualLossRuntime
+
+    generator_config = FlowGeneratorConfig.from_dict(_latent_meanflow_config())
+    direct_generator = build_generator(generator_config.to_dict())
+    module_generator = build_generator(generator_config.to_dict())
+    module_generator.load_state_dict(direct_generator.state_dict())
+    module = _GeneratorTrainingStep(
+        module_generator,
+        nn.Identity(),
+        generator_config,
+        7,
+        latent_perceptual_loss_runtime=LatentPerceptualLossRuntime(enabled=False),
+    )
+    encoded = torch.randn(4, 4, 8, 8)
+    condition = torch.randn(4, 8)
+    state = torch.random.get_rng_state()
+    direct_loss, direct_metrics = direct_generator.flow_matching_loss(encoded, condition)
+    torch.random.set_rng_state(state)
+    module_loss, module_metrics = module._compute_flow_loss(
+        encoded, condition, "embedding", encoded_flow_images=encoded
+    )
+
+    assert torch.equal(direct_loss, module_loss)
+    assert torch.equal(direct_metrics["flow_matching_mse"], module_metrics["flow_matching_mse"])
+    assert module._flow_generator is None
+    assert module._last_flow_rng_draw == {}
 
 
 def _lpl_config_payload(*, enabled: bool) -> dict:
@@ -532,14 +625,36 @@ def test_r13_control_and_lpl_configs_bind_conditioning_ema_and_7500_steps(enable
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     config.update(
         {
+            "r13_arm_id": "lpl" if enabled else "control",
             "generator_trainable": "conditioning_only",
             "resume_mode": "model_weights_only",
             "resume_checkpoint_model": "ema",
             "resume_optimizer_state": False,
+            "resume_from": (
+                "artifacts/checkpoints/e15_meanflow_sit_b_face_mixed_h100_resume_2400ep/"
+                "last_nopretrained.pt"
+            ),
+            "resume_from_sha256": "4690717781db58a6021d57d124300a9b212f0a5043cf3028fb5de4d9c835cc4d",
+            "global_batch_size": 4,
+            "per_device_batch_size": 4,
+            "world_size": 1,
             "latent_perceptual_loss": _lpl_config_payload(enabled=enabled),
             "optimizer_step_contract": {
                 "contract_type": "safa_r13_exact_optimizer_steps_v1",
                 "required_steps": 7500,
+            },
+            "optimizer_checkpoint_contract": {
+                "contract_type": "safa_r13_optimizer_checkpoint_steps_v1",
+                "save_steps": [0, 2500, 5000, 7500],
+            },
+            "flow_matching_rng_contract": _flow_rng_contract(),
+            "train_order_contract": {
+                "contract_type": "safa_r13_locked_train_order_v1",
+                "path": "artifacts/r13_control_lpl_training/preparation_v1/train_order_seed1337.jsonl",
+                "sha256": "05e805511058f241cc35f1b7c1086b30354f6d80756009cc9997a47904424e41",
+                "seed": 1337,
+                "sample_count": 30000,
+                "batch_size": 4,
             },
         }
     )
@@ -547,5 +662,5 @@ def test_r13_control_and_lpl_configs_bind_conditioning_ema_and_7500_steps(enable
     g_loop._validate_train_g_config(config)
 
     config["optimizer_step_contract"]["required_steps"] = 7499
-    with pytest.raises(ValueError, match="required_steps=7500"):
+    with pytest.raises(ValueError, match="required_steps"):
         g_loop._validate_train_g_config(config)

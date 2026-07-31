@@ -51,6 +51,11 @@ from safa.training.projected_update import (
     update_two_task_famo_logits,
 )
 from safa.training.representation_losses import hyperspherical_gram_loss, hyperspherical_point_cosine_loss
+from safa.training.r13_training_contract import (
+    R13_SOURCE_CHECKPOINT,
+    R13_SOURCE_CHECKPOINT_SHA256,
+    build_r13_training_contract,
+)
 from safa.training.multitask_loss import UncertaintyWeightedLoss
 from safa.training.transforms import generator_image_transform
 from safa.utils.device import assert_finite_tensor
@@ -100,6 +105,10 @@ _RESUME_CHECKPOINT_MODEL_EMA = "ema"
 _RESUME_CHECKPOINT_MODELS = (_RESUME_CHECKPOINT_MODEL_RAW, _RESUME_CHECKPOINT_MODEL_EMA)
 _R13_OPTIMIZER_STEP_CONTRACT = "safa_r13_exact_optimizer_steps_v1"
 _R13_REQUIRED_OPTIMIZER_STEPS = 7500
+_R13_OPTIMIZER_CHECKPOINT_CONTRACT = "safa_r13_optimizer_checkpoint_steps_v1"
+_R13_LOCKED_TRAIN_ORDER_CONTRACT = "safa_r13_locked_train_order_v1"
+_R13_ACTIVE_ROW_PROBE_CONTRACT = "safa_r13_active_row_probe_v1"
+_R13_FLOW_RNG_CONTRACT = "safa_r13_dedicated_flow_rng_v1"
 
 
 @dataclass(frozen=True)
@@ -198,6 +207,7 @@ class _GeneratorTrainingStep:
         stage2_objective: _Stage2ObjectiveRuntime | None = None,
         latent_codec=None,
         latent_perceptual_loss_runtime: LatentPerceptualLossRuntime | None = None,
+        flow_matching_rng_contract: Mapping | None = None,
     ):
         from torch import nn
         schedule = generator_config.cycle_steps_schedule
@@ -219,6 +229,14 @@ class _GeneratorTrainingStep:
                     else LatentPerceptualLossRuntime(enabled=False)
                 )
                 self._last_latent_perceptual_metrics: dict[str, float] = {}
+                self._last_flow_rng_draw: dict[str, object] = {}
+                self._flow_generator = None
+                if flow_matching_rng_contract is not None:
+                    import torch
+
+                    parameter = next(self.generator.parameters())
+                    self._flow_generator = torch.Generator(device=parameter.device)
+                    self._flow_generator.manual_seed(int(flow_matching_rng_contract["seed"]))
                 self._schedule = schedule
                 self._batch_idx = 0
                 self.last_loss_metrics: dict[str, float | str] = {}
@@ -489,14 +507,21 @@ class _GeneratorTrainingStep:
                 condition_z = self._flow_condition_z(z, flow_condition)
                 flow_images = encoded_flow_images if encoded_flow_images is not None else self._encode_flow_images(images)
                 self._last_latent_perceptual_metrics = {}
-                if not self.latent_perceptual_loss_runtime.enabled:
-                    return self.generator.flow_matching_loss(flow_images, condition_z, generator=noise_generator)
+                self._last_flow_rng_draw = {}
+                effective_generator = noise_generator if noise_generator is not None else self._flow_generator
+                capture_flow_draw = self._flow_generator is not None and noise_generator is None
+                if not self.latent_perceptual_loss_runtime.enabled and not capture_flow_draw:
+                    return self.generator.flow_matching_loss(flow_images, condition_z, generator=effective_generator)
                 flow_loss, flow_metrics, clean_latents = self.generator.flow_matching_loss(
                     flow_images,
                     condition_z,
-                    generator=noise_generator,
+                    generator=effective_generator,
                     return_clean_latents=True,
                 )
+                if capture_flow_draw:
+                    self._last_flow_rng_draw = _flow_rng_draw_record(clean_latents)
+                if not self.latent_perceptual_loss_runtime.enabled:
+                    return flow_loss, flow_metrics
                 perceptual_loss, perceptual_metrics = decoder_latent_perceptual_loss(
                     self.latent_codec,
                     clean_latents,
@@ -1321,6 +1346,20 @@ def _resume_checkpoint_state_dict(checkpoint: Mapping, selector: str, checkpoint
     return state_dict, state_key
 
 
+def _verify_resume_checkpoint_sha256(config: Mapping, checkpoint_path: Path) -> None:
+    expected = config.get("resume_from_sha256")
+    if expected is None:
+        return
+    if not isinstance(expected, str) or len(expected) != 64 or any(ch not in "0123456789abcdef" for ch in expected):
+        raise ValueError("resume_from_sha256 must be a lowercase SHA-256 digest")
+    digest = hashlib.sha256()
+    with checkpoint_path.open("rb") as handle:
+        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    if digest.hexdigest() != expected:
+        raise ValueError(f"resume_from checkpoint SHA-256 mismatch: {checkpoint_path}")
+
+
 def _optimizer_step_contract(config: Mapping) -> int | None:
     payload = config.get("optimizer_step_contract")
     if payload is None:
@@ -1340,6 +1379,218 @@ def _optimizer_step_contract(config: Mapping) -> int | None:
     if unexpected:
         raise ValueError(f"{context} has unexpected fields: {unexpected!r}")
     return int(required_steps)
+
+
+def _optimizer_checkpoint_steps(config: Mapping, required_steps: int | None) -> tuple[int, ...]:
+    payload = config.get("optimizer_checkpoint_contract")
+    if payload is None:
+        return ()
+    if required_steps is None:
+        raise ValueError("optimizer_checkpoint_contract requires optimizer_step_contract")
+    if not isinstance(payload, Mapping):
+        raise ValueError("train_g config.optimizer_checkpoint_contract must be a mapping")
+    context = "train_g config.optimizer_checkpoint_contract"
+    if payload.get("contract_type") != _R13_OPTIMIZER_CHECKPOINT_CONTRACT:
+        raise ValueError(
+            f"{context}.contract_type must equal {_R13_OPTIMIZER_CHECKPOINT_CONTRACT!r}"
+        )
+    unexpected = sorted(set(payload) - {"contract_type", "save_steps"})
+    if unexpected:
+        raise ValueError(f"{context} has unexpected fields: {unexpected!r}")
+    raw_steps = payload.get("save_steps")
+    if not isinstance(raw_steps, list) or not raw_steps:
+        raise ValueError(f"{context}.save_steps must be a non-empty list")
+    if any(isinstance(step, bool) or not isinstance(step, int) for step in raw_steps):
+        raise ValueError(f"{context}.save_steps must contain integers")
+    steps = tuple(int(step) for step in raw_steps)
+    if steps != tuple(sorted(set(steps))):
+        raise ValueError(f"{context}.save_steps must be strictly increasing and unique")
+    if steps[0] != 0 or steps[-1] != required_steps:
+        raise ValueError(
+            f"{context}.save_steps must start at 0 and end at required_steps={required_steps}"
+        )
+    return steps
+
+
+def _r13_active_row_probe_contract(config: Mapping) -> dict | None:
+    payload = config.get("r13_active_row_probe")
+    if payload is None:
+        return None
+    if not isinstance(payload, Mapping):
+        raise ValueError("train_g config.r13_active_row_probe must be a mapping")
+    expected_fields = {
+        "contract_type",
+        "arm_id",
+        "required_steps",
+        "batch_size",
+        "require_cumulative_active_rows",
+    }
+    if set(payload) != expected_fields:
+        raise ValueError(
+            "train_g config.r13_active_row_probe fields must match the registered schema exactly"
+        )
+    arm_id = payload.get("arm_id")
+    if arm_id not in {"control", "lpl"}:
+        raise ValueError("r13_active_row_probe.arm_id must be 'control' or 'lpl'")
+    if payload.get("contract_type") != _R13_ACTIVE_ROW_PROBE_CONTRACT:
+        raise ValueError("r13_active_row_probe.contract_type mismatch")
+    if payload.get("required_steps") != 8 or payload.get("batch_size") != 4:
+        raise ValueError("r13_active_row_probe requires exactly 8 optimizer steps at batch_size=4")
+    required_active = payload.get("require_cumulative_active_rows")
+    if type(required_active) is not bool or required_active != (arm_id == "lpl"):
+        raise ValueError(
+            "r13_active_row_probe.require_cumulative_active_rows must be true only for the LPL arm"
+        )
+    return dict(payload)
+
+
+def _locked_train_order_contract(config: Mapping) -> dict | None:
+    payload = config.get("train_order_contract")
+    if payload is None:
+        return None
+    if not isinstance(payload, Mapping):
+        raise ValueError("train_g config.train_order_contract must be a mapping")
+    expected_fields = {
+        "contract_type",
+        "path",
+        "sha256",
+        "seed",
+        "sample_count",
+        "batch_size",
+    }
+    if set(payload) != expected_fields:
+        raise ValueError(
+            "train_g config.train_order_contract fields must match the registered schema exactly"
+        )
+    if payload.get("contract_type") != _R13_LOCKED_TRAIN_ORDER_CONTRACT:
+        raise ValueError("train_order_contract.contract_type mismatch")
+    path = payload.get("path")
+    digest = payload.get("sha256")
+    if not isinstance(path, str) or not path:
+        raise ValueError("train_order_contract.path must be a non-empty string")
+    if not isinstance(digest, str) or len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+        raise ValueError("train_order_contract.sha256 must be lowercase SHA-256")
+    if payload.get("seed") != 1337:
+        raise ValueError("train_order_contract.seed must be 1337")
+    sample_count = payload.get("sample_count")
+    batch_size = payload.get("batch_size")
+    if sample_count != 30000 or batch_size != 4:
+        raise ValueError("train_order_contract requires sample_count=30000 and batch_size=4")
+    return dict(payload)
+
+
+def _flow_matching_rng_contract(config: Mapping) -> dict | None:
+    payload = config.get("flow_matching_rng_contract")
+    if payload is None:
+        return None
+    if not isinstance(payload, Mapping):
+        raise ValueError("train_g config.flow_matching_rng_contract must be a mapping")
+    expected = {
+        "contract_type": _R13_FLOW_RNG_CONTRACT,
+        "seed": 1337,
+        "algorithm": "torch.Generator",
+        "draw_order": ["eps", "r_t_pairs", "equality_mask"],
+        "ledger_filename": "flow_rng_ledger.jsonl",
+    }
+    if dict(payload) != expected:
+        raise ValueError("flow_matching_rng_contract differs from the registered R13 contract")
+    return dict(payload)
+
+
+def _tensor_sha256(value) -> str:
+    tensor = value.detach().to(device="cpu").contiguous()
+    return hashlib.sha256(tensor.numpy().tobytes(order="C")).hexdigest()
+
+
+def _flow_rng_draw_record(clean_latents: Mapping) -> dict[str, object]:
+    required = {"sampled_noise", "sampled_r", "sampled_t", "active_mask"}
+    missing = sorted(required - set(clean_latents))
+    if missing:
+        raise RuntimeError(f"R13 flow RNG capture is missing fields: {missing!r}")
+    eps = clean_latents["sampled_noise"]
+    sampled_r = clean_latents["sampled_r"]
+    sampled_t = clean_latents["sampled_t"]
+    active_mask = clean_latents["active_mask"]
+    return {
+        "eps_sha256": _tensor_sha256(eps),
+        "sampled_r_sha256": _tensor_sha256(sampled_r),
+        "sampled_t_sha256": _tensor_sha256(sampled_t),
+        "active_count": int(active_mask.sum().item()),
+    }
+
+
+def _append_flow_rng_ledger(path: Path, global_step: int, draw: Mapping) -> None:
+    expected = {"eps_sha256", "sampled_r_sha256", "sampled_t_sha256", "active_count"}
+    if set(draw) != expected:
+        raise RuntimeError("R13 flow RNG draw record fields differ")
+    row = {"global_step": int(global_step), **dict(draw)}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
+
+
+def _validate_r13_active_row_probe_metrics(config: Mapping, metrics: Mapping) -> None:
+    contract = _r13_active_row_probe_contract(config)
+    if contract is None or not contract["require_cumulative_active_rows"]:
+        return
+    active_rows = metrics.get("r13_cumulative_active_rows")
+    if isinstance(active_rows, bool) or not isinstance(active_rows, int) or active_rows <= 0:
+        raise RuntimeError("R13 LPL active-row probe observed no active row across 8 true flow draws")
+    lpl_value = metrics.get("latent_perceptual_loss_raw")
+    if isinstance(lpl_value, bool) or not isinstance(lpl_value, (int, float)) or not math.isfinite(float(lpl_value)) or float(lpl_value) <= 0.0:
+        raise RuntimeError("R13 LPL active-row probe observed no positive finite LPL loss")
+
+
+class _LockedOrderSampler:
+    def __init__(self, indices: tuple[int, ...]):
+        self.indices = indices
+
+    def __iter__(self):
+        return iter(self.indices)
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def set_epoch(self, epoch: int) -> None:
+        if epoch != 0:
+            raise RuntimeError("locked one-epoch train order only permits epoch 0")
+
+
+def _locked_train_order_indices(train_set, contract: Mapping) -> tuple[int, ...]:
+    manifest_path = Path(str(contract["path"]))
+    if not manifest_path.is_absolute():
+        manifest_path = _REPO_ROOT / manifest_path
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"locked train order manifest not found: {manifest_path}")
+    digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    if digest != contract["sha256"]:
+        raise ValueError("locked train order manifest SHA-256 mismatch")
+    records = getattr(train_set, "records", None)
+    if records is None or len(records) != contract["sample_count"]:
+        raise ValueError("locked train order sample count differs from the training dataset")
+    rows = []
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                raise ValueError(f"locked train order contains a blank row at line {line_number}")
+            row = json.loads(line)
+            expected_fields = {"order_ordinal", "source_index", "sample_id", "batch_index", "batch_offset"}
+            if not isinstance(row, dict) or set(row) != expected_fields:
+                raise ValueError(f"locked train order row {line_number} fields differ")
+            order_ordinal = line_number - 1
+            source_index = row["source_index"]
+            if row["order_ordinal"] != order_ordinal:
+                raise ValueError(f"locked train order ordinal differs at line {line_number}")
+            if row["batch_index"] != order_ordinal // contract["batch_size"] or row["batch_offset"] != order_ordinal % contract["batch_size"]:
+                raise ValueError(f"locked train order batch coordinates differ at line {line_number}")
+            if isinstance(source_index, bool) or not isinstance(source_index, int) or not 0 <= source_index < len(records):
+                raise ValueError(f"locked train order source index differs at line {line_number}")
+            if row["sample_id"] != records[source_index].sample_id:
+                raise ValueError(f"locked train order sample_id differs at line {line_number}")
+            rows.append(source_index)
+    if len(rows) != contract["sample_count"] or set(rows) != set(range(len(records))):
+        raise ValueError("locked train order must be an exact permutation of the training dataset")
+    return tuple(rows)
 
 
 def _resume_global_step(checkpoint: Mapping, checkpoint_path: str, required_steps: int) -> int:
@@ -1699,10 +1950,15 @@ class _EpochPairingSampler:
             generator.manual_seed(self.seed + self.epoch)
 
 
-def _build_train_sampler(train_set, *, distributed: DistributedContext, seed: int):
+def _build_train_sampler(train_set, *, distributed: DistributedContext, seed: int, config: Mapping | None = None):
     import torch
     from torch.utils.data import DistributedSampler, RandomSampler
 
+    locked_contract = _locked_train_order_contract(config or {})
+    if locked_contract is not None:
+        if distributed.enabled:
+            raise ValueError("locked train order requires a single-GPU non-distributed run")
+        return _LockedOrderSampler(_locked_train_order_indices(train_set, locked_contract))
     sampler = (
         DistributedSampler(
             train_set,
@@ -1816,6 +2072,8 @@ def train_g_from_config(config: dict) -> dict:
     generator_config = _generator_config_from_train_config(config)
     latent_perceptual_loss_runtime = latent_perceptual_loss_runtime_from_config(config, generator_config)
     required_optimizer_steps = _optimizer_step_contract(config)
+    optimizer_checkpoint_steps = _optimizer_checkpoint_steps(config, required_optimizer_steps)
+    flow_matching_rng_contract = _flow_matching_rng_contract(config)
     stages = _stage_config(config)
     ema_config = _ema_config(config)
     best_model = _best_model(config, ema_config)
@@ -1875,6 +2133,7 @@ def train_g_from_config(config: dict) -> dict:
         resume_path = Path(config["resume_from"])
         if not resume_path.is_file():
             raise FileNotFoundError(f"resume_from checkpoint not found: {resume_path}")
+        _verify_resume_checkpoint_sha256(config, resume_path)
         ckpt = torch.load(resume_path, map_location=device, weights_only=True)
         checkpoint_model_state, checkpoint_model_state_key = _resume_checkpoint_state_dict(
             ckpt,
@@ -1960,6 +2219,7 @@ def train_g_from_config(config: dict) -> dict:
         stage2_objective,
         latent_codec=latent_codec,
         latent_perceptual_loss_runtime=latent_perceptual_loss_runtime,
+        flow_matching_rng_contract=flow_matching_rng_contract,
     ).to(device)
     set_seed(int(config["seed"]) + distributed.rank)
 
@@ -1972,6 +2232,7 @@ def train_g_from_config(config: dict) -> dict:
         train_set,
         distributed=distributed,
         seed=int(config["seed"]),
+        config=config,
     )
     train_loader = _build_train_loader(train_set, train_sampler=train_sampler, batch_config=batch_config, num_workers=num_workers)
     validation_loader = _build_validation_loader(config) if distributed.is_main else None
@@ -2028,6 +2289,32 @@ def train_g_from_config(config: dict) -> dict:
     stage1_stable_hits = 0
     allow_stage2_without_stage1_gate = _require_bool(config, "allow_stage2_without_stage1_gate", "train_g config")
 
+    if 0 in optimizer_checkpoint_steps and distributed.is_main:
+        initial_metrics = {
+            "stage": "stage2",
+            "stage_epoch": 0,
+            "stage_epoch_0based": 0,
+            "stage_epoch_1based": 1,
+            "loss": 0.0,
+            "global_step": 0,
+            "required_optimizer_steps": int(required_optimizer_steps),
+            "checkpoint_kind": "optimizer_step",
+            **batch_metadata,
+        }
+        _save_generator(
+            out_dir / _optimizer_step_checkpoint_filename(0),
+            unwrap_model(training_module).generator,
+            generator_config,
+            config,
+            initial_metrics,
+            history,
+            ema_model_state_dict=ema.state_dict() if ema is not None and ema_config["save_ema_checkpoint"] else None,
+            ema_config=ema_config,
+            best_model=best_model,
+            loss_weighting_state=unwrap_model(training_module).loss_weighting_checkpoint_state(),
+            optimizer_state_dict=optimizer.state_dict(),
+        )
+
     total_epoch = 0
     optimizer_step_limit_reached = False
     for stage_name in ("stage1", "stage2"):
@@ -2062,6 +2349,7 @@ def train_g_from_config(config: dict) -> dict:
             e0.eval()
             totals = _initial_epoch_totals()
             seen = 0
+            r13_cumulative_active_rows = 0
             for batch_index, batch in enumerate(tqdm(train_loader, desc=f"train_g {stage_name} epoch={stage_epoch}", disable=not distributed.is_main)):
                 images = batch["image"].to(device, non_blocking=True)
                 z = batch["z"].to(device, non_blocking=True)
@@ -2237,6 +2525,46 @@ def train_g_from_config(config: dict) -> dict:
                 totals["flow_matching_mse"] += float(flow_mse.cpu()) * batch_size
                 totals["cycle"] += float(cycle.detach().cpu()) * batch_size
                 totals["grad_norm"] += batch_grad_norm * batch_size
+                if flow_matching_rng_contract is not None:
+                    flow_draw = dict(unwrap_model(training_module)._last_flow_rng_draw)
+                    if not flow_draw:
+                        raise RuntimeError("R13 dedicated flow RNG produced no draw record")
+                    r13_cumulative_active_rows += int(flow_draw["active_count"])
+                    if distributed.is_main:
+                        _append_flow_rng_ledger(
+                            out_dir / str(flow_matching_rng_contract["ledger_filename"]),
+                            global_step,
+                            flow_draw,
+                        )
+                if global_step in optimizer_checkpoint_steps:
+                    snapshot_metrics = _reduce_epoch_metrics(totals, seen, device, distributed)
+                    if distributed.is_main:
+                        snapshot_metrics.update(
+                            {
+                                "stage": stage_name,
+                                "stage_epoch": stage_epoch,
+                                "stage_epoch_0based": stage_epoch,
+                                "stage_epoch_1based": stage_epoch + 1,
+                                "global_step": int(global_step),
+                                "required_optimizer_steps": int(required_optimizer_steps),
+                                "checkpoint_kind": "optimizer_step",
+                                "r13_cumulative_active_rows": int(r13_cumulative_active_rows),
+                                **batch_metadata,
+                            }
+                        )
+                        _save_generator(
+                            out_dir / _optimizer_step_checkpoint_filename(global_step),
+                            unwrap_model(training_module).generator,
+                            generator_config,
+                            config,
+                            snapshot_metrics,
+                            history,
+                            ema_model_state_dict=ema.state_dict() if ema is not None and ema_config["save_ema_checkpoint"] else None,
+                            ema_config=ema_config,
+                            best_model=best_model,
+                            loss_weighting_state=unwrap_model(training_module).loss_weighting_checkpoint_state(),
+                            optimizer_state_dict=optimizer.state_dict(),
+                        )
                 if optimizer_step_limit_reached:
                     break
 
@@ -2261,6 +2589,9 @@ def train_g_from_config(config: dict) -> dict:
                 if required_optimizer_steps is not None:
                     metrics["global_step"] = int(global_step)
                     metrics["required_optimizer_steps"] = int(required_optimizer_steps)
+                if flow_matching_rng_contract is not None:
+                    metrics["r13_cumulative_active_rows"] = int(r13_cumulative_active_rows)
+                    _validate_r13_active_row_probe_metrics(config, metrics)
                 if loss_weighting_runtime.type == "uncertainty":
                     metrics["lambda_cycle_legacy_schedule"] = lambda_cycle
                 raw_validation_metrics = None
@@ -2810,12 +3141,22 @@ def _validate_train_g_config(config: dict) -> None:
     validate_latent_training_config(config, generator_config)
     latent_perceptual_loss_runtime = latent_perceptual_loss_runtime_from_config(config, generator_config)
     required_optimizer_steps = _optimizer_step_contract(config)
+    optimizer_checkpoint_steps = _optimizer_checkpoint_steps(config, required_optimizer_steps)
+    active_row_probe = _r13_active_row_probe_contract(config)
+    locked_train_order = _locked_train_order_contract(config)
+    flow_rng = _flow_matching_rng_contract(config)
     if "latent_perceptual_loss" in config:
-        if required_optimizer_steps != _R13_REQUIRED_OPTIMIZER_STEPS:
+        expected_steps = 8 if active_row_probe is not None else _R13_REQUIRED_OPTIMIZER_STEPS
+        if required_optimizer_steps != expected_steps:
             raise ValueError(
                 "R13 latent_perceptual_loss control/LPL arms require "
-                f"optimizer_step_contract.required_steps={_R13_REQUIRED_OPTIMIZER_STEPS}"
+                f"optimizer_step_contract.required_steps={expected_steps}"
             )
+        arm_id = config.get("r13_arm_id")
+        if arm_id not in {"control", "lpl"} or latent_perceptual_loss_runtime.enabled != (arm_id == "lpl"):
+            raise ValueError("R13 r13_arm_id and latent_perceptual_loss.enabled disagree")
+        if active_row_probe is not None and active_row_probe["arm_id"] != arm_id:
+            raise ValueError("R13 active-row probe arm_id differs from r13_arm_id")
         if generator_trainable_mode != _GENERATOR_TRAINABLE_CONDITIONING_ONLY:
             raise ValueError("R13 latent_perceptual_loss control/LPL arms require generator_trainable='conditioning_only'")
         if resume_mode != _RESUME_MODE_MODEL_WEIGHTS_ONLY or resume_checkpoint_model != _RESUME_CHECKPOINT_MODEL_EMA:
@@ -2825,6 +3166,14 @@ def _validate_train_g_config(config: dict) -> None:
             )
         if not str(config.get("resume_from", "") or ""):
             raise ValueError("R13 latent_perceptual_loss control/LPL arms require an explicit resume_from checkpoint")
+        if config.get("resume_from") != R13_SOURCE_CHECKPOINT or config.get("resume_from_sha256") != R13_SOURCE_CHECKPOINT_SHA256:
+            raise ValueError("R13 latent_perceptual_loss control/LPL arms require the locked E15 EMA source")
+        if locked_train_order is None or flow_rng is None:
+            raise ValueError("R13 control/LPL arms require locked train order and dedicated flow RNG contracts")
+        if active_row_probe is None and optimizer_checkpoint_steps != (0, 2500, 5000, 7500):
+            raise ValueError("R13 full arms require optimizer checkpoint steps [0,2500,5000,7500]")
+        if active_row_probe is not None and optimizer_checkpoint_steps:
+            raise ValueError("R13 disposable probes must not write optimizer-step checkpoint snapshots")
     _require_bool(config, "allow_stage2_without_stage1_gate", "train_g config")
     stages = _stage_config(config)
     ema_config = _ema_config(config)
@@ -2853,6 +3202,12 @@ def _validate_train_g_config(config: dict) -> None:
     _stage2_lambda_schedule(stages, loss_weighting, stage2_objective)
     _validate_stage1_gate_config(stages["stage1"])
     batch_config = _training_batch_config(config)
+    if "latent_perceptual_loss" in config and (
+        batch_config.global_batch_size != 4
+        or batch_config.per_device_batch_size != 4
+        or batch_config.world_size != 1
+    ):
+        raise ValueError("R13 control/LPL arms require single-GPU global/per-device batch_size=4")
     gradient_conflict = _stage2_gradient_conflict_config(stages)
     if gradient_conflict.enabled:
         if gradient_conflict.max_samples is None:
@@ -5069,6 +5424,12 @@ def _is_better_overall(metrics: dict, previous: list[dict], best_model: str = "r
     return (current_score, -metrics["loss"]) > (_composite_score(best, best_model), -best["loss"])
 
 
+def _optimizer_step_checkpoint_filename(global_step: int) -> str:
+    if isinstance(global_step, bool) or not isinstance(global_step, int) or global_step < 0:
+        raise ValueError("optimizer checkpoint global_step must be a non-negative integer")
+    return f"step_{global_step:08d}.pt"
+
+
 def _save_generator(
     path: Path,
     generator,
@@ -5119,6 +5480,7 @@ def _save_generator(
         training_config["seed"] = train_config["seed"]
     if "sampling_seed" in train_config and train_config["sampling_seed"] is not None:
         training_config["sampling_seed"] = train_config["sampling_seed"]
+    r13_training_contract = build_r13_training_contract(train_config, generator)
     payload = {
         "model_state_dict": generator.state_dict(),
         "model_config": generator_config.to_dict(),
@@ -5135,6 +5497,8 @@ def _save_generator(
         "history": history,
         "training_config": training_config,
     }
+    if r13_training_contract is not None:
+        payload["r13_training_contract"] = r13_training_contract
     if loss_weighting_state is not None:
         payload["loss_weighting_state"] = loss_weighting_state
     if optimizer_state_dict is not None:
