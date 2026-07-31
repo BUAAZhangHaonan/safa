@@ -377,7 +377,11 @@ def build_meanflow_sit_generator(config):
             velocity = self.vector_field(x, r_batch, t_batch, z)
             return x - horizon * velocity
 
-        def flow_matching_loss(self, x_1, z, generator=None):
+        def flow_matching_loss(self, x_1, z, generator=None, *, return_clean_latents: bool = False):
+            if not isinstance(return_clean_latents, bool):
+                raise TypeError(
+                    f"return_clean_latents must be a bool, got {type(return_clean_latents).__name__}"
+                )
             self._validate_z(z)
             if x_1.ndim != 4 or tuple(x_1.shape[1:]) != (config.sit_input_channels, self.image_size, self.image_size):
                 raise ValueError(
@@ -394,10 +398,44 @@ def build_meanflow_sit_generator(config):
             error = predicted_velocity - meanflow_target.detach()
             raw_mse = error.square().mean()
             loss = self._weighted_loss(error)
+            clean_latents = None
+            if return_clean_latents:
+                if config.sit_data_space != "latent" or config.sit_input_channels != 4:
+                    raise RuntimeError(
+                        "return_clean_latents requires latent MeanFlow with sit_data_space='latent' "
+                        "and sit_input_channels=4"
+                    )
+                one_minus_t = 1.0 - t
+                if torch.any(one_minus_t <= 0.0).item():
+                    raise RuntimeError("MeanFlow LPL requires sampled_t < 1 for finite SNR")
+                snr = t / one_minus_t
+                active_mask = torch.eq(r, t) & (snr <= 3.0)
+                predicted_clean = z_t - view_t * predicted_velocity
+                for name, value in (
+                    ("target_clean_latent", x_data),
+                    ("predicted_clean_latent", predicted_clean),
+                    ("noisy_latent", z_t),
+                    ("sampled_interval_velocity", predicted_velocity),
+                    ("sampled_r", r),
+                    ("sampled_t", t),
+                    ("snr", snr),
+                ):
+                    if not torch.isfinite(value).all().item():
+                        raise RuntimeError(f"MeanFlow {name} contains non-finite values")
+                clean_latents = {
+                    "target_clean_latent": x_data[active_mask].detach(),
+                    "predicted_clean_latent": predicted_clean[active_mask],
+                    "noisy_latent": z_t.detach(),
+                    "sampled_interval_velocity": predicted_velocity,
+                    "sampled_r": r.detach(),
+                    "sampled_t": t.detach(),
+                    "snr": snr.detach(),
+                    "active_mask": active_mask.detach(),
+                }
             # DDP: keep null_condition.embedding in autograd graph even when unused
             if self.null_condition is not None:
                 loss = loss + 0.0 * self.null_condition.embedding.sum()
-            return loss, {
+            metrics = {
                 "flow_matching_mse": raw_mse.detach(),
                 "meanflow_raw_mse": raw_mse.detach(),
                 "meanflow_backbone": "sit",
@@ -413,6 +451,9 @@ def build_meanflow_sit_generator(config):
                 "target_velocity_abs_mean": target_velocity.detach().abs().mean(),
                 "predicted_velocity_abs_mean": predicted_velocity.detach().abs().mean(),
             }
+            if clean_latents is not None:
+                return loss, metrics, clean_latents
+            return loss, metrics
 
         def make_null_condition(self, *, batch_size: int, device, dtype):
             if self.null_condition is None:

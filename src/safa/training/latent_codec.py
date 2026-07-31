@@ -49,6 +49,74 @@ class LatentCodec:
             raise RuntimeError("VAE decode output must expose a tensor sample")
         return sample.add(1.0).mul(0.5).clamp(0.0, 1.0)
 
+    def decode_intermediate_features(self, latents: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Decode latents through explicit frozen VAE decoder block boundaries.
+
+        The returned tensors are the decoder ``conv_in``, ``mid_block``, and
+        ordered ``up_blocks`` outputs.  This deliberately does not return the
+        final RGB output and does not use forward hooks.  Gradients therefore
+        flow to ``latents`` through frozen decoder weights, while the VAE
+        remains outside the optimizer.
+        """
+
+        self._validate_latents(latents)
+        self._assert_decoder_feature_runtime()
+        self._assert_finite_tensor("decoder feature input latents", latents)
+
+        sample = latents / self.scaling_factor
+        post_quant_conv = self.vae.post_quant_conv
+        if post_quant_conv is not None:
+            sample = post_quant_conv(sample)
+
+        decoder = self.vae.decoder
+        sample = decoder.conv_in(sample)
+        features = {"conv_in": self._finite_decoder_feature("conv_in", sample)}
+        sample = decoder.mid_block(sample, None)
+        features["mid_block"] = self._finite_decoder_feature("mid_block", sample)
+        for index, up_block in enumerate(decoder.up_blocks):
+            sample = up_block(sample, None)
+            name = f"up_block_{index}"
+            features[name] = self._finite_decoder_feature(name, sample)
+        if not features:
+            raise RuntimeError("VAE decoder produced no intermediate features")
+        return features
+
+    def _assert_decoder_feature_runtime(self) -> None:
+        if self.vae.training:
+            raise RuntimeError("VAE must remain in eval mode for decoder intermediate features")
+        trainable = [name for name, parameter in self.vae.named_parameters() if parameter.requires_grad]
+        if trainable:
+            raise RuntimeError(f"VAE must remain frozen for decoder intermediate features; trainable={trainable}")
+        if bool(getattr(self.vae, "use_tiling", False)):
+            raise RuntimeError("decoder intermediate features do not support VAE tiling")
+        for name in ("post_quant_conv", "decoder"):
+            if not hasattr(self.vae, name):
+                raise RuntimeError(f"VAE missing required decoder feature attribute {name!r}")
+        decoder = self.vae.decoder
+        for name in ("conv_in", "mid_block", "up_blocks"):
+            if not hasattr(decoder, name):
+                raise RuntimeError(f"VAE decoder missing required intermediate feature attribute {name!r}")
+        try:
+            up_block_count = len(decoder.up_blocks)
+        except TypeError as exc:
+            raise RuntimeError("VAE decoder up_blocks must be an ordered collection") from exc
+        if up_block_count <= 0:
+            raise RuntimeError("VAE decoder up_blocks must be non-empty")
+
+    @classmethod
+    def _finite_decoder_feature(cls, name: str, value: torch.Tensor) -> torch.Tensor:
+        if not isinstance(value, torch.Tensor):
+            raise RuntimeError(f"VAE decoder {name} output must be a tensor, got {type(value).__name__}")
+        if value.ndim != 4:
+            raise RuntimeError(f"VAE decoder {name} output must have shape [B,C,H,W], got {tuple(value.shape)}")
+        cls._assert_finite_tensor(f"VAE decoder {name} output", value)
+        return value
+
+    @staticmethod
+    def _assert_finite_tensor(name: str, value: torch.Tensor) -> None:
+        if not torch.isfinite(value).all().item():
+            raise RuntimeError(f"{name} contains non-finite values")
+
     @staticmethod
     def _validate_images(images: torch.Tensor) -> None:
         if not isinstance(images, torch.Tensor):
