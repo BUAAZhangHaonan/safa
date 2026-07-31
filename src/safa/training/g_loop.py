@@ -3498,8 +3498,8 @@ def _validate_r14_inpaint_training_contract(
         raise ValueError("R14 inpaint feasibility requires validation.enabled=false")
     if not ema_config["enabled"] or not ema_config["save_ema_checkpoint"]:
         raise ValueError("R14 inpaint requires enabled, checkpointed EMA")
-    if batch_config.per_device_batch_size != 2 or batch_config.global_batch_size != 4:
-        raise ValueError("R14 inpaint two-GPU run requires per_device_batch_size=2 and global_batch_size=4")
+    if batch_config.per_device_batch_size != 2 or batch_config.global_batch_size != 8:
+        raise ValueError("R14 inpaint four-GPU run requires per_device_batch_size=2 and global_batch_size=8")
     spatial = _require_mapping(config, "r14_spatial", "train_g config")
     expected_spatial = {
         "contract_type",
