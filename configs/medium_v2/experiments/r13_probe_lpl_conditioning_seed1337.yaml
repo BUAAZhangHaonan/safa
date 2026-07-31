@@ -3,6 +3,10 @@ r13_arm_id: lpl
 seed: 1337
 sampling_seed: 1337
 device: cuda:0
+r13_resource_binding:
+  contract_type: safa_r13_disposable_probe_resource_binding_v1
+  physical_gpu_index: 1
+  physical_gpu_uuid: GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1
 num_workers: 4
 global_batch_size: 4
 per_device_batch_size: 4

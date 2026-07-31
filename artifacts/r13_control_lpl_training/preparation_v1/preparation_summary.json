@@ -20,7 +20,7 @@
       "sha256": "5dcd0d4c75a792db50f730033511d3713253d26ba2fd5d0915aa20fc62d93471"
     }
   ],
-  "git_sha": "9758cd6c2601d12499ed0e2f988129f675fefe60",
+  "git_sha": "09dbd5532110425ddf6447a06677b8a3520d9e80",
   "probe_configs": [
     {
       "arm_id": "control",
@@ -29,7 +29,7 @@
       "out_dir": "artifacts/r13_control_lpl_training/probes_v1/control",
       "path": "configs/medium_v2/experiments/r13_probe_control_conditioning_seed1337.yaml",
       "required_steps": 8,
-      "sha256": "08fa851ad2fb38539891e81eba51c33eb30c534062978716ec41dbc3064f74e1"
+      "sha256": "fe25efa3819a76ee21f7b9a4331b5d6ca8f349a01bfbb1bfdac87f788146ce7c"
     },
     {
       "arm_id": "lpl",
@@ -38,7 +38,7 @@
       "out_dir": "artifacts/r13_control_lpl_training/probes_v1/lpl",
       "path": "configs/medium_v2/experiments/r13_probe_lpl_conditioning_seed1337.yaml",
       "required_steps": 8,
-      "sha256": "6d76340bc9f7decc952326280a2cd16a569b285abaf1e6aa886628406a46e17a"
+      "sha256": "16e12e32b951f89b7298a90be9b2510653eaf22d3342db9e404d27372f33dbc5"
     }
   ],
   "probe_launched": false,

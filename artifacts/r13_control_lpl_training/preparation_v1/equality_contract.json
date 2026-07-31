@@ -3,7 +3,9 @@
     "experiment_name",
     "r13_arm_id",
     "out_dir",
-    "latent_perceptual_loss.enabled"
+    "latent_perceptual_loss.enabled",
+    "r13_resource_binding.physical_gpu_index",
+    "r13_resource_binding.physical_gpu_uuid"
   ],
   "contract_type": "safa_r13_control_lpl_equality_v1",
   "post_run_checks": {

@@ -82,7 +82,12 @@ def _without_paths(value: Mapping[str, Any], ignored: Sequence[str]) -> dict[str
 def _assert_arm_equality(control: Mapping[str, Any], lpl: Mapping[str, Any], *, probe: bool) -> None:
     ignored = ["experiment_name", "r13_arm_id", "out_dir", "latent_perceptual_loss.enabled"]
     if probe:
-        ignored.extend(["r13_active_row_probe.arm_id", "r13_active_row_probe.require_cumulative_active_rows"])
+        ignored.extend([
+            "r13_active_row_probe.arm_id",
+            "r13_active_row_probe.require_cumulative_active_rows",
+            "r13_resource_binding.physical_gpu_index",
+            "r13_resource_binding.physical_gpu_uuid",
+        ])
     if _without_paths(control, ignored) != _without_paths(lpl, ignored):
         raise R13PreparationValidationError("R13 control/LPL configs differ outside the registered arm switch")
 
@@ -123,8 +128,11 @@ def _validate_ledgers(preparation: Path) -> None:
     probe_jobs = probe.get("jobs")
     if not isinstance(training_jobs, list) or [job["physical_gpu"]["index"] for job in training_jobs] != [0, 1]:
         raise R13PreparationValidationError("R13 training ledger must map control/LPL to GPU0/GPU1")
-    if not isinstance(probe_jobs, list) or [job["physical_gpu"]["index"] for job in probe_jobs] != [2, 3]:
-        raise R13PreparationValidationError("R13 probe ledger must map control/LPL to GPU2/GPU3")
+    if not isinstance(probe_jobs, list) or [job["physical_gpu"]["index"] for job in probe_jobs] != [2, 1]:
+        raise R13PreparationValidationError("R13 probe ledger must map control/LPL to GPU2/GPU1")
+    resource = _json(preparation / "resource_contract.json")
+    if resource.get("allowed_physical_gpus") != [0, 1, 2] or resource.get("training_gpu_bindings") != {"control": 0, "lpl": 1} or resource.get("probe_gpu_bindings") != {"control": 2, "lpl": 1} or resource.get("probe_and_training_are_sequential") is not True:
+        raise R13PreparationValidationError("R13 resource binding contract differs")
     for job in [*training_jobs, *probe_jobs]:
         if job.get("batch_size") != 4 or job.get("attempt_limit") != 1 or job.get("retry_count") != 0:
             raise R13PreparationValidationError("R13 ledger batch/retry semantics differ")
@@ -195,6 +203,15 @@ def validate(preparation: Path, *, post_probe: bool = False, post_training: bool
         _validate_train_g_config(config)
     _assert_arm_equality(full["control"], full["lpl"], probe=False)
     _assert_arm_equality(probes["control"], probes["lpl"], probe=True)
+    expected_probe_bindings = {
+        "control": {"contract_type": "safa_r13_disposable_probe_resource_binding_v1", "physical_gpu_index": 2, "physical_gpu_uuid": "GPU-e27fe71d-eaf7-3eb5-d0ff-c1c63b4f6b02"},
+        "lpl": {"contract_type": "safa_r13_disposable_probe_resource_binding_v1", "physical_gpu_index": 1, "physical_gpu_uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"},
+    }
+    if {arm: config.get("r13_resource_binding") for arm, config in probes.items()} != expected_probe_bindings:
+        raise R13PreparationValidationError("R13 probe config resource bindings differ")
+    recorded_probe_configs = {row["arm_id"]: row for row in summary.get("probe_configs", [])}
+    if set(recorded_probe_configs) != set(PROBE_CONFIGS) or any(recorded_probe_configs[arm].get("sha256") != _sha256(path) for arm, path in PROBE_CONFIGS.items()):
+        raise R13PreparationValidationError("R13 recorded probe config SHA-256 differs")
     _validate_order(full["control"])
     _validate_ledgers(preparation)
     for (arm, sample_set), path in EVAL_TEMPLATES.items():

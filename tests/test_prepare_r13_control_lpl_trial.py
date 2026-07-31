@@ -51,6 +51,9 @@ def test_r13_configs_lock_full_and_probe_matrix() -> None:
             assert config["resume_checkpoint_model"] == "ema"
             assert config["resume_optimizer_state"] is False
             assert config["optimizer_type"] == "adamw"
+            if kind == "probe":
+                expected_index = {"control": 2, "lpl": 1}[arm]
+                assert config["r13_resource_binding"]["physical_gpu_index"] == expected_index
     assert [configs[(arm, "full")]["optimizer_step_contract"]["required_steps"] for arm in ("control", "lpl")] == [7500, 7500]
     assert [configs[(arm, "probe")]["optimizer_step_contract"]["required_steps"] for arm in ("control", "lpl")] == [8, 8]
     assert configs[("control", "full")]["optimizer_checkpoint_contract"]["save_steps"] == [0, 2500, 5000, 7500]
@@ -66,7 +69,11 @@ def test_materialized_preparation_validates_and_maps_all_four_gpus() -> None:
     training = json.loads((preparation / "training_ledger.json").read_text(encoding="utf-8"))
     probe = json.loads((preparation / "probe_ledger.json").read_text(encoding="utf-8"))
     assert [job["physical_gpu"]["index"] for job in training["jobs"]] == [0, 1]
-    assert [job["physical_gpu"]["index"] for job in probe["jobs"]] == [2, 3]
+    assert [job["physical_gpu"]["index"] for job in probe["jobs"]] == [2, 1]
+    resource = json.loads((preparation / "resource_contract.json").read_text(encoding="utf-8"))
+    assert resource["probe_gpu_bindings"] == {"control": 2, "lpl": 1}
+    assert resource["training_gpu_bindings"] == {"control": 0, "lpl": 1}
+    assert resource["probe_and_training_are_sequential"] is True
     assert all(job["batch_size"] == 4 and job["retry_count"] == 0 for job in [*training["jobs"], *probe["jobs"]])
 
 

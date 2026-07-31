@@ -3,6 +3,10 @@ r13_arm_id: control
 seed: 1337
 sampling_seed: 1337
 device: cuda:0
+r13_resource_binding:
+  contract_type: safa_r13_disposable_probe_resource_binding_v1
+  physical_gpu_index: 2
+  physical_gpu_uuid: GPU-e27fe71d-eaf7-3eb5-d0ff-c1c63b4f6b02
 num_workers: 4
 global_batch_size: 4
 per_device_batch_size: 4

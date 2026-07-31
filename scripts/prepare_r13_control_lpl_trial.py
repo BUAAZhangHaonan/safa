@@ -161,6 +161,15 @@ def _job(*, arm_id: str, config_path: str, physical_gpu: int, probe: bool) -> di
     config = yaml.safe_load((REPO_ROOT / config_path).read_text(encoding="utf-8"))
     out_dir = str(config["out_dir"])
     kind = "probe" if probe else "training"
+    if probe:
+        binding = config.get("r13_resource_binding")
+        expected = {
+            "contract_type": "safa_r13_disposable_probe_resource_binding_v1",
+            "physical_gpu_index": physical_gpu,
+            "physical_gpu_uuid": GPU_UUIDS[physical_gpu],
+        }
+        if binding != expected:
+            raise R13PreparationError(f"R13 {arm_id} probe resource binding differs")
     return {
         "job_id": f"r13_{kind}_{arm_id}",
         "arm_id": arm_id,
@@ -210,7 +219,7 @@ def prepare(output: Path = DEFAULT_OUTPUT) -> dict[str, Any]:
             "jobs": training_jobs,
         },
     )
-    probe_jobs = [_job(arm_id="control", config_path=PROBE_CONFIGS["control"], physical_gpu=2, probe=True), _job(arm_id="lpl", config_path=PROBE_CONFIGS["lpl"], physical_gpu=3, probe=True)]
+    probe_jobs = [_job(arm_id="control", config_path=PROBE_CONFIGS["control"], physical_gpu=2, probe=True), _job(arm_id="lpl", config_path=PROBE_CONFIGS["lpl"], physical_gpu=1, probe=True)]
     write_json(
         output / "probe_ledger.json",
         {
@@ -229,7 +238,10 @@ def prepare(output: Path = DEFAULT_OUTPUT) -> dict[str, Any]:
         output / "resource_contract.json",
         {
             "contract_type": "safa_r13_resource_admission_v1",
-            "allowed_physical_gpus": [0, 1, 2, 3],
+            "allowed_physical_gpus": [0, 1, 2],
+            "training_gpu_bindings": {"control": 0, "lpl": 1},
+            "probe_gpu_bindings": {"control": 2, "lpl": 1},
+            "probe_and_training_are_sequential": True,
             "max_cpu_percent": 90.0,
             "max_ram_percent": 90.0,
             "swap_policy": "observe_only_main_memory_is_the_admission_gate",
@@ -249,7 +261,7 @@ def prepare(output: Path = DEFAULT_OUTPUT) -> dict[str, Any]:
         output / "equality_contract.json",
         {
             "contract_type": "safa_r13_control_lpl_equality_v1",
-            "allowed_config_differences": ["experiment_name", "r13_arm_id", "out_dir", "latent_perceptual_loss.enabled"],
+            "allowed_config_differences": ["experiment_name", "r13_arm_id", "out_dir", "latent_perceptual_loss.enabled", "r13_resource_binding.physical_gpu_index", "r13_resource_binding.physical_gpu_uuid"],
             "required_equal_semantics": ["seed", "sampling_seed", "train_index", "train_features", "train_order_contract", "flow_matching_rng_contract", "optimizer_step_contract", "optimizer_checkpoint_contract", "optimizer_type", "learning_rate", "weight_decay", "generator", "ema", "stages"],
             "post_run_checks": {
                 "flow_rng_ledger": "byte_for_byte_equal",

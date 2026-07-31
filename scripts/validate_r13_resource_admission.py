@@ -84,6 +84,13 @@ def validate(preparation: Path, *, mode: str, peak_results: Path | None) -> dict
     jobs = ledger.get("jobs")
     if not isinstance(jobs, list) or len(jobs) != 2:
         raise R13ResourceAdmissionError(f"{mode} ledger must contain exactly two jobs")
+    binding_key = "probe_gpu_bindings" if mode == "probe" else "training_gpu_bindings"
+    expected_bindings = {"control": 2, "lpl": 1} if mode == "probe" else {"control": 0, "lpl": 1}
+    if contract.get(binding_key) != expected_bindings or contract.get("probe_and_training_are_sequential") is not True:
+        raise R13ResourceAdmissionError(f"{mode} resource binding contract differs")
+    ledger_bindings = {str(job["arm_id"]): int(job["physical_gpu"]["index"]) for job in jobs}
+    if ledger_bindings != expected_bindings:
+        raise R13ResourceAdmissionError(f"{mode} ledger resource bindings differ")
     arms = tuple(str(job["arm_id"]) for job in jobs)
     peaks = _peak_bytes(peak_results, arms)
     if mode == "training" and peak_results is None:
@@ -123,7 +130,7 @@ def validate(preparation: Path, *, mode: str, peak_results: Path | None) -> dict
         index = int(job["physical_gpu"]["index"])
         arm = str(job["arm_id"])
         row = gpu_rows.get(index)
-        if row is None or row["uuid"] != EXPECTED_UUIDS[index] or job["physical_gpu"]["uuid"] != EXPECTED_UUIDS[index]:
+        if row is None or row["uuid"] != EXPECTED_UUIDS[index] or job["physical_gpu"]["uuid"] != EXPECTED_UUIDS[index] or job.get("environment", {}).get("CUDA_VISIBLE_DEVICES") != EXPECTED_UUIDS[index]:
             raise R13ResourceAdmissionError(f"GPU identity differs for physical GPU {index}")
         predicted_used = int(row["used_bytes"]) + peaks[arm]
         predicted_percent = 100.0 * predicted_used / int(row["total_bytes"])

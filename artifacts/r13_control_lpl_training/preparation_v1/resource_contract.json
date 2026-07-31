@@ -2,8 +2,7 @@
   "allowed_physical_gpus": [
     0,
     1,
-    2,
-    3
+    2
   ],
   "automatic_batch_change": false,
   "automatic_retry": false,
@@ -15,8 +14,17 @@
   "minimum_gpu_free_bytes_after_launch": 4294967296,
   "minimum_repo_filesystem_free_bytes": 25769803776,
   "one_worker_per_gpu": true,
+  "probe_and_training_are_sequential": true,
   "probe_before_training": true,
+  "probe_gpu_bindings": {
+    "control": 2,
+    "lpl": 1
+  },
   "swap_policy": "observe_only_main_memory_is_the_admission_gate",
   "swap_io_sample_seconds": 1.0,
-  "maximum_swap_in_out_delta_bytes": 0
+  "maximum_swap_in_out_delta_bytes": 0,
+  "training_gpu_bindings": {
+    "control": 0,
+    "lpl": 1
+  }
 }
