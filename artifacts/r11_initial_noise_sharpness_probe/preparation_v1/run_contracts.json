@@ -19,9 +19,19 @@
       ],
       "arm_id": "eta025_prefix128",
       "config": "configs/medium_v2/experiments/r11_initial_noise_fixed_eta025_prefix128.yaml",
-      "config_sha256": "c5ef32d0301cbf79939e66ab83d44aa10a2d8d1defbb4104bc447a786bf57cf4",
+      "config_sha256": "983b9caef6a322325ff6722afe9088307b7ae015f305df561c3815be37bfafdc",
       "environment": {
         "CUDA_VISIBLE_DEVICES": "0"
+      },
+      "expected_outputs": {
+        "per_sample_required": [
+          "edev_cosine",
+          "native_edev_cosine"
+        ],
+        "summary_required": [
+          "candidate_edev_source",
+          "native_edev_source"
+        ]
       },
       "eta": 0.25,
       "gpu_index": 0,
@@ -45,9 +55,19 @@
       ],
       "arm_id": "eta05_prefix128",
       "config": "configs/medium_v2/experiments/r11_initial_noise_fixed_eta05_prefix128.yaml",
-      "config_sha256": "6ffe35b966ed24b6e176da20d6c9faebf671ca4e302a0b34f4b6ef124c2ad342",
+      "config_sha256": "ba69366c4e57d07bcd481ad5a24baf8bc366a9547bd1b31442c66414cdde37ab",
       "environment": {
         "CUDA_VISIBLE_DEVICES": "1"
+      },
+      "expected_outputs": {
+        "per_sample_required": [
+          "edev_cosine",
+          "native_edev_cosine"
+        ],
+        "summary_required": [
+          "candidate_edev_source",
+          "native_edev_source"
+        ]
       },
       "eta": 0.5,
       "gpu_index": 1,
@@ -71,9 +91,19 @@
       ],
       "arm_id": "eta025_tail32",
       "config": "configs/medium_v2/experiments/r11_initial_noise_fixed_eta025_tail32.yaml",
-      "config_sha256": "ab03f01eb6f6dce2dbf324188742f4c4febd8a0c3dad37c816ed85259fbc9644",
+      "config_sha256": "af7f717c2d305c9ce21017bc953e92a73e03a2b4bc11bde22e7de322b7450a48",
       "environment": {
         "CUDA_VISIBLE_DEVICES": "2"
+      },
+      "expected_outputs": {
+        "per_sample_required": [
+          "edev_cosine",
+          "native_edev_cosine"
+        ],
+        "summary_required": [
+          "candidate_edev_source",
+          "native_edev_source"
+        ]
       },
       "eta": 0.25,
       "gpu_index": 2,
@@ -97,9 +127,19 @@
       ],
       "arm_id": "eta05_tail32",
       "config": "configs/medium_v2/experiments/r11_initial_noise_fixed_eta05_tail32.yaml",
-      "config_sha256": "b79e90ece271b5bd673c3a79a7bef02c3cb95e0922abe3f973110e66b722f586",
+      "config_sha256": "bfb0a05f73ac129ae805b8cfaaccd1c3dc7cc17dfaf9bf26e387ce6c95c326e9",
       "environment": {
         "CUDA_VISIBLE_DEVICES": "3"
+      },
+      "expected_outputs": {
+        "per_sample_required": [
+          "edev_cosine",
+          "native_edev_cosine"
+        ],
+        "summary_required": [
+          "candidate_edev_source",
+          "native_edev_source"
+        ]
       },
       "eta": 0.5,
       "gpu_index": 3,
@@ -114,6 +154,7 @@
     "batch_size": 2,
     "mode": "initial_noise",
     "num_updates": 16,
+    "phase": "calibration",
     "projection": "fixed_radius",
     "sampling_seed": 1337
   }

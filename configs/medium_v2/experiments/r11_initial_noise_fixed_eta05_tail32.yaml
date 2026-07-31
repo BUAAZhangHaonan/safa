@@ -1,7 +1,7 @@
 experiment_name: r11_initial_noise_fixed_eta05_tail32
 out_dir: artifacts/r11_initial_noise_sharpness_probe/runs_v1/eta05_tail32
 mode: initial_noise
-phase: r11_sharpness_probe
+phase: calibration
 projection: fixed_radius
 eta: 0.5
 num_updates: 16

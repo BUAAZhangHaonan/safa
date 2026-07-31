@@ -10,6 +10,11 @@ from typing import Any
 
 import yaml
 
+from safa.evaluation.meanflow_guidance_runner import (
+    _edev_required_for_config,
+    resolve_frozen_effective_guidance_config,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 PREPARATION = ROOT / "artifacts/r11_initial_noise_sharpness_probe/preparation_v1"
@@ -21,6 +26,10 @@ RUN_CONTRACTS = PREPARATION / "run_contracts.json"
 EXPECTED_POOL_SHA256 = "56c2baf99779d8b9cf7460b34bc1e388ba1f8687e8073ca1d636f137dd2c00e8"
 EXPECTED_PREFIX128_SHA256 = "9e1bfa90057c9b72f02a29340d91f0d87d4d4f35119733824b9659bd7ee8db89"
 EXPECTED_TAIL32_SHA256 = "f38fb6f6542c267b6c7d9cbec9ce57abdf9b0657edfe8d060fe533178a9f5b29"
+EXPECTED_EDEV_OUTPUTS = {
+    "per_sample_required": ["edev_cosine", "native_edev_cosine"],
+    "summary_required": ["candidate_edev_source", "native_edev_source"],
+}
 
 
 def sha256(path: Path) -> str:
@@ -104,6 +113,7 @@ def validate_configs(run_contracts: dict[str, Any]) -> None:
         actual_matrix.add((role, eta, count))
         if (
             config.get("mode") != "initial_noise"
+            or config.get("phase") != "calibration"
             or config.get("projection") != "fixed_radius"
             or config.get("num_updates") != 16
             or config.get("batch_size") != 2
@@ -112,6 +122,15 @@ def validate_configs(run_contracts: dict[str, Any]) -> None:
             or config.get("max_samples") != count
         ):
             raise ValueError(f"{run.get('arm_id')}: frozen run semantics drifted")
+        effective_config = resolve_frozen_effective_guidance_config(config)
+        if not _edev_required_for_config(effective_config):
+            raise ValueError(
+                f"{run.get('arm_id')}: effective config must require Edev scoring"
+            )
+        if run.get("expected_outputs") != EXPECTED_EDEV_OUTPUTS:
+            raise ValueError(
+                f"{run.get('arm_id')}: required Edev output fields drifted"
+            )
         base_name = (
             "r8_meanflow_noise_fixed_eta025.yaml"
             if eta == 0.25

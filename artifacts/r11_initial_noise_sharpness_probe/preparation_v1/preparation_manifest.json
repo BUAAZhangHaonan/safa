@@ -19,12 +19,23 @@
     ],
     "mode": "initial_noise",
     "num_updates": 16,
+    "phase": "calibration",
     "projection": "fixed_radius",
     "sampling_seed": 1337,
     "seed": 1337,
     "vae_digest": "ac188e7f6ff31ff1a3bbde37fea3c345ec72f9e10589cf8aa8a3ec7e86afb188",
     "vae_path": "artifacts/checkpoints/external/sd-vae-ft-ema",
     "vae_scaling_factor": 0.18215
+  },
+  "required_edev_outputs": {
+    "per_sample_required": [
+      "edev_cosine",
+      "native_edev_cosine"
+    ],
+    "summary_required": [
+      "candidate_edev_source",
+      "native_edev_source"
+    ]
   },
   "inputs": {
     "eligible_pool": {
