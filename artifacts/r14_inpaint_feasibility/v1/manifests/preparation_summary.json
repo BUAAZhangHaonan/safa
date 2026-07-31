@@ -1,0 +1,15 @@
+{
+  "bbox_expansion_pixels": 0,
+  "contract_type": "safa_r14_inpaint_manifest_preparation_v1",
+  "eval_role": "single_S_cached_affect_original_context_mask",
+  "global_batch_size": 4,
+  "morphology": null,
+  "optimizer_steps": 256,
+  "pairing_seed": 1337,
+  "regular32_count": 32,
+  "schema_version": 1,
+  "smoke8_count": 8,
+  "train_pair_count": 1024,
+  "train_pair_role": "A_cached_affect_to_B_clean_target_context_mask",
+  "visual8_count": 8
+}
