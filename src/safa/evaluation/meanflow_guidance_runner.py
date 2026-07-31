@@ -1476,6 +1476,7 @@ def execute_guidance_mode(
     x_init: torch.Tensor,
     target_z0: torch.Tensor,
     schedule: Mapping[str, Any] | None,
+    initial_noise_snapshot_steps: Sequence[int] | None = None,
 ) -> GuidanceResult:
     mode = _MODE_ALIASES.get(str(config.get("mode", "")), str(config.get("mode", "")))
     if mode not in SUPPORTED_MODES:
@@ -1521,8 +1522,11 @@ def execute_guidance_mode(
             eta=float(config.get("eta", 0.25)),
             projection=str(config.get("projection", "fixed_radius")),
             typical_delta=float(config.get("typical_delta", 0.05)),
+            spectral_snapshot_steps=initial_noise_snapshot_steps,
         )
         return _result_with_trace(result, counted.trace, mode)
+    if initial_noise_snapshot_steps is not None:
+        raise ValueError("spectral snapshots are supported only for initial_noise mode")
     if schedule is None:
         raise ValueError(f"{mode} requires a locked schedule")
     guided_times = schedule["guided_times"]

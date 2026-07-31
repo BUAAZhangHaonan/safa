@@ -624,6 +624,99 @@ def project_gaussian_typical_shell(candidate, *, delta, eps: float = 1.0e-8):
     return _finite_tensor("typical-shell projection", projected)
 
 
+def radial_shell_rfft_energy(noise: torch.Tensor) -> dict[str, Any]:
+    """Summarize per-channel radial-shell energy without retaining noise.
+
+    The orthonormal real FFT is evaluated in float64 on CPU. Half-spectrum
+    coefficients use their Hermitian multiplicity, so the shell sum obeys
+    Parseval and enabling this diagnostic cannot perturb CUDA sampling math.
+    """
+
+    _validate_noise_tensor("spectral snapshot noise", noise)
+    if noise.ndim != 4:
+        raise ValueError(
+            "spectral snapshot noise must have shape [batch, channels, height, width]"
+        )
+    height, width = (int(noise.shape[-2]), int(noise.shape[-1]))
+    if height < 2 or width < 2:
+        raise ValueError("spectral snapshot spatial dimensions must both be at least 2")
+    host = noise.detach().to(device="cpu", dtype=torch.float64)
+    spectrum = torch.fft.rfft2(host, norm="ortho")
+    power = spectrum.real.square() + spectrum.imag.square()
+
+    x_index = (
+        torch.fft.rfftfreq(width, d=1.0, dtype=torch.float64) * width
+    ).round().to(torch.int64)
+    y_index = (
+        torch.fft.fftfreq(height, d=1.0, dtype=torch.float64) * height
+    ).round().to(torch.int64)
+    radius_squared_grid = y_index[:, None].square() + x_index[None, :].square()
+    radius_squared = torch.unique(radius_squared_grid, sorted=True)
+
+    multiplicity = torch.full((width // 2 + 1,), 2.0, dtype=torch.float64)
+    multiplicity[0] = 1.0
+    if width % 2 == 0:
+        multiplicity[-1] = 1.0
+    weighted_power = power * multiplicity.view(1, 1, 1, -1)
+
+    shell_energies = []
+    coefficient_counts = []
+    for value in radius_squared:
+        mask = radius_squared_grid == value
+        shell_energies.append(
+            (weighted_power * mask.view(1, 1, height, -1)).sum(dim=(-2, -1))
+        )
+        coefficient_counts.append(
+            int((mask.to(torch.float64) * multiplicity.view(1, -1)).sum().item())
+        )
+    per_channel_shell_energy = torch.stack(shell_energies, dim=-1)
+    per_channel_spatial_energy = host.square().sum(dim=(-2, -1))
+    per_channel_spectral_energy = per_channel_shell_energy.sum(dim=-1)
+    if not torch.allclose(
+        per_channel_spatial_energy,
+        per_channel_spectral_energy,
+        rtol=1.0e-10,
+        atol=1.0e-8,
+    ):
+        raise RuntimeError("orthonormal rFFT radial shells violate Parseval identity")
+
+    high_frequency_min_radius = float(min(height, width)) / 4.0
+    high_mask = radius_squared.to(torch.float64) >= high_frequency_min_radius**2
+    per_channel_high_frequency_energy = per_channel_shell_energy[..., high_mask].sum(
+        dim=-1
+    )
+    return {
+        "norm": "ortho",
+        "height": height,
+        "width": width,
+        "radius_squared": [int(value) for value in radius_squared.tolist()],
+        "full_spectrum_coefficient_count": coefficient_counts,
+        "high_frequency_min_radius": high_frequency_min_radius,
+        "per_channel_shell_energy": per_channel_shell_energy,
+        "per_channel_spatial_energy": per_channel_spatial_energy,
+        "per_channel_high_frequency_energy": per_channel_high_frequency_energy,
+    }
+
+
+def _spectral_snapshot_steps(
+    requested: Sequence[int] | None, *, num_updates: int
+) -> tuple[int, ...]:
+    if requested is None:
+        return ()
+    if isinstance(requested, (str, bytes)):
+        raise ValueError("spectral_snapshot_steps must be an integer sequence")
+    values = tuple(requested)
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+        raise ValueError("spectral_snapshot_steps must contain only integers")
+    if values != tuple(sorted(set(values))):
+        raise ValueError("spectral_snapshot_steps must be strictly increasing and unique")
+    if any(value < 0 or value > num_updates for value in values):
+        raise ValueError(
+            f"spectral_snapshot_steps must be within [0,{num_updates}]"
+        )
+    return values
+
+
 def optimize_initial_noise(
     *,
     flow_map: CountedFlowMap,
@@ -636,6 +729,7 @@ def optimize_initial_noise(
     eta: float,
     projection: Literal["fixed_radius", "typical_shell"],
     typical_delta: float = 0.05,
+    spectral_snapshot_steps: Sequence[int] | None = None,
 ) -> GuidanceResult:
     assert_guidance_stack_frozen(flow_map.generator, codec, e0)
     _validate_noise_tensor("x_init", x_init)
@@ -659,12 +753,18 @@ def optimize_initial_noise(
                 f"typical-shell projection requires 0 < delta < 1, got {typical_delta!r}"
             )
 
+    snapshot_steps = _spectral_snapshot_steps(
+        spectral_snapshot_steps, num_updates=int(num_updates)
+    )
     initial_nfe = flow_map.nfe
     initial = x_init.detach().clone()
     noise = initial.clone()
     loss_history: list[float] = []
+    spectral_snapshots: list[dict[str, Any]] = []
+    if 0 in snapshot_steps:
+        spectral_snapshots.append({"step": 0, **radial_shell_rfft_energy(noise)})
 
-    for _ in range(num_updates):
+    for update_index in range(num_updates):
         active_noise = noise.detach().requires_grad_(True)
         endpoint = flow_map(active_noise, transport_condition, t=1.0, r=0.0)
         loss = _representation_loss(endpoint, codec, e0, target_z0)
@@ -680,6 +780,11 @@ def optimize_initial_noise(
         else:
             noise = project_gaussian_typical_shell(candidate, delta=typical_delta)
         noise = _finite_tensor("projected noise", noise.detach())
+        completed_updates = update_index + 1
+        if completed_updates in snapshot_steps:
+            spectral_snapshots.append(
+                {"step": completed_updates, **radial_shell_rfft_energy(noise)}
+            )
 
     final_noise = noise.detach()
     final_endpoint = flow_map(final_noise, transport_condition, t=1.0, r=0.0)
@@ -710,6 +815,11 @@ def optimize_initial_noise(
             "channel_mean": final_noise.mean(dim=(2, 3)),
             "channel_std": final_noise.std(dim=(2, 3), unbiased=False),
             "loss_history": loss_history,
+            **(
+                {"spectral_snapshots": spectral_snapshots}
+                if snapshot_steps
+                else {}
+            ),
         },
     )
 
