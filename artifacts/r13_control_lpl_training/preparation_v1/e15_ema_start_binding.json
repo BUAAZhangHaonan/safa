@@ -1,0 +1,14 @@
+{
+  "checkpoint_model": "ema",
+  "checkpoint_path": "artifacts/checkpoints/e15_meanflow_sit_b_face_mixed_h100_resume_2400ep/last_nopretrained.pt",
+  "checkpoint_sha256": "4690717781db58a6021d57d124300a9b212f0a5043cf3028fb5de4d9c835cc4d",
+  "contract_type": "safa_r13_e15_ema_start_binding_v1",
+  "initialization": {
+    "ema": "fresh EMA clone of the loaded generator",
+    "generator": "load ema_model_state_dict",
+    "optimizer": "fresh AdamW with no restored state"
+  },
+  "source_stage": "stage2",
+  "source_stage_epoch_1based": 1652,
+  "state_tensor_count": 139
+}

@@ -1,0 +1,22 @@
+{
+  "allowed_physical_gpus": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "automatic_batch_change": false,
+  "automatic_retry": false,
+  "batch_size": 4,
+  "contract_type": "safa_r13_resource_admission_v1",
+  "max_cpu_percent": 90.0,
+  "max_gpu_memory_percent_after_launch": 85.0,
+  "max_ram_percent": 90.0,
+  "minimum_gpu_free_bytes_after_launch": 4294967296,
+  "minimum_repo_filesystem_free_bytes": 25769803776,
+  "one_worker_per_gpu": true,
+  "probe_before_training": true,
+  "swap_policy": "observe_only_main_memory_is_the_admission_gate",
+  "swap_io_sample_seconds": 1.0,
+  "maximum_swap_in_out_delta_bytes": 0
+}

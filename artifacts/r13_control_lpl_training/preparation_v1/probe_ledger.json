@@ -1,0 +1,70 @@
+{
+  "contract_type": "safa_r13_disposable_probe_ledger_v1",
+  "jobs": [
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "-m",
+        "safa.cli.train_g",
+        "--config",
+        "configs/medium_v2/experiments/r13_probe_control_conditioning_seed1337.yaml"
+      ],
+      "arm_id": "control",
+      "attempt_limit": 1,
+      "batch_size": 4,
+      "config": "configs/medium_v2/experiments/r13_probe_control_conditioning_seed1337.yaml",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-e27fe71d-eaf7-3eb5-d0ff-c1c63b4f6b02"
+      },
+      "job_id": "r13_probe_control",
+      "kind": "probe",
+      "last_checkpoint": "artifacts/r13_control_lpl_training/probes_v1/control/last.pt",
+      "log_path": "artifacts/r13_control_lpl_training/logs_v1/probe_control.log",
+      "logical_device": "cuda:0",
+      "output_root": "artifacts/r13_control_lpl_training/probes_v1/control",
+      "physical_gpu": {
+        "index": 2,
+        "uuid": "GPU-e27fe71d-eaf7-3eb5-d0ff-c1c63b4f6b02"
+      },
+      "required_steps": 8,
+      "retry_count": 0,
+      "tmux_session": "safa-r13-probe-control"
+    },
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "-m",
+        "safa.cli.train_g",
+        "--config",
+        "configs/medium_v2/experiments/r13_probe_lpl_conditioning_seed1337.yaml"
+      ],
+      "arm_id": "lpl",
+      "attempt_limit": 1,
+      "batch_size": 4,
+      "config": "configs/medium_v2/experiments/r13_probe_lpl_conditioning_seed1337.yaml",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-61ea2925-9905-7f56-cd64-7a792a32efef"
+      },
+      "job_id": "r13_probe_lpl",
+      "kind": "probe",
+      "last_checkpoint": "artifacts/r13_control_lpl_training/probes_v1/lpl/last.pt",
+      "log_path": "artifacts/r13_control_lpl_training/logs_v1/probe_lpl.log",
+      "logical_device": "cuda:0",
+      "output_root": "artifacts/r13_control_lpl_training/probes_v1/lpl",
+      "physical_gpu": {
+        "index": 3,
+        "uuid": "GPU-61ea2925-9905-7f56-cd64-7a792a32efef"
+      },
+      "required_steps": 8,
+      "retry_count": 0,
+      "tmux_session": "safa-r13-probe-lpl"
+    }
+  ],
+  "lpl_acceptance": {
+    "flow_rng_rows": 8,
+    "global_step": 8,
+    "latent_perceptual_loss_raw": ">0 and finite",
+    "r13_cumulative_active_rows": ">0"
+  },
+  "status": "prepared_not_launched"
+}

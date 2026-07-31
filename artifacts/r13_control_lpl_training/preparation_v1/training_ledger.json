@@ -1,0 +1,78 @@
+{
+  "contract_type": "safa_r13_single_gpu_training_ledger_v1",
+  "jobs": [
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "-m",
+        "safa.cli.train_g",
+        "--config",
+        "configs/medium_v2/experiments/r13_control_conditioning_1epoch_seed1337.yaml"
+      ],
+      "arm_id": "control",
+      "attempt_limit": 1,
+      "batch_size": 4,
+      "checkpoint_paths": [
+        "artifacts/checkpoints/r13_control_conditioning_1epoch_seed1337/step_00000000.pt",
+        "artifacts/checkpoints/r13_control_conditioning_1epoch_seed1337/step_00002500.pt",
+        "artifacts/checkpoints/r13_control_conditioning_1epoch_seed1337/step_00005000.pt",
+        "artifacts/checkpoints/r13_control_conditioning_1epoch_seed1337/step_00007500.pt",
+        "artifacts/checkpoints/r13_control_conditioning_1epoch_seed1337/last.pt"
+      ],
+      "config": "configs/medium_v2/experiments/r13_control_conditioning_1epoch_seed1337.yaml",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+      },
+      "job_id": "r13_training_control",
+      "kind": "training",
+      "last_checkpoint": "artifacts/checkpoints/r13_control_conditioning_1epoch_seed1337/last.pt",
+      "log_path": "artifacts/r13_control_lpl_training/logs_v1/training_control.log",
+      "logical_device": "cuda:0",
+      "output_root": "artifacts/checkpoints/r13_control_conditioning_1epoch_seed1337",
+      "physical_gpu": {
+        "index": 0,
+        "uuid": "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6"
+      },
+      "required_steps": 7500,
+      "retry_count": 0,
+      "tmux_session": "safa-r13-training-control"
+    },
+    {
+      "argv": [
+        "/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python",
+        "-m",
+        "safa.cli.train_g",
+        "--config",
+        "configs/medium_v2/experiments/r13_lpl_conditioning_1epoch_seed1337.yaml"
+      ],
+      "arm_id": "lpl",
+      "attempt_limit": 1,
+      "batch_size": 4,
+      "checkpoint_paths": [
+        "artifacts/checkpoints/r13_lpl_conditioning_1epoch_seed1337/step_00000000.pt",
+        "artifacts/checkpoints/r13_lpl_conditioning_1epoch_seed1337/step_00002500.pt",
+        "artifacts/checkpoints/r13_lpl_conditioning_1epoch_seed1337/step_00005000.pt",
+        "artifacts/checkpoints/r13_lpl_conditioning_1epoch_seed1337/step_00007500.pt",
+        "artifacts/checkpoints/r13_lpl_conditioning_1epoch_seed1337/last.pt"
+      ],
+      "config": "configs/medium_v2/experiments/r13_lpl_conditioning_1epoch_seed1337.yaml",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "job_id": "r13_training_lpl",
+      "kind": "training",
+      "last_checkpoint": "artifacts/checkpoints/r13_lpl_conditioning_1epoch_seed1337/last.pt",
+      "log_path": "artifacts/r13_control_lpl_training/logs_v1/training_lpl.log",
+      "logical_device": "cuda:0",
+      "output_root": "artifacts/checkpoints/r13_lpl_conditioning_1epoch_seed1337",
+      "physical_gpu": {
+        "index": 1,
+        "uuid": "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1"
+      },
+      "required_steps": 7500,
+      "retry_count": 0,
+      "tmux_session": "safa-r13-training-lpl"
+    }
+  ],
+  "status": "prepared_not_launched"
+}

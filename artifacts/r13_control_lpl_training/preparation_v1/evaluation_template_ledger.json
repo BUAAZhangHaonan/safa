@@ -1,0 +1,26 @@
+{
+  "contract_type": "safa_r13_post_training_evaluation_templates_v1",
+  "placeholders": {
+    "control": "__R13_CONTROL_LAST_PT_SHA256__",
+    "lpl": "__R13_LPL_LAST_PT_SHA256__"
+  },
+  "status": "template_not_launchable_until_sha_substitution",
+  "templates": [
+    {
+      "path": "configs/medium_v2/experiments/r13_eval_control_regular32.template.yaml",
+      "sha256": "ed4ea8e0833cfc67b44f88fee10b9cb90ed4b53ee9470064139354c72b4a9370"
+    },
+    {
+      "path": "configs/medium_v2/experiments/r13_eval_control_tail32.template.yaml",
+      "sha256": "7d8d573e4c5aac3225078bb282c3e29ae689be8d7e395d2f3221a514537dfcb5"
+    },
+    {
+      "path": "configs/medium_v2/experiments/r13_eval_lpl_regular32.template.yaml",
+      "sha256": "40d9e60ad130aed58d92bddded70922843c170bda59c63ba880278bfc357ca44"
+    },
+    {
+      "path": "configs/medium_v2/experiments/r13_eval_lpl_tail32.template.yaml",
+      "sha256": "913ee680f3abfb6373cc5cb254aeb8d2c6acbc2ed4cd219f362621be8e2424b2"
+    }
+  ]
+}

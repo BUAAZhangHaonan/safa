@@ -1,0 +1,31 @@
+{
+  "allowed_config_differences": [
+    "experiment_name",
+    "r13_arm_id",
+    "out_dir",
+    "latent_perceptual_loss.enabled"
+  ],
+  "contract_type": "safa_r13_control_lpl_equality_v1",
+  "post_run_checks": {
+    "flow_rng_ledger": "byte_for_byte_equal",
+    "step_00000000_ema_state": "byte_for_byte_equal",
+    "step_00000000_model_state": "byte_for_byte_equal",
+    "trainable_parameter_names": "exact_registered_30_name_allowlist"
+  },
+  "required_equal_semantics": [
+    "seed",
+    "sampling_seed",
+    "train_index",
+    "train_features",
+    "train_order_contract",
+    "flow_matching_rng_contract",
+    "optimizer_step_contract",
+    "optimizer_checkpoint_contract",
+    "optimizer_type",
+    "learning_rate",
+    "weight_decay",
+    "generator",
+    "ema",
+    "stages"
+  ]
+}
