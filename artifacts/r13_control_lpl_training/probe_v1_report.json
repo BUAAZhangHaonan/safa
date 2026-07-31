@@ -1,0 +1,100 @@
+{
+  "contract_type": "safa_r13_control_lpl_probe_report_v1",
+  "git_sha": "1c3ba91d9b03407c4d77cefd283f08a9a52b5e6a",
+  "decision": "no_go_formal_training",
+  "decision_reason": "The probe is technically valid, but weighted LPL is 22420.0 times the FM objective and produces a 59014.6 times larger mean pre-clip gradient than control. A full control/LPL comparison at this scale would be clip-dominated and scientifically invalid.",
+  "formal_training_launched": false,
+  "attempts": {
+    "control": {
+      "attempt_count": 1,
+      "terminal_status": "completed_global_step_8",
+      "launch_provenance": "exact ledger env and argv; foreground because the tmux launch wrapper was parsed incorrectly",
+      "retry_count": 0
+    },
+    "lpl": {
+      "attempt_count": 1,
+      "terminal_status": "tmux_exit_0_global_step_8",
+      "launch_provenance": "direct tmux with exact ledger env and argv",
+      "retry_count": 0
+    }
+  },
+  "equality": {
+    "source_checkpoint_sha256": "4690717781db58a6021d57d124300a9b212f0a5043cf3028fb5de4d9c835cc4d",
+    "source_model": "ema_model_state_dict",
+    "train_order_sha256": "05e805511058f241cc35f1b7c1086b30354f6d80756009cc9997a47904424e41",
+    "first_32_samples_sha256": "e9c2987d2bab5062bb32bdace6a5d80c82c1bf3d50e40aa873d6fd99146409e9",
+    "flow_rng_byte_equal": true,
+    "flow_rng_sha256": "98645238358b061fb6c4861d491f5ac4be518e65a3dc95cc6c888fb8ccaaaae8",
+    "flow_rng_rows_per_arm": 8,
+    "trainable_parameter_names_equal": true,
+    "trainable_parameter_count": 30
+  },
+  "control": {
+    "global_step": 8,
+    "loss": 1.0628088414669037,
+    "flow_matching_objective_raw": 1.0628088414669037,
+    "flow_matching_mse": 66.25273891538382,
+    "mean_pre_clip_grad_norm": 0.8882459476590157,
+    "post_clip_norm_upper_bound_per_step": 1.0,
+    "cumulative_active_rows": 5
+  },
+  "lpl": {
+    "global_step": 8,
+    "loss": 23862.698491230607,
+    "flow_matching_objective_raw": 1.064301237463951,
+    "flow_matching_mse": 67.25790444016457,
+    "latent_perceptual_loss_raw": 7953.8779296875,
+    "latent_perceptual_loss_weighted": 23861.6337890625,
+    "mean_pre_clip_grad_norm": 52419.49162552878,
+    "post_clip_norm_upper_bound_per_step": 1.0,
+    "cumulative_active_rows": 5,
+    "active_fraction": 0.15625,
+    "reported_epoch_mean_min_prediction_variance": 0.05822395998984575,
+    "layer_contributions_to_raw_loss": {
+      "mid_block": 388.6345672607422,
+      "up_block_0": 523.5448226928711,
+      "up_block_1": 1313.046157836914,
+      "up_block_2": 3196.784912109375,
+      "up_block_3": 2531.8673706054688
+    },
+    "up_block_2_and_3_fraction": 0.7202338789695565
+  },
+  "cross_arm": {
+    "raw_lpl_over_fm": 7473.333347464895,
+    "weighted_lpl_over_fm": 22420.000042394684,
+    "mean_pre_clip_grad_ratio": 59014.61387319702,
+    "fm_objective_relative_delta": 0.001404199832387166,
+    "fm_mse_relative_delta": 0.015171682578504719,
+    "final_trainable_tensor_difference_count": 30
+  },
+  "update_integrity": {
+    "finite_changed_trainable_tensors_per_arm": 30,
+    "finite_nonzero_optimizer_states_per_arm": 30,
+    "optimizer_step": 8,
+    "changed_outside_allowlist_per_arm": 0,
+    "vae_in_optimizer_or_trainable_allowlist": false
+  },
+  "resources": {
+    "control_sampled_max_gpu_used_mib": 5987,
+    "control_sampled_min_gpu_reserve_mib": 18140,
+    "lpl_sampled_max_gpu_used_mib": 4971,
+    "lpl_sampled_min_gpu_reserve_mib": 19156,
+    "minimum_required_reserve_mib": 4096,
+    "no_oom": true,
+    "sampling_note": "These are the largest nvidia-smi samples observed by the monitor, not allocator-instrumented exact peaks."
+  },
+  "timing": {
+    "control_warmup_step_seconds": 25.83,
+    "control_total_8_step_seconds_rounded": 26.0,
+    "lpl_warmup_step_seconds": 26.22,
+    "lpl_total_8_step_seconds_rounded": 39.0,
+    "lpl_post_warmup_7500_step_projection_hours": 3.803571428571429,
+    "projection_within_5_hours": true
+  },
+  "validation": {
+    "preparation_post_probe_validator": "passed",
+    "all_metrics_and_optimizer_updates_finite": true,
+    "technical_probe_contract": "passed",
+    "scientific_full_training_gate": "failed_lpl_scale"
+  }
+}
