@@ -10,6 +10,7 @@ import hashlib
 import os
 import subprocess
 import sys
+import tempfile
 from contextlib import nullcontext
 from safa.data.feature_dataset import (
     BALANCED_EPOCH_CYCLE_PAIRING,
@@ -27,7 +28,14 @@ from safa.evaluation.metrics import (
 from safa.evaluation.recognizers import InsightFaceDetector
 from safa.models.conditioning import fixed_null_condition_like, learned_null_condition_like
 from safa.models.e0 import assert_e0_frozen, freeze_e0, load_e0_checkpoint
-from safa.models.generator import GENERATOR_MODEL_TYPE_FLOW, FlowGeneratorConfig, build_generator, generator_sample_channels
+from safa.models.generator import (
+    GENERATOR_MODEL_TYPE_FLOW,
+    GENERATOR_MODEL_TYPE_MEANFLOW_SIT_INPAINT,
+    FlowGeneratorConfig,
+    build_generator,
+    generator_sample_channels,
+)
+from safa.models.meanflow_sit import encode_inpaint_training_latents
 from safa.training.audit import audit_no_identity_supervision
 from safa.training.latent_codec import (
     build_latent_codec_from_train_config,
@@ -105,6 +113,11 @@ _RESUME_CHECKPOINT_MODEL_EMA = "ema"
 _RESUME_CHECKPOINT_MODELS = (_RESUME_CHECKPOINT_MODEL_RAW, _RESUME_CHECKPOINT_MODEL_EMA)
 _R13_OPTIMIZER_STEP_CONTRACT = "safa_r13_exact_optimizer_steps_v1"
 _R13_REQUIRED_OPTIMIZER_STEPS = 7500
+_R14_OPTIMIZER_STEP_CONTRACT = "safa_r14_exact_optimizer_steps_v1"
+_R14_OPTIMIZER_CHECKPOINT_CONTRACT = "safa_r14_optimizer_checkpoint_steps_v1"
+_R14_COMPLETION_CONTRACT = "safa_r14_inpaint_exact_optimizer_steps_v1"
+_R14_REQUIRED_OPTIMIZER_STEPS = 256
+_R14_SPATIAL_TRAINING_CONTRACT = "safa_r14_spatial_training_v1"
 _R13_OPTIMIZER_CHECKPOINT_CONTRACT = "safa_r13_optimizer_checkpoint_steps_v1"
 _R13_LOCKED_TRAIN_ORDER_CONTRACT = "safa_r13_locked_train_order_v1"
 _R13_ACTIVE_ROW_PROBE_CONTRACT = "safa_r13_active_row_probe_v1"
@@ -304,7 +317,18 @@ class _GeneratorTrainingStep:
                 flow_condition: str | None = None,
                 noise_generator=None,
                 encoded_flow_images=None,
+                context_images=None,
+                face_masks=None,
             ):
+                inpaint = self.generator_config.model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT_INPAINT
+                if inpaint and (context_images is None or face_masks is None):
+                    raise ValueError(
+                        "meanflow_sit_inpaint training requires context_images and face_masks"
+                    )
+                if not inpaint and (context_images is not None or face_masks is not None):
+                    raise ValueError(
+                        "legacy generator training does not accept R14 context_images or face_masks"
+                    )
                 effective_flow_condition = self._effective_flow_condition(use_cycle=use_cycle, flow_condition=flow_condition)
                 cycle_loss = z.new_tensor(0.0)
                 if use_cycle:
@@ -387,6 +411,8 @@ class _GeneratorTrainingStep:
                                 effective_flow_condition,
                                 noise_generator=noise_generator,
                                 encoded_flow_images=encoded_flow_images,
+                                context_images=context_images,
+                                face_masks=face_masks,
                             )
                             self._batch_idx += 1
                             secondary_loss = flow_loss.new_tensor(0.0)
@@ -409,6 +435,8 @@ class _GeneratorTrainingStep:
                                 effective_flow_condition,
                                 noise_generator=noise_generator,
                                 encoded_flow_images=encoded_flow_images,
+                                context_images=context_images,
+                                face_masks=face_masks,
                             )
                             loss = flow_loss + self.stage2_objective.lambda_repr * repr_loss
                             loss_metrics = self._stage2_repr_loss_metrics(
@@ -442,6 +470,8 @@ class _GeneratorTrainingStep:
                                 effective_flow_condition,
                                 noise_generator=noise_generator,
                                 encoded_flow_images=encoded_flow_images,
+                                context_images=context_images,
+                                face_masks=face_masks,
                             )
                             loss_metrics = self._stage2_repr_loss_metrics(
                                 flow_loss,
@@ -481,6 +511,8 @@ class _GeneratorTrainingStep:
                     effective_flow_condition,
                     noise_generator=noise_generator,
                     encoded_flow_images=encoded_flow_images,
+                    context_images=context_images,
+                    face_masks=face_masks,
                 )
                 loss, loss_metrics = self._combine_losses(flow_loss, cycle_loss, use_cycle=use_cycle, lambda_cycle=lambda_cycle)
                 loss_metrics["flow_condition"] = effective_flow_condition
@@ -503,20 +535,49 @@ class _GeneratorTrainingStep:
                 flow_condition: str,
                 noise_generator=None,
                 encoded_flow_images=None,
+                context_images=None,
+                face_masks=None,
             ):
                 condition_z = self._flow_condition_z(z, flow_condition)
-                flow_images = encoded_flow_images if encoded_flow_images is not None else self._encode_flow_images(images)
+                inpaint_kwargs = {}
+                if self.generator_config.model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT_INPAINT:
+                    if encoded_flow_images is not None:
+                        raise ValueError("R14 inpaint path does not accept encoded_flow_images")
+                    if self.latent_codec is None:
+                        raise RuntimeError("R14 inpaint training requires a latent codec")
+                    flow_images, context_latent, latent_mask = encode_inpaint_training_latents(
+                        self.latent_codec,
+                        images,
+                        context_images,
+                        face_masks,
+                    )
+                    inpaint_kwargs = {
+                        "context_latent": context_latent,
+                        "latent_mask": latent_mask,
+                    }
+                else:
+                    flow_images = (
+                        encoded_flow_images
+                        if encoded_flow_images is not None
+                        else self._encode_flow_images(images)
+                    )
                 self._last_latent_perceptual_metrics = {}
                 self._last_flow_rng_draw = {}
                 effective_generator = noise_generator if noise_generator is not None else self._flow_generator
                 capture_flow_draw = self._flow_generator is not None and noise_generator is None
                 if not self.latent_perceptual_loss_runtime.enabled and not capture_flow_draw:
-                    return self.generator.flow_matching_loss(flow_images, condition_z, generator=effective_generator)
+                    return self.generator.flow_matching_loss(
+                        flow_images,
+                        condition_z,
+                        generator=effective_generator,
+                        **inpaint_kwargs,
+                    )
                 flow_loss, flow_metrics, clean_latents = self.generator.flow_matching_loss(
                     flow_images,
                     condition_z,
                     generator=effective_generator,
                     return_clean_latents=True,
+                    **inpaint_kwargs,
                 )
                 if capture_flow_draw:
                     self._last_flow_rng_draw = _flow_rng_draw_record(clean_latents)
@@ -1367,10 +1428,12 @@ def _optimizer_step_contract(config: Mapping) -> int | None:
     if not isinstance(payload, Mapping):
         raise ValueError("train_g config.optimizer_step_contract must be a mapping")
     context = "train_g config.optimizer_step_contract"
-    if payload.get("contract_type") != _R13_OPTIMIZER_STEP_CONTRACT:
+    contract_type = payload.get("contract_type")
+    allowed_contracts = (_R13_OPTIMIZER_STEP_CONTRACT, _R14_OPTIMIZER_STEP_CONTRACT)
+    if contract_type not in allowed_contracts:
         raise ValueError(
-            f"{context}.contract_type must equal {_R13_OPTIMIZER_STEP_CONTRACT!r}, "
-            f"got {payload.get('contract_type')!r}"
+            f"{context}.contract_type must be one of {allowed_contracts!r}, "
+            f"got {contract_type!r}"
         )
     required_steps = payload.get("required_steps")
     if isinstance(required_steps, bool) or not isinstance(required_steps, int) or required_steps <= 0:
@@ -1390,9 +1453,14 @@ def _optimizer_checkpoint_steps(config: Mapping, required_steps: int | None) -> 
     if not isinstance(payload, Mapping):
         raise ValueError("train_g config.optimizer_checkpoint_contract must be a mapping")
     context = "train_g config.optimizer_checkpoint_contract"
-    if payload.get("contract_type") != _R13_OPTIMIZER_CHECKPOINT_CONTRACT:
+    contract_type = payload.get("contract_type")
+    allowed_contracts = (
+        _R13_OPTIMIZER_CHECKPOINT_CONTRACT,
+        _R14_OPTIMIZER_CHECKPOINT_CONTRACT,
+    )
+    if contract_type not in allowed_contracts:
         raise ValueError(
-            f"{context}.contract_type must equal {_R13_OPTIMIZER_CHECKPOINT_CONTRACT!r}"
+            f"{context}.contract_type must be one of {allowed_contracts!r}"
         )
     unexpected = sorted(set(payload) - {"contract_type", "save_steps"})
     if unexpected:
@@ -1989,6 +2057,40 @@ def _coerce_many_to_many_int(value, field: str) -> int:
 
 
 def _build_train_feature_dataset(config: dict, transform):
+    generator_config = _generator_config_from_train_config(config)
+    if generator_config.model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT_INPAINT:
+        payload = _require_mapping(config, "r14_spatial", "train_g config")
+        expected_fields = {
+            "contract_type",
+            "pair_manifest",
+            "horizontal_flip_probability",
+        }
+        if set(payload) != expected_fields:
+            raise ValueError(
+                "train_g config.r14_spatial fields must match the registered schema exactly"
+            )
+        if payload.get("contract_type") != _R14_SPATIAL_TRAINING_CONTRACT:
+            raise ValueError("train_g config.r14_spatial.contract_type mismatch")
+        if payload.get("horizontal_flip_probability") != 0.0:
+            raise ValueError(
+                "R14 feasibility training requires horizontal_flip_probability=0.0"
+            )
+        pair_manifest = payload.get("pair_manifest")
+        if not isinstance(pair_manifest, str) or not pair_manifest:
+            raise ValueError("train_g config.r14_spatial.pair_manifest must be a non-empty path")
+        from safa.data.r14_spatial import R14SpatialPairDataset
+        from safa.training.transforms import r14_joint_transform
+
+        return R14SpatialPairDataset(
+            pair_manifest_path=pair_manifest,
+            source_index_path=config["train_index"],
+            source_feature_dir=config["train_features"],
+            e0_checkpoint=config["e0_checkpoint"],
+            joint_transform=r14_joint_transform(
+                _generator_image_transform_size(config),
+                horizontal_flip_probability=0.0,
+            ),
+        )
     many_to_many = config.get("many_to_many", {})
     if many_to_many is None:
         many_to_many = {}
@@ -2070,6 +2172,11 @@ def train_g_from_config(config: dict) -> dict:
     freeze_e0(e0)
 
     generator_config = _generator_config_from_train_config(config)
+    if (
+        distributed.is_main
+        and generator_config.model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT_INPAINT
+    ):
+        (out_dir / "completion.json").unlink(missing_ok=True)
     latent_perceptual_loss_runtime = latent_perceptual_loss_runtime_from_config(config, generator_config)
     required_optimizer_steps = _optimizer_step_contract(config)
     optimizer_checkpoint_steps = _optimizer_checkpoint_steps(config, required_optimizer_steps)
@@ -2147,22 +2254,47 @@ def train_g_from_config(config: dict) -> dict:
         _is_peft_mlp = (stage2_objective is not None and stage2_objective.type == _PEFT_MLP)
         _is_peft_lora = (stage2_objective is not None and stage2_objective.type in {_PEFT_LORA, _LORA_SWEEP}) or (stage2_objective is not None and stage2_objective.type == _POINT_PROJECTED_TWO_STEP and bool(config.get("stages", {}).get("stage2", {}).get("stage2_objective", {}).get("lora_target_modules")))
         missing, unexpected = generator.load_state_dict(checkpoint_model_state, strict=False)
-        if missing:
-            if _is_peft_lora:
-                # Whitelist PEFT-LoRA adapter keys.
-                adapter_tags = (
-                    "lora_a", "lora_b",
-                    "gated_low_rank_z", "generic_bank",
-                    "_peft_lora_null_embed",
+        if generator_config.model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT_INPAINT:
+            expected_missing = {
+                "vector_field.context_embedder.weight",
+                "vector_field.context_embedder.bias",
+            }
+            if set(missing) != expected_missing:
+                raise RuntimeError(
+                    "R14 E15 EMA load must miss only the zero-init context embedder; "
+                    f"missing={sorted(missing)!r}"
                 )
-                non_adapter_missing = [k for k in missing if not any(tag in k for tag in adapter_tags)]
-            else:
-                non_adapter_missing = [k for k in missing if 'cond_mlp_adapter' not in k]
-            if non_adapter_missing:
-                raise RuntimeError(f'Missing non-adapter keys: {non_adapter_missing}')
-            print(f'[PEFT] adapter random-init, missing keys OK: {len(missing)} keys')
-        if unexpected:
-            print(f'[load_state_dict] unexpected keys: {unexpected[:5]}')
+            if unexpected:
+                raise RuntimeError(
+                    "R14 E15 EMA load contains unexpected keys: "
+                    f"{sorted(unexpected)!r}"
+                )
+            context_embedder = generator.vector_field.context_embedder
+            if context_embedder is None:
+                raise RuntimeError("R14 inpaint generator has no context embedder")
+            if (
+                torch.count_nonzero(context_embedder.weight).item() != 0
+                or torch.count_nonzero(context_embedder.bias).item() != 0
+            ):
+                raise RuntimeError("R14 context embedder is not exactly zero after E15 EMA load")
+            print("[R14] loaded E15 EMA; context embedder remains exactly zero")
+        else:
+            if missing:
+                if _is_peft_lora:
+                    # Whitelist PEFT-LoRA adapter keys.
+                    adapter_tags = (
+                        "lora_a", "lora_b",
+                        "gated_low_rank_z", "generic_bank",
+                        "_peft_lora_null_embed",
+                    )
+                    non_adapter_missing = [k for k in missing if not any(tag in k for tag in adapter_tags)]
+                else:
+                    non_adapter_missing = [k for k in missing if 'cond_mlp_adapter' not in k]
+                if non_adapter_missing:
+                    raise RuntimeError(f'Missing non-adapter keys: {non_adapter_missing}')
+                print(f'[PEFT] adapter random-init, missing keys OK: {len(missing)} keys')
+            if unexpected:
+                print(f'[load_state_dict] unexpected keys: {unexpected[:5]}')
         if resume_mode == _RESUME_MODE_TRAINING_STATE:
             if "history" in ckpt:
                 resume_history = _resume_history_for_checkpoint_selection(ckpt["history"], str(resume_path), config, stages)
@@ -2351,11 +2483,48 @@ def train_g_from_config(config: dict) -> dict:
             seen = 0
             r13_cumulative_active_rows = 0
             for batch_index, batch in enumerate(tqdm(train_loader, desc=f"train_g {stage_name} epoch={stage_epoch}", disable=not distributed.is_main)):
-                images = batch["image"].to(device, non_blocking=True)
-                z = batch["z"].to(device, non_blocking=True)
+                if generator_config.model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT_INPAINT:
+                    expected_keys = {
+                        "source_z",
+                        "target_image",
+                        "context_image",
+                        "face_mask",
+                        "pair_id",
+                        "source_sample_id",
+                        "target_sample_id",
+                        "affect_label",
+                        "bbox_xywh",
+                        "landmarks68",
+                    }
+                    if set(batch) != expected_keys:
+                        raise ValueError(
+                            "R14 train batch fields differ from the registered spatial contract"
+                        )
+                    source_ids = list(batch["source_sample_id"])
+                    target_ids = list(batch["target_sample_id"])
+                    if any(source_id == target_id for source_id, target_id in zip(source_ids, target_ids, strict=True)):
+                        raise ValueError("R14 train batch requires source_sample_id != target_sample_id")
+                    images = batch["target_image"].to(device, non_blocking=True)
+                    z = batch["source_z"].to(device, non_blocking=True)
+                    context_images = batch["context_image"].to(device, non_blocking=True)
+                    face_masks = batch["face_mask"].to(device, non_blocking=True)
+                    if not torch.isfinite(z).all().item():
+                        raise ValueError("R14 source_z contains non-finite values")
+                    z_norm = torch.linalg.vector_norm(z.float(), dim=1)
+                    if not torch.allclose(z_norm, torch.ones_like(z_norm), atol=1.0e-4, rtol=0.0):
+                        raise ValueError("R14 source_z must be L2-normalized")
+                    sample_ids = list(batch["target_sample_id"])
+                    inpaint_batch_kwargs = {
+                        "context_images": context_images,
+                        "face_masks": face_masks,
+                    }
+                else:
+                    images = batch["image"].to(device, non_blocking=True)
+                    z = batch["z"].to(device, non_blocking=True)
+                    sample_ids = list(batch["sample_id"])
+                    inpaint_batch_kwargs = {}
                 optimizer.zero_grad(set_to_none=True)
                 amp_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if use_amp else nullcontext()
-                sample_ids = list(batch["sample_id"])
                 batch_size = int(z.shape[0])
                 if _should_record_gradient_conflict(stage_name, batch_index, gradient_conflict_config):
                     if gradient_conflict_config.max_samples is None:
@@ -2496,6 +2665,7 @@ def train_g_from_config(config: dict) -> dict:
                             stage_name == "stage2",
                             lambda_cycle,
                             flow_condition=stage_flow_condition,
+                            **inpaint_batch_kwargs,
                         )
                     _assert_finite_training_scalars(loss, flow_mse, cycle)
                     assert_finite_tensor("g_loss", loss)
@@ -2700,15 +2870,21 @@ def train_g_from_config(config: dict) -> dict:
             f"optimizer_step_contract incomplete: global_step={global_step}, required_steps={required_optimizer_steps}"
         )
 
+    barrier(distributed)
     manifest = {}
     if distributed.is_main:
         final_checkpoint = best_checkpoint if best_checkpoint.is_file() else out_dir / "last.pt"
         final_metrics = history[-1] if history else {}
+        generator_input = (
+            "source_z+masked_context+face_mask"
+            if generator_config.model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT_INPAINT
+            else "z_only"
+        )
         manifest = {
             "checkpoint": str(final_checkpoint),
             "metrics": final_metrics,
             "history": history,
-            "generator_input": "z_only",
+            "generator_input": generator_input,
             "model_type": _manifest_model_type(generator_config),
             "identity_supervision": False,
             "distributed": _distributed_manifest(distributed),
@@ -2719,6 +2895,23 @@ def train_g_from_config(config: dict) -> dict:
             "resume_from_legacy_stage1_metrics": bool(config.get("resume_from_legacy_stage1_metrics", False)),
         }
         _write_json(out_dir / "manifest.json", manifest)
+        if generator_config.model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT_INPAINT:
+            last_checkpoint = out_dir / "last.pt"
+            if not last_checkpoint.is_file() or last_checkpoint.stat().st_size <= 0:
+                raise RuntimeError("R14 exact-step training did not produce a non-empty last.pt")
+            if ema is None or not ema_config["save_ema_checkpoint"]:
+                raise RuntimeError("R14 exact-step training completed without checkpointed EMA state")
+            _write_json_atomic(
+                out_dir / "completion.json",
+                {
+                    "contract_type": _R14_COMPLETION_CONTRACT,
+                    "completed": True,
+                    "optimizer_steps": int(global_step),
+                    "ema_available": True,
+                    "checkpoint": str(last_checkpoint),
+                    "manifest": str(out_dir / "manifest.json"),
+                },
+            )
     barrier(distributed)
     cleanup_distributed(distributed)
     return manifest
@@ -3227,6 +3420,98 @@ def _validate_train_g_config(config: dict) -> None:
     _validate_quality_eval_configs(config, stages)
     if int(_require_field(stages["stage2"], "epochs", "stages.stage2")) > 0:
         _validate_stage2_validation_config(config)
+
+
+    if generator_config.model_type == GENERATOR_MODEL_TYPE_MEANFLOW_SIT_INPAINT:
+        _validate_r14_inpaint_training_contract(
+            config,
+            generator_config=generator_config,
+            generator_trainable_mode=generator_trainable_mode,
+            resume_mode=resume_mode,
+            resume_checkpoint_model=resume_checkpoint_model,
+            required_optimizer_steps=required_optimizer_steps,
+            optimizer_checkpoint_steps=optimizer_checkpoint_steps,
+            stages=stages,
+            stage2_objective=stage2_objective,
+            ema_config=ema_config,
+            batch_config=batch_config,
+            gradient_conflict=gradient_conflict,
+            validation=validation,
+        )
+
+
+def _validate_r14_inpaint_training_contract(
+    config,
+    *,
+    generator_config,
+    generator_trainable_mode,
+    resume_mode,
+    resume_checkpoint_model,
+    required_optimizer_steps,
+    optimizer_checkpoint_steps,
+    stages,
+    stage2_objective,
+    ema_config,
+    batch_config,
+    gradient_conflict,
+    validation,
+):
+    if config["optimizer_step_contract"].get("contract_type") != _R14_OPTIMIZER_STEP_CONTRACT:
+        raise ValueError("R14 inpaint requires the registered optimizer-step contract")
+    if required_optimizer_steps != _R14_REQUIRED_OPTIMIZER_STEPS:
+        raise ValueError("R14 inpaint requires exactly 256 optimizer steps")
+    checkpoint_contract = _require_mapping(
+        config, "optimizer_checkpoint_contract", "train_g config"
+    )
+    if checkpoint_contract.get("contract_type") != _R14_OPTIMIZER_CHECKPOINT_CONTRACT:
+        raise ValueError("R14 inpaint requires the registered optimizer-checkpoint contract")
+    if optimizer_checkpoint_steps != (0, _R14_REQUIRED_OPTIMIZER_STEPS):
+        raise ValueError("R14 inpaint checkpoint steps must be exactly [0, 256]")
+    if generator_trainable_mode != _GENERATOR_TRAINABLE_FULL:
+        raise ValueError("R14 inpaint requires generator_trainable='full'")
+    if resume_mode != _RESUME_MODE_MODEL_WEIGHTS_ONLY:
+        raise ValueError("R14 inpaint requires resume_mode='model_weights_only'")
+    if resume_checkpoint_model != _RESUME_CHECKPOINT_MODEL_EMA:
+        raise ValueError("R14 inpaint requires resume_checkpoint_model='ema'")
+    if (
+        config.get("resume_from") != R13_SOURCE_CHECKPOINT
+        or config.get("resume_from_sha256") != R13_SOURCE_CHECKPOINT_SHA256
+    ):
+        raise ValueError("R14 inpaint requires the locked E15 EMA source")
+    if not generator_config.learned_null_condition:
+        raise ValueError("R14 inpaint requires learned_null_condition=true")
+    if "latent_perceptual_loss" in config:
+        raise ValueError("R14 inpaint feasibility does not use latent_perceptual_loss")
+    if int(stages["stage1"]["epochs"]) != 0:
+        raise ValueError("R14 inpaint requires stages.stage1.epochs=0")
+    if int(stages["stage2"]["epochs"]) <= 0:
+        raise ValueError("R14 inpaint requires positive stages.stage2.epochs")
+    if stage2_objective is None or stage2_objective.type != "fm_only_probe":
+        raise ValueError("R14 inpaint requires stage2_objective.type='fm_only_probe'")
+    if stage2_objective.flow_condition != _FLOW_CONDITION_EMBEDDING:
+        raise ValueError("R14 inpaint requires flow_condition='embedding'")
+    if config.get("many_to_many", {}).get("enabled", False):
+        raise ValueError("R14 inpaint uses r14_spatial pairs, not many_to_many")
+    if gradient_conflict.enabled:
+        raise ValueError("R14 inpaint feasibility disables gradient-conflict monitoring")
+    if _require_bool(validation, "enabled", "validation"):
+        raise ValueError("R14 inpaint feasibility requires validation.enabled=false")
+    if not ema_config["enabled"] or not ema_config["save_ema_checkpoint"]:
+        raise ValueError("R14 inpaint requires enabled, checkpointed EMA")
+    if batch_config.per_device_batch_size != 2 or batch_config.global_batch_size != 4:
+        raise ValueError("R14 inpaint two-GPU run requires per_device_batch_size=2 and global_batch_size=4")
+    spatial = _require_mapping(config, "r14_spatial", "train_g config")
+    expected_spatial = {
+        "contract_type",
+        "pair_manifest",
+        "horizontal_flip_probability",
+    }
+    if set(spatial) != expected_spatial:
+        raise ValueError("R14 r14_spatial fields differ from the registered schema")
+    if spatial.get("contract_type") != _R14_SPATIAL_TRAINING_CONTRACT:
+        raise ValueError("R14 r14_spatial contract_type mismatch")
+    if spatial.get("horizontal_flip_probability") != 0.0:
+        raise ValueError("R14 feasibility requires horizontal_flip_probability=0.0")
 
 
 def _validate_independent_prior_m2m(
@@ -5514,6 +5799,25 @@ def _save_generator(
 def _write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False), encoding="utf-8")
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
 
 
 def _append_metrics_history(out_dir: Path, metrics: dict) -> None:
