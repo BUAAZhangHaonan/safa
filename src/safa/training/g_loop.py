@@ -116,7 +116,8 @@ _R13_REQUIRED_OPTIMIZER_STEPS = 7500
 _R14_OPTIMIZER_STEP_CONTRACT = "safa_r14_exact_optimizer_steps_v1"
 _R14_OPTIMIZER_CHECKPOINT_CONTRACT = "safa_r14_optimizer_checkpoint_steps_v1"
 _R14_COMPLETION_CONTRACT = "safa_r14_inpaint_exact_optimizer_steps_v1"
-_R14_REQUIRED_OPTIMIZER_STEPS = 256
+_R14_REQUIRED_OPTIMIZER_STEPS = 2560
+_R14_REQUIRED_STAGE2_EPOCHS = 20
 _R14_SPATIAL_TRAINING_CONTRACT = "safa_r14_spatial_training_v1"
 _R13_OPTIMIZER_CHECKPOINT_CONTRACT = "safa_r13_optimizer_checkpoint_steps_v1"
 _R13_LOCKED_TRAIN_ORDER_CONTRACT = "safa_r13_locked_train_order_v1"
@@ -3459,14 +3460,14 @@ def _validate_r14_inpaint_training_contract(
     if config["optimizer_step_contract"].get("contract_type") != _R14_OPTIMIZER_STEP_CONTRACT:
         raise ValueError("R14 inpaint requires the registered optimizer-step contract")
     if required_optimizer_steps != _R14_REQUIRED_OPTIMIZER_STEPS:
-        raise ValueError("R14 inpaint requires exactly 256 optimizer steps")
+        raise ValueError("R14 inpaint requires exactly 2560 optimizer steps")
     checkpoint_contract = _require_mapping(
         config, "optimizer_checkpoint_contract", "train_g config"
     )
     if checkpoint_contract.get("contract_type") != _R14_OPTIMIZER_CHECKPOINT_CONTRACT:
         raise ValueError("R14 inpaint requires the registered optimizer-checkpoint contract")
     if optimizer_checkpoint_steps != (0, _R14_REQUIRED_OPTIMIZER_STEPS):
-        raise ValueError("R14 inpaint checkpoint steps must be exactly [0, 256]")
+        raise ValueError("R14 inpaint checkpoint steps must be exactly [0, 2560]")
     if generator_trainable_mode != _GENERATOR_TRAINABLE_FULL:
         raise ValueError("R14 inpaint requires generator_trainable='full'")
     if resume_mode != _RESUME_MODE_MODEL_WEIGHTS_ONLY:
@@ -3484,8 +3485,8 @@ def _validate_r14_inpaint_training_contract(
         raise ValueError("R14 inpaint feasibility does not use latent_perceptual_loss")
     if int(stages["stage1"]["epochs"]) != 0:
         raise ValueError("R14 inpaint requires stages.stage1.epochs=0")
-    if int(stages["stage2"]["epochs"]) <= 0:
-        raise ValueError("R14 inpaint requires positive stages.stage2.epochs")
+    if int(stages["stage2"]["epochs"]) != _R14_REQUIRED_STAGE2_EPOCHS:
+        raise ValueError("R14 inpaint requires exactly 20 stages.stage2 epochs")
     if stage2_objective is None or stage2_objective.type != "fm_only_probe":
         raise ValueError("R14 inpaint requires stage2_objective.type='fm_only_probe'")
     if stage2_objective.flow_condition != _FLOW_CONDITION_EMBEDDING:
