@@ -48,6 +48,7 @@ from safa.evaluation.r13_evaluator_contract import (
     is_r13_evaluator_config,
     r13_execution_contract,
     validate_r13_checkpoint_declaration,
+    validate_r13_checkpoint_training_contract,
     validate_r13_evaluator_contract,
 )
 from safa.utils.sampling import make_x_init_for_sample_ids
@@ -195,6 +196,7 @@ def validate_checkpoint_contract(
     *,
     expected_stage_epoch_1based: int = EXPECTED_STAGE_EPOCH,
     expected_global_step: int | None = None,
+    expected_r13_arm_id: str | None = None,
 ) -> dict[str, Any]:
     if not isinstance(payload, Mapping):
         raise ValueError("MeanFlow checkpoint must contain a mapping")
@@ -254,6 +256,20 @@ def validate_checkpoint_contract(
     ema_state = payload.get("ema_model_state_dict")
     if not isinstance(ema_state, Mapping) or not ema_state:
         raise ValueError("checkpoint missing non-empty ema_model_state_dict")
+    r13_training_contract = None
+    if expected_r13_arm_id is not None:
+        r13_training_contract = validate_r13_checkpoint_training_contract(
+            payload, expected_arm_id=expected_r13_arm_id
+        )
+        contract_steps = r13_training_contract["optimizer_step_contract"][
+            "required_steps"
+        ]
+        if expected_global_step != contract_steps:
+            raise ValueError(
+                "R13 checkpoint expected_global_step must match its persisted "
+                f"optimizer step contract: expected={expected_global_step!r} "
+                f"persisted={contract_steps!r}"
+            )
     metadata = {
         "stage": EXPECTED_STAGE,
         "stage_epoch_1based": expected_stage_epoch_1based,
@@ -266,6 +282,8 @@ def validate_checkpoint_contract(
     if expected_global_step is not None:
         metadata["global_step"] = expected_global_step
         metadata["required_optimizer_steps"] = expected_global_step
+    if r13_training_contract is not None:
+        metadata["r13_training_contract"] = r13_training_contract
     return metadata
 
 
@@ -293,6 +311,7 @@ def load_ema_generator(
                 "stage_epoch_1based"
             ],
             expected_global_step=checkpoint_contract["global_step"],
+            expected_r13_arm_id=checkpoint_contract["arm_id"],
         )
     model_config = dict(payload["model_config"])
     # The target EMA is complete. Do not load an older pretrained SiT before replacing it.

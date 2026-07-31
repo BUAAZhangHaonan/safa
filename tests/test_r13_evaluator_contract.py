@@ -30,7 +30,9 @@ from safa.evaluation.r13_evaluator_contract import (  # noqa: E402
     R13_FINAL_GLOBAL_STEP,
     R13_LOCKED_ASSETS,
     R13_SAMPLE_MANIFESTS,
+    R13_TRAINING_CONTRACT_FIELD,
     apply_r13_strict_cuda_determinism,
+    expected_r13_training_contract,
     validate_r13_checkpoint_declaration,
     validate_r13_evaluator_contract,
 )
@@ -118,6 +120,7 @@ def _config(arm_id: str = "control", sample_set: str = "regular32") -> dict:
 
 def _checkpoint_payload(
     *,
+    arm_id: str = "control",
     epoch: object = 1,
     global_step: object = R13_FINAL_GLOBAL_STEP,
     required_optimizer_steps: object = R13_FINAL_GLOBAL_STEP,
@@ -131,6 +134,8 @@ def _checkpoint_payload(
         },
         "model_config": dict(EXPECTED_MODEL_CONFIG),
         "ema_model_state_dict": {"weight": torch.ones(())},
+        "training_config": {"generator_trainable": "conditioning_only"},
+        R13_TRAINING_CONTRACT_FIELD: expected_r13_training_contract(arm_id),
     }
 
 
@@ -280,6 +285,7 @@ def test_r13_checkpoint_rejects_missing_nonfinite_or_drifted_step_evidence(
             payload,
             expected_stage_epoch_1based=1,
             expected_global_step=R13_FINAL_GLOBAL_STEP,
+            expected_r13_arm_id="control",
         )
 
 
@@ -288,11 +294,193 @@ def test_r13_checkpoint_accepts_exact_internal_step_evidence() -> None:
         _checkpoint_payload(),
         expected_stage_epoch_1based=1,
         expected_global_step=R13_FINAL_GLOBAL_STEP,
+        expected_r13_arm_id="control",
     )
 
     assert metadata["global_step"] == R13_FINAL_GLOBAL_STEP
     assert metadata["required_optimizer_steps"] == R13_FINAL_GLOBAL_STEP
     assert metadata["weight_source"] == "ema_model_state_dict"
+    assert metadata[R13_TRAINING_CONTRACT_FIELD] == expected_r13_training_contract(
+        "control"
+    )
+
+
+@pytest.mark.parametrize("arm_id", ("control", "lpl"))
+def test_r13_checkpoint_accepts_only_the_exact_persisted_arm_semantics(
+    arm_id: str,
+) -> None:
+    metadata = validate_checkpoint_contract(
+        _checkpoint_payload(arm_id=arm_id),
+        expected_stage_epoch_1based=1,
+        expected_global_step=R13_FINAL_GLOBAL_STEP,
+        expected_r13_arm_id=arm_id,
+    )
+
+    persisted = metadata[R13_TRAINING_CONTRACT_FIELD]
+    assert persisted["arm_id"] == arm_id
+    assert persisted["latent_perceptual_loss"]["enabled"] is (arm_id == "lpl")
+    assert persisted["trainable"]["parameter_count"] == 30
+    assert persisted["trainable"]["parameter_numel"] == 44_688_384
+
+
+@pytest.mark.parametrize("arm_id", ("control", "lpl"))
+def test_evaluator_contract_matches_training_serializer_exactly(arm_id: str) -> None:
+    from safa.training.r13_training_contract import build_r13_training_contract
+
+    expected = expected_r13_training_contract(arm_id)
+
+    class FakeParameter:
+        requires_grad = True
+
+        def __init__(self, numel: int) -> None:
+            self._numel = numel
+
+        def numel(self) -> int:
+            return self._numel
+
+    class FakeGenerator:
+        def named_parameters(self):
+            names = expected["trainable"]["parameter_names"]
+            sizes = [1] * len(names)
+            sizes[0] += expected["trainable"]["parameter_numel"] - len(names)
+            return iter(
+                (name, FakeParameter(size))
+                for name, size in zip(names, sizes, strict=True)
+            )
+
+    resume = expected["resume"]
+    config = {
+        "r13_arm_id": arm_id,
+        "latent_perceptual_loss": expected["latent_perceptual_loss"],
+        "optimizer_step_contract": expected["optimizer_step_contract"],
+        "optimizer_checkpoint_contract": expected[
+            "optimizer_checkpoint_contract"
+        ],
+        "flow_matching_rng_contract": expected["flow_matching_rng_contract"],
+        "train_order_contract": expected["train_order_contract"],
+        "resume_mode": resume["mode"],
+        "resume_checkpoint_model": resume["checkpoint_model"],
+        "resume_from": resume["source_checkpoint"],
+        "resume_from_sha256": resume["source_checkpoint_sha256"],
+        "generator_trainable": expected["trainable"]["selector"],
+    }
+
+    assert build_r13_training_contract(config, FakeGenerator()) == expected
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    (
+        (("arm_id",), "lpl"),
+        (("latent_perceptual_loss", "enabled"), True),
+        (("latent_perceptual_loss", "contract_type"), "other"),
+        (("latent_perceptual_loss", "weight"), float("nan")),
+        (("latent_perceptual_loss", "snr_tau"), 2.0),
+        (("latent_perceptual_loss", "normalization"), "other"),
+        (("latent_perceptual_loss", "layer_weighting"), "uniform"),
+        (("latent_perceptual_loss", "flow_subset"), "all"),
+        (("latent_perceptual_loss", "spatial_validity"), "masked"),
+        (("latent_perceptual_loss", "feature_names"), ["mid_block"]),
+        (("optimizer_step_contract", "required_steps"), 7499),
+        (("optimizer_checkpoint_contract", "save_steps"), [0, 7500]),
+        (("flow_matching_rng_contract", "seed"), 7919),
+        (("flow_matching_rng_contract", "algorithm"), "global_rng"),
+        (("flow_matching_rng_contract", "draw_order"), ["eps"]),
+        (("flow_matching_rng_contract", "ledger_filename"), "other.jsonl"),
+        (("train_order_contract", "path"), "other.jsonl"),
+        (("train_order_contract", "sha256"), "0" * 64),
+        (("train_order_contract", "seed"), 7919),
+        (("train_order_contract", "sample_count"), 29999),
+        (("train_order_contract", "batch_size"), 2),
+        (("resume", "mode"), "training_state"),
+        (("resume", "checkpoint_model"), "raw"),
+        (("resume", "source_checkpoint"), "renamed.pt"),
+        (("resume", "source_checkpoint_sha256"), "0" * 64),
+        (("trainable", "selector"), "full"),
+        (("trainable", "parameter_names"), ["vector_field.z_embedder.0.bias"]),
+        (("trainable", "parameter_count"), 29),
+        (("trainable", "parameter_numel"), 44_688_383),
+    ),
+)
+def test_r13_checkpoint_rejects_any_persisted_control_semantic_drift(
+    path: tuple[str, ...], value: object
+) -> None:
+    payload = _checkpoint_payload()
+    target = payload[R13_TRAINING_CONTRACT_FIELD]
+    for field in path[:-1]:
+        target = target[field]
+    target[path[-1]] = value
+
+    with pytest.raises(ValueError):
+        validate_checkpoint_contract(
+            payload,
+            expected_stage_epoch_1based=1,
+            expected_global_step=R13_FINAL_GLOBAL_STEP,
+            expected_r13_arm_id="control",
+        )
+
+
+@pytest.mark.parametrize("mutation", ("missing", "extra"))
+def test_r13_checkpoint_training_contract_schema_is_exact(mutation: str) -> None:
+    payload = _checkpoint_payload()
+    contract = payload[R13_TRAINING_CONTRACT_FIELD]
+    if mutation == "missing":
+        contract.pop("resume")
+    else:
+        contract["unexpected"] = "forbidden"
+
+    with pytest.raises(ValueError, match="fields must match exactly"):
+        validate_checkpoint_contract(
+            payload,
+            expected_stage_epoch_1based=1,
+            expected_global_step=R13_FINAL_GLOBAL_STEP,
+            expected_r13_arm_id="control",
+        )
+
+
+@pytest.mark.parametrize("value", (None, "missing"))
+def test_r13_checkpoint_requires_top_level_training_contract(value: object) -> None:
+    payload = _checkpoint_payload()
+    if value == "missing":
+        payload.pop(R13_TRAINING_CONTRACT_FIELD)
+    else:
+        payload[R13_TRAINING_CONTRACT_FIELD] = value
+
+    with pytest.raises(ValueError, match="r13_training_contract"):
+        validate_checkpoint_contract(
+            payload,
+            expected_stage_epoch_1based=1,
+            expected_global_step=R13_FINAL_GLOBAL_STEP,
+            expected_r13_arm_id="control",
+        )
+
+
+def test_r13_lpl_checkpoint_rejects_disabled_lpl_semantics() -> None:
+    payload = _checkpoint_payload(arm_id="lpl")
+    payload[R13_TRAINING_CONTRACT_FIELD]["latent_perceptual_loss"][
+        "enabled"
+    ] = False
+
+    with pytest.raises(ValueError, match="enabled"):
+        validate_checkpoint_contract(
+            payload,
+            expected_stage_epoch_1based=1,
+            expected_global_step=R13_FINAL_GLOBAL_STEP,
+            expected_r13_arm_id="lpl",
+        )
+
+
+def test_r13_checkpoint_requires_matching_legacy_training_config_selector() -> None:
+    payload = _checkpoint_payload()
+    payload["training_config"]["generator_trainable"] = "full"
+
+    with pytest.raises(ValueError, match="generator_trainable"):
+        validate_checkpoint_contract(
+            payload,
+            expected_stage_epoch_1based=1,
+            expected_global_step=R13_FINAL_GLOBAL_STEP,
+            expected_r13_arm_id="control",
+        )
 
 
 def test_r13_checkpoint_declaration_binds_the_loader_path() -> None:
@@ -338,6 +526,26 @@ def test_r13_ema_loader_uses_exact_declaration_and_internal_step_evidence(
     assert metadata["weight_source"] == "ema_model_state_dict"
     assert metadata["global_step"] == R13_FINAL_GLOBAL_STEP
     assert metadata["required_optimizer_steps"] == R13_FINAL_GLOBAL_STEP
+
+
+def test_control_checkpoint_cannot_be_renamed_into_the_lpl_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lpl_declaration = _declaration(arm_id="lpl")
+    control_payload = _checkpoint_payload(arm_id="control")
+    monkeypatch.setattr(Path, "is_file", lambda self: True)
+    monkeypatch.setattr(torch, "load", lambda *args, **kwargs: control_payload)
+
+    with pytest.raises(ValueError, match="arm_id"):
+        load_ema_generator(
+            lpl_declaration["checkpoint_path"],
+            device=torch.device("cpu"),
+            r9_attention_backend="native",
+            checkpoint_contract=lpl_declaration,
+            generator_builder=lambda config: pytest.fail(
+                "arm substitution must fail before model construction"
+            ),
+        )
 
 
 def _mock_asset_digests(monkeypatch: pytest.MonkeyPatch, config: dict) -> None:

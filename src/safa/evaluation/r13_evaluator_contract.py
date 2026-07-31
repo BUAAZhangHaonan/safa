@@ -17,6 +17,48 @@ R13_EVALUATOR_CONTRACT_TYPE = "safa_r13_r12_protocol_initial_noise_v1"
 R13_EVALUATOR_CONTRACT_FIELD = "r13_evaluator_contract"
 R13_FINAL_GLOBAL_STEP = 7500
 R13_STAGE_EPOCH_1BASED = 1
+R13_TRAINING_CONTRACT_FIELD = "r13_training_contract"
+R13_TRAINING_CONTRACT_TYPE = "safa_r13_control_lpl_training_v1"
+R13_E15_SOURCE_CHECKPOINT = (
+    "artifacts/checkpoints/e15_meanflow_sit_b_face_mixed_h100_resume_2400ep/"
+    "last_nopretrained.pt"
+)
+R13_E15_SOURCE_CHECKPOINT_SHA256 = (
+    "4690717781db58a6021d57d124300a9b212f0a5043cf3028fb5de4d9c835cc4d"
+)
+R13_CONDITIONING_PARAMETER_NAMES = (
+    "vector_field.blocks.0.adaLN_modulation.1.bias",
+    "vector_field.blocks.0.adaLN_modulation.1.weight",
+    "vector_field.blocks.1.adaLN_modulation.1.bias",
+    "vector_field.blocks.1.adaLN_modulation.1.weight",
+    "vector_field.blocks.10.adaLN_modulation.1.bias",
+    "vector_field.blocks.10.adaLN_modulation.1.weight",
+    "vector_field.blocks.11.adaLN_modulation.1.bias",
+    "vector_field.blocks.11.adaLN_modulation.1.weight",
+    "vector_field.blocks.2.adaLN_modulation.1.bias",
+    "vector_field.blocks.2.adaLN_modulation.1.weight",
+    "vector_field.blocks.3.adaLN_modulation.1.bias",
+    "vector_field.blocks.3.adaLN_modulation.1.weight",
+    "vector_field.blocks.4.adaLN_modulation.1.bias",
+    "vector_field.blocks.4.adaLN_modulation.1.weight",
+    "vector_field.blocks.5.adaLN_modulation.1.bias",
+    "vector_field.blocks.5.adaLN_modulation.1.weight",
+    "vector_field.blocks.6.adaLN_modulation.1.bias",
+    "vector_field.blocks.6.adaLN_modulation.1.weight",
+    "vector_field.blocks.7.adaLN_modulation.1.bias",
+    "vector_field.blocks.7.adaLN_modulation.1.weight",
+    "vector_field.blocks.8.adaLN_modulation.1.bias",
+    "vector_field.blocks.8.adaLN_modulation.1.weight",
+    "vector_field.blocks.9.adaLN_modulation.1.bias",
+    "vector_field.blocks.9.adaLN_modulation.1.weight",
+    "vector_field.final_layer.adaLN_modulation.1.bias",
+    "vector_field.final_layer.adaLN_modulation.1.weight",
+    "vector_field.z_embedder.0.bias",
+    "vector_field.z_embedder.0.weight",
+    "vector_field.z_embedder.2.bias",
+    "vector_field.z_embedder.2.weight",
+)
+R13_CONDITIONING_PARAMETER_NUMEL = 44_688_384
 
 R13_ARM_CHECKPOINT_ROOTS = {
     "control": PurePosixPath(
@@ -271,6 +313,97 @@ def validate_r13_checkpoint_declaration(
     return contract
 
 
+def expected_r13_training_contract(arm_id: str) -> dict[str, Any]:
+    if arm_id not in R13_ARM_CHECKPOINT_ROOTS:
+        raise ValueError("R13 training arm_id must be 'control' or 'lpl'")
+    lpl_enabled = arm_id == "lpl"
+    return {
+        "schema_version": 1,
+        "contract_type": R13_TRAINING_CONTRACT_TYPE,
+        "arm_id": arm_id,
+        "latent_perceptual_loss": {
+            "contract_type": "safa_r13_decoder_latent_perceptual_loss_v1",
+            "enabled": lpl_enabled,
+            "weight": 3.0,
+            "snr_tau": 3.0,
+            "normalization": "prediction_spatial_mean_variance_cross_normalization",
+            "layer_weighting": "inverse_linear_upsampling",
+            "flow_subset": "r_equals_t_and_snr_lte_tau",
+            "spatial_validity": "all_features_fail_closed",
+            "feature_names": [
+                "mid_block",
+                "up_block_0",
+                "up_block_1",
+                "up_block_2",
+                "up_block_3",
+            ],
+        },
+        "optimizer_step_contract": {
+            "contract_type": "safa_r13_exact_optimizer_steps_v1",
+            "required_steps": R13_FINAL_GLOBAL_STEP,
+        },
+        "optimizer_checkpoint_contract": {
+            "contract_type": "safa_r13_optimizer_checkpoint_steps_v1",
+            "save_steps": [0, 2500, 5000, R13_FINAL_GLOBAL_STEP],
+        },
+        "flow_matching_rng_contract": {
+            "contract_type": "safa_r13_dedicated_flow_rng_v1",
+            "seed": 1337,
+            "algorithm": "torch.Generator",
+            "draw_order": ["eps", "r_t_pairs", "equality_mask"],
+            "ledger_filename": "flow_rng_ledger.jsonl",
+        },
+        "train_order_contract": {
+            "contract_type": "safa_r13_locked_train_order_v1",
+            "path": (
+                "artifacts/r13_control_lpl_training/preparation_v1/"
+                "train_order_seed1337.jsonl"
+            ),
+            "sha256": (
+                "05e805511058f241cc35f1b7c1086b30354f6d80756009cc9997a47904424e41"
+            ),
+            "seed": 1337,
+            "sample_count": 30000,
+            "batch_size": 4,
+        },
+        "resume": {
+            "mode": "model_weights_only",
+            "checkpoint_model": "ema",
+            "source_checkpoint": R13_E15_SOURCE_CHECKPOINT,
+            "source_checkpoint_sha256": R13_E15_SOURCE_CHECKPOINT_SHA256,
+        },
+        "trainable": {
+            "selector": "conditioning_only",
+            "parameter_names": list(R13_CONDITIONING_PARAMETER_NAMES),
+            "parameter_count": len(R13_CONDITIONING_PARAMETER_NAMES),
+            "parameter_numel": R13_CONDITIONING_PARAMETER_NUMEL,
+        },
+    }
+
+
+def validate_r13_checkpoint_training_contract(
+    payload: Mapping[str, Any], *, expected_arm_id: str
+) -> dict[str, Any]:
+    if not isinstance(payload, Mapping):
+        raise ValueError("R13 checkpoint payload must be a mapping")
+    actual = payload.get(R13_TRAINING_CONTRACT_FIELD)
+    expected = expected_r13_training_contract(expected_arm_id)
+    _require_exact_json_structure(
+        actual,
+        expected,
+        path=f"checkpoint.{R13_TRAINING_CONTRACT_FIELD}",
+    )
+    training_config = payload.get("training_config")
+    if not isinstance(training_config, Mapping):
+        raise ValueError("R13 checkpoint missing training_config mapping")
+    if training_config.get("generator_trainable") != "conditioning_only":
+        raise ValueError(
+            "R13 checkpoint training_config.generator_trainable must be "
+            "'conditioning_only'"
+        )
+    return expected
+
+
 def apply_r13_strict_cuda_determinism(
     config: Mapping[str, Any], *, torch_module
 ) -> dict[str, Any]:
@@ -375,3 +508,36 @@ def _require_sha256(value: Any, label: str) -> str:
     if not re.fullmatch(r"[0-9a-f]{64}", text):
         raise ValueError(f"{label} must be a lowercase SHA256 digest")
     return text
+
+
+def _require_exact_json_structure(actual: Any, expected: Any, *, path: str) -> None:
+    if isinstance(expected, dict):
+        if not isinstance(actual, Mapping):
+            raise ValueError(f"{path} must be a mapping")
+        actual_keys = set(actual)
+        expected_keys = set(expected)
+        if actual_keys != expected_keys:
+            raise ValueError(
+                f"{path} fields must match exactly; "
+                f"missing={sorted(expected_keys - actual_keys)!r} "
+                f"extra={sorted(actual_keys - expected_keys)!r}"
+            )
+        for key, expected_value in expected.items():
+            _require_exact_json_structure(
+                actual[key], expected_value, path=f"{path}.{key}"
+            )
+        return
+    if isinstance(expected, list):
+        if not isinstance(actual, list) or len(actual) != len(expected):
+            raise ValueError(
+                f"{path} must be the exact registered list of length {len(expected)}"
+            )
+        for index, (actual_value, expected_value) in enumerate(
+            zip(actual, expected, strict=True)
+        ):
+            _require_exact_json_structure(
+                actual_value, expected_value, path=f"{path}[{index}]"
+            )
+        return
+    if type(actual) is not type(expected) or actual != expected:
+        raise ValueError(f"{path} must be {expected!r}, got {actual!r}")
