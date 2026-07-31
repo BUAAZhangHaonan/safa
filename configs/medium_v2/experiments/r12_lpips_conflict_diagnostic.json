@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "contract_type": "safa_r12_lpips_conflict_request_v1",
+  "arcface_request": "artifacts/r9_meanflow_flow_map_guidance/campaigns/r9-report-only-formal-v9/full/evaluator_runs/arcface/winner/request.json",
+  "statistics": {
+    "bootstrap_seed": 91637,
+    "bootstrap_iterations": 10000,
+    "top_k": 8,
+    "paired_resampling_unit": "sample_id"
+  },
+  "license_rule": {
+    "cell_direction": "spearman_gt_0_and_top8_failure_group_roi_lpips_gap_gt_0",
+    "consistency": "cell_direction_true_for_u12_and_u16_per_target",
+    "statistical_support": "at_least_one_update_spearman_ci95_lower_gt_0_per_target",
+    "overall": "regular_privacy_and_tail_sharpness_targets_licensed"
+  },
+  "datasets": [
+    {
+      "dataset_id": "regular32",
+      "formal_native_bindings": "artifacts/r12_seed_aligned_trajectory/preparation_v1/formal_native_bindings/regular32.jsonl",
+      "native_quality": "artifacts/r12_seed_aligned_trajectory/evaluation_v1/regular32/quality/native/quality.json",
+      "arms": {
+        "u12": {
+          "run_rows": "artifacts/r12_seed_aligned_trajectory/runs_v1/u12_regular32/per_sample.jsonl",
+          "quality": "artifacts/r12_seed_aligned_trajectory/evaluation_v1/regular32/quality/u12_regular32/quality.json",
+          "arcface": "artifacts/r12_seed_aligned_trajectory/evaluation_v1/regular32/arcface/u12_regular32/result.json"
+        },
+        "u16": {
+          "run_rows": "artifacts/r12_seed_aligned_trajectory/runs_v1/u16_regular32/per_sample.jsonl",
+          "quality": "artifacts/r12_seed_aligned_trajectory/evaluation_v1/regular32/quality/u16_regular32/quality.json",
+          "arcface": "artifacts/r12_seed_aligned_trajectory/evaluation_v1/regular32/arcface/u16_regular32/result.json"
+        }
+      }
+    },
+    {
+      "dataset_id": "sharpness_tail32",
+      "formal_native_bindings": "artifacts/r12_seed_aligned_trajectory/preparation_v1/formal_native_bindings/sharpness_tail32.jsonl",
+      "native_quality": "artifacts/r12_seed_aligned_trajectory/evaluation_v1/sharpness_tail32/quality/native/quality.json",
+      "arms": {
+        "u12": {
+          "run_rows": "artifacts/r12_seed_aligned_trajectory/runs_v1/u12_tail32/per_sample.jsonl",
+          "quality": "artifacts/r12_seed_aligned_trajectory/evaluation_v1/sharpness_tail32/quality/u12_tail32/quality.json",
+          "arcface": "artifacts/r12_seed_aligned_trajectory/evaluation_v1/sharpness_tail32/arcface/u12_tail32/result.json"
+        },
+        "u16": {
+          "run_rows": "artifacts/r12_seed_aligned_trajectory/runs_v1/u16_tail32/per_sample.jsonl",
+          "quality": "artifacts/r12_seed_aligned_trajectory/evaluation_v1/sharpness_tail32/quality/u16_tail32/quality.json",
+          "arcface": "artifacts/r12_seed_aligned_trajectory/evaluation_v1/sharpness_tail32/arcface/u16_tail32/result.json"
+        }
+      }
+    }
+  ]
+}
