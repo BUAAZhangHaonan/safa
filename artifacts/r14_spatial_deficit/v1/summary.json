@@ -1,0 +1,349 @@
+{
+  "bootstrap": {
+    "iterations": 10000,
+    "quantiles": [
+      0.025,
+      0.975
+    ],
+    "seed": 91637,
+    "unit": "paired sample_id"
+  },
+  "boundary": {
+    "existing_images_only": true,
+    "formal_gate": false,
+    "new_generation": false,
+    "new_training": false,
+    "privacy_proof": false
+  },
+  "contract_type": "safa_r14_spatial_deficit_summary_v1",
+  "datasets": {
+    "regular32": {
+      "arms": {
+        "u12": {
+          "centered_squared_laplacian_energy": {
+            "mean_deficit_per_pixel": {
+              "background": 18.173916922664226,
+              "face": -13.004692286246001,
+              "total": 5.169224636418221
+            },
+            "positive_background_deficit_share": {
+              "ci95": [
+                0.4150604244399105,
+                0.6946746978429595
+              ],
+              "point": 0.5593374759066885
+            },
+            "positive_full_deficit_fraction": 0.5625,
+            "relation_to_full_image_deficit": {
+              "background_pearson": 0.9275152632003927,
+              "background_spearman": 0.8555718475073314,
+              "face_pearson": 0.9153772718734614,
+              "face_spearman": 0.8867302052785924,
+              "max_abs_reconstruction_error": 0.0,
+              "regional_sum_pearson": 1.0
+            }
+          },
+          "exact_one_native_candidate_count": 32,
+          "mean_face_mask_fraction": 0.46814489364624023,
+          "multiscale_gradient_energy": {
+            "mean_deficit_per_pixel": {
+              "background": 184.69996101623545,
+              "face": -122.01819655241067,
+              "total": 62.68176446382475
+            },
+            "positive_background_deficit_share": {
+              "ci95": [
+                0.5126023904498059,
+                0.7522451453295913
+              ],
+              "point": 0.6109750461509484
+            },
+            "positive_full_deficit_fraction": 0.59375,
+            "relation_to_full_image_deficit": {
+              "background_pearson": 0.8385762655688918,
+              "background_spearman": 0.8324780058651027,
+              "face_pearson": 0.864232309305227,
+              "face_spearman": 0.8775659824046921,
+              "max_abs_reconstruction_error": 0.0,
+              "regional_sum_pearson": 1.0
+            }
+          },
+          "official_sharpness_max_abs_reproduction_error": 0.0,
+          "sample_count": 32
+        },
+        "u16": {
+          "centered_squared_laplacian_energy": {
+            "mean_deficit_per_pixel": {
+              "background": -6.744586006294503,
+              "face": -9.064666186131843,
+              "total": -15.809252192426356
+            },
+            "positive_background_deficit_share": {
+              "ci95": [
+                0.41687393276022405,
+                0.6693992645235376
+              ],
+              "point": 0.5531175310959681
+            },
+            "positive_full_deficit_fraction": 0.53125,
+            "relation_to_full_image_deficit": {
+              "background_pearson": 0.9711539636165561,
+              "background_spearman": 0.9178885630498533,
+              "face_pearson": 0.9504381225573802,
+              "face_spearman": 0.9156891495601173,
+              "max_abs_reconstruction_error": 0.0,
+              "regional_sum_pearson": 1.0
+            }
+          },
+          "exact_one_native_candidate_count": 32,
+          "mean_face_mask_fraction": 0.4706692695617676,
+          "multiscale_gradient_energy": {
+            "mean_deficit_per_pixel": {
+              "background": 119.46966568549018,
+              "face": -128.98875051452268,
+              "total": -9.519084829032536
+            },
+            "positive_background_deficit_share": {
+              "ci95": [
+                0.5189411185821373,
+                0.700872324673845
+              ],
+              "point": 0.5911579994844491
+            },
+            "positive_full_deficit_fraction": 0.46875,
+            "relation_to_full_image_deficit": {
+              "background_pearson": 0.9090249699534411,
+              "background_spearman": 0.8874633431085044,
+              "face_pearson": 0.8914997400626858,
+              "face_spearman": 0.8878299120234604,
+              "max_abs_reconstruction_error": 0.0,
+              "regional_sum_pearson": 1.0
+            }
+          },
+          "official_sharpness_max_abs_reproduction_error": 0.0,
+          "sample_count": 32
+        }
+      },
+      "sample_count": 32,
+      "u12_u16_consistency": {
+        "centered_squared_laplacian_energy": {
+          "background": {
+            "pearson": 0.7280989717177462,
+            "spearman": 0.8196480938416423
+          },
+          "face": {
+            "pearson": 0.8296474530914991,
+            "spearman": 0.9156891495601173
+          },
+          "total": {
+            "pearson": 0.7749941178047951,
+            "spearman": 0.8977272727272727
+          }
+        },
+        "multiscale_gradient_energy": {
+          "background": {
+            "pearson": 0.8695774272376172,
+            "spearman": 0.7774926686217009
+          },
+          "face": {
+            "pearson": 0.891615428274268,
+            "spearman": 0.8152492668621701
+          },
+          "total": {
+            "pearson": 0.889624752541711,
+            "spearman": 0.8288123167155426
+          }
+        }
+      }
+    },
+    "sharpness_tail32": {
+      "arms": {
+        "u12": {
+          "centered_squared_laplacian_energy": {
+            "mean_deficit_per_pixel": {
+              "background": 898.8955172295555,
+              "face": 331.4060399580103,
+              "total": 1230.3015571875658
+            },
+            "positive_background_deficit_share": {
+              "ci95": [
+                0.6776147306820327,
+                0.7802195826967112
+              ],
+              "point": 0.7269967284363915
+            },
+            "positive_full_deficit_fraction": 0.78125,
+            "relation_to_full_image_deficit": {
+              "background_pearson": 0.9803787807519004,
+              "background_spearman": 0.9739736070381232,
+              "face_pearson": 0.8782529268405875,
+              "face_spearman": 0.908357771260997,
+              "max_abs_reconstruction_error": 0.0,
+              "regional_sum_pearson": 1.0
+            }
+          },
+          "exact_one_native_candidate_count": 32,
+          "mean_face_mask_fraction": 0.43073511123657227,
+          "multiscale_gradient_energy": {
+            "mean_deficit_per_pixel": {
+              "background": 1858.9072185504583,
+              "face": 671.9329456663804,
+              "total": 2530.8401642168383
+            },
+            "positive_background_deficit_share": {
+              "ci95": [
+                0.6698436076174024,
+                0.799827279287354
+              ],
+              "point": 0.7334562537912012
+            },
+            "positive_full_deficit_fraction": 0.71875,
+            "relation_to_full_image_deficit": {
+              "background_pearson": 0.9847037317993901,
+              "background_spearman": 0.9442815249266863,
+              "face_pearson": 0.8822540029887245,
+              "face_spearman": 0.8834310850439883,
+              "max_abs_reconstruction_error": 0.0,
+              "regional_sum_pearson": 1.0
+            }
+          },
+          "official_sharpness_max_abs_reproduction_error": 0.0,
+          "sample_count": 32
+        },
+        "u16": {
+          "centered_squared_laplacian_energy": {
+            "mean_deficit_per_pixel": {
+              "background": 717.1960472125927,
+              "face": 369.6252541428996,
+              "total": 1086.8213013554923
+            },
+            "positive_background_deficit_share": {
+              "ci95": [
+                0.5891796275668902,
+                0.7747686745511122
+              ],
+              "point": 0.6915172853988837
+            },
+            "positive_full_deficit_fraction": 0.8125,
+            "relation_to_full_image_deficit": {
+              "background_pearson": 0.9545263503875253,
+              "background_spearman": 0.9109237536656891,
+              "face_pearson": 0.7294370675624655,
+              "face_spearman": 0.9358504398826979,
+              "max_abs_reconstruction_error": 0.0,
+              "regional_sum_pearson": 1.0
+            }
+          },
+          "exact_one_native_candidate_count": 32,
+          "mean_face_mask_fraction": 0.44623899459838867,
+          "multiscale_gradient_energy": {
+            "mean_deficit_per_pixel": {
+              "background": 1640.7506826615117,
+              "face": 619.9827648438305,
+              "total": 2260.733447505342
+            },
+            "positive_background_deficit_share": {
+              "ci95": [
+                0.6478898987106635,
+                0.7980745843523044
+              ],
+              "point": 0.7196324264129211
+            },
+            "positive_full_deficit_fraction": 0.75,
+            "relation_to_full_image_deficit": {
+              "background_pearson": 0.9790218140356312,
+              "background_spearman": 0.9134897360703812,
+              "face_pearson": 0.8698957469245315,
+              "face_spearman": 0.8471407624633431,
+              "max_abs_reconstruction_error": 0.0,
+              "regional_sum_pearson": 1.0
+            }
+          },
+          "official_sharpness_max_abs_reproduction_error": 0.0,
+          "sample_count": 32
+        }
+      },
+      "sample_count": 32,
+      "u12_u16_consistency": {
+        "centered_squared_laplacian_energy": {
+          "background": {
+            "pearson": 0.8849009760285581,
+            "spearman": 0.8914956011730205
+          },
+          "face": {
+            "pearson": 0.8149878399355426,
+            "spearman": 0.9010263929618768
+          },
+          "total": {
+            "pearson": 0.914357048121702,
+            "spearman": 0.9637096774193549
+          }
+        },
+        "multiscale_gradient_energy": {
+          "background": {
+            "pearson": 0.9755782734108307,
+            "spearman": 0.8922287390029325
+          },
+          "face": {
+            "pearson": 0.9446830278718308,
+            "spearman": 0.8988269794721407
+          },
+          "total": {
+            "pearson": 0.976693043975845,
+            "spearman": 0.9384164222873901
+          }
+        }
+      }
+    }
+  },
+  "decision": {
+    "architecture_supported": true,
+    "arms": {
+      "u12": {
+        "bootstrap_lower": 0.6776147306820327,
+        "bootstrap_lower_pass": true,
+        "point": 0.7269967284363915,
+        "point_pass": true,
+        "support": true
+      },
+      "u16": {
+        "bootstrap_lower": 0.5891796275668902,
+        "bootstrap_lower_pass": true,
+        "point": 0.6915172853988837,
+        "point_pass": true,
+        "support": true
+      }
+    },
+    "classification": "background_preserving_face_only_generation_supported",
+    "next_direction": "Run one bounded face-only architecture probe that preserves native background pixels exactly and keeps face ROI/privacy gates explicit.",
+    "predeclared_rule": "tail32 positive background centered-Laplacian deficit share point and paired-bootstrap lower bound must both be strictly greater than 0.5 at u12 and u16",
+    "threshold": 0.5
+  },
+  "inputs": {
+    "r12_identity_rows": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r12_arcface_absolute_identity_risk/v1/per_sample.jsonl"
+  },
+  "mask_contract": {
+    "combine": "union",
+    "coordinate_rule": "original_coordinate_pixel_center_inside_half_open_bbox",
+    "expansion_pixels": 0,
+    "morphology": null,
+    "roles": [
+      "native",
+      "candidate"
+    ]
+  },
+  "metrics": {
+    "centered_squared_laplacian_energy": "(Laplacian - full-image mean Laplacian)^2; total/pixels exactly reproduces official grayscale Laplacian variance",
+    "multiscale_gradient_energy": {
+      "aggregation": "equal_scale_mean",
+      "gaussian_sigmas": [
+        0.0,
+        1.0,
+        2.0
+      ],
+      "operator": "Sobel squared magnitude after Gaussian smoothing"
+    }
+  },
+  "positive_deficit_share_definition": "sum(max(background native-candidate regional energy,0)) divided by positive face plus positive background regional deficit",
+  "schema_version": 1
+}
