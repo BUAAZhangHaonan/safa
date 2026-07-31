@@ -257,6 +257,22 @@ def test_meanflow_clean_latent_rejects_pixel_mode_and_non_bool_opt_in() -> None:
         )
 
 
+def test_r13_seed1337_eight_step_probe_has_sparse_but_nonzero_active_rows() -> None:
+    from safa.models.generator import build_generator
+
+    config = _latent_meanflow_config()
+    config["meanflow_ratio_r_not_equal_t"] = 0.75
+    generator = build_generator(config)
+    rng = torch.Generator().manual_seed(1337)
+    active_counts = []
+    for _ in range(8):
+        r, t = generator._sample_t_r(2, device="cpu", dtype=torch.float32, generator=rng)
+        active_counts.append(int(((r == t) & (t / (1.0 - t) <= 3.0)).sum().item()))
+
+    assert active_counts == [2, 0, 0, 0, 0, 0, 0, 0]
+    assert sum(active_counts) > 0
+
+
 def _lpl_config_payload(*, enabled: bool) -> dict:
     from safa.training.latent_perceptual_loss import (
         R13_LPL_CONTRACT,
