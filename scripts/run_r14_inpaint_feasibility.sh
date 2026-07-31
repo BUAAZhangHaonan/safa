@@ -10,6 +10,8 @@ SESSION="safa-r14-inpaint-v1"
 LOG="$ARTIFACT_ROOT/logs/pipeline.log"
 GPU_LIST="0,1,2,3"
 NPROC=4
+NCCL_IB_DISABLE_VALUE="1"
+NCCL_P2P_DISABLE_VALUE="0"
 
 usage() {
   printf '%s\n' \
@@ -38,6 +40,8 @@ export PYTHONPATH="src${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS=4
 export MKL_NUM_THREADS=4
 export PYTHONUNBUFFERED=1
+export NCCL_IB_DISABLE="$NCCL_IB_DISABLE_VALUE"
+export NCCL_P2P_DISABLE="$NCCL_P2P_DISABLE_VALUE"
 
 SMOKE=(
   "$PYTHON_BIN" -m torch.distributed.run
@@ -159,6 +163,8 @@ case "$MODE" in
       "OMP_NUM_THREADS=$OMP_NUM_THREADS"
       "MKL_NUM_THREADS=$MKL_NUM_THREADS"
       "PYTHONUNBUFFERED=1"
+      "NCCL_IB_DISABLE=$NCCL_IB_DISABLE"
+      "NCCL_P2P_DISABLE=$NCCL_P2P_DISABLE"
       bash scripts/run_r14_inpaint_feasibility.sh --inside-tmux
     )
     printf -v TMUX_COMMAND '%q ' "${TMUX_PAYLOAD[@]}"

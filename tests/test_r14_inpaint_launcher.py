@@ -213,6 +213,10 @@ def test_launcher_is_single_locked_gpu0123_pipeline() -> None:
     assert 'GPU_LIST="0,1,2,3"' in text
     assert 'NPROC=4' in text
     assert 'SESSION="safa-r14-inpaint-v1"' in text
+    assert 'export NCCL_IB_DISABLE="$NCCL_IB_DISABLE_VALUE"' in text
+    assert 'export NCCL_P2P_DISABLE="$NCCL_P2P_DISABLE_VALUE"' in text
+    assert '"NCCL_IB_DISABLE=$NCCL_IB_DISABLE"' in text
+    assert '"NCCL_P2P_DISABLE=$NCCL_P2P_DISABLE"' in text
     assert "--nproc_per_node=$NPROC" in text
     assert text.count('"--nproc_per_node=$NPROC"') == 3
     assert "batch" not in text.lower() or "batch" in text.lower()
@@ -223,6 +227,23 @@ def test_launcher_is_single_locked_gpu0123_pipeline() -> None:
     assert positions == sorted(positions)
     result = subprocess.run(["bash", "-n", str(path)], text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stderr
+
+
+def test_nccl_transport_boundary_is_explicit_and_fail_closed() -> None:
+    expected = {
+        "NCCL_IB_DISABLE": "1",
+        "NCCL_P2P_DISABLE": "0",
+    }
+    assert validator.NCCL_TRANSPORT_ENV == expected
+    validator._validate_nccl_transport_environment(expected)
+    with pytest.raises(validator.R14LaunchError, match="NCCL_IB_DISABLE"):
+        validator._validate_nccl_transport_environment(
+            {"NCCL_P2P_DISABLE": "0"}
+        )
+    with pytest.raises(validator.R14LaunchError, match="NCCL_P2P_DISABLE"):
+        validator._validate_nccl_transport_environment(
+            {"NCCL_IB_DISABLE": "1", "NCCL_P2P_DISABLE": "1"}
+        )
 
 
 def test_smoke_and_generation_require_four_rank_batch2() -> None:

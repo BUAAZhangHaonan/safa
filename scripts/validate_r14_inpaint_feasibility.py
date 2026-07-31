@@ -31,6 +31,10 @@ GPU_BINDINGS = {
     2: "GPU-e27fe71d-eaf7-3eb5-d0ff-c1c63b4f6b02",
     3: "GPU-61ea2925-9905-7f56-cd64-7a792a32efef",
 }
+NCCL_TRANSPORT_ENV = {
+    "NCCL_IB_DISABLE": "1",
+    "NCCL_P2P_DISABLE": "0",
+}
 MANIFEST_COUNTS = {
     "manifests/smoke8.jsonl": 8,
     "manifests/regular32.jsonl": 32,
@@ -89,6 +93,14 @@ def _run(argv: Sequence[str]) -> str:
 def _require_equal(actual: Any, expected: Any, name: str) -> None:
     if actual != expected:
         raise R14LaunchError(f"{name} differs: expected {expected!r}, got {actual!r}")
+
+
+def _validate_nccl_transport_environment(
+    environ: Mapping[str, str] | None = None,
+) -> None:
+    values = os.environ if environ is None else environ
+    for name, expected in NCCL_TRANSPORT_ENV.items():
+        _require_equal(values.get(name), expected, f"environment.{name}")
 
 
 def _validate_config(path: Path) -> None:
@@ -270,6 +282,7 @@ def _validate_cache_membership(
 
 
 def validate_static() -> None:
+    _validate_nccl_transport_environment()
     config_path = REPO_ROOT / CONFIG
     if not config_path.is_file():
         raise R14LaunchError(f"missing config: {CONFIG}")
