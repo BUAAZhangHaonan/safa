@@ -1,0 +1,80 @@
+{
+  "contract_type": "safa_r11_initial_noise_sharpness_probe_preparation_v1",
+  "counts": {
+    "eligible_pool": 2045,
+    "labels": 8,
+    "prefix128": 128,
+    "prefix128_tail32_overlap": 2,
+    "tail32": 32,
+    "tail_per_label": 4
+  },
+  "fixed_semantics": {
+    "batch_size": 2,
+    "checkpoint": "artifacts/checkpoints/e15_meanflow_sit_b_face_mixed_h100_resume_2400ep/last_nopretrained.pt",
+    "checkpoint_model": "ema",
+    "checkpoint_sha256": "4690717781db58a6021d57d124300a9b212f0a5043cf3028fb5de4d9c835cc4d",
+    "eta_values": [
+      0.25,
+      0.5
+    ],
+    "mode": "initial_noise",
+    "num_updates": 16,
+    "projection": "fixed_radius",
+    "sampling_seed": 1337,
+    "seed": 1337,
+    "vae_digest": "ac188e7f6ff31ff1a3bbde37fea3c345ec72f9e10589cf8aa8a3ec7e86afb188",
+    "vae_path": "artifacts/checkpoints/external/sd-vae-ft-ema",
+    "vae_scaling_factor": 0.18215
+  },
+  "inputs": {
+    "eligible_pool": {
+      "path": "artifacts/r10_triangle_exploration/preparation_v1/eligible_pool_2045.jsonl",
+      "sha256": "56c2baf99779d8b9cf7460b34bc1e388ba1f8687e8073ca1d636f137dd2c00e8"
+    },
+    "prefix128": {
+      "path": "artifacts/r10_triangle_exploration/preparation_v1/prefix128.jsonl",
+      "sha256": "9e1bfa90057c9b72f02a29340d91f0d87d4d4f35119733824b9659bd7ee8db89"
+    },
+    "r8_eta025_completion": {
+      "path": "artifacts/r8_meanflow_flow_map_guidance/calibration/noise_noise_fixed_eta025/completion.json",
+      "sample_count": 64,
+      "status": "complete"
+    },
+    "r8_eta025_quality": {
+      "fid": 151.906005859375,
+      "kid_mean": 0.031970176845788956,
+      "niqe_mean": 4.93192308330396,
+      "path": "artifacts/r8_meanflow_flow_map_guidance/calibration/noise_noise_fixed_eta025/quality.json",
+      "sharpness_mean": 667.4890273426463
+    },
+    "r8_eta05_completion": {
+      "path": "artifacts/r8_meanflow_flow_map_guidance/calibration/noise_noise_fixed_eta05/completion.json",
+      "sample_count": 64,
+      "status": "complete"
+    },
+    "r8_eta05_quality": {
+      "fid": 142.58702087402344,
+      "kid_mean": 0.026251940056681633,
+      "niqe_mean": 4.852654212565975,
+      "path": "artifacts/r8_meanflow_flow_map_guidance/calibration/noise_noise_fixed_eta05/quality.json",
+      "sharpness_mean": 585.3569139268438
+    }
+  },
+  "outputs": {
+    "tail32": {
+      "path": "artifacts/r11_initial_noise_sharpness_probe/preparation_v1/tail32.jsonl",
+      "sha256": "f38fb6f6542c267b6c7d9cbec9ce57abdf9b0657edfe8d060fe533178a9f5b29"
+    }
+  },
+  "schema_version": 1,
+  "selection": {
+    "order": [
+      "label_ascending",
+      "matched_native_sharpness_descending",
+      "sample_id_ascending"
+    ],
+    "selection_role": "sharpness_tail32",
+    "selector": "top4_matched_native_sharpness_per_label_v1",
+    "tie_break": "sample_id_ascending"
+  }
+}
