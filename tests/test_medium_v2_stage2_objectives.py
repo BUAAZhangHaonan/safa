@@ -25,6 +25,50 @@ def _small_generator_payload() -> dict:
     }
 
 
+def _conditioning_sit_generator(*, z_dim: int = 3, hidden_size: int = 4, depth: int = 2, dtype=None):
+    from torch import nn
+
+    linear_kwargs = {} if dtype is None else {"dtype": dtype}
+
+    class Block(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(hidden_size, 6 * hidden_size, **linear_kwargs),
+            )
+            self.attention = nn.Linear(hidden_size, hidden_size, **linear_kwargs)
+
+    class FinalLayer(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(hidden_size, 2 * hidden_size, **linear_kwargs),
+            )
+            self.linear = nn.Linear(hidden_size, 1, **linear_kwargs)
+
+    class Backbone(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.z_embedder = nn.Sequential(
+                nn.Linear(z_dim, hidden_size, **linear_kwargs),
+                nn.SiLU(),
+                nn.Linear(hidden_size, hidden_size, **linear_kwargs),
+            )
+            self.blocks = nn.ModuleList([Block() for _ in range(depth)])
+            self.final_layer = FinalLayer()
+            self.x_embedder = nn.Linear(hidden_size, hidden_size, **linear_kwargs)
+
+    class Generator(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.vector_field = Backbone()
+            self.outside_vector_field = nn.Parameter(torch.ones(1, dtype=dtype))
+
+    return Generator()
+
+
 def test_medium_v2_stage2_configs_use_explicit_paths_batches_and_objectives() -> None:
     from safa.training import g_loop
 
@@ -345,47 +389,126 @@ def test_generator_trainable_defaults_to_full() -> None:
     assert all(param.requires_grad for param in generator.parameters())
 
 
-def test_generator_trainable_conditioning_only_keeps_only_z_mlp_and_film_condition() -> None:
-    from safa.models.generator import ConditionalFlowGenerator
+def test_generator_trainable_conditioning_only_selects_only_sit_conditioning_modules() -> None:
     from safa.training import g_loop
 
-    generator = ConditionalFlowGenerator(_small_generator_payload())
+    generator = _conditioning_sit_generator(depth=2)
     mode = g_loop._generator_trainable_mode({"generator_trainable": "conditioning_only"})
 
     g_loop._apply_generator_trainable_mode(generator, mode)
 
     trainable_names = {name for name, param in generator.named_parameters() if param.requires_grad}
     expected_trainable_names = {
-        "vector_field.z_mlp.0.weight",
-        "vector_field.z_mlp.0.bias",
-        "vector_field.z_mlp.2.weight",
-        "vector_field.z_mlp.2.bias",
-        "vector_field.down_blocks.0.condition.weight",
-        "vector_field.down_blocks.0.condition.bias",
-        "vector_field.mid.condition.weight",
-        "vector_field.mid.condition.bias",
-        "vector_field.up_blocks.0.condition.weight",
-        "vector_field.up_blocks.0.condition.bias",
+        "vector_field.z_embedder.0.weight",
+        "vector_field.z_embedder.0.bias",
+        "vector_field.z_embedder.2.weight",
+        "vector_field.z_embedder.2.bias",
+        "vector_field.blocks.0.adaLN_modulation.1.weight",
+        "vector_field.blocks.0.adaLN_modulation.1.bias",
+        "vector_field.blocks.1.adaLN_modulation.1.weight",
+        "vector_field.blocks.1.adaLN_modulation.1.bias",
+        "vector_field.final_layer.adaLN_modulation.1.weight",
+        "vector_field.final_layer.adaLN_modulation.1.bias",
     }
     assert trainable_names == expected_trainable_names
 
     parameters_by_name = dict(generator.named_parameters())
     expected_frozen_names = {
-        "vector_field.input.weight",
-        "vector_field.input.bias",
-        "vector_field.time_mlp.0.weight",
-        "vector_field.time_mlp.0.bias",
-        "vector_field.down_blocks.0.in_conv.weight",
-        "vector_field.down_blocks.0.out_conv.bias",
-        "vector_field.mid.in_norm.weight",
-        "vector_field.mid.in_conv.weight",
-        "vector_field.up_blocks.0.skip.weight",
-        "vector_field.upsamplers.0.bias",
-        "vector_field.output.2.weight",
+        "outside_vector_field",
+        "vector_field.x_embedder.weight",
+        "vector_field.x_embedder.bias",
+        "vector_field.blocks.0.attention.weight",
+        "vector_field.blocks.0.attention.bias",
+        "vector_field.blocks.1.attention.weight",
+        "vector_field.blocks.1.attention.bias",
+        "vector_field.final_layer.linear.weight",
+        "vector_field.final_layer.linear.bias",
     }
     assert expected_frozen_names <= set(parameters_by_name)
     for name in expected_frozen_names:
         assert not parameters_by_name[name].requires_grad, name
+
+
+def test_generator_trainable_conditioning_only_e15_exact_names_count_and_numel() -> None:
+    from safa.training import g_loop
+
+    generator = _conditioning_sit_generator(z_dim=512, hidden_size=768, depth=12, dtype=torch.float16)
+    g_loop._apply_generator_trainable_mode(generator, "conditioning_only")
+
+    trainable = [(name, param) for name, param in generator.named_parameters() if param.requires_grad]
+    expected_names = {
+        "vector_field.z_embedder.0.weight",
+        "vector_field.z_embedder.0.bias",
+        "vector_field.z_embedder.2.weight",
+        "vector_field.z_embedder.2.bias",
+        "vector_field.final_layer.adaLN_modulation.1.weight",
+        "vector_field.final_layer.adaLN_modulation.1.bias",
+        *{
+            f"vector_field.blocks.{index}.adaLN_modulation.1.{suffix}"
+            for index in range(12)
+            for suffix in ("weight", "bias")
+        },
+    }
+    assert {name for name, _ in trainable} == expected_names
+    assert len(trainable) == 30
+    assert sum(param.numel() for _, param in trainable) == 44_688_384
+
+
+@pytest.mark.parametrize("failure", ["missing_z", "empty_z", "empty_blocks", "missing_block_group", "missing_final_group"])
+def test_generator_trainable_conditioning_only_fails_closed_on_missing_or_empty_groups(failure) -> None:
+    from torch import nn
+
+    from safa.training import g_loop
+
+    generator = _conditioning_sit_generator(depth=1)
+    if failure == "missing_z":
+        del generator.vector_field.z_embedder
+    elif failure == "empty_z":
+        generator.vector_field.z_embedder = nn.Identity()
+    elif failure == "empty_blocks":
+        generator.vector_field.blocks = nn.ModuleList()
+    elif failure == "missing_block_group":
+        generator.vector_field.blocks[0] = nn.Linear(4, 4)
+    elif failure == "missing_final_group":
+        generator.vector_field.final_layer = nn.Linear(4, 4)
+
+    with pytest.raises(RuntimeError, match="conditioning_only"):
+        g_loop._apply_generator_trainable_mode(generator, "conditioning_only")
+
+
+def test_generator_trainable_conditioning_only_rejects_nonfinite_selected_parameter() -> None:
+    from safa.training import g_loop
+
+    generator = _conditioning_sit_generator(depth=1)
+    with torch.no_grad():
+        generator.vector_field.z_embedder[0].weight[0, 0] = float("nan")
+
+    with pytest.raises(FloatingPointError, match="conditioning_only.*z_embedder"):
+        g_loop._apply_generator_trainable_mode(generator, "conditioning_only")
+
+
+def test_optimizer_generator_group_matches_conditioning_only_allowlist() -> None:
+    from torch import nn
+
+    from safa.training import g_loop
+
+    class TrainingModule(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.generator = _conditioning_sit_generator(depth=2)
+            self.uncertainty_loss = None
+
+    module = TrainingModule()
+    g_loop._apply_generator_trainable_mode(module.generator, "conditioning_only")
+    selected = dict(g_loop._conditioning_only_named_parameters(module.generator))
+    groups = g_loop._optimizer_param_groups(
+        module,
+        {"learning_rate": 0.001, "weight_decay": 0.0},
+        g_loop._LossWeightingRuntime(type="legacy"),
+    )
+
+    assert {id(param) for param in groups[0]["params"]} == {id(param) for param in selected.values()}
+    assert all(param.requires_grad for param in groups[0]["params"])
 
 
 def test_optimizer_param_groups_filter_frozen_generator_params() -> None:
@@ -427,10 +550,9 @@ def test_optimizer_param_groups_filter_frozen_generator_params() -> None:
 
 
 def test_optimizer_resume_skips_full_state_for_conditioning_only_param_group_mismatch(capsys) -> None:
-    from safa.models.generator import ConditionalFlowGenerator
     from safa.training import g_loop
 
-    generator = ConditionalFlowGenerator(_small_generator_payload())
+    generator = _conditioning_sit_generator(depth=1)
     full_optimizer = torch.optim.AdamW(generator.parameters(), lr=0.001)
     full_optimizer_state = full_optimizer.state_dict()
 
@@ -554,7 +676,14 @@ def test_train_g_applies_generator_trainable_after_resume_before_ddp_and_optimiz
     monkeypatch.setattr(g_loop, "_stage2_objective_from_config", lambda stages: None)
     monkeypatch.setattr(g_loop, "sampling_base_seed_from_config", lambda config: 123)
     monkeypatch.setattr(g_loop, "build_generator", lambda payload: generator)
-    monkeypatch.setattr(torch, "load", lambda path, map_location, weights_only: {"model_state_dict": {}, "metrics": {}})
+    monkeypatch.setattr(
+        torch,
+        "load",
+        lambda path, map_location, weights_only: {
+            "model_state_dict": {"weight": torch.tensor(2.0)},
+            "metrics": {},
+        },
+    )
     monkeypatch.setattr(g_loop, "_resume_stage_progress_from_metrics", lambda metrics, path: g_loop._ResumeProgress("stage1", 0))
 
     def fake_apply_generator_trainable_mode(actual_generator, mode):
@@ -611,7 +740,19 @@ def test_train_g_applies_generator_trainable_after_resume_before_ddp_and_optimiz
 
 
 
-def test_train_g_model_weights_only_resume_skips_training_state_and_initializes_ema_from_loaded_model(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize(
+    ("checkpoint_selector", "expected_weight"),
+    [
+        (None, 7.0),
+        ("ema", 3.0),
+    ],
+)
+def test_train_g_model_weights_only_resume_skips_training_state_and_initializes_ema_from_loaded_model(
+    monkeypatch,
+    tmp_path,
+    checkpoint_selector,
+    expected_weight,
+) -> None:
     from torch import nn
 
     from safa.training import g_loop
@@ -797,14 +938,18 @@ def test_train_g_model_weights_only_resume_skips_training_state_and_initializes_
         "resume_mode": "model_weights_only",
         "generator_trainable": "conditioning_only",
     }
+    if checkpoint_selector is not None:
+        config["resume_checkpoint_model"] = checkpoint_selector
 
     with pytest.raises(StopAfterOptimizerResume):
         g_loop.train_g_from_config(config)
 
+    expected_bytes = torch.tensor(expected_weight).numpy().tobytes()
+    assert generator.weight.detach().numpy().tobytes() == expected_bytes
     assert events == [
-        "load_resume:7.0",
+        f"load_resume:{expected_weight}",
         "apply_generator_trainable",
-        "ema_init:7.0",
+        f"ema_init:{expected_weight}",
         "loss_weighting_state:None",
         "optimizer_param_groups",
         "assert_e0_frozen",
@@ -823,6 +968,70 @@ def test_resume_mode_defaults_to_training_state_and_accepts_known_values(config,
     from safa.training import g_loop
 
     assert g_loop._resume_mode(config) == expected
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        ({}, "raw"),
+        ({"resume_checkpoint_model": "raw"}, "raw"),
+        (
+            {"resume_mode": "model_weights_only", "resume_checkpoint_model": "ema"},
+            "ema",
+        ),
+    ],
+)
+def test_resume_checkpoint_model_defaults_to_raw_and_accepts_explicit_ema_for_weights_only(config, expected) -> None:
+    from safa.training import g_loop
+
+    assert g_loop._resume_checkpoint_model(config) == expected
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"resume_checkpoint_model": "bad"},
+        {"resume_checkpoint_model": "ema"},
+        {"resume_mode": "training_state", "resume_checkpoint_model": "ema"},
+    ],
+)
+def test_resume_checkpoint_model_rejects_unknown_or_ema_training_state(config) -> None:
+    from safa.training import g_loop
+
+    with pytest.raises(ValueError, match="resume_checkpoint_model|model_weights_only"):
+        g_loop._resume_checkpoint_model(config)
+
+
+def test_resume_checkpoint_state_dict_distinguishes_raw_and_ema_without_fallback(tmp_path) -> None:
+    from safa.training import g_loop
+
+    raw = {"weight": torch.tensor([1.25], dtype=torch.float32)}
+    ema = {"weight": torch.tensor([-2.5], dtype=torch.float32)}
+    payload = {"model_state_dict": raw, "ema_model_state_dict": ema}
+    checkpoint_path = tmp_path / "resume.pt"
+
+    raw_state, raw_key = g_loop._resume_checkpoint_state_dict(payload, "raw", checkpoint_path)
+    ema_state, ema_key = g_loop._resume_checkpoint_state_dict(payload, "ema", checkpoint_path)
+
+    assert raw_state is raw
+    assert ema_state is ema
+    assert raw_key == "model_state_dict"
+    assert ema_key == "ema_model_state_dict"
+    with pytest.raises(ValueError, match="ema_model_state_dict"):
+        g_loop._resume_checkpoint_state_dict({"model_state_dict": raw}, "ema", checkpoint_path)
+
+
+@pytest.mark.parametrize("selector", ["raw", "ema"])
+def test_resume_checkpoint_state_dict_rejects_nonfinite_selected_weights(tmp_path, selector) -> None:
+    from safa.training import g_loop
+
+    key = "model_state_dict" if selector == "raw" else "ema_model_state_dict"
+    with pytest.raises(FloatingPointError, match=key):
+        g_loop._resume_checkpoint_state_dict(
+            {key: {"weight": torch.tensor([float("inf")])}},
+            selector,
+            tmp_path / "resume.pt",
+        )
 
 
 def test_validate_train_g_config_rejects_bad_resume_mode() -> None:

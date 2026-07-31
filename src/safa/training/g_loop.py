@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from dataclasses import dataclass
 import gc
@@ -89,6 +90,9 @@ _GENERATOR_TRAINABLE_MODES = (_GENERATOR_TRAINABLE_FULL, _GENERATOR_TRAINABLE_CO
 _RESUME_MODE_TRAINING_STATE = "training_state"
 _RESUME_MODE_MODEL_WEIGHTS_ONLY = "model_weights_only"
 _RESUME_MODES = (_RESUME_MODE_TRAINING_STATE, _RESUME_MODE_MODEL_WEIGHTS_ONLY)
+_RESUME_CHECKPOINT_MODEL_RAW = "raw"
+_RESUME_CHECKPOINT_MODEL_EMA = "ema"
+_RESUME_CHECKPOINT_MODELS = (_RESUME_CHECKPOINT_MODEL_RAW, _RESUME_CHECKPOINT_MODEL_EMA)
 
 
 @dataclass(frozen=True)
@@ -1241,15 +1245,107 @@ def _resume_mode(config: dict) -> str:
     return mode
 
 
+def _resume_checkpoint_model(config: dict) -> str:
+    selector = str(config.get("resume_checkpoint_model", _RESUME_CHECKPOINT_MODEL_RAW))
+    if selector not in _RESUME_CHECKPOINT_MODELS:
+        raise ValueError(
+            "train_g config.resume_checkpoint_model must be "
+            f"{_RESUME_CHECKPOINT_MODEL_RAW!r} or {_RESUME_CHECKPOINT_MODEL_EMA!r}, got {selector!r}"
+        )
+    if selector == _RESUME_CHECKPOINT_MODEL_EMA and _resume_mode(config) != _RESUME_MODE_MODEL_WEIGHTS_ONLY:
+        raise ValueError(
+            "train_g config.resume_checkpoint_model='ema' requires "
+            "resume_mode='model_weights_only'"
+        )
+    return selector
+
+
+def _resume_checkpoint_state_dict(checkpoint: Mapping, selector: str, checkpoint_path: Path) -> tuple[Mapping, str]:
+    import torch
+
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError(f"Resume checkpoint {checkpoint_path} must contain a mapping payload")
+    if selector == _RESUME_CHECKPOINT_MODEL_RAW:
+        state_key = "model_state_dict"
+    elif selector == _RESUME_CHECKPOINT_MODEL_EMA:
+        state_key = "ema_model_state_dict"
+    else:
+        raise ValueError(f"Unsupported resume checkpoint model selector: {selector!r}")
+    state_dict = checkpoint.get(state_key)
+    if not isinstance(state_dict, Mapping) or not state_dict:
+        raise ValueError(f"Resume checkpoint {checkpoint_path} missing non-empty {state_key}")
+    for name, value in state_dict.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"Resume checkpoint {checkpoint_path} has invalid key in {state_key}: {name!r}")
+        if torch.is_tensor(value):
+            assert_finite_tensor(f"{state_key}.{name}", value)
+    return state_dict, state_key
+
+
+def _conditioning_only_named_parameters(generator) -> tuple[tuple[str, object], ...]:
+    backbone = getattr(generator, "vector_field", None)
+    if backbone is None:
+        raise RuntimeError("conditioning_only requires generator.vector_field")
+    z_embedder = getattr(backbone, "z_embedder", None)
+    if z_embedder is None:
+        raise RuntimeError("conditioning_only requires generator.vector_field.z_embedder")
+    blocks = getattr(backbone, "blocks", None)
+    if blocks is None:
+        raise RuntimeError("conditioning_only requires generator.vector_field.blocks")
+    blocks = tuple(blocks)
+    if not blocks:
+        raise RuntimeError("conditioning_only requires at least one generator.vector_field.blocks entry")
+    final_layer = getattr(backbone, "final_layer", None)
+    if final_layer is None or getattr(final_layer, "adaLN_modulation", None) is None:
+        raise RuntimeError("conditioning_only requires generator.vector_field.final_layer.adaLN_modulation")
+
+    modules = [("vector_field.z_embedder", z_embedder)]
+    for index, block in enumerate(blocks):
+        modulation = getattr(block, "adaLN_modulation", None)
+        if modulation is None:
+            raise RuntimeError(
+                "conditioning_only requires "
+                f"generator.vector_field.blocks.{index}.adaLN_modulation"
+            )
+        modules.append((f"vector_field.blocks.{index}.adaLN_modulation", modulation))
+    modules.append(("vector_field.final_layer.adaLN_modulation", final_layer.adaLN_modulation))
+
+    generator_parameters = dict(generator.named_parameters())
+    selected: list[tuple[str, object]] = []
+    selected_names: set[str] = set()
+    for module_name, module in modules:
+        module_parameters = tuple(module.named_parameters())
+        if not module_parameters:
+            raise RuntimeError(f"conditioning_only parameter group is empty: {module_name}")
+        for local_name, parameter in module_parameters:
+            full_name = f"{module_name}.{local_name}"
+            if full_name in selected_names or generator_parameters.get(full_name) is not parameter:
+                raise RuntimeError(f"conditioning_only parameter topology mismatch: {full_name}")
+            assert_finite_tensor(f"conditioning_only.{full_name}", parameter)
+            selected.append((full_name, parameter))
+            selected_names.add(full_name)
+    if not selected:
+        raise RuntimeError("conditioning_only selected zero parameters")
+    return tuple(selected)
+
+
 def _apply_generator_trainable_mode(generator, mode: str) -> None:
     if mode == _GENERATOR_TRAINABLE_FULL:
         for param in generator.parameters():
             param.requires_grad_(True)
         return
     if mode == _GENERATOR_TRAINABLE_CONDITIONING_ONLY:
-        for name, param in generator.named_parameters():
-            trainable = name.startswith("vector_field.z_mlp.") or ".condition." in name
-            param.requires_grad_(trainable)
+        selected = _conditioning_only_named_parameters(generator)
+        selected_ids = {id(param) for _, param in selected}
+        for param in generator.parameters():
+            param.requires_grad_(id(param) in selected_ids)
+        actual_names = {name for name, param in generator.named_parameters() if param.requires_grad}
+        expected_names = {name for name, _ in selected}
+        if actual_names != expected_names:
+            raise RuntimeError(
+                "conditioning_only trainable parameter allowlist mismatch: "
+                f"expected={sorted(expected_names)!r}, actual={sorted(actual_names)!r}"
+            )
         return
     if mode == _GENERATOR_TRAINABLE_IP_ADAPTER:
         # No-op at this stage: init_peft_generator (called lazily on the first
@@ -1590,6 +1686,7 @@ def train_g_from_config(config: dict) -> dict:
     _validate_train_g_config(config)
     generator_trainable_mode = _generator_trainable_mode(config)
     resume_mode = _resume_mode(config)
+    resume_checkpoint_model = _resume_checkpoint_model(config)
     distributed = init_distributed(config)
     try:
         batch_config = _training_batch_config(config, world_size=distributed.world_size)
@@ -1675,13 +1772,18 @@ def train_g_from_config(config: dict) -> dict:
         if not resume_path.is_file():
             raise FileNotFoundError(f"resume_from checkpoint not found: {resume_path}")
         ckpt = torch.load(resume_path, map_location=device, weights_only=True)
+        checkpoint_model_state, checkpoint_model_state_key = _resume_checkpoint_state_dict(
+            ckpt,
+            resume_checkpoint_model,
+            resume_path,
+        )
         # PEFT path: adapter keys (cond_mlp_adapter.* / lora_a.* / lora_b.* /
         # gated_low_rank_z.* / generic_bank.* / _peft_lora_null_embed) are NOT
         # in the resume ckpt. Load backbone strict=False so adapter uses random
         # init (PEFT standard).
         _is_peft_mlp = (stage2_objective is not None and stage2_objective.type == _PEFT_MLP)
         _is_peft_lora = (stage2_objective is not None and stage2_objective.type in {_PEFT_LORA, _LORA_SWEEP}) or (stage2_objective is not None and stage2_objective.type == _POINT_PROJECTED_TWO_STEP and bool(config.get("stages", {}).get("stage2", {}).get("stage2_objective", {}).get("lora_target_modules")))
-        missing, unexpected = generator.load_state_dict(ckpt["model_state_dict"], strict=False)
+        missing, unexpected = generator.load_state_dict(checkpoint_model_state, strict=False)
         if missing:
             if _is_peft_lora:
                 # Whitelist PEFT-LoRA adapter keys.
@@ -1709,7 +1811,7 @@ def train_g_from_config(config: dict) -> dict:
             if "loss_weighting_state" in ckpt:
                 resume_loss_weighting_state = ckpt["loss_weighting_state"]
         if distributed.is_main:
-            restored = ["model_state_dict"]
+            restored = [checkpoint_model_state_key]
             if resume_mode == _RESUME_MODE_TRAINING_STATE:
                 if resume_history is not None:
                     restored.append("history")
@@ -2574,6 +2676,7 @@ def _distributed_manifest(distributed: DistributedContext) -> dict:
 def _validate_train_g_config(config: dict) -> None:
     _generator_trainable_mode(config)
     _resume_mode(config)
+    _resume_checkpoint_model(config)
     generator_config = _generator_config_from_train_config(config)
     validate_latent_training_config(config, generator_config)
     _require_bool(config, "allow_stage2_without_stage1_gate", "train_g config")
