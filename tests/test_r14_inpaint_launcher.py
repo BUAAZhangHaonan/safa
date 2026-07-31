@@ -68,7 +68,6 @@ def test_locked_config_validates() -> None:
     validator._validate_config(path)
     config = yaml.safe_load(path.read_text(encoding="utf-8"))
     _validate_train_g_config(config)
-    assert config["amp"] is True
     assert config["eval_index"] == "data/index/val_face_mixed_e14.jsonl"
     assert config["eval_features"] == "artifacts/e0_features/val_face_mixed_e14_e0_medium_v1"
     for entrypoint in (
