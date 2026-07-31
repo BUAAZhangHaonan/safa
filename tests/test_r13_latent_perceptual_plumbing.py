@@ -40,30 +40,29 @@ def _latent_meanflow_config() -> dict:
 
 
 class _FeatureBlock(nn.Module):
-    def __init__(self, channels: int, *, scale_factor: int = 1):
+    def __init__(self, channels: int):
         super().__init__()
         self.proj = nn.Conv2d(channels, channels, kernel_size=1)
-        self.scale_factor = int(scale_factor)
 
-    def forward(self, sample, latent_embeds=None):
-        if latent_embeds is not None:
+    def forward(self, sample, latent_embeds=None, temb=None):
+        if latent_embeds is not None or temb is not None:
             raise AssertionError("the frozen SD VAE path must not supply latent_embeds")
-        if self.scale_factor != 1:
-            sample = torch.nn.functional.interpolate(sample, scale_factor=self.scale_factor, mode="nearest")
         return torch.nn.functional.silu(self.proj(sample))
 
 
 class _FakeDecoder(nn.Module):
     def __init__(self):
         super().__init__()
+        from diffusers.models.unets.unet_2d_blocks import UpDecoderBlock2D
+
         self.conv_in = nn.Conv2d(4, 4, kernel_size=1)
         self.mid_block = _FeatureBlock(4)
         self.up_blocks = nn.ModuleList(
             [
-                _FeatureBlock(4),
-                _FeatureBlock(4, scale_factor=2),
-                _FeatureBlock(4, scale_factor=2),
-                _FeatureBlock(4, scale_factor=2),
+                UpDecoderBlock2D(4, 4, num_layers=1, resnet_groups=1, add_upsample=True),
+                UpDecoderBlock2D(4, 4, num_layers=1, resnet_groups=1, add_upsample=True),
+                UpDecoderBlock2D(4, 4, num_layers=1, resnet_groups=1, add_upsample=True),
+                UpDecoderBlock2D(4, 4, num_layers=1, resnet_groups=1, add_upsample=False),
             ]
         )
 

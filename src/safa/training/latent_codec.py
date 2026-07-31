@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
 from pathlib import Path
 from typing import Any
 
@@ -52,11 +53,12 @@ class LatentCodec:
     def decode_intermediate_features(self, latents: torch.Tensor) -> dict[str, torch.Tensor]:
         """Decode latents through explicit frozen VAE decoder block boundaries.
 
-        The returned tensors are the decoder ``conv_in``, ``mid_block``, and
-        ordered ``up_blocks`` outputs.  This deliberately does not return the
-        final RGB output and does not use forward hooks.  Gradients therefore
-        flow to ``latents`` through frozen decoder weights, while the VAE
-        remains outside the optimizer.
+        The returned tensors are the decoder ``conv_in`` and ``mid_block``
+        outputs plus each ordered up block after its resnets and before its
+        terminal upsampler.  This deliberately does not return the final RGB
+        output and does not use forward hooks.  Gradients therefore flow to
+        ``latents`` through frozen decoder weights, while the VAE remains
+        outside the optimizer.
         """
 
         self._validate_latents(latents)
@@ -74,9 +76,9 @@ class LatentCodec:
         sample = decoder.mid_block(sample, None)
         features["mid_block"] = self._finite_decoder_feature("mid_block", sample)
         for index, up_block in enumerate(decoder.up_blocks):
-            sample = up_block(sample, None)
             name = f"up_block_{index}"
-            features[name] = self._finite_decoder_feature(name, sample)
+            sample, feature = self._run_decoder_up_block(up_block, sample, name)
+            features[name] = feature
         if not features:
             raise RuntimeError("VAE decoder produced no intermediate features")
         return features
@@ -102,6 +104,45 @@ class LatentCodec:
             raise RuntimeError("VAE decoder up_blocks must be an ordered collection") from exc
         if up_block_count <= 0:
             raise RuntimeError("VAE decoder up_blocks must be non-empty")
+
+    @classmethod
+    def _run_decoder_up_block(cls, up_block, sample: torch.Tensor, name: str) -> tuple[torch.Tensor, torch.Tensor]:
+        try:
+            from diffusers.models.unets.unet_2d_blocks import UpDecoderBlock2D
+        except ImportError as exc:
+            raise RuntimeError("decoder intermediate features require diffusers UpDecoderBlock2D") from exc
+        if type(up_block) is not UpDecoderBlock2D:
+            raise RuntimeError(
+                f"VAE decoder {name} must be exactly diffusers UpDecoderBlock2D, got {type(up_block).__name__}"
+            )
+        forward_parameters = tuple(inspect.signature(type(up_block).forward).parameters)
+        if forward_parameters != ("self", "hidden_states", "temb"):
+            raise RuntimeError(
+                f"VAE decoder {name} has unsupported UpDecoderBlock2D.forward signature {forward_parameters!r}"
+            )
+        for attribute in ("resnets", "upsamplers"):
+            if not hasattr(up_block, attribute):
+                raise RuntimeError(f"VAE decoder {name} missing required attribute {attribute!r}")
+        try:
+            resnets = tuple(up_block.resnets)
+        except TypeError as exc:
+            raise RuntimeError(f"VAE decoder {name}.resnets must be an ordered collection") from exc
+        if not resnets:
+            raise RuntimeError(f"VAE decoder {name}.resnets must be non-empty")
+        for resnet in resnets:
+            sample = resnet(sample, temb=None)
+        feature = cls._finite_decoder_feature(name, sample)
+        if up_block.upsamplers is not None:
+            try:
+                upsamplers = tuple(up_block.upsamplers)
+            except TypeError as exc:
+                raise RuntimeError(f"VAE decoder {name}.upsamplers must be an ordered collection or None") from exc
+            if not upsamplers:
+                raise RuntimeError(f"VAE decoder {name}.upsamplers must be non-empty when present")
+            for upsampler in upsamplers:
+                sample = upsampler(sample)
+            sample = cls._finite_decoder_feature(f"{name} post-upsampling", sample)
+        return sample, feature
 
     @classmethod
     def _finite_decoder_feature(cls, name: str, value: torch.Tensor) -> torch.Tensor:
