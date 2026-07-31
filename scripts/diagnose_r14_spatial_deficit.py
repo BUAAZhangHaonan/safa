@@ -338,10 +338,18 @@ def analyze_pair(
 
     native = cv2.imread(str(row["native_path"]), cv2.IMREAD_COLOR)
     candidate = cv2.imread(str(row["candidate_path"]), cv2.IMREAD_COLOR)
-    if native is None or candidate is None or native.shape != candidate.shape:
+    native_gray = cv2.imread(str(row["native_path"]), cv2.IMREAD_GRAYSCALE)
+    candidate_gray = cv2.imread(str(row["candidate_path"]), cv2.IMREAD_GRAYSCALE)
+    if (
+        native is None
+        or candidate is None
+        or native_gray is None
+        or candidate_gray is None
+        or native.shape != candidate.shape
+        or native_gray.shape != candidate_gray.shape
+        or native.shape[:2] != native_gray.shape
+    ):
         raise SpatialDeficitError("native/candidate decoding or shape mismatch")
-    native_gray = cv2.cvtColor(native, cv2.COLOR_BGR2GRAY)
-    candidate_gray = cv2.cvtColor(candidate, cv2.COLOR_BGR2GRAY)
     mask = bbox_union_mask(native.shape, row["native_bbox"], row["candidate_bbox"])
     laplacian = pair_partition(
         centered_laplacian_energy(native_gray),
