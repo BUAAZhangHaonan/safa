@@ -101,6 +101,7 @@ def _validate_config(path: Path) -> None:
         "sampling_seed": 1337,
         "global_batch_size": 4,
         "per_device_batch_size": 2,
+        "amp": True,
         "resume_from": str(E15_PATH),
         "resume_from_sha256": E15_SHA256,
         "resume_mode": "model_weights_only",

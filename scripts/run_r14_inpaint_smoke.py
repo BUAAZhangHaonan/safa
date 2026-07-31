@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections.abc import Mapping
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -132,13 +133,19 @@ def main() -> None:
                 codec, original, context, pixel_mask
             )
             rng = torch.Generator(device=device).manual_seed(int(config["seed"]))
-            loss, metrics = generator.flow_matching_loss(
-                target_latent,
-                source_z,
-                generator=rng,
-                context_latent=train_context_latent,
-                latent_mask=train_latent_mask,
+            amp_context = (
+                torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                if bool(config["amp"])
+                else nullcontext()
             )
+            with amp_context:
+                loss, metrics = generator.flow_matching_loss(
+                    target_latent,
+                    source_z,
+                    generator=rng,
+                    context_latent=train_context_latent,
+                    latent_mask=train_latent_mask,
+                )
             if not torch.isfinite(loss).item():
                 raise FloatingPointError("R14 smoke masked loss is non-finite")
             for value in metrics.values():
