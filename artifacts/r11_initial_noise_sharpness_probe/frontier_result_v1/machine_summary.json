@@ -1,0 +1,146 @@
+{
+  "schema_version": 1,
+  "contract_type": "safa_r11_frontier_result_v1",
+  "created_at_cst": "2026-07-31T15:39:26+08:00",
+  "status": "no_frontier_survivor",
+  "source_git_head": "6babd797cfc3e63e1d262e31e001e0b1a20df43f",
+  "evaluation": {
+    "plan_path": "artifacts/r11_initial_noise_sharpness_probe/evaluation_preparation_v1/evaluation_plan.json",
+    "plan_sha256": "c55f59f4ca8bd8e59ade13fea013f1839719ef486879156b8b6ec583511d4573",
+    "plan_contract_type": "safa_r11_official_evaluation_preparation_v2",
+    "job_count": 10,
+    "retry_count": 0,
+    "arcface_contract": {
+      "request_contract": "safa_r11_arcface_evaluator_request_v1",
+      "output_contract": "safa_r11_arcface_evaluator_output_v1",
+      "pair_policy": "pairwise_exact_one_v1",
+      "worker_sha256": "1eff291bdc06e0371e249eb547e06a86804a93d7a0367452d7c1c82f89f7a9a3"
+    }
+  },
+  "datasets": [
+    {
+      "dataset_id": "prefix128",
+      "selection_role": "prefix128",
+      "stage": 128,
+      "sample_count": 128,
+      "dataset_contract_path": "artifacts/r11_initial_noise_sharpness_probe/evaluation_preparation_v1/prefix128.json",
+      "dataset_contract_sha256": "bf0a80aff1503290ce37c62fa67ee0b5c6a1d59bebf73c0c455009158150fce8",
+      "selection_manifest_path": "artifacts/r10_triangle_exploration/preparation_v1/prefix128.jsonl",
+      "selection_manifest_sha256": "9e1bfa90057c9b72f02a29340d91f0d87d4d4f35119733824b9659bd7ee8db89",
+      "ordered_sample_id_sha256": "3af3ecd3f844f61b7e7e5a25519ed97fa30dc56663e52fc2ee84cdd9cabac2d5",
+      "materialization": {
+        "summary_path": "artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/rows/materialization_summary.json",
+        "summary_sha256": "c0520ebf334aef48a2eac8b78662693f43f91122801b39611d5a5fa51b94d35a",
+        "contract_type": "safa_r11_typed_triangle_rows_v1",
+        "materialized_row_sha256": {
+          "eta025_prefix128": "ca01b3ea4c793c5b0f9cbd92724b52345957b5a2d7fa4ccf31ab03c0af2b363c",
+          "eta05_prefix128": "a99a68a2ee0866e0f904d38695d9cf9fad7c70036063224f17f98ef888dd691c"
+        }
+      },
+      "screening": {
+        "request_path": "artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/rows/screening_request.json",
+        "request_sha256": "c66227741743f8c7605eb0f08b8ff15c0963a9b87d05b822ff39f213c51ceefc",
+        "summary_path": "artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/screening/summary.json",
+        "summary_sha256": "bf97a30c265bb593da041a849c175ffd648a8a28498c082f46cfd0ca236c7718",
+        "arm_count": 2,
+        "gate_survivor_count": 0,
+        "pareto_arm_ids": [],
+        "selected_arm_ids": [],
+        "arms": [
+          {
+            "arm_id": "eta025_prefix128",
+            "hard_gate_pass": false,
+            "failed_gates": ["e0", "niqe"],
+            "fid": 122.81310272216797,
+            "kid": 0.029005078598856926,
+            "arcface_delta_u95": 0.010844857165031039,
+            "R": -0.025592153038208682,
+            "Q": -0.5052197650152923,
+            "P": 0.45775714174844806,
+            "status": "no_gate_survivor"
+          },
+          {
+            "arm_id": "eta05_prefix128",
+            "hard_gate_pass": false,
+            "failed_gates": ["niqe"],
+            "fid": 114.43486785888672,
+            "kid": 0.020816471427679062,
+            "arcface_delta_u95": 0.017537614940731347,
+            "R": 0.1164032332599163,
+            "Q": -1.2782119138198933,
+            "P": 0.12311925296343267,
+            "status": "no_gate_survivor"
+          }
+        ]
+      }
+    },
+    {
+      "dataset_id": "sharpness_tail32",
+      "selection_role": "sharpness_tail32",
+      "stage": 32,
+      "sample_count": 32,
+      "dataset_contract_path": "artifacts/r11_initial_noise_sharpness_probe/evaluation_preparation_v1/sharpness_tail32.json",
+      "dataset_contract_sha256": "640a1b64a7ec1bca70ca4e5491c16b785a53956a52d44edbef9fd40e394b56f4",
+      "selection_manifest_path": "artifacts/r11_initial_noise_sharpness_probe/preparation_v1/tail32.jsonl",
+      "selection_manifest_sha256": "f38fb6f6542c267b6c7d9cbec9ce57abdf9b0657edfe8d060fe533178a9f5b29",
+      "ordered_sample_id_sha256": "0df6a923d37a45c67910d5f9f118700392403e12bdf6e8a6dbb04edfde86987f",
+      "materialization": {
+        "summary_path": "artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/rows/materialization_summary.json",
+        "summary_sha256": "2189813c8229b13e1c985f7645fac976e98f53711be000e9f5558ad7878a3a88",
+        "contract_type": "safa_r11_typed_triangle_rows_v1",
+        "materialized_row_sha256": {
+          "eta025_tail32": "f1df58b3532a21b8fbd779dcafc0fac688b9f9b762adfaf217761c79ba8df515",
+          "eta05_tail32": "266bac7668d629046cd7dd131c9842806318a885e91d0c76b6da5a82714acd32"
+        }
+      },
+      "screening": {
+        "request_path": "artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/rows/screening_request.json",
+        "request_sha256": "f1e6639e46849fdddf9d9d2b625fa8c60c15343f6fce6b39c57a8a20839595be",
+        "summary_path": "artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/screening/summary.json",
+        "summary_sha256": "266c51361919b3ae034c84746789b45a54e4d8afe1c94ea87aeba39c4bc96ebf",
+        "arm_count": 2,
+        "gate_survivor_count": 0,
+        "pareto_arm_ids": [],
+        "selected_arm_ids": [],
+        "privacy_inference": "provisional_point_arcface_delta",
+        "arms": [
+          {
+            "arm_id": "eta025_tail32",
+            "hard_gate_pass": false,
+            "failed_gates": ["e0", "niqe", "sharpness"],
+            "arcface_delta": 0.0016249781023907643,
+            "R": -0.008718842950960001,
+            "Q": -2.3569432080481256,
+            "P": 0.9187510948804617,
+            "status": "no_gate_survivor"
+          },
+          {
+            "arm_id": "eta05_tail32",
+            "hard_gate_pass": false,
+            "failed_gates": ["niqe", "sharpness"],
+            "arcface_delta": -0.0075821480703862345,
+            "R": 0.12417346922059853,
+            "Q": -4.538436982972538,
+            "P": 1.3791074035193118,
+            "status": "no_gate_survivor"
+          }
+        ]
+      }
+    }
+  ],
+  "decision": {
+    "frontier_status": "no_frontier_survivor",
+    "selected_arm_ids": [],
+    "formal_winner": null,
+    "next_step": "causal_decomposition",
+    "causal_generation_status": "not_started",
+    "causal_evaluation_status": "not_started"
+  },
+  "excluded_artifact_classes": [
+    "generated_png",
+    "model_log",
+    "evaluator_log",
+    "bulk_per_sample_rows",
+    "evaluator_bulk_outputs"
+  ]
+}

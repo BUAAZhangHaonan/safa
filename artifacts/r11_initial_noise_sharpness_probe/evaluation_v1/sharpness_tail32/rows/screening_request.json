@@ -1,0 +1,17 @@
+{
+  "arms": [
+    {
+      "arm_id": "eta025_tail32",
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/rows/eta025_tail32.jsonl"
+    },
+    {
+      "arm_id": "eta05_tail32",
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/rows/eta05_tail32.jsonl"
+    }
+  ],
+  "baseline_arm_id": "eta025_tail32",
+  "selection_manifest_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/preparation_v1/tail32.jsonl",
+  "selection_manifest_sha256": "f38fb6f6542c267b6c7d9cbec9ce57abdf9b0657edfe8d060fe533178a9f5b29",
+  "selection_role": "sharpness_tail32",
+  "stage": 32
+}

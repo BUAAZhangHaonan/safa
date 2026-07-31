@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "contract_type": "safa_r11_frontier_artifact_manifest_v1",
+  "created_at_cst": "2026-07-31T15:39:26+08:00",
+  "result_status": "no_frontier_survivor",
+  "source_git_head": "6babd797cfc3e63e1d262e31e001e0b1a20df43f",
+  "artifact_count": 16,
+  "artifacts": [
+    {"path": "artifacts/r11_initial_noise_sharpness_probe/evaluation_preparation_v1/evaluation_plan.json", "sha256": "c55f59f4ca8bd8e59ade13fea013f1839719ef486879156b8b6ec583511d4573", "size": 41062},
+    {"path": "artifacts/r11_initial_noise_sharpness_probe/evaluation_preparation_v1/prefix128.json", "sha256": "bf0a80aff1503290ce37c62fa67ee0b5c6a1d59bebf73c0c455009158150fce8", "size": 1807},
+    {"path": "artifacts/r11_initial_noise_sharpness_probe/evaluation_preparation_v1/sharpness_tail32.json", "sha256": "640a1b64a7ec1bca70ca4e5491c16b785a53956a52d44edbef9fd40e394b56f4", "size": 1781},
+    {"path": "artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/rows/materialization_summary.json", "sha256": "c0520ebf334aef48a2eac8b78662693f43f91122801b39611d5a5fa51b94d35a", "size": 2018},
+    {"path": "artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/rows/screening_request.json", "sha256": "c66227741743f8c7605eb0f08b8ff15c0963a9b87d05b822ff39f213c51ceefc", "size": 1062},
+    {"path": "artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/screening/summary.json", "sha256": "bf97a30c265bb593da041a849c175ffd648a8a28498c082f46cfd0ca236c7718", "size": 29766},
+    {"path": "artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/screening/arms.csv", "sha256": "a40902852b8820c3e110ca1a2f31aeaccd0db3d679a3478d1a0aebe2f7b5c25b", "size": 992},
+    {"path": "artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/screening/arcface_failures.json", "sha256": "ec8775bba264d292a59f32a33ce6f81966028721251847035c52d6a59ee6f267", "size": 44},
+    {"path": "artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/screening/conclusion.md", "sha256": "18645e7aad021122f913eea6b005b1d13df0e713e2fb333f2982db1f651b1e40", "size": 185},
+    {"path": "artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/rows/materialization_summary.json", "sha256": "2189813c8229b13e1c985f7645fac976e98f53711be000e9f5558ad7878a3a88", "size": 1983},
+    {"path": "artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/rows/screening_request.json", "sha256": "f1e6639e46849fdddf9d9d2b625fa8c60c15343f6fce6b39c57a8a20839595be", "size": 863},
+    {"path": "artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/screening/summary.json", "sha256": "266c51361919b3ae034c84746789b45a54e4d8afe1c94ea87aeba39c4bc96ebf", "size": 9740},
+    {"path": "artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/screening/arms.csv", "sha256": "0696b38cc5506d3750be82e9c8b00f0ea5ea8626308ebc48773891be12d26f08", "size": 809},
+    {"path": "artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/screening/arcface_failures.json", "sha256": "ec8775bba264d292a59f32a33ce6f81966028721251847035c52d6a59ee6f267", "size": 44},
+    {"path": "artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/sharpness_tail32/screening/conclusion.md", "sha256": "c7bec7e916205a5520c063b313ae48189fc7ed6cf4e993ffec17bc15e9589e6f", "size": 178},
+    {"path": "artifacts/r11_initial_noise_sharpness_probe/frontier_result_v1/machine_summary.json", "sha256": "a8dbebda8bc8d727b554ab7256d85491235ebd7f3636751b215a5abceb2f4b8e", "size": 6635}
+  ],
+  "excluded_artifact_classes": ["generated_png", "model_log", "evaluator_log", "bulk_per_sample_rows", "evaluator_bulk_outputs"]
+}

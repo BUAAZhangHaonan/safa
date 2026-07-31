@@ -1,0 +1,23 @@
+{
+  "arms": [
+    {
+      "arm_id": "eta025_prefix128",
+      "fid": 122.81310272216797,
+      "kid": 0.029005078598856926,
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/rows/eta025_prefix128.jsonl"
+    },
+    {
+      "arm_id": "eta05_prefix128",
+      "fid": 114.43486785888672,
+      "kid": 0.020816471427679062,
+      "rows_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r11_initial_noise_sharpness_probe/evaluation_v1/prefix128/rows/eta05_prefix128.jsonl"
+    }
+  ],
+  "baseline_arm_id": "eta025_prefix128",
+  "native_fid": 133.32554626464844,
+  "native_kid": 0.037948451936244965,
+  "selection_manifest_path": "/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization/artifacts/r10_triangle_exploration/preparation_v1/prefix128.jsonl",
+  "selection_manifest_sha256": "9e1bfa90057c9b72f02a29340d91f0d87d4d4f35119733824b9659bd7ee8db89",
+  "selection_role": "prefix128",
+  "stage": 128
+}

@@ -1,0 +1,48 @@
+{
+  "arms": [
+    {
+      "arcface_request_sha256": "8206ffb3da80c387b738af8bec16fdf57ff7cc61f979f58fcf2f6dca874b6bd1",
+      "arcface_result_sha256": "6a9289ef5f180b53f0a55c4d223ed5675c06eeb034bd34d73e1fe221fe7ead58",
+      "arm_id": "eta025_prefix128",
+      "candidate_quality_output_sha256": "894ce7c098f59b0da038a48afe887414cd1d52fb54b17f19c4711734ec0c121b",
+      "generation_rows_sha256": "38910b525d170f958082faa1359c8d0885978386a5da1934a572f00e1309f2ea",
+      "materialized_rows_sha256": "ca01b3ea4c793c5b0f9cbd92724b52345957b5a2d7fa4ccf31ab03c0af2b363c"
+    },
+    {
+      "arcface_request_sha256": "bb083260481094869b5def40e470eb1b89de1dbabd7c6fe2901d66e9e4fbddd6",
+      "arcface_result_sha256": "855b684913102996c68aa209efac541fbb5cada1cc1a6d8bcf13ee4ee9f7832b",
+      "arm_id": "eta05_prefix128",
+      "candidate_quality_output_sha256": "4e94a1afca177d5bb9fc2045cb4cb74f15b13da5a5e0e5157ccb1cddb86badda",
+      "generation_rows_sha256": "e03dfcc0d76fa12efc6c2a0144a3608a991c77767c70b7d666f8c4d0cea77d42",
+      "materialized_rows_sha256": "a99a68a2ee0866e0f904d38695d9cf9fad7c70036063224f17f98ef888dd691c"
+    }
+  ],
+  "contract_type": "safa_r11_typed_triangle_rows_v1",
+  "diagnostic_manifest_sha256": "bf0a80aff1503290ce37c62fa67ee0b5c6a1d59bebf73c0c455009158150fce8",
+  "metric_contract": {
+    "arcface_detector": "buffalo_l",
+    "fid_kid": "required",
+    "privacy": "arcface_delta_u95_shared_pcg64_2000",
+    "quality": [
+      "fid",
+      "kid",
+      "niqe",
+      "sharpness"
+    ]
+  },
+  "native_quality_output_sha256": "3352f25136b27d920ed98a4057f3be62061ea0930eccd743c9131aa0126a25c0",
+  "native_representation_rows": {
+    "binding": "direct_per_arm_generation_rows",
+    "fields": [
+      "native_cosine",
+      "candidate_cosine",
+      "native_edev_cosine",
+      "edev_cosine"
+    ]
+  },
+  "sample_count": 128,
+  "schema_version": 1,
+  "selection_manifest_sha256": "9e1bfa90057c9b72f02a29340d91f0d87d4d4f35119733824b9659bd7ee8db89",
+  "selection_role": "prefix128",
+  "stage": 128
+}

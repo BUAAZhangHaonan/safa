@@ -1,0 +1,46 @@
+{
+  "arms": [
+    {
+      "arcface_request_sha256": "e7248192c54ece48e006e1491c9f569b41e05e00da12ab63fa9a4d5e65f51330",
+      "arcface_result_sha256": "b53763294e27e9b50b160313037b7054e43bba94e42946e6032d8673e1698cf6",
+      "arm_id": "eta025_tail32",
+      "candidate_quality_output_sha256": "ba2bca0ad0c69a4a4b97b08d60e43aad7e1448218d7da32e2c1f0a67ecb12476",
+      "generation_rows_sha256": "380f2a1e70648e58a8035c4e02fc3b7c05a2b89b245c585a65f8f2230002b60d",
+      "materialized_rows_sha256": "f1df58b3532a21b8fbd779dcafc0fac688b9f9b762adfaf217761c79ba8df515"
+    },
+    {
+      "arcface_request_sha256": "875b2a207781493c6a78e6006cd728745ed8b7e5326f58f13bcee1d53ac8e377",
+      "arcface_result_sha256": "24960e7273f9f2f0e09ca3ca17cf67314ff6f40e72225a26daf7add870fb2c68",
+      "arm_id": "eta05_tail32",
+      "candidate_quality_output_sha256": "f01cdb4b0dc0bb33e697a27a3bd9304971f54a6c0f0baa8f2cee506a6ea3506e",
+      "generation_rows_sha256": "0afd5aae70bb7a04dcf20568c00b3d5cf9ed729ae97f549ec2cf73a765f6a56f",
+      "materialized_rows_sha256": "266bac7668d629046cd7dd131c9842806318a885e91d0c76b6da5a82714acd32"
+    }
+  ],
+  "contract_type": "safa_r11_typed_triangle_rows_v1",
+  "diagnostic_manifest_sha256": "640a1b64a7ec1bca70ca4e5491c16b785a53956a52d44edbef9fd40e394b56f4",
+  "metric_contract": {
+    "arcface_detector": "buffalo_l",
+    "fid_kid": "forbidden_absent",
+    "privacy": "point_arcface_delta",
+    "quality": [
+      "niqe",
+      "sharpness"
+    ]
+  },
+  "native_quality_output_sha256": "15f9733fb2f338d9313d22b69c165112213d050c2f526bbda69df8c812a98768",
+  "native_representation_rows": {
+    "binding": "direct_per_arm_generation_rows",
+    "fields": [
+      "native_cosine",
+      "candidate_cosine",
+      "native_edev_cosine",
+      "edev_cosine"
+    ]
+  },
+  "sample_count": 32,
+  "schema_version": 1,
+  "selection_manifest_sha256": "f38fb6f6542c267b6c7d9cbec9ce57abdf9b0657edfe8d060fe533178a9f5b29",
+  "selection_role": "sharpness_tail32",
+  "stage": 32
+}
