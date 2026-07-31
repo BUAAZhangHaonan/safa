@@ -58,14 +58,28 @@ def canonical_arm_config_payload(config: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(locked_schedule, Mapping)
         else config.get("schedule_contract_sha256")
     )
+    fixed_assets = {
+        field: _json_value(config.get(field)) for field in FIXED_ASSET_FIELDS
+    }
+    r13_contract = config.get("r13_evaluator_contract")
+    if r13_contract is not None:
+        if not isinstance(r13_contract, Mapping):
+            raise ValueError("r13_evaluator_contract must be a mapping")
+        encoded_contract = json.dumps(
+            dict(r13_contract),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        fixed_assets["r13_evaluator_contract_sha256"] = hashlib.sha256(
+            encoded_contract
+        ).hexdigest()
     return {
         "schema_version": 1,
         "mode": mode,
         "algorithm": {field: _json_value(config.get(field)) for field in ALGORITHM_FIELDS},
         "schedule_contract_sha256": _json_value(schedule_digest),
-        "fixed_assets": {
-            field: _json_value(config.get(field)) for field in FIXED_ASSET_FIELDS
-        },
+        "fixed_assets": fixed_assets,
     }
 
 

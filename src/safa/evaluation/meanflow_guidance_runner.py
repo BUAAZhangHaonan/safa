@@ -42,6 +42,14 @@ from safa.evaluation.r9_semigroup_contracts import (
     validate_r9_locked_schedule_bindings,
     validate_r9_semigroup_preflight_config,
 )
+from safa.evaluation.r13_evaluator_contract import (
+    apply_r13_strict_cuda_determinism,
+    assert_r13_strict_cuda_determinism,
+    is_r13_evaluator_config,
+    r13_execution_contract,
+    validate_r13_checkpoint_declaration,
+    validate_r13_evaluator_contract,
+)
 from safa.utils.sampling import make_x_init_for_sample_ids
 
 
@@ -182,9 +190,23 @@ class GuidanceRuntime:
     heldout_e2: dict[str, str] | None = None
 
 
-def validate_checkpoint_contract(payload: Mapping[str, Any]) -> dict[str, Any]:
+def validate_checkpoint_contract(
+    payload: Mapping[str, Any],
+    *,
+    expected_stage_epoch_1based: int = EXPECTED_STAGE_EPOCH,
+    expected_global_step: int | None = None,
+) -> dict[str, Any]:
     if not isinstance(payload, Mapping):
         raise ValueError("MeanFlow checkpoint must contain a mapping")
+    if (
+        type(expected_stage_epoch_1based) is not int
+        or expected_stage_epoch_1based <= 0
+    ):
+        raise ValueError("expected_stage_epoch_1based must be a positive integer")
+    if expected_global_step is not None and (
+        type(expected_global_step) is not int or expected_global_step <= 0
+    ):
+        raise ValueError("expected_global_step must be a positive integer")
     if payload.get("stage") != EXPECTED_STAGE:
         raise ValueError(
             f"checkpoint stage must be {EXPECTED_STAGE!r}, got {payload.get('stage')!r}"
@@ -193,9 +215,32 @@ def validate_checkpoint_contract(payload: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(metrics, Mapping):
         raise ValueError("checkpoint missing metrics mapping")
     epoch = metrics.get("stage_epoch_1based")
-    if epoch != EXPECTED_STAGE_EPOCH:
+    epoch_invalid = (
+        epoch != expected_stage_epoch_1based
+        if expected_global_step is None
+        else type(epoch) is not int or epoch != expected_stage_epoch_1based
+    )
+    if epoch_invalid:
         raise ValueError(
-            f"checkpoint metrics.stage_epoch_1based must be {EXPECTED_STAGE_EPOCH}, got {epoch!r}"
+            "checkpoint metrics.stage_epoch_1based must be integer "
+            f"{expected_stage_epoch_1based}, got {epoch!r}"
+        )
+    global_step = metrics.get("global_step")
+    if expected_global_step is not None and (
+        type(global_step) is not int or global_step != expected_global_step
+    ):
+        raise ValueError(
+            "checkpoint metrics.global_step must be integer "
+            f"{expected_global_step}, got {global_step!r}"
+        )
+    required_optimizer_steps = metrics.get("required_optimizer_steps")
+    if expected_global_step is not None and (
+        type(required_optimizer_steps) is not int
+        or required_optimizer_steps != expected_global_step
+    ):
+        raise ValueError(
+            "checkpoint metrics.required_optimizer_steps must be integer "
+            f"{expected_global_step}, got {required_optimizer_steps!r}"
         )
     model_config = payload.get("model_config")
     if not isinstance(model_config, Mapping):
@@ -209,15 +254,19 @@ def validate_checkpoint_contract(payload: Mapping[str, Any]) -> dict[str, Any]:
     ema_state = payload.get("ema_model_state_dict")
     if not isinstance(ema_state, Mapping) or not ema_state:
         raise ValueError("checkpoint missing non-empty ema_model_state_dict")
-    return {
+    metadata = {
         "stage": EXPECTED_STAGE,
-        "stage_epoch_1based": EXPECTED_STAGE_EPOCH,
+        "stage_epoch_1based": expected_stage_epoch_1based,
         "model_type": EXPECTED_MODEL_CONFIG["model_type"],
         "sit_patch_size": EXPECTED_MODEL_CONFIG["sit_patch_size"],
         "model_config": dict(model_config),
         "weight_source": "ema_model_state_dict",
         "strict_state_load": True,
     }
+    if expected_global_step is not None:
+        metadata["global_step"] = expected_global_step
+        metadata["required_optimizer_steps"] = expected_global_step
+    return metadata
 
 
 def load_ema_generator(
@@ -225,13 +274,26 @@ def load_ema_generator(
     *,
     device: torch.device,
     r9_attention_backend: str | None = None,
+    checkpoint_contract: Mapping[str, Any] | None = None,
     generator_builder=None,
 ) -> tuple[Any, dict[str, Any]]:
     checkpoint = Path(checkpoint_path)
     if not checkpoint.is_file():
         raise FileNotFoundError(f"MeanFlow checkpoint does not exist: {checkpoint}")
     payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
-    metadata = validate_checkpoint_contract(payload)
+    if checkpoint_contract is None:
+        metadata = validate_checkpoint_contract(payload)
+    else:
+        checkpoint_contract = validate_r13_checkpoint_declaration(
+            checkpoint_contract, checkpoint_path
+        )
+        metadata = validate_checkpoint_contract(
+            payload,
+            expected_stage_epoch_1based=checkpoint_contract[
+                "stage_epoch_1based"
+            ],
+            expected_global_step=checkpoint_contract["global_step"],
+        )
     model_config = dict(payload["model_config"])
     # The target EMA is complete. Do not load an older pretrained SiT before replacing it.
     model_config["sit_pretrained_path"] = ""
@@ -287,10 +349,16 @@ def validate_guidance_config(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError(
             f"guidance runner accepts only locked heldout E1/E2 assets: {present_forbidden!r}"
         )
+    r13_contract = validate_r13_evaluator_contract(resolved)
     checkpoint = str(resolved.get("checkpoint", ""))
-    if checkpoint != EXPECTED_CHECKPOINT_PATH:
+    expected_checkpoint = (
+        str(r13_contract["checkpoint_path"])
+        if r13_contract is not None
+        else EXPECTED_CHECKPOINT_PATH
+    )
+    if checkpoint != expected_checkpoint:
         raise ValueError(
-            f"guidance checkpoint must be exactly {EXPECTED_CHECKPOINT_PATH!r}, got {checkpoint!r}"
+            f"guidance checkpoint must be exactly {expected_checkpoint!r}, got {checkpoint!r}"
         )
     if resolved.get("checkpoint_model") != "ema":
         raise ValueError("guidance checkpoint_model must be 'ema'")
@@ -359,9 +427,14 @@ def validate_guidance_config(config: Mapping[str, Any]) -> dict[str, Any]:
     if "sampling_seed" not in resolved and "seed" not in resolved:
         raise ValueError("guidance config requires sampling_seed or seed")
     resolved["sampling_seed"] = int(resolved.get("sampling_seed", resolved.get("seed")))
+    expected_stage_epoch = (
+        int(r13_contract["stage_epoch_1based"])
+        if r13_contract is not None
+        else EXPECTED_STAGE_EPOCH
+    )
     for field, expected in (
         ("expected_stage", EXPECTED_STAGE),
-        ("expected_stage_epoch_1based", EXPECTED_STAGE_EPOCH),
+        ("expected_stage_epoch_1based", expected_stage_epoch),
         ("expected_model_type", EXPECTED_MODEL_CONFIG["model_type"]),
         ("expected_sit_patch_size", EXPECTED_MODEL_CONFIG["sit_patch_size"]),
     ):
@@ -635,6 +708,11 @@ def validate_r9_phase_contract(config: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _edev_required_for_config(config: Mapping[str, Any]) -> bool:
+    if is_r13_evaluator_config(config):
+        contract = validate_r13_evaluator_contract(config)
+        if contract is None or contract["phase"] != "diagnose":
+            raise ValueError("R13 evaluator requires the locked diagnose phase")
+        return True
     if is_r9_guidance_config(config):
         contract = validate_r9_phase_contract(config)
         if config.get(R9_PHASE_CONTRACT_FIELD) != contract:
@@ -873,6 +951,8 @@ def _materialize_runtime_guidance_config(
         resolved["r9_execution_contract"] = validate_r9_execution_config(
             resolved
         )
+    if is_r13_evaluator_config(resolved):
+        resolved["r13_execution_contract"] = r13_execution_contract(resolved)
     return resolved, cache_path, allowed_roots
 
 
@@ -1019,6 +1099,7 @@ def _register_shard_asset_cache_contract(
 
 
 def asset_contract_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    r13_contract = validate_r13_evaluator_contract(config)
     required = (
         "checkpoint",
         "checkpoint_sha256",
@@ -1048,8 +1129,13 @@ def asset_contract_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
     mode = _MODE_ALIASES.get(str(config.get("mode", "")), str(config.get("mode", "")))
     if mode not in SUPPORTED_MODES:
         raise ValueError(f"guidance asset contract has unsupported mode {mode!r}")
+    expected_checkpoint = (
+        str(r13_contract["checkpoint_path"])
+        if r13_contract is not None
+        else EXPECTED_CHECKPOINT_PATH
+    )
     for field, expected in (
-        ("checkpoint", EXPECTED_CHECKPOINT_PATH),
+        ("checkpoint", expected_checkpoint),
         ("e0_checkpoint", EXPECTED_E0_CHECKPOINT_PATH),
         ("edev_checkpoint", EXPECTED_EDEV_CHECKPOINT_PATH),
         ("vae_path", EXPECTED_VAE_PATH),
@@ -1084,6 +1170,11 @@ def asset_contract_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
     sample_manifest_digest = digest(sample_manifest_path, "sample_id_manifest_sha256")
     ordered_manifest_rows = read_ordered_sample_manifest(sample_manifest_path)
     ordered_manifest_ids = [str(row["sample_id"]) for row in ordered_manifest_rows]
+    if r13_contract is not None and len(ordered_manifest_ids) != 32:
+        raise ValueError(
+            "R13 evaluator sample manifest must contain exactly 32 ordered samples, "
+            f"got {len(ordered_manifest_ids)}"
+        )
     heldout_e1_digest = digest(heldout_e1_path, "heldout_e1_sha256")
     heldout_e2_digest = digest(heldout_e2_path, "heldout_e2_sha256")
     _validate_expected_digest(
@@ -1159,11 +1250,14 @@ def build_frozen_runtime(
         from safa.training.latent_codec import build_latent_codec_from_train_config
 
         codec_builder = build_latent_codec_from_train_config
+    r13_contract = validate_r13_evaluator_contract(config)
     generator_loader_kwargs: dict[str, Any] = {"device": device}
-    if is_r9_guidance_config(config):
+    if is_r9_guidance_config(config) or r13_contract is not None:
         generator_loader_kwargs["r9_attention_backend"] = str(
             config["attention_backend"]
         )
+    if r13_contract is not None:
+        generator_loader_kwargs["checkpoint_contract"] = r13_contract
     generator, checkpoint_state = generator_loader(
         config["checkpoint"], **generator_loader_kwargs
     )
@@ -1624,6 +1718,7 @@ def run_guidance_records(
     resolved_config["mode"] = mode
     resolved_config.pop("route", None)
     r9_execution_contract = None
+    r13_applied_execution_contract = None
     r9_phase_contract = None
     r9_interval_contract = validate_r9_interval_guidance_config(
         resolved_config, mode=mode
@@ -1648,6 +1743,18 @@ def run_guidance_records(
                 "R9 run requires the validated interval guidance contract from config preflight"
             )
         assert_r9_strict_cuda_determinism(torch_module=torch)
+    if is_r13_evaluator_config(resolved_config):
+        r13_applied_execution_contract = r13_execution_contract(resolved_config)
+        if (
+            resolved_config.get("r13_execution_contract")
+            != r13_applied_execution_contract
+        ):
+            raise ValueError(
+                "R13 run requires the applied strict execution contract from runner preflight"
+            )
+        assert_r13_strict_cuda_determinism(
+            resolved_config, torch_module=torch
+        )
     external_native_contract, external_native_rows = _load_external_native_bindings(
         resolved_config, selected
     )
@@ -2257,6 +2364,7 @@ def run_guidance_records(
         "config": _json_safe(resolved_config),
         "resume_contract": _json_safe(resume_contract),
         "r9_execution_contract": _json_safe(r9_execution_contract),
+        "r13_execution_contract": _json_safe(r13_applied_execution_contract),
         "artifacts": {
             "generated_dir": str(generated_dir),
             "native_dir": str(native_dir)
@@ -2342,6 +2450,14 @@ def run_guidance_from_config(
         if resolved["r9_execution_contract"] != applied_contract:
             raise RuntimeError(
                 "materialized R9 execution contract differs from the applied contract"
+            )
+    if is_r13_evaluator_config(resolved):
+        applied_contract = apply_r13_strict_cuda_determinism(
+            resolved, torch_module=torch
+        )
+        if resolved["r13_execution_contract"] != applied_contract:
+            raise RuntimeError(
+                "materialized R13 execution contract differs from the applied contract"
             )
     from safa.data.feature_dataset import FeatureAlignedAffectNet
     from safa.training.transforms import generator_image_transform

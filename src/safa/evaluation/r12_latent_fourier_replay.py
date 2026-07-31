@@ -23,6 +23,10 @@ from safa.evaluation.r9_determinism import (
     apply_r9_strict_cuda_determinism,
     assert_r9_strict_cuda_determinism,
 )
+from safa.evaluation.r13_evaluator_contract import (
+    R13_EVALUATOR_CONTRACT_FIELD,
+    R13_EVALUATOR_CONTRACT_TYPE,
+)
 from safa.utils.sampling import make_x_init_for_sample_ids
 
 
@@ -105,6 +109,11 @@ def _sample_spectral_snapshots(
 
 
 def validate_replay_config(config: Mapping[str, Any], dataset_id: str) -> None:
+    if (
+        config.get("experiment_contract") == R13_EVALUATOR_CONTRACT_TYPE
+        or R13_EVALUATOR_CONTRACT_FIELD in config
+    ):
+        raise ValueError("R12 Fourier replay does not accept the R13 evaluator contract")
     expected_manifest_suffix = {
         "regular32": "artifacts/r10_triangle_exploration/preparation_v1/prefix32.jsonl",
         "sharpness_tail32": "artifacts/r11_initial_noise_sharpness_probe/preparation_v1/tail32.jsonl",
