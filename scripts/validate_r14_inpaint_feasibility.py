@@ -26,8 +26,10 @@ E15_PATH = Path(
 )
 E15_SHA256 = "4690717781db58a6021d57d124300a9b212f0a5043cf3028fb5de4d9c835cc4d"
 GPU_BINDINGS = {
+    0: "GPU-7ba69fc7-12ac-3dfb-8265-3476ce2504b6",
     1: "GPU-dfaeaa7c-32c8-ebb4-aa59-ab7f829805f1",
     2: "GPU-e27fe71d-eaf7-3eb5-d0ff-c1c63b4f6b02",
+    3: "GPU-61ea2925-9905-7f56-cd64-7a792a32efef",
 }
 MANIFEST_COUNTS = {
     "manifests/smoke8.jsonl": 8,
@@ -99,7 +101,7 @@ def _validate_config(path: Path) -> None:
         "r14_contract": "safa_r14_face_region_inpaint_feasibility_v1",
         "seed": 1337,
         "sampling_seed": 1337,
-        "global_batch_size": 4,
+        "global_batch_size": 8,
         "per_device_batch_size": 2,
         "amp": False,
         "resume_from": str(E15_PATH),
@@ -124,6 +126,7 @@ def _validate_config(path: Path) -> None:
         "bbox_expansion_pixels": 0,
         "morphology": None,
         "source_face_removed_before_context_encoder": True,
+        "conditioning": "cached_source_z_only",
         "flow_and_loss_region": "inside_latent_mask_only",
         "outside_latent_projection": "context_after_every_flow_step",
         "outside_pixel_contract": "bit_exact_context_pixels",
@@ -142,6 +145,9 @@ def _validate_config(path: Path) -> None:
     }
     for key, expected in locked_data.items():
         _require_equal(data.get(key), expected, f"config.r14_spatial.{key}")
+    stages = _mapping(config.get("stages"), "config.stages")
+    stage2 = _mapping(stages.get("stage2"), "config.stages.stage2")
+    _require_equal(stage2.get("epochs"), 2, "config.stages.stage2.epochs")
     _require_equal(config.get("train_index"), "data/index/train_face_mixed_e14_4029avail.jsonl", "config.train_index")
     _require_equal(config.get("train_features"), "artifacts/e0_features/train_face_mixed_e14_e0_medium_v1", "config.train_features")
     _require_equal(config.get("eval_index"), "data/index/val_face_mixed_e14.jsonl", "config.eval_index")
@@ -228,6 +234,14 @@ def _validate_train_manifest(path: Path) -> None:
         _validate_bbox_and_landmarks(row, "target_bbox_xywh", "target_landmarks68", f"{path}:{index + 1}")
 
 
+def _optimizer_steps_from_geometry(pair_count: int, global_batch_size: int, epochs: int) -> int:
+    if any(type(value) is not int or value <= 0 for value in (pair_count, global_batch_size, epochs)):
+        raise R14LaunchError("R14 step geometry values must be positive integers")
+    if pair_count % global_batch_size != 0:
+        raise R14LaunchError("R14 pair count must be divisible by global batch size")
+    return (pair_count // global_batch_size) * epochs
+
+
 def _validate_cache_membership(
     index_path: Path,
     feature_dir: Path,
@@ -274,6 +288,15 @@ def validate_static() -> None:
         raise R14LaunchError("smoke8/visual8 must be the same ordered subset of regular32")
     train_pairs = REPO_ROOT / ARTIFACT_ROOT / "manifests/train_pairs.jsonl"
     _validate_train_manifest(train_pairs)
+    preparation = _read_json(REPO_ROOT / ARTIFACT_ROOT / "manifests/preparation_summary.json")
+    _require_equal(preparation.get("train_pair_count"), 1024, "preparation.train_pair_count")
+    _require_equal(preparation.get("global_batch_size"), 8, "preparation.global_batch_size")
+    _require_equal(preparation.get("optimizer_steps"), 256, "preparation.optimizer_steps")
+    _require_equal(
+        _optimizer_steps_from_geometry(1024, 8, 2),
+        256,
+        "R14 optimizer-step geometry",
+    )
     eval_ids = regular_ids
     _validate_cache_membership(
         REPO_ROOT / "data/index/val_face_mixed_e14.jsonl",
@@ -392,6 +415,9 @@ def validate_artifact(stage: str) -> None:
         payload = _read_json(root / "smoke8/summary.json")
         checks = {
             "sample_count": 8,
+            "world_size": 4,
+            "batch_size_per_rank": 2,
+            "ddp_backward": True,
             "source_face_pixels_enter_context_encoder": False,
             "outside_mask_bit_exact": True,
             "same_seed_noise_deterministic": True,
@@ -422,6 +448,8 @@ def validate_artifact(stage: str) -> None:
         _require_equal(payload.get("sample_count"), 32, "generation.sample_count")
         _require_equal(payload.get("outside_mask_bit_exact_all"), True, "generation.outside_mask_bit_exact_all")
         _require_equal(payload.get("candidate_count"), 32, "generation.candidate_count")
+        _require_equal(payload.get("world_size"), 4, "generation.world_size")
+        _require_equal(payload.get("batch_size_per_rank"), 2, "generation.batch_size_per_rank")
     elif stage == "evaluation":
         payload = _read_json(root / "regular32_evaluation/summary.json")
         _require_equal(payload.get("sample_count"), 32, "evaluation.sample_count")

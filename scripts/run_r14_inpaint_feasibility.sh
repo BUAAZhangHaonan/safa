@@ -8,8 +8,8 @@ ARTIFACT_ROOT="artifacts/r14_inpaint_feasibility/v1"
 CHECKPOINT_ROOT="checkpoints/r14_inpaint_feasibility_256step"
 SESSION="safa-r14-inpaint-v1"
 LOG="$ARTIFACT_ROOT/logs/pipeline.log"
-GPU_LIST="1,2"
-NPROC=2
+GPU_LIST="0,1,2,3"
+NPROC=4
 
 usage() {
   printf '%s\n' \
@@ -40,7 +40,10 @@ export MKL_NUM_THREADS=4
 export PYTHONUNBUFFERED=1
 
 SMOKE=(
-  "$PYTHON_BIN" scripts/run_r14_inpaint_smoke.py
+  "$PYTHON_BIN" -m torch.distributed.run
+  --standalone
+  "--nproc_per_node=$NPROC"
+  scripts/run_r14_inpaint_smoke.py
   --config "$CONFIG"
   --manifest "$ARTIFACT_ROOT/manifests/smoke8.jsonl"
   --output-dir "$ARTIFACT_ROOT/smoke8"
@@ -161,7 +164,7 @@ case "$MODE" in
     printf -v TMUX_COMMAND '%q ' "${TMUX_PAYLOAD[@]}"
     TMUX_COMMAND+="2>&1 | tee -- $(printf '%q' "$LOG")"
     tmux new-session -d -s "$SESSION" "$TMUX_COMMAND"
-    printf 'Started %s on physical GPU1,2. Log: %s\n' "$SESSION" "$LOG"
+    printf 'Started %s on physical GPU0,1,2,3. Log: %s\n' "$SESSION" "$LOG"
     ;;
   *)
     printf 'unreachable mode: %s\n' "$MODE" >&2

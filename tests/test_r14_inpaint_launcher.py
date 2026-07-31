@@ -71,6 +71,9 @@ def test_locked_config_validates() -> None:
     assert config["amp"] is False
     assert config["global_batch_size"] == 8
     assert config["per_device_batch_size"] == 2
+    assert config["stages"]["stage2"]["epochs"] == 2
+    assert validator._optimizer_steps_from_geometry(1024, 8, 2) == 256
+    assert config["generator"]["inpaint"]["conditioning"] == "cached_source_z_only"
     assert config["eval_index"] == "data/index/val_face_mixed_e14.jsonl"
     assert config["eval_features"] == "artifacts/e0_features/val_face_mixed_e14_e0_medium_v1"
     for entrypoint in (
@@ -202,13 +205,14 @@ def test_locked_conclusion_priority_and_roi_inflation() -> None:
     assert closeout._classification(privacy_fail, {"severe_count": 0})[0] == "no_go_privacy"
 
 
-def test_launcher_is_single_locked_gpu12_pipeline() -> None:
+def test_launcher_is_single_locked_gpu0123_pipeline() -> None:
     path = REPO / "scripts/run_r14_inpaint_feasibility.sh"
     text = path.read_text(encoding="utf-8")
-    assert 'GPU_LIST="1,2"' in text
-    assert 'NPROC=2' in text
+    assert 'GPU_LIST="0,1,2,3"' in text
+    assert 'NPROC=4' in text
     assert 'SESSION="safa-r14-inpaint-v1"' in text
     assert "--nproc_per_node=$NPROC" in text
+    assert text.count('"--nproc_per_node=$NPROC"') == 3
     assert "batch" not in text.lower() or "batch" in text.lower()
     for forbidden in ("retry", "controller", "postclaim", "/tmp/safa-node3"):
         assert forbidden not in text.lower()
@@ -217,6 +221,20 @@ def test_launcher_is_single_locked_gpu12_pipeline() -> None:
     assert positions == sorted(positions)
     result = subprocess.run(["bash", "-n", str(path)], text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stderr
+
+
+def test_smoke_and_generation_require_four_rank_batch2() -> None:
+    smoke_source = (REPO / "scripts/run_r14_inpaint_smoke.py").read_text(encoding="utf-8")
+    generation_source = (REPO / "scripts/run_r14_inpaint_generation.py").read_text(encoding="utf-8")
+    assert "world_size != 4" in smoke_source
+    assert "DistributedDataParallel" in smoke_source
+    assert "range(rank * 2, (rank + 1) * 2)" in smoke_source
+    assert '"world_size": world_size' in smoke_source
+    assert '"batch_size_per_rank": 2' in smoke_source
+    assert "world_size != 4" in generation_source
+    assert '"world_size": 4' in generation_source
+    assert '"batch_size_per_rank": 2' in generation_source
+    assert set(validator.GPU_BINDINGS) == {0, 1, 2, 3}
 
 
 def test_artifact_validator_rejects_511_equivalent_and_nonfinite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

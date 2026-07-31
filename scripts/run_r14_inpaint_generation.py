@@ -113,8 +113,8 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
-    if world_size != 2 or local_rank not in (0, 1) or rank not in (0, 1):
-        raise RuntimeError("R14 regular32 generation requires exactly two torchrun ranks")
+    if world_size != 4 or local_rank not in range(4) or rank not in range(4):
+        raise RuntimeError("R14 regular32 generation requires exactly four torchrun ranks")
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend="nccl")
     device = torch.device("cuda", local_rank)
@@ -225,7 +225,7 @@ def main() -> None:
                 "candidate_count": 32,
                 "native_count": 32,
                 "outside_mask_bit_exact_all": True,
-                "world_size": 2,
+                "world_size": 4,
                 "batch_size_per_rank": 2,
                 "matched_native_condition": "learned_null_condition",
                 "candidate_native_share_x_init_context_mask": True,

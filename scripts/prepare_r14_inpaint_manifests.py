@@ -90,7 +90,7 @@ def main() -> None:
         "contract_type": "safa_r14_inpaint_manifest_preparation_v1",
         "train_pair_count": len(pairs),
         "optimizer_steps": 256,
-        "global_batch_size": 4,
+        "global_batch_size": 8,
         "regular32_count": len(regular_eval),
         "smoke8_count": len(fixed8),
         "visual8_count": len(fixed8),

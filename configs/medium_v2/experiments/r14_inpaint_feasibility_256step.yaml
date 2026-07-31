@@ -4,7 +4,7 @@ seed: 1337
 sampling_seed: 1337
 device: cuda:0
 num_workers: 4
-global_batch_size: 4
+global_batch_size: 8
 per_device_batch_size: 2
 amp: false
 optimizer_type: adamw
@@ -100,7 +100,7 @@ stages:
     epochs: 0
     require_face_detection_gate: false
   stage2:
-    epochs: 1
+    epochs: 2
     gradient_monitor:
       enabled: false
       interval: 20

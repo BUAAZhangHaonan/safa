@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from collections.abc import Mapping
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 import yaml
-from torch.utils.data import DataLoader
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, Subset
 
 from safa.data.r14_spatial import R14SpatialEvalDataset
 from safa.models.generator import build_generator
@@ -77,12 +80,51 @@ def _load_legacy_e15_into_inpaint(generator, state: Mapping[str, object]) -> Non
             raise RuntimeError(f"new R14 parameter must remain exact zero-init after E15 load: {name}")
 
 
+class _SmokeTrainingStep(torch.nn.Module):
+    def __init__(self, generator: torch.nn.Module) -> None:
+        super().__init__()
+        self.generator = generator
+
+    def forward(
+        self,
+        target_latent: torch.Tensor,
+        source_z: torch.Tensor,
+        context_latent: torch.Tensor,
+        latent_mask: torch.Tensor,
+        seed: int,
+    ):
+        rng = torch.Generator(device=target_latent.device).manual_seed(seed)
+        return self.generator.flow_matching_loss(
+            target_latent,
+            source_z,
+            generator=rng,
+            context_latent=context_latent,
+            latent_mask=latent_mask,
+        )
+
+
 def main() -> None:
     args = parse_args()
-    if args.output_dir.exists():
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    if world_size != 4 or local_rank not in range(4) or rank not in range(4):
+        raise RuntimeError("R14 smoke8 requires exactly four torchrun ranks")
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl")
+    device = torch.device("cuda", local_rank)
+    output_exists = torch.tensor(
+        [1 if args.output_dir.exists() else 0], device=device, dtype=torch.int64
+    )
+    dist.all_reduce(output_exists, op=dist.ReduceOp.MAX)
+    if int(output_exists.item()) != 0:
         raise FileExistsError(f"refusing to reuse smoke output: {args.output_dir}")
-    args.output_dir.mkdir(parents=True, exist_ok=False)
+    if rank == 0:
+        args.output_dir.mkdir(parents=True, exist_ok=False)
+    dist.barrier()
     config = _mapping(yaml.safe_load(args.config.read_text(encoding="utf-8")), "config")
+    if config.get("global_batch_size") != 8 or config.get("per_device_batch_size") != 2:
+        raise RuntimeError("R14 smoke8 requires global batch 8 and per-rank batch 2")
     dataset = R14SpatialEvalDataset(
         args.manifest,
         Path(str(config["eval_index"])),
@@ -92,75 +134,117 @@ def main() -> None:
     )
     if len(dataset) != 8:
         raise RuntimeError(f"smoke8 must contain exactly 8 samples, got {len(dataset)}")
-    loader = DataLoader(dataset, batch_size=2, shuffle=False, num_workers=0)
-    device = torch.device("cuda", 0)
+    indices = list(range(rank * 2, (rank + 1) * 2))
+    loader = DataLoader(Subset(dataset, indices), batch_size=2, shuffle=False, num_workers=0)
+    if len(loader) != 1:
+        raise RuntimeError("each R14 smoke rank must receive exactly one full batch")
     generator, codec = _load_e15_inpaint(config, device)
-    all_context_clean = True
-    all_outside_exact = True
-    all_deterministic = True
-    all_source_z_finite = True
-    loss_value: float | None = None
-    finite_gradients = False
-    for batch_index, batch in enumerate(loader):
-        sample_ids = [str(value) for value in batch["sample_id"]]
-        source_z = batch["source_z"].to(device=device, dtype=torch.float32)
-        original = batch["image"].to(device=device, dtype=torch.float32)
-        context = batch["context_image"].to(device=device, dtype=torch.float32)
-        pixel_mask = batch["face_mask"].to(device=device, dtype=torch.bool)
-        all_source_z_finite &= bool(
-            torch.isfinite(source_z).all().item()
-            and torch.allclose(source_z.norm(dim=1), torch.ones(source_z.shape[0], device=device), atol=1e-5, rtol=0.0)
+    training_step = DistributedDataParallel(
+        _SmokeTrainingStep(generator),
+        device_ids=[local_rank],
+        output_device=local_rank,
+        find_unused_parameters=False,
+    )
+    batch = next(iter(loader))
+    sample_ids = [str(value) for value in batch["sample_id"]]
+    source_z = batch["source_z"].to(device=device, dtype=torch.float32)
+    original = batch["image"].to(device=device, dtype=torch.float32)
+    context = batch["context_image"].to(device=device, dtype=torch.float32)
+    pixel_mask = batch["face_mask"].to(device=device, dtype=torch.bool)
+    source_z_finite = bool(
+        torch.isfinite(source_z).all().item()
+        and torch.allclose(
+            source_z.norm(dim=1),
+            torch.ones(source_z.shape[0], device=device),
+            atol=1e-5,
+            rtol=0.0,
         )
-        expanded = pixel_mask.expand_as(context)
-        all_context_clean &= bool(torch.equal(context[expanded], torch.zeros_like(context[expanded])))
-        context_latent, latent_mask = encode_masked_context_latent(codec, context, pixel_mask)
-        x_a = make_x_init_for_sample_ids(sample_ids, int(config["sampling_seed"]), 32, device, source_z.dtype, channels=4)
-        x_b = make_x_init_for_sample_ids(sample_ids, int(config["sampling_seed"]), 32, device, source_z.dtype, channels=4)
-        all_deterministic &= bool(torch.equal(x_a, x_b))
-        generator.eval()
-        with torch.no_grad():
-            latent_a = generator.sample(source_z, x_init=x_a, context_latent=context_latent, latent_mask=latent_mask)
-            latent_b = generator.sample(source_z, x_init=x_b, context_latent=context_latent, latent_mask=latent_mask)
-            all_deterministic &= bool(torch.equal(latent_a, latent_b))
-            decoded = codec.decode(latent_a)
-            assembled = assemble_inpainted_pixels(original, decoded, pixel_mask)
-        all_outside_exact &= bool(torch.equal(assembled[~expanded], original[~expanded]))
-        if batch_index == 0:
-            generator.train()
-            generator.zero_grad(set_to_none=True)
-            target_latent, train_context_latent, train_latent_mask = encode_inpaint_training_latents(
-                codec, original, context, pixel_mask
-            )
-            rng = torch.Generator(device=device).manual_seed(int(config["seed"]))
-            loss, metrics = generator.flow_matching_loss(
-                target_latent,
-                source_z,
-                generator=rng,
-                context_latent=train_context_latent,
-                latent_mask=train_latent_mask,
-            )
-            if not torch.isfinite(loss).item():
-                raise FloatingPointError("R14 smoke masked loss is non-finite")
-            for value in metrics.values():
-                if torch.is_tensor(value) and torch.is_floating_point(value) and not torch.isfinite(value).all().item():
-                    raise FloatingPointError("R14 smoke loss metric is non-finite")
-            loss.backward()
-            gradients = [parameter.grad for parameter in generator.parameters() if parameter.grad is not None]
-            finite_gradients = bool(gradients) and all(torch.isfinite(gradient).all().item() for gradient in gradients)
-            loss_value = float(loss.detach().item())
-            generator.zero_grad(set_to_none=True)
+    )
+    expanded = pixel_mask.expand_as(context)
+    context_clean = bool(torch.equal(context[expanded], torch.zeros_like(context[expanded])))
+    context_latent, latent_mask = encode_masked_context_latent(codec, context, pixel_mask)
+    x_a = make_x_init_for_sample_ids(
+        sample_ids, int(config["sampling_seed"]), 32, device, source_z.dtype, channels=4
+    )
+    x_b = make_x_init_for_sample_ids(
+        sample_ids, int(config["sampling_seed"]), 32, device, source_z.dtype, channels=4
+    )
+    deterministic = bool(torch.equal(x_a, x_b))
+    runtime_generator = training_step.module.generator
+    runtime_generator.eval()
+    with torch.no_grad():
+        latent_a = runtime_generator.sample(
+            source_z, x_init=x_a, context_latent=context_latent, latent_mask=latent_mask
+        )
+        latent_b = runtime_generator.sample(
+            source_z, x_init=x_b, context_latent=context_latent, latent_mask=latent_mask
+        )
+        deterministic &= bool(torch.equal(latent_a, latent_b))
+        decoded = codec.decode(latent_a)
+        assembled = assemble_inpainted_pixels(original, decoded, pixel_mask)
+    outside_exact = bool(torch.equal(assembled[~expanded], original[~expanded]))
+    training_step.train()
+    training_step.zero_grad(set_to_none=True)
+    target_latent, train_context_latent, train_latent_mask = encode_inpaint_training_latents(
+        codec, original, context, pixel_mask
+    )
+    loss, metrics = training_step(
+        target_latent,
+        source_z,
+        train_context_latent,
+        train_latent_mask,
+        int(config["seed"]),
+    )
+    loss_finite = bool(torch.isfinite(loss).item())
+    metrics_finite = all(
+        not (torch.is_tensor(value) and torch.is_floating_point(value))
+        or bool(torch.isfinite(value).all().item())
+        for value in metrics.values()
+    )
+    if not loss_finite or not metrics_finite:
+        raise FloatingPointError("R14 smoke masked loss or metric is non-finite")
+    loss.backward()
+    gradients = [
+        parameter.grad
+        for parameter in runtime_generator.parameters()
+        if parameter.grad is not None
+    ]
+    finite_gradients = bool(gradients) and all(
+        bool(torch.isfinite(gradient).all().item()) for gradient in gradients
+    )
+    vae_frozen = not any(parameter.requires_grad for parameter in codec.vae.parameters())
+    flags = torch.tensor(
+        [
+            int(context_clean),
+            int(outside_exact),
+            int(deterministic),
+            int(source_z_finite),
+            int(loss_finite and metrics_finite),
+            int(finite_gradients),
+            int(vae_frozen),
+        ],
+        device=device,
+        dtype=torch.int64,
+    )
+    dist.all_reduce(flags, op=dist.ReduceOp.MIN)
+    loss_total = loss.detach().to(dtype=torch.float64)
+    dist.all_reduce(loss_total, op=dist.ReduceOp.SUM)
+    training_step.zero_grad(set_to_none=True)
     summary = {
         "schema_version": 1,
         "contract_type": "safa_r14_inpaint_smoke8_v1",
         "sample_count": 8,
-        "source_face_pixels_enter_context_encoder": not all_context_clean,
-        "outside_mask_bit_exact": all_outside_exact,
-        "same_seed_noise_deterministic": all_deterministic,
-        "source_z_finite_l2_normalized": all_source_z_finite,
-        "masked_loss_finite": loss_value is not None and torch.isfinite(torch.tensor(loss_value)).item(),
-        "masked_gradients_finite": finite_gradients,
-        "vae_frozen": not any(parameter.requires_grad for parameter in codec.vae.parameters()),
-        "masked_loss": loss_value,
+        "world_size": world_size,
+        "batch_size_per_rank": 2,
+        "ddp_backward": True,
+        "source_face_pixels_enter_context_encoder": not bool(flags[0].item()),
+        "outside_mask_bit_exact": bool(flags[1].item()),
+        "same_seed_noise_deterministic": bool(flags[2].item()),
+        "source_z_finite_l2_normalized": bool(flags[3].item()),
+        "masked_loss_finite": bool(flags[4].item()),
+        "masked_gradients_finite": bool(flags[5].item()),
+        "vae_frozen": bool(flags[6].item()),
+        "masked_loss_mean_across_ranks": float((loss_total / world_size).item()),
     }
     required = (
         not summary["source_face_pixels_enter_context_encoder"]
@@ -173,10 +257,13 @@ def main() -> None:
     )
     if not required:
         raise RuntimeError(f"R14 smoke8 correctness gate failed: {summary}")
-    with (args.output_dir / "summary.json").open("x", encoding="utf-8") as handle:
-        json.dump(summary, handle, indent=2, sort_keys=True, allow_nan=False)
-        handle.write("\n")
-    print(json.dumps(summary, sort_keys=True))
+    if rank == 0:
+        with (args.output_dir / "summary.json").open("x", encoding="utf-8") as handle:
+            json.dump(summary, handle, indent=2, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+        print(json.dumps(summary, sort_keys=True))
+    dist.barrier()
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":
