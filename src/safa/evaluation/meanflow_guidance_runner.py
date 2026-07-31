@@ -820,20 +820,12 @@ def _prepare_sharded_guidance_config(
     shard_index: int,
     num_shards: int,
 ) -> dict[str, Any]:
-    _validate_shard_coordinates(shard_index, num_shards)
-    cache_path, allowed_roots = _resolve_asset_digest_cache(
-        config, num_shards=num_shards
+    resolved, cache_path, allowed_roots = _materialize_runtime_guidance_config(
+        config,
+        shard_index=shard_index,
+        num_shards=num_shards,
     )
-    resolved = validate_guidance_config(config)
-    if cache_path is None:
-        return resolved
-    resolved["asset_digest_cache"] = str(cache_path)
-    explicit_root = config.get("asset_digest_cache_root")
-    if explicit_root:
-        resolved["asset_digest_cache_root"] = str(
-            _repository_relative_candidate(explicit_root).resolve(strict=False)
-        )
-    if num_shards > 1:
+    if cache_path is not None and num_shards > 1:
         _register_shard_asset_cache_contract(
             resolved,
             cache_path=cache_path,
@@ -842,6 +834,46 @@ def _prepare_sharded_guidance_config(
             num_shards=num_shards,
         )
     return resolved
+
+
+def materialize_runtime_guidance_config(
+    config: Mapping[str, Any],
+    *,
+    shard_index: int = 0,
+    num_shards: int = 1,
+) -> dict[str, Any]:
+    """Purely materialize the exact config recorded by a guidance run."""
+    resolved, _, _ = _materialize_runtime_guidance_config(
+        config,
+        shard_index=shard_index,
+        num_shards=num_shards,
+    )
+    return resolved
+
+
+def _materialize_runtime_guidance_config(
+    config: Mapping[str, Any],
+    *,
+    shard_index: int,
+    num_shards: int,
+) -> tuple[dict[str, Any], Path | None, tuple[Path, ...]]:
+    _validate_shard_coordinates(shard_index, num_shards)
+    cache_path, allowed_roots = _resolve_asset_digest_cache(
+        config, num_shards=num_shards
+    )
+    resolved = validate_guidance_config(config)
+    if cache_path is not None:
+        resolved["asset_digest_cache"] = str(cache_path)
+        explicit_root = config.get("asset_digest_cache_root")
+        if explicit_root:
+            resolved["asset_digest_cache_root"] = str(
+                _repository_relative_candidate(explicit_root).resolve(strict=False)
+            )
+    if is_r9_guidance_config(resolved):
+        resolved["r9_execution_contract"] = validate_r9_execution_config(
+            resolved
+        )
+    return resolved, cache_path, allowed_roots
 
 
 def _validate_shard_coordinates(shard_index: int, num_shards: int) -> None:
@@ -2300,9 +2332,13 @@ def run_guidance_from_config(
         num_shards=num_shards,
     )
     if is_r9_guidance_config(resolved):
-        resolved["r9_execution_contract"] = apply_r9_strict_cuda_determinism(
+        applied_contract = apply_r9_strict_cuda_determinism(
             resolved, torch_module=torch
         )
+        if resolved["r9_execution_contract"] != applied_contract:
+            raise RuntimeError(
+                "materialized R9 execution contract differs from the applied contract"
+            )
     from safa.data.feature_dataset import FeatureAlignedAffectNet
     from safa.training.transforms import generator_image_transform
     from safa.utils.device import require_cuda_device

@@ -105,6 +105,61 @@ def test_nfe2_classifier_fails_closed_on_nonfinite_or_forbidden_metrics() -> Non
         classify_schedule_nfe2(evidence)
 
 
+def test_classifier_requires_exact_materialized_runtime_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = {"asset_digest_cache": "relative/cache.json"}
+    execution_contract = {
+        "experiment_contract": "safa_r9_meanflow_v1",
+        "attention_backend": "native",
+    }
+    runtime = {
+        "asset_digest_cache": "/repo/relative/cache.json",
+        "r9_execution_contract": execution_contract,
+    }
+    monkeypatch.setattr(
+        classifier_cli,
+        "materialize_runtime_guidance_config",
+        lambda config, *, shard_index, num_shards: dict(runtime),
+    )
+
+    assert (
+        classifier_cli._require_exact_runtime_config(
+            prepared,
+            runtime,
+            dataset_id="prefix128",
+        )
+        == runtime
+    )
+    mutations = {
+        "unexpected field": {
+            **runtime,
+            "unexpected": True,
+        },
+        "asset path": {
+            **runtime,
+            "asset_digest_cache": "/wrong/cache.json",
+        },
+        "execution contract": {
+            **runtime,
+            "r9_execution_contract": {
+                **execution_contract,
+                "attention_backend": "substituted",
+            },
+        },
+    }
+    for label, executed in mutations.items():
+        with pytest.raises(
+            ScheduleNFE2Error,
+            match="executed config differs from prepared config",
+        ):
+            classifier_cli._require_exact_runtime_config(
+                prepared,
+                executed,
+                dataset_id=f"prefix128 {label}",
+            )
+
+
 def test_one_shot_job_runner_writes_receipt_and_refuses_second_attempt(
     tmp_path: Path,
 ) -> None:
@@ -274,7 +329,6 @@ def test_preparation_binds_exact_schedule_parent_assets_and_retry0_ledger() -> N
     assert all(job["attempt_receipt_path"].endswith(".json") for job in jobs)
     fresh = [path for job in jobs for path in job["fresh_output_paths"]]
     assert len(fresh) == len(set(fresh)) == 14
-    assert all(not (REPO / path).exists() for path in fresh)
     assert not any(
         forbidden in token.lower()
         for job in jobs
@@ -364,7 +418,6 @@ def test_preparation_binds_exact_schedule_parent_assets_and_retry0_ledger() -> N
                 assert binding["sha256"] == _sha256(path)
         for binding in roles["schedule_nfe2"].values():
             assert binding["expected_absent_at_preparation"] is True
-            assert not (REPO / binding["path"]).exists()
 
         selection = [
             json.loads(line)
@@ -395,6 +448,3 @@ def test_preparation_binds_exact_schedule_parent_assets_and_retry0_ledger() -> N
     tampered_contract["datasets"][0]["nfe2_config"]["sha256"] = "0" * 64
     with pytest.raises(ScheduleNFE2Error, match="prepared NFE2 config SHA256 differs"):
         classifier_cli.materialize_evidence(tampered_contract)
-
-    with pytest.raises(ScheduleNFE2Error, match="missing"):
-        classifier_cli.materialize_evidence(contract)

@@ -13,6 +13,7 @@ import yaml
 
 from safa.evaluation.meanflow_guidance_runner import (
     locked_r11_nfe2_schedule_contract,
+    materialize_runtime_guidance_config,
 )
 from safa.evaluation.schedule_nfe2 import (
     ScheduleNFE2Error,
@@ -195,6 +196,24 @@ def _representation(
     }
 
 
+def _require_exact_runtime_config(
+    prepared_config: Mapping[str, Any],
+    executed_config: Mapping[str, Any],
+    *,
+    dataset_id: str,
+) -> dict[str, Any]:
+    expected_runtime_config = materialize_runtime_guidance_config(
+        prepared_config,
+        shard_index=0,
+        num_shards=1,
+    )
+    if dict(executed_config) != expected_runtime_config:
+        raise ScheduleNFE2Error(
+            f"{dataset_id} executed config differs from prepared config"
+        )
+    return expected_runtime_config
+
+
 def _validate_generation(
     path: Path,
     *,
@@ -213,10 +232,11 @@ def _validate_generation(
     config = result.get("config")
     if not isinstance(config, Mapping):
         raise ScheduleNFE2Error(f"{dataset_id} NFE2 config is missing")
-    if dict(config) != dict(prepared_config):
-        raise ScheduleNFE2Error(
-            f"{dataset_id} executed config differs from prepared config"
-        )
+    _require_exact_runtime_config(
+        prepared_config,
+        config,
+        dataset_id=dataset_id,
+    )
     if (
         config.get("arm_name") != "schedule_nfe2"
         or config.get("sampling_seed") != 7919

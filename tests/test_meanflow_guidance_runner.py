@@ -27,6 +27,7 @@ from safa.evaluation.meanflow_guidance_runner import (  # noqa: E402
     deterministic_shard,
     execute_guidance_mode,
     load_ema_generator,
+    materialize_runtime_guidance_config,
     read_ordered_sample_manifest,
     resolve_locked_schedule,
     resume_remaining_ids,
@@ -691,6 +692,47 @@ def test_shared_cache_must_be_in_repo_or_explicit_asset_root(tmp_path: Path) -> 
         num_shards=4,
     )
     assert resolved["asset_digest_cache"] == str(outside_cache.resolve())
+
+
+def test_runtime_config_materialization_is_pure_and_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    relative_cache = "artifacts/r11_schedule_nfe2/runtime-cache.json"
+    config = {
+        **_r8_guidance_config(),
+        "experiment_contract": R9_EXPERIMENT_CONTRACT,
+        "determinism_policy": dict(R9_DETERMINISM_POLICY),
+        "determinism_policy_sha256": R9_DETERMINISM_POLICY_SHA256,
+        "attention_backend": "native",
+        "asset_digest_cache": relative_cache,
+    }
+    original = dict(config)
+    expected_cache = REPO_ROOT / relative_cache
+    monkeypatch.setattr(
+        runner_module,
+        "_resolve_asset_digest_cache",
+        lambda actual, *, num_shards: (
+            expected_cache,
+            (REPO_ROOT,),
+        ),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "validate_guidance_config",
+        lambda actual: dict(actual),
+    )
+
+    runtime = materialize_runtime_guidance_config(config)
+
+    assert config == original
+    assert runtime["asset_digest_cache"] == str(expected_cache)
+    assert runtime["r9_execution_contract"] == {
+        "experiment_contract": R9_EXPERIMENT_CONTRACT,
+        "determinism_policy": R9_DETERMINISM_POLICY,
+        "determinism_policy_sha256": R9_DETERMINISM_POLICY_SHA256,
+        "attention_backend": "native",
+    }
+    assert "r9_execution_contract" not in config
 
 
 def test_four_shards_share_one_exact_cache_contract(tmp_path: Path) -> None:
