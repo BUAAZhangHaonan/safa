@@ -212,6 +212,20 @@ def test_batch4_smoke_is_one_real_resume_update_without_production_writes() -> N
     ):
         assert forbidden not in text.lower()
 
+    launcher = REPO / "scripts/run_r14_inpaint_resume_batch4_smoke.sh"
+    launcher_text = launcher.read_text(encoding="utf-8")
+    assert 'GPU_LIST="0,1"' in launcher_text
+    assert "NPROC=2" in launcher_text
+    assert 'SESSION="safa-r14-inpaint-batch4-smoke-v1"' in launcher_text
+    assert 'NCCL_IB_DISABLE=1' in launcher_text
+    assert 'NCCL_P2P_DISABLE=0' in launcher_text
+    assert "run_r14_inpaint_resume_batch4_smoke.py" in launcher_text
+    assert "retry" not in launcher_text.lower()
+    result = subprocess.run(
+        ["bash", "-n", str(launcher)], text=True, capture_output=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
+
 
 def test_batch4_smoke_reads_real_optimizer_steps() -> None:
     import torch
