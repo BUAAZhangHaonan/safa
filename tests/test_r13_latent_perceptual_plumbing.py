@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import MethodType
 
 import pytest
+import yaml
 
 
 torch = pytest.importorskip("torch")
 from torch import nn
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _latent_meanflow_config() -> dict:
@@ -409,3 +414,122 @@ def test_decoder_lpl_fails_closed_on_zero_prediction_variance_and_invalid_mask()
     payload["sampled_r"] = torch.zeros_like(payload["sampled_t"])
     with pytest.raises(RuntimeError, match="active_mask violates"):
         decoder_latent_perceptual_loss(_ConstantFeatureCodec(), payload, runtime)
+
+
+def test_generator_training_step_adds_lpl_without_changing_flow_mse() -> None:
+    from safa.models.generator import FlowGeneratorConfig, build_generator
+    from safa.training.g_loop import _GeneratorTrainingStep
+    from safa.training.latent_codec import LatentCodec, LatentCodecConfig
+    from safa.training.latent_perceptual_loss import LatentPerceptualLossRuntime
+
+    torch.manual_seed(59)
+    generator_config = FlowGeneratorConfig.from_dict(_latent_meanflow_config())
+    control_generator = build_generator(generator_config.to_dict())
+    lpl_generator = build_generator(generator_config.to_dict())
+    with torch.no_grad():
+        control_generator.vector_field.final_layer.linear.weight.normal_()
+        control_generator.vector_field.final_layer.linear.bias.normal_()
+    lpl_generator.load_state_dict(control_generator.state_dict())
+    control_generator._sample_t_r = MethodType(_fixed_interval, control_generator)
+    lpl_generator._sample_t_r = MethodType(_fixed_interval, lpl_generator)
+    codec = LatentCodec(_FakeVAE(), LatentCodecConfig(source="fake", scaling_factor=1.0))
+    control_module = _GeneratorTrainingStep(
+        control_generator,
+        nn.Identity(),
+        generator_config,
+        7,
+        latent_codec=codec,
+        latent_perceptual_loss_runtime=LatentPerceptualLossRuntime(enabled=False),
+    )
+    lpl_module = _GeneratorTrainingStep(
+        lpl_generator,
+        nn.Identity(),
+        generator_config,
+        7,
+        latent_codec=codec,
+        latent_perceptual_loss_runtime=LatentPerceptualLossRuntime(enabled=True),
+    )
+    encoded = torch.randn(2, 4, 8, 8)
+    condition = torch.randn(2, 8)
+
+    control_loss, control_metrics = control_module._compute_flow_loss(
+        encoded,
+        condition,
+        "embedding",
+        noise_generator=torch.Generator().manual_seed(61),
+        encoded_flow_images=encoded,
+    )
+    lpl_loss, lpl_metrics = lpl_module._compute_flow_loss(
+        encoded,
+        condition,
+        "embedding",
+        noise_generator=torch.Generator().manual_seed(61),
+        encoded_flow_images=encoded,
+    )
+    lpl_loss.backward()
+
+    assert torch.equal(control_metrics["flow_matching_mse"], lpl_metrics["flow_matching_mse"])
+    assert lpl_loss.item() > control_loss.item()
+    assert control_module._last_latent_perceptual_metrics == {}
+    assert lpl_module._last_latent_perceptual_metrics["latent_perceptual_active_count"] == 1.0
+    assert lpl_module._last_latent_perceptual_metrics["latent_perceptual_loss_raw"] > 0.0
+    assert any(
+        parameter.grad is not None
+        and torch.isfinite(parameter.grad).all()
+        and torch.count_nonzero(parameter.grad).item() > 0
+        for parameter in lpl_generator.parameters()
+    )
+    assert all(parameter.grad is None for parameter in codec.vae.parameters())
+
+
+def test_r13_optimizer_step_contract_counts_only_successful_steps_and_resumes_exactly() -> None:
+    from safa.training.g_loop import (
+        _advance_global_step,
+        _optimizer_step_contract,
+        _resume_global_step,
+    )
+
+    config = {
+        "optimizer_step_contract": {
+            "contract_type": "safa_r13_exact_optimizer_steps_v1",
+            "required_steps": 7500,
+        }
+    }
+    assert _optimizer_step_contract(config) == 7500
+    with pytest.raises(RuntimeError, match="explicit successful optimizer.step"):
+        _advance_global_step(12, 7500, optimizer_step_succeeded=False)
+    assert _advance_global_step(7499, 7500, optimizer_step_succeeded=True) == (7500, True)
+    with pytest.raises(RuntimeError, match="exceeded"):
+        _advance_global_step(7500, 7500, optimizer_step_succeeded=True)
+    assert _resume_global_step({"metrics": {"global_step": 17}}, "resume.pt", 7500) == 17
+    with pytest.raises(ValueError, match="must be a non-negative integer"):
+        _resume_global_step({"metrics": {"global_step": 17.0}}, "resume.pt", 7500)
+    with pytest.raises(ValueError, match="already satisfies"):
+        _resume_global_step({"metrics": {"global_step": 7500}}, "resume.pt", 7500)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_r13_control_and_lpl_configs_bind_conditioning_ema_and_7500_steps(enabled: bool) -> None:
+    from safa.training import g_loop
+
+    config_path = REPO_ROOT / "configs" / "medium_v2" / "experiments" / "e15_meanflow_sit_b_face_mixed_resume_e14_2400ep.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config.update(
+        {
+            "generator_trainable": "conditioning_only",
+            "resume_mode": "model_weights_only",
+            "resume_checkpoint_model": "ema",
+            "resume_optimizer_state": False,
+            "latent_perceptual_loss": _lpl_config_payload(enabled=enabled),
+            "optimizer_step_contract": {
+                "contract_type": "safa_r13_exact_optimizer_steps_v1",
+                "required_steps": 7500,
+            },
+        }
+    )
+
+    g_loop._validate_train_g_config(config)
+
+    config["optimizer_step_contract"]["required_steps"] = 7499
+    with pytest.raises(ValueError, match="required_steps=7500"):
+        g_loop._validate_train_g_config(config)

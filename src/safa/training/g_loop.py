@@ -34,6 +34,11 @@ from safa.training.latent_codec import (
     latent_training_enabled,
     validate_latent_training_config,
 )
+from safa.training.latent_perceptual_loss import (
+    LatentPerceptualLossRuntime,
+    decoder_latent_perceptual_loss,
+    latent_perceptual_loss_runtime_from_config,
+)
 from safa.training.losses import cosine_cycle_loss, normalize_for_e0
 from safa.training.projected_update import (
     aggregate_two_task_fm_anchored_cagrad,
@@ -93,6 +98,8 @@ _RESUME_MODES = (_RESUME_MODE_TRAINING_STATE, _RESUME_MODE_MODEL_WEIGHTS_ONLY)
 _RESUME_CHECKPOINT_MODEL_RAW = "raw"
 _RESUME_CHECKPOINT_MODEL_EMA = "ema"
 _RESUME_CHECKPOINT_MODELS = (_RESUME_CHECKPOINT_MODEL_RAW, _RESUME_CHECKPOINT_MODEL_EMA)
+_R13_OPTIMIZER_STEP_CONTRACT = "safa_r13_exact_optimizer_steps_v1"
+_R13_REQUIRED_OPTIMIZER_STEPS = 7500
 
 
 @dataclass(frozen=True)
@@ -190,6 +197,7 @@ class _GeneratorTrainingStep:
         loss_weighting: _LossWeightingRuntime | None = None,
         stage2_objective: _Stage2ObjectiveRuntime | None = None,
         latent_codec=None,
+        latent_perceptual_loss_runtime: LatentPerceptualLossRuntime | None = None,
     ):
         from torch import nn
         schedule = generator_config.cycle_steps_schedule
@@ -205,6 +213,12 @@ class _GeneratorTrainingStep:
                 self.uncertainty_loss = UncertaintyWeightedLoss(["flow", "cycle"]) if self.loss_weighting.type == "uncertainty" else None
                 self.stage2_objective = stage2_objective
                 self.latent_codec = latent_codec
+                self.latent_perceptual_loss_runtime = (
+                    latent_perceptual_loss_runtime
+                    if latent_perceptual_loss_runtime is not None
+                    else LatentPerceptualLossRuntime(enabled=False)
+                )
+                self._last_latent_perceptual_metrics: dict[str, float] = {}
                 self._schedule = schedule
                 self._batch_idx = 0
                 self.last_loss_metrics: dict[str, float | str] = {}
@@ -474,7 +488,27 @@ class _GeneratorTrainingStep:
             ):
                 condition_z = self._flow_condition_z(z, flow_condition)
                 flow_images = encoded_flow_images if encoded_flow_images is not None else self._encode_flow_images(images)
-                return self.generator.flow_matching_loss(flow_images, condition_z, generator=noise_generator)
+                self._last_latent_perceptual_metrics = {}
+                if not self.latent_perceptual_loss_runtime.enabled:
+                    return self.generator.flow_matching_loss(flow_images, condition_z, generator=noise_generator)
+                flow_loss, flow_metrics, clean_latents = self.generator.flow_matching_loss(
+                    flow_images,
+                    condition_z,
+                    generator=noise_generator,
+                    return_clean_latents=True,
+                )
+                perceptual_loss, perceptual_metrics = decoder_latent_perceptual_loss(
+                    self.latent_codec,
+                    clean_latents,
+                    self.latent_perceptual_loss_runtime,
+                )
+                total = flow_loss + self.latent_perceptual_loss_runtime.weight * perceptual_loss
+                assert_finite_tensor("flow_plus_latent_perceptual_loss", total)
+                self._last_latent_perceptual_metrics = {
+                    "flow_matching_objective_raw": float(flow_loss.detach().cpu()),
+                    **perceptual_metrics,
+                }
+                return total, flow_metrics
 
             def _encode_flow_images(self, images):
                 if self.latent_codec is None:
@@ -567,7 +601,7 @@ class _GeneratorTrainingStep:
                 flow_condition: str,
                 effective_flow_weight: float = 1.0,
             ):
-                return {
+                metrics = {
                     "flow_loss_raw": float(flow_loss.detach().cpu()),
                     "cycle_loss_raw": float(cycle_loss.detach().cpu()),
                     "repr_loss": float(repr_loss.detach().cpu()),
@@ -584,6 +618,8 @@ class _GeneratorTrainingStep:
                     "sample_condition": self.stage2_objective.sample_condition,
                     "loss_weighting_type": self.loss_weighting.type,
                 }
+                metrics.update(self._last_latent_perceptual_metrics)
+                return metrics
 
             def _stage2_probe_loss_metrics(
                 self,
@@ -595,7 +631,7 @@ class _GeneratorTrainingStep:
                 effective_repr_weight: float,
                 flow_condition: str,
             ):
-                return {
+                metrics = {
                     "flow_loss_raw": float(flow_loss.detach().cpu()),
                     "cycle_loss_raw": 0.0,
                     "repr_loss": float(secondary_loss.detach().cpu()),
@@ -611,12 +647,15 @@ class _GeneratorTrainingStep:
                     "flow_condition": flow_condition,
                     "loss_weighting_type": self.loss_weighting.type,
                 }
+                metrics.update(self._last_latent_perceptual_metrics)
+                return metrics
 
             def _combine_losses(self, flow_loss, cycle_loss, *, use_cycle: bool, lambda_cycle: float):
                 metrics = {
                     "flow_loss_raw": float(flow_loss.detach().cpu()),
                     "cycle_loss_raw": float(cycle_loss.detach().cpu()),
                     "loss_weighting_type": self.loss_weighting.type,
+                    **self._last_latent_perceptual_metrics,
                 }
                 if self.loss_weighting.type == "legacy":
                     cycle_weight = float(lambda_cycle) if use_cycle else 0.0
@@ -1282,6 +1321,68 @@ def _resume_checkpoint_state_dict(checkpoint: Mapping, selector: str, checkpoint
     return state_dict, state_key
 
 
+def _optimizer_step_contract(config: Mapping) -> int | None:
+    payload = config.get("optimizer_step_contract")
+    if payload is None:
+        return None
+    if not isinstance(payload, Mapping):
+        raise ValueError("train_g config.optimizer_step_contract must be a mapping")
+    context = "train_g config.optimizer_step_contract"
+    if payload.get("contract_type") != _R13_OPTIMIZER_STEP_CONTRACT:
+        raise ValueError(
+            f"{context}.contract_type must equal {_R13_OPTIMIZER_STEP_CONTRACT!r}, "
+            f"got {payload.get('contract_type')!r}"
+        )
+    required_steps = payload.get("required_steps")
+    if isinstance(required_steps, bool) or not isinstance(required_steps, int) or required_steps <= 0:
+        raise ValueError(f"{context}.required_steps must be a positive integer, got {required_steps!r}")
+    unexpected = sorted(set(payload) - {"contract_type", "required_steps"})
+    if unexpected:
+        raise ValueError(f"{context} has unexpected fields: {unexpected!r}")
+    return int(required_steps)
+
+
+def _resume_global_step(checkpoint: Mapping, checkpoint_path: str, required_steps: int) -> int:
+    metrics = checkpoint.get("metrics")
+    if not isinstance(metrics, Mapping):
+        raise ValueError(
+            f"Resume checkpoint {checkpoint_path} missing metrics mapping required by optimizer_step_contract"
+        )
+    global_step = metrics.get("global_step")
+    if isinstance(global_step, bool) or not isinstance(global_step, int) or global_step < 0:
+        raise ValueError(
+            f"Resume checkpoint {checkpoint_path} metrics.global_step must be a non-negative integer, "
+            f"got {global_step!r}"
+        )
+    if global_step > required_steps:
+        raise ValueError(
+            f"Resume checkpoint {checkpoint_path} metrics.global_step={global_step} exceeds "
+            f"required_steps={required_steps}"
+        )
+    if global_step == required_steps:
+        raise ValueError(
+            f"Resume checkpoint {checkpoint_path} already satisfies required_steps={required_steps}; "
+            "no optimizer step remains to execute"
+        )
+    return int(global_step)
+
+
+def _advance_global_step(
+    global_step: int,
+    required_steps: int | None,
+    *,
+    optimizer_step_succeeded: bool,
+) -> tuple[int, bool]:
+    if required_steps is None:
+        return int(global_step), False
+    if not optimizer_step_succeeded:
+        raise RuntimeError("optimizer_step_contract can only count an explicit successful optimizer.step()")
+    next_step = int(global_step) + 1
+    if next_step > required_steps:
+        raise RuntimeError(f"optimizer global_step={next_step} exceeded required_steps={required_steps}")
+    return next_step, next_step == required_steps
+
+
 def _conditioning_only_named_parameters(generator) -> tuple[tuple[str, object], ...]:
     backbone = getattr(generator, "vector_field", None)
     if backbone is None:
@@ -1713,6 +1814,8 @@ def train_g_from_config(config: dict) -> dict:
     freeze_e0(e0)
 
     generator_config = _generator_config_from_train_config(config)
+    latent_perceptual_loss_runtime = latent_perceptual_loss_runtime_from_config(config, generator_config)
+    required_optimizer_steps = _optimizer_step_contract(config)
     stages = _stage_config(config)
     ema_config = _ema_config(config)
     best_model = _best_model(config, ema_config)
@@ -1725,6 +1828,7 @@ def train_g_from_config(config: dict) -> dict:
     resume_ema_state_dict = None
     resume_optimizer_state_dict = None
     resume_loss_weighting_state = None
+    global_step = 0
     # Optional: absent resume_from starts a fresh generator run.
     # R6-continue local patch: if the stage2 objective is peft_mlp, eagerly wrap
     # the ConditionMLPAdapter BEFORE loading the resume checkpoint so adapter
@@ -1810,6 +1914,8 @@ def train_g_from_config(config: dict) -> dict:
                 resume_optimizer_state_dict = ckpt["optimizer_state_dict"]
             if "loss_weighting_state" in ckpt:
                 resume_loss_weighting_state = ckpt["loss_weighting_state"]
+            if required_optimizer_steps is not None:
+                global_step = _resume_global_step(ckpt, str(resume_path), required_optimizer_steps)
         if distributed.is_main:
             restored = [checkpoint_model_state_key]
             if resume_mode == _RESUME_MODE_TRAINING_STATE:
@@ -1853,6 +1959,7 @@ def train_g_from_config(config: dict) -> dict:
         loss_weighting_runtime,
         stage2_objective,
         latent_codec=latent_codec,
+        latent_perceptual_loss_runtime=latent_perceptual_loss_runtime,
     ).to(device)
     set_seed(int(config["seed"]) + distributed.rank)
 
@@ -1922,6 +2029,7 @@ def train_g_from_config(config: dict) -> dict:
     allow_stage2_without_stage1_gate = _require_bool(config, "allow_stage2_without_stage1_gate", "train_g config")
 
     total_epoch = 0
+    optimizer_step_limit_reached = False
     for stage_name in ("stage1", "stage2"):
         if _should_check_stage2_gate(stage_name, resume_progress):
             blocked = _stage2_blocked(
@@ -2036,6 +2144,7 @@ def train_g_from_config(config: dict) -> dict:
                             gradient_metrics["gradient_conflict_full_batch_size"]
                         )
                         totals["gradient_conflict_samples"].append(gradient_metrics)
+                optimizer_step_succeeded = False
                 if stage_name == "stage2" and stage2_objective is not None and stage2_objective.type in _PROJECTED_STAGE2_OBJECTIVES:
                     loss, flow_mse, cycle, flow_loss, cycle_loss, batch_grad_norm, projection_metrics = _run_projected_stage2_batch(
                         training_module=training_module,
@@ -2112,8 +2221,15 @@ def train_g_from_config(config: dict) -> dict:
                         )
                         batch_grad_norm = float(grad_norm) if isinstance(grad_norm, float) else float(grad_norm.detach().cpu())
                     optimizer.step()
+                    optimizer_step_succeeded = True
                     if ema is not None:
                         ema.update(unwrap_model(training_module).generator)
+                if required_optimizer_steps is not None:
+                    global_step, optimizer_step_limit_reached = _advance_global_step(
+                        global_step,
+                        required_optimizer_steps,
+                        optimizer_step_succeeded=optimizer_step_succeeded,
+                    )
                 _assert_finite_training_scalars(loss, flow_mse, cycle)
                 _accumulate_extra_loss_metrics(totals, unwrap_model(training_module).last_loss_metrics, batch_size)
                 seen += batch_size
@@ -2121,6 +2237,8 @@ def train_g_from_config(config: dict) -> dict:
                 totals["flow_matching_mse"] += float(flow_mse.cpu()) * batch_size
                 totals["cycle"] += float(cycle.detach().cpu()) * batch_size
                 totals["grad_norm"] += batch_grad_norm * batch_size
+                if optimizer_step_limit_reached:
+                    break
 
             metrics = _reduce_epoch_metrics(totals, seen, device, distributed)
             should_break = False
@@ -2140,6 +2258,9 @@ def train_g_from_config(config: dict) -> dict:
                 metrics.update(batch_metadata)
                 if config.get("resume_from"):
                     metrics["optimizer_resumed"] = optimizer_resumed
+                if required_optimizer_steps is not None:
+                    metrics["global_step"] = int(global_step)
+                    metrics["required_optimizer_steps"] = int(required_optimizer_steps)
                 if loss_weighting_runtime.type == "uncertainty":
                     metrics["lambda_cycle_legacy_schedule"] = lambda_cycle
                 raw_validation_metrics = None
@@ -2236,9 +2357,17 @@ def train_g_from_config(config: dict) -> dict:
                 distributed,
             )
             completed_stage_epochs = stage_epoch + 1
-            if should_break:
+            if should_break or optimizer_step_limit_reached:
                 break
         total_epoch += completed_stage_epochs
+        if optimizer_step_limit_reached:
+            break
+
+    if required_optimizer_steps is not None and global_step != required_optimizer_steps:
+        cleanup_distributed(distributed)
+        raise RuntimeError(
+            f"optimizer_step_contract incomplete: global_step={global_step}, required_steps={required_optimizer_steps}"
+        )
 
     manifest = {}
     if distributed.is_main:
@@ -2674,17 +2803,39 @@ def _distributed_manifest(distributed: DistributedContext) -> dict:
 
 
 def _validate_train_g_config(config: dict) -> None:
-    _generator_trainable_mode(config)
-    _resume_mode(config)
-    _resume_checkpoint_model(config)
+    generator_trainable_mode = _generator_trainable_mode(config)
+    resume_mode = _resume_mode(config)
+    resume_checkpoint_model = _resume_checkpoint_model(config)
     generator_config = _generator_config_from_train_config(config)
     validate_latent_training_config(config, generator_config)
+    latent_perceptual_loss_runtime = latent_perceptual_loss_runtime_from_config(config, generator_config)
+    required_optimizer_steps = _optimizer_step_contract(config)
+    if "latent_perceptual_loss" in config:
+        if required_optimizer_steps != _R13_REQUIRED_OPTIMIZER_STEPS:
+            raise ValueError(
+                "R13 latent_perceptual_loss control/LPL arms require "
+                f"optimizer_step_contract.required_steps={_R13_REQUIRED_OPTIMIZER_STEPS}"
+            )
+        if generator_trainable_mode != _GENERATOR_TRAINABLE_CONDITIONING_ONLY:
+            raise ValueError("R13 latent_perceptual_loss control/LPL arms require generator_trainable='conditioning_only'")
+        if resume_mode != _RESUME_MODE_MODEL_WEIGHTS_ONLY or resume_checkpoint_model != _RESUME_CHECKPOINT_MODEL_EMA:
+            raise ValueError(
+                "R13 latent_perceptual_loss control/LPL arms require resume_mode='model_weights_only' "
+                "and resume_checkpoint_model='ema'"
+            )
+        if not str(config.get("resume_from", "") or ""):
+            raise ValueError("R13 latent_perceptual_loss control/LPL arms require an explicit resume_from checkpoint")
     _require_bool(config, "allow_stage2_without_stage1_gate", "train_g config")
     stages = _stage_config(config)
     ema_config = _ema_config(config)
     _best_model(config, ema_config)
     loss_weighting = _loss_weighting_runtime_from_config(config)
     stage2_objective = _stage2_objective_from_config(stages)
+    objective_type = None if stage2_objective is None else stage2_objective.type
+    if latent_perceptual_loss_runtime.enabled and objective_type not in (None, "fm_only_probe"):
+        raise ValueError("latent_perceptual_loss enabled runs require no stage2 objective or type='fm_only_probe'")
+    if required_optimizer_steps is not None and objective_type not in (None, "fm_only_probe"):
+        raise ValueError("optimizer_step_contract requires no stage2 objective or type='fm_only_probe'")
     _validate_independent_prior_m2m(config, generator_config, stage2_objective)
     if stage2_objective is None and _requires_medium_v2_stage2_objective(config, stages):
         raise ValueError("medium_v2 Stage 2 configs require stages.stage2.stage2_objective")
