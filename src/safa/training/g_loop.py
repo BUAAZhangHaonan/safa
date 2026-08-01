@@ -119,6 +119,7 @@ _R14_COMPLETION_CONTRACT = "safa_r14_inpaint_exact_optimizer_steps_v1"
 _R14_REQUIRED_OPTIMIZER_STEPS = 2560
 _R14_REQUIRED_STAGE2_EPOCHS = 20
 _R14_RESUME_CONTRACT = "safa_r14_epoch_boundary_world_size_resume_v1"
+_R14_LONG_RESUME_CONTRACT = "safa_r14_long_resume_v1"
 _R14_RESUME_SOURCE_CHECKPOINT = "checkpoints/r14_inpaint_feasibility_2560step/last.pt"
 _R14_SPATIAL_TRAINING_CONTRACT = "safa_r14_spatial_training_v1"
 _R13_OPTIMIZER_CHECKPOINT_CONTRACT = "safa_r13_optimizer_checkpoint_steps_v1"
@@ -1430,8 +1431,7 @@ def _r14_resume_contract(config: Mapping) -> dict | None:
         return None
     if not isinstance(payload, Mapping):
         raise ValueError("train_g config.r14_resume_contract must be a mapping")
-    expected = {
-        "contract_type": _R14_RESUME_CONTRACT,
+    base_expected = {
         "source_global_step": 2432,
         "source_completed_stage2_epochs": 19,
         "source_world_size": 4,
@@ -1441,9 +1441,29 @@ def _r14_resume_contract(config: Mapping) -> dict | None:
         "target_world_size": 2,
         "target_global_batch_size": 8,
         "target_per_device_batch_size": 4,
-        "additional_optimizer_steps": 128,
-        "target_global_step": 2560,
     }
+    contract_type = payload.get("contract_type")
+    if contract_type == _R14_RESUME_CONTRACT:
+        expected = {
+            "contract_type": contract_type,
+            **base_expected,
+            "additional_optimizer_steps": 128,
+            "target_global_step": 2560,
+        }
+    elif contract_type == _R14_LONG_RESUME_CONTRACT:
+        expected = {
+            "contract_type": contract_type,
+            **base_expected,
+            "additional_optimizer_steps": 10368,
+            "target_global_step": 12800,
+            "target_completed_stage2_epochs": 100,
+            "checkpoint_steps": [2560, 5120, 7680, 10240, 12800],
+        }
+    else:
+        raise ValueError(
+            "train_g config.r14_resume_contract.contract_type must be one of "
+            f"{(_R14_RESUME_CONTRACT, _R14_LONG_RESUME_CONTRACT)!r}"
+        )
     if set(payload) != set(expected):
         raise ValueError(
             "train_g config.r14_resume_contract fields differ from the registered schema"
@@ -1454,7 +1474,11 @@ def _r14_resume_contract(config: Mapping) -> dict | None:
                 f"train_g config.r14_resume_contract.{field} must be "
                 f"{expected_value!r}, got {payload.get(field)!r}"
             )
-    return dict(payload)
+    normalized = dict(payload)
+    if contract_type == _R14_RESUME_CONTRACT:
+        normalized["target_completed_stage2_epochs"] = _R14_REQUIRED_STAGE2_EPOCHS
+        normalized["checkpoint_steps"] = [2560]
+    return normalized
 
 
 def _optimizer_step_contract(config: Mapping) -> int | None:
@@ -1740,9 +1764,12 @@ def _validate_r14_resume_checkpoint(
         raise ValueError("R14 resume contract does not describe an exact source epoch boundary")
     target_global_batch = int(contract["target_global_batch_size"])
     target_steps_per_epoch, target_remainder = divmod(samples_per_epoch, target_global_batch)
-    if target_remainder or target_steps_per_epoch != int(contract["additional_optimizer_steps"]):
-        raise ValueError("R14 resume contract does not describe one complete target epoch")
-    if int(contract["source_global_step"]) + target_steps_per_epoch != int(contract["target_global_step"]):
+    target_completed_epochs = int(contract["target_completed_stage2_epochs"])
+    remaining_epochs = target_completed_epochs - completed_epochs
+    expected_additional_steps = remaining_epochs * target_steps_per_epoch
+    if target_remainder or remaining_epochs <= 0 or expected_additional_steps != int(contract["additional_optimizer_steps"]):
+        raise ValueError("R14 resume contract does not describe complete target epochs")
+    if int(contract["source_global_step"]) + expected_additional_steps != int(contract["target_global_step"]):
         raise ValueError("R14 resume contract target_global_step is inconsistent")
 
     metrics = checkpoint.get("metrics")
@@ -1825,7 +1852,7 @@ def _validate_r14_training_state_load(missing, unexpected) -> None:
 
 
 def _validate_r14_resume_completion(history: list[dict], contract: Mapping) -> None:
-    completed_epochs = int(contract["source_completed_stage2_epochs"]) + 1
+    completed_epochs = int(contract["target_completed_stage2_epochs"])
     if len(history) != completed_epochs:
         raise RuntimeError(
             f"R14 resume must end with {completed_epochs} completed epochs, got {len(history)}"
@@ -3668,9 +3695,16 @@ def _validate_r14_inpaint_training_contract(
             raise ValueError("R14 inpaint four-GPU fresh run requires per_device_batch_size=2 and global_batch_size=8")
     else:
         if required_optimizer_steps != int(resume_contract["target_global_step"]):
-            raise ValueError("R14 resume requires optimizer target global_step=2560")
-        if optimizer_checkpoint_steps != (int(resume_contract["target_global_step"]),):
-            raise ValueError("R14 resume checkpoint steps must be exactly [2560]")
+            raise ValueError(
+                "R14 resume requires optimizer target global_step="
+                f"{resume_contract['target_global_step']}"
+            )
+        expected_checkpoint_steps = tuple(resume_contract["checkpoint_steps"])
+        if optimizer_checkpoint_steps != expected_checkpoint_steps:
+            raise ValueError(
+                "R14 resume checkpoint steps must be exactly "
+                f"{list(expected_checkpoint_steps)!r}"
+            )
         if resume_mode != _RESUME_MODE_TRAINING_STATE:
             raise ValueError("R14 resume requires resume_mode='training_state'")
         if resume_checkpoint_model != _RESUME_CHECKPOINT_MODEL_RAW:
@@ -3690,8 +3724,16 @@ def _validate_r14_inpaint_training_contract(
         raise ValueError("R14 inpaint feasibility does not use latent_perceptual_loss")
     if int(stages["stage1"]["epochs"]) != 0:
         raise ValueError("R14 inpaint requires stages.stage1.epochs=0")
-    if int(stages["stage2"]["epochs"]) != _R14_REQUIRED_STAGE2_EPOCHS:
-        raise ValueError("R14 inpaint requires exactly 20 stages.stage2 epochs")
+    expected_stage2_epochs = (
+        _R14_REQUIRED_STAGE2_EPOCHS
+        if resume_contract is None
+        else int(resume_contract["target_completed_stage2_epochs"])
+    )
+    if int(stages["stage2"]["epochs"]) != expected_stage2_epochs:
+        raise ValueError(
+            "R14 inpaint requires exactly "
+            f"{expected_stage2_epochs} stages.stage2 epochs"
+        )
     if stage2_objective is None or stage2_objective.type != "fm_only_probe":
         raise ValueError("R14 inpaint requires stage2_objective.type='fm_only_probe'")
     if stage2_objective.flow_condition != _FLOW_CONDITION_EMBEDDING:

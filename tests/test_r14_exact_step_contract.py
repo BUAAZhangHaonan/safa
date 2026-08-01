@@ -301,3 +301,66 @@ def test_r14_resume_completion_requires_twenty_epochs_and_1024_samples() -> None
     history[-1]["epoch_sample_count"] = 512
     with pytest.raises(RuntimeError, match="epoch_sample_count"):
         g_loop._validate_r14_resume_completion(history, g_loop._r14_resume_contract(config))
+
+
+def _long_resume_contract_inputs() -> tuple[dict, dict]:
+    config, kwargs = _resume_contract_inputs()
+    contract = {
+        "contract_type": g_loop._R14_LONG_RESUME_CONTRACT,
+        "source_global_step": 2432,
+        "source_completed_stage2_epochs": 19,
+        "source_world_size": 4,
+        "source_global_batch_size": 8,
+        "source_per_device_batch_size": 2,
+        "samples_per_epoch": 1024,
+        "target_world_size": 2,
+        "target_global_batch_size": 8,
+        "target_per_device_batch_size": 4,
+        "additional_optimizer_steps": 10368,
+        "target_global_step": 12800,
+        "target_completed_stage2_epochs": 100,
+        "checkpoint_steps": [2560, 5120, 7680, 10240, 12800],
+    }
+    config["r14_resume_contract"] = contract
+    config["optimizer_step_contract"]["required_steps"] = 12800
+    config["optimizer_checkpoint_contract"]["save_steps"] = list(contract["checkpoint_steps"])
+    kwargs["required_optimizer_steps"] = 12800
+    kwargs["optimizer_checkpoint_steps"] = tuple(contract["checkpoint_steps"])
+    kwargs["stages"]["stage2"]["epochs"] = 100
+    return config, kwargs
+
+
+def test_r14_long_resume_runs_to_epoch100_and_records_all_milestones() -> None:
+    config, kwargs = _long_resume_contract_inputs()
+    contract = g_loop._r14_resume_contract(config)
+
+    assert contract is not None
+    assert g_loop._optimizer_step_contract(config) == 12800
+    assert g_loop._optimizer_checkpoint_steps(config, 12800) == (2560, 5120, 7680, 10240, 12800)
+    g_loop._validate_r14_inpaint_training_contract(config, **kwargs)
+    g_loop._validate_r14_resume_checkpoint(_resume_checkpoint(), "last.pt", contract)
+    progress = g_loop._resume_stage_progress_from_metrics(_resume_checkpoint()["metrics"], "last.pt")
+    assert g_loop._resume_stage_start_epoch("stage2", kwargs["stages"], progress) == 19
+
+    step = 2432
+    for _ in range(10368):
+        step, reached = g_loop._advance_global_step(step, 12800, optimizer_step_succeeded=True)
+    assert (step, reached) == (12800, True)
+    with pytest.raises(RuntimeError, match="exceeded required_steps=12800"):
+        g_loop._advance_global_step(step, 12800, optimizer_step_succeeded=True)
+
+    history = _resume_checkpoint()["history"]
+    for epoch in range(19, 100):
+        history.append(
+            {
+                "stage": "stage2",
+                "stage_epoch": epoch,
+                "stage_epoch_1based": epoch + 1,
+                "global_step": (epoch + 1) * 128,
+                "world_size": 2,
+                "global_batch_size": 8,
+                "per_device_batch_size": 4,
+                "epoch_sample_count": 1024,
+            }
+        )
+    g_loop._validate_r14_resume_completion(history, contract)
