@@ -82,11 +82,11 @@ run_pipeline() {
 
 case "$MODE" in
   dry-run)
-    "$PYTHON_BIN" scripts/validate_r14_inpaint_resume_gpu01.py --mode static
+    "$PYTHON_BIN" scripts/validate_r14_inpaint_resume_gpu12_epoch100.py --mode static
     print_pipeline
     ;;
   validate)
-    "$PYTHON_BIN" scripts/validate_r14_inpaint_resume_gpu01.py --mode resource
+    "$PYTHON_BIN" scripts/validate_r14_inpaint_resume_gpu12_epoch100.py --mode resource
     print_pipeline
     ;;
   inside-tmux)
@@ -103,7 +103,7 @@ case "$MODE" in
     run_pipeline
     ;;
   launch)
-    "$PYTHON_BIN" scripts/validate_r14_inpaint_resume_gpu01.py --mode resource
+    "$PYTHON_BIN" scripts/validate_r14_inpaint_resume_gpu12_epoch100.py --mode resource
     mkdir -p "$(dirname "$LOG")"
     TMUX_PAYLOAD=(
       env
