@@ -1,0 +1,131 @@
+experiment_name: r14_inpaint_resume_gpu12_epoch100
+r14_contract: safa_r14_face_region_inpaint_feasibility_v1
+r14_resume_contract:
+  contract_type: safa_r14_long_resume_v1
+  source_global_step: 2432
+  source_completed_stage2_epochs: 19
+  source_world_size: 4
+  source_global_batch_size: 8
+  source_per_device_batch_size: 2
+  samples_per_epoch: 1024
+  target_world_size: 2
+  target_global_batch_size: 8
+  target_per_device_batch_size: 4
+  additional_optimizer_steps: 10368
+  target_global_step: 12800
+  target_completed_stage2_epochs: 100
+  checkpoint_steps: [2560, 5120, 7680, 10240, 12800]
+seed: 1337
+sampling_seed: 1337
+device: cuda:0
+num_workers: 4
+global_batch_size: 8
+per_device_batch_size: 4
+amp: false
+optimizer_type: adamw
+learning_rate: 0.0001
+weight_decay: 0.0
+grad_clip_norm: 1.0
+latent_training: true
+pixel_image_size: 256
+vae_model: stabilityai/sd-vae-ft-ema
+vae_path: artifacts/checkpoints/external/sd-vae-ft-ema
+vae_scaling_factor: 0.18215
+image_size: 32
+embedding_dim: 512
+train_index: data/index/train_face_mixed_e14_4029avail.jsonl
+train_features: artifacts/e0_features/train_face_mixed_e14_e0_medium_v1
+eval_index: data/index/val_face_mixed_e14.jsonl
+eval_features: artifacts/e0_features/val_face_mixed_e14_e0_medium_v1
+e0_checkpoint: artifacts/checkpoints/e0_medium_v1/best.pt
+r14_spatial:
+  contract_type: safa_r14_spatial_training_v1
+  pair_manifest: artifacts/r14_inpaint_feasibility/v1/manifests/train_pairs.jsonl
+  horizontal_flip_probability: 0.0
+r14_pairing:
+  expression_relation: same
+  identity_relation: different_sample_id
+  require_source_target_distinct: true
+out_dir: checkpoints/r14_inpaint_resume_gpu12_epoch100
+allow_stage2_without_stage1_gate: true
+resume_from: checkpoints/r14_inpaint_feasibility_2560step/last.pt
+resume_mode: training_state
+resume_checkpoint_model: raw
+resume_optimizer_state: true
+generator_trainable: full
+optimizer_step_contract:
+  contract_type: safa_r14_exact_optimizer_steps_v1
+  required_steps: 12800
+optimizer_checkpoint_contract:
+  contract_type: safa_r14_optimizer_checkpoint_steps_v1
+  save_steps: [2560, 5120, 7680, 10240, 12800]
+ema:
+  enabled: true
+  decay: 0.9999
+  evaluate_raw: true
+  evaluate_ema: true
+  save_ema_checkpoint: true
+best_model: ema
+distributed:
+  backend: nccl
+generator:
+  model_type: meanflow_sit_inpaint
+  base_channels: 1
+  channel_multipliers: [1]
+  time_embedding_dim: 128
+  condition_dim: 512
+  sample_steps: 1
+  train_cycle_steps: 1
+  cycle_steps_schedule: []
+  sampler: meanflow
+  learned_null_condition: true
+  meanflow_ratio: 0.25
+  meanflow_ratio_r_not_equal_t: 0.75
+  meanflow_adaptive_weighting: true
+  meanflow_norm_p: 1.0
+  meanflow_norm_eps: 0.001
+  meanflow_jvp_mode: torch_func
+  sit_input_channels: 4
+  sit_data_space: latent
+  sit_patch_size: 4
+  sit_hidden_size: 768
+  sit_depth: 12
+  sit_num_heads: 12
+  sit_mlp_ratio: 4.0
+  sit_time_embedding_dim: 256
+  attention_backend: native
+  sit_pretrained_path: ''
+  sit_pretrained_state_key: ''
+  sit_pretrained_source: https://drive.google.com/drive/folders/1oWt6tdm5WIeVaZnBuUVheKIG3cNDffl9?usp=drive_link
+  sit_pretrained_source_repo: zhuyu-cs/MeanFlow@40a766689c8bccad61f2993ee6905630ac030ff3
+  inpaint:
+    mask_source: affectnet_original_bbox
+    bbox_expansion_pixels: 0
+    morphology: null
+    source_face_removed_before_context_encoder: true
+    conditioning: cached_source_z_only
+    clean_target: target_image
+    context_image: target_image_with_target_bbox_zeroed
+    flow_and_loss_region: inside_latent_mask_only
+    outside_latent_projection: context_after_every_flow_step
+    outside_pixel_contract: bit_exact_context_pixels
+stages:
+  stage1:
+    epochs: 0
+    require_face_detection_gate: false
+  stage2:
+    epochs: 100
+    gradient_monitor:
+      enabled: false
+      interval: 20
+      max_samples: 2
+    stage2_objective:
+      type: fm_only_probe
+      flow_condition: embedding
+      sample_condition: embedding
+    quality_eval:
+      enabled: false
+validation:
+  enabled: false
+  face_detection:
+    enabled: false
