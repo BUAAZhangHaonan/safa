@@ -12,6 +12,7 @@ import argparse
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
@@ -131,6 +132,31 @@ def _checkpoint_path(step: int) -> Path:
     return path
 
 
+def _prepare_evaluator_generation(generation: Path, manifest: Path, staging: Path) -> Path:
+    """Bind source paths to the locked val index while preserving raw generation output."""
+    if staging.exists():
+        raise FileExistsError(f"refusing to replace evaluator staging: {staging}")
+    rows = _read_jsonl(generation / "per_sample.jsonl")
+    manifest_rows = _validate_manifest(manifest)
+    source_by_id = {str(row["sample_id"]): str(row["image_path"]) for row in manifest_rows}
+    if any(not row.get("sample_id") or row["sample_id"] not in source_by_id for row in rows):
+        raise RuntimeError("generation rows do not match evaluator manifest IDs")
+    staging.mkdir(parents=True, exist_ok=False)
+    for name in ("generated_images", "native_images"):
+        (staging / name).symlink_to((generation / name).resolve(), target_is_directory=True)
+    bound_rows = []
+    for row in rows:
+        bound = dict(row)
+        bound["source"] = source_by_id[str(row["sample_id"])]
+        bound_rows.append(bound)
+    (staging / "per_sample.jsonl").write_text(
+        "".join(json.dumps(row, sort_keys=True, allow_nan=False) + "\n" for row in bound_rows),
+        encoding="utf-8",
+    )
+    shutil.copy2(generation / "completion.json", staging / "completion.json")
+    return staging
+
+
 def _summarize_dataset(step: int, dataset: str, generation: Path, evaluation: Path) -> dict[str, object]:
     summary = _mapping(json.loads((evaluation / "summary.json").read_text(encoding="utf-8")), "official summary")
     metrics = _mapping(summary.get("metrics"), "official metrics")
@@ -184,13 +210,15 @@ def _run_one(step: int, dataset: str, manifest: Path, root: Path, config: Path, 
         )
     run_root = root / "runs" / f"step_{step:08d}" / dataset
     generation = run_root / "generation"
+    evaluator_generation = run_root / "evaluation_input"
     evaluation = run_root / "evaluation"
     _run(
         [str(PYTHON), "-m", "torch.distributed.run", "--standalone", "--nproc_per_node=2", "scripts/run_r14_inpaint_milestone_generation.py", "--config", str(config), "--checkpoint", str(export), "--manifest", str(manifest), "--output-dir", str(generation)],
         env=env,
     )
+    _prepare_evaluator_generation(generation, manifest, evaluator_generation)
     _run(
-        [str(PYTHON), "scripts/evaluate_r14_inpaint_feasibility.py", "--config", str(config), "--manifest", str(manifest), "--generation-dir", str(generation), "--output-dir", str(evaluation)],
+        [str(PYTHON), "scripts/evaluate_r14_inpaint_feasibility.py", "--config", str(config), "--manifest", str(manifest), "--generation-dir", str(evaluator_generation), "--output-dir", str(evaluation)],
         env=env,
     )
     return _summarize_dataset(step, dataset, generation, evaluation)
@@ -221,7 +249,7 @@ def _dry_run(root: Path) -> dict[str, object]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=("dry-run", "run"), required=True)
-    parser.add_argument("--output-root", type=Path, default=REPO_ROOT / "artifacts/r14_inpaint_milestone_eval/v1")
+    parser.add_argument("--output-root", type=Path, default=REPO_ROOT / "artifacts/r14_inpaint_milestone_eval/v2")
     args = parser.parse_args()
     root = args.output_root.resolve()
     if args.mode == "dry-run":

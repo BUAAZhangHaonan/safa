@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO_ROOT="/home/hdd3/zhanghaonan/projects/samplewise-affective-face-anonymization"
 PYTHON_BIN="/home/hdd3/zhanghaonan/anaconda3/envs/safa/bin/python"
-OUTPUT_ROOT="artifacts/r14_inpaint_milestone_eval/v1"
+OUTPUT_ROOT="artifacts/r14_inpaint_milestone_eval/v2"
 SESSION="safa-r14-inpaint-milestone-eval-v1"
 LOG="$OUTPUT_ROOT/logs/pipeline.log"
 
