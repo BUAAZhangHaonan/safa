@@ -228,8 +228,17 @@ def main() -> None:
         print(json.dumps(_dry_run(root), indent=2, sort_keys=True))
         return
     if root.exists():
-        raise FileExistsError(f"refusing to reuse eval root: {root}")
-    root.mkdir(parents=True, exist_ok=False)
+        existing = list(root.iterdir())
+        precreated_logs_only = (
+            root.is_dir()
+            and len(existing) == 1
+            and existing[0].is_dir()
+            and existing[0].name == "logs"
+        )
+        if not precreated_logs_only:
+            raise FileExistsError(f"refusing to reuse eval root: {root}")
+    else:
+        root.mkdir(parents=True, exist_ok=False)
     _validate_config()
     tail_manifest = _materialize_tail_manifest(root / "preparation" / "tail32.jsonl")
     _validate_manifest(REGULAR_MANIFEST)
